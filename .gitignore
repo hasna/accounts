@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+*.tgz
+.secrets/
+coverage/
+
+# projects CLI generates a machine-specific CLAUDE.md (local only)
+CLAUDE.md
