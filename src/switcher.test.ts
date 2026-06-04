@@ -15,6 +15,7 @@ import {
 import { liveClaudePaths, profileOAuthSnapshot } from "./lib/claude-layout.js";
 import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook.js";
 import { resolvePickMode } from "./lib/pick.js";
+import { switchProfile } from "./lib/switch.js";
 import { loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -224,4 +225,36 @@ test("resolvePickMode maps Commander --no-act to none", () => {
   expect(resolvePickMode({ act: false })).toBe("none");
   expect(resolvePickMode({ env: true })).toBe("env");
   expect(resolvePickMode({})).toBe("apply");
+});
+
+test("switchProfile applies Claude and returns a continue handoff command", () => {
+  const dir = mkdtempSync(join(tmpdir(), "switch-claude-"));
+  writeOAuth(dir, "switch@example.com");
+  addProfile({ name: "switcher", dir });
+  ensureProfileAuthSnapshot(dir, getTool("claude"));
+
+  const result = switchProfile("switcher", { tool: "claude", resume: true });
+
+  expect(result.applied).toBe(true);
+  expect(result.restartRequired).toBe(true);
+  expect(result.command).toEqual(["claude", "--continue"]);
+  expect(result.commandLine).toContain("CLAUDE_CONFIG_DIR=");
+  expect(appliedProfile("claude")?.name).toBe("switcher");
+  const live = JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")) as {
+    oauthAccount: { emailAddress: string };
+  };
+  expect(live.oauthAccount.emailAddress).toBe("switch@example.com");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("switchProfile marks Codex active and returns resume command without applying live auth", () => {
+  const p = addProfile({ name: "codexer", tool: "codex" });
+
+  const result = switchProfile("codexer", { tool: "codex", resume: true });
+
+  expect(result.applied).toBe(false);
+  expect(result.command).toEqual(["codex", "resume", "--last"]);
+  expect(result.env.CODEX_HOME).toBe(p.dir);
+  expect(currentProfile("codex")?.name).toBe("codexer");
+  expect(appliedProfile("codex")).toBeUndefined();
 });

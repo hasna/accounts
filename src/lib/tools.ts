@@ -16,6 +16,7 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     defaultDir: join(homedir(), ".claude"),
     bin: "claude",
     loginHint: "run /login inside Claude, then /exit when done",
+    resumeArgs: ["--continue"],
     accountFile: ".claude.json",
     emailPath: ["oauthAccount", "emailAddress"],
   },
@@ -27,6 +28,7 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     bin: "codex",
     loginArgs: ["login"],
     loginHint: "complete the Codex login flow for this CODEX_HOME",
+    resumeArgs: ["resume", "--last"],
   },
   {
     id: "opencode",
@@ -40,6 +42,7 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     bin: "opencode",
     loginArgs: ["auth", "login"],
     loginHint: "complete opencode auth login for this isolated config/data root",
+    resumeArgs: ["--continue"],
   },
   {
     id: "cursor",

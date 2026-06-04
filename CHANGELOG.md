@@ -6,6 +6,14 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-06-04
+
+### Added
+
+- `accounts switch <name> --tool <tool>` to switch profiles and print or launch a restart/resume command.
+- `accounts-mcp` stdio server with `list_tools`, `list_profiles`, `current_profile`, and `switch_profile`.
+- Resume handoff defaults for Claude (`claude --continue`), Codex (`codex resume --last`), and opencode (`opencode --continue`).
+
 ## [0.1.3] - 2026-06-04
 
 ### Fixed

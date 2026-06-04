@@ -29,6 +29,7 @@ import { profileHasAuth } from "./lib/claude-auth.js";
 import { loadStore } from "./storage.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin } from "./lib/login.js";
+import { switchProfile, type SwitchMode } from "./lib/switch.js";
 
 const program = new Command();
 
@@ -283,6 +284,41 @@ program
       const p = appliedProfile(tool);
       if (!p) die(`no applied profile for "${tool}". Run \`accounts apply <name>\` first.`);
       console.log(p.name);
+    }),
+  );
+
+program
+  .command("switch")
+  .argument("<name>", "profile name")
+  .argument("[args...]", "extra args passed when printing/launching the tool")
+  .description("switch to a profile and print a restart/resume command; use --launch to run it")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
+  .option("--mode <mode>", "switch mode: auto, apply, env, active", "auto")
+  .option("--resume", "include the tool's resume/continue args in the handoff command")
+  .option("--launch", "launch the tool after switching")
+  .option("--json", "output JSON")
+  .action(
+    action((name: string, args: string[], opts: { tool?: string; mode: SwitchMode; resume?: boolean; launch?: boolean; json?: boolean }) => {
+      const result = switchProfile(name, { tool: opts.tool, mode: opts.mode, resume: opts.resume, args });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.green(`✓ ${result.message}`));
+        if (result.applied) console.log(chalk.dim("  live/default auth updated"));
+        console.log(chalk.dim(`  restart command: ${result.commandLine}`));
+        if (!opts.launch) {
+          console.log(chalk.yellow("  Exit the current agent session, then run the restart command above."));
+        }
+      }
+      if (opts.launch) {
+        const [bin, ...launchArgs] = result.command;
+        const res = spawnSync(bin!, launchArgs, {
+          stdio: "inherit",
+          env: { ...process.env, ...result.env },
+        });
+        if (res.error) die(`failed to launch ${bin}: ${res.error.message}`);
+        process.exit(res.status ?? 0);
+      }
     }),
   );
 

@@ -20,6 +20,7 @@ export const toolDefSchema = z.object({
   bin: z.string().min(1),
   loginArgs: z.array(z.string()).optional(),
   loginHint: z.string().optional(),
+  resumeArgs: z.array(z.string()).optional(),
   accountFile: z.string().optional(),
   emailPath: z.array(z.string()).optional(),
 });

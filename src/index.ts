@@ -31,6 +31,8 @@ export { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 export type { ImportOptions } from "./lib/import-profile.js";
 export { finalizeLogin } from "./lib/login.js";
 export type { FinalizeLoginResult } from "./lib/login.js";
+export { switchProfile } from "./lib/switch.js";
+export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
 export { pickProfile } from "./lib/pick.js";
 export type { PickOptions, PickResult } from "./lib/pick.js";
 export { installHook, uninstallHook, hookPath, hookScript, shellSnippet } from "./lib/hook.js";

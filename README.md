@@ -91,6 +91,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts login <name> --tool <tool>` | Launch the tool's login flow in an isolated profile dir. |
 | `accounts apply <name> --tool claude` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
+| `accounts switch <name> --tool <tool>` | Switch profile and print a restart/resume command. Add `--resume`; add `--launch` to run it. |
 | `accounts use <name> --tool <tool>` | Mark profile active; prints apply/env hints. |
 | `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
 | `accounts show <name> --tool <tool>` | Profile details including active/applied flags. |
@@ -107,6 +108,36 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
 
 See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
+
+## Agent / MCP Switching
+
+`accounts` ships a stdio MCP server:
+
+```bash
+accounts-mcp
+```
+
+Add it to Claude/Codex/opencode/Cursor MCP config as a command server named
+`accounts`. It exposes:
+
+- `list_tools`
+- `list_profiles`
+- `current_profile`
+- `switch_profile`
+
+`switch_profile` applies Claude live auth when the target profile is Claude and
+returns a restart handoff command. MCP servers cannot safely kill their parent
+agent process, so the tool returns an instruction such as: exit this session and
+run `CLAUDE_CONFIG_DIR=... claude --continue`.
+
+Human equivalent:
+
+```bash
+accounts switch account001 --tool claude --resume
+accounts switch account001 --tool claude --resume --launch
+accounts switch codex-work --tool codex --resume
+accounts switch ops --tool opencode --resume
+```
 
 ## Shell hook (optional)
 
