@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
+import { registerEventsCommands } from "@hasna/events/commander";
 import chalk from "chalk";
 import { AccountsError, type Profile } from "./types.js";
 import { DEFAULT_TOOL, getTool, listTools, isBuiltinTool, addCustomTool, removeCustomTool } from "./lib/tools.js";
@@ -915,6 +916,8 @@ program
       console.log(chalk.green("\nhealthy."));
     }),
   );
+
+registerEventsCommands(program, { source: "accounts" });
 
 program.parseAsync(process.argv);
 
