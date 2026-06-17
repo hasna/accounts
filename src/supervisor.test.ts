@@ -82,6 +82,7 @@ test("runSupervisedTool restarts a child under the requested profile", async () 
     defaultDir: join(home, "fake-default"),
     bin: process.execPath,
     resumeArgs: [scriptPath, "--resume"],
+    permissionArgs: { dangerous: ["--no-warnings"] },
   });
   const one = addProfile({ name: "one", tool: "fakeagent" });
   const two = addProfile({ name: "two", tool: "fakeagent" });
@@ -102,10 +103,16 @@ test("runSupervisedTool restarts a child under the requested profile", async () 
       type: "switch_profile",
       name: "two",
       resume: true,
+      permissions: "dangerous",
     });
 
     expect(response?.ok).toBe(true);
-    expect(response && "queued" in response ? response.result.command : []).toEqual([process.execPath, scriptPath, "--resume"]);
+    expect(response && "queued" in response ? response.result.command : []).toEqual([
+      process.execPath,
+      "--no-warnings",
+      scriptPath,
+      "--resume",
+    ]);
 
     await waitFor(() => {
       const hit = readLog(logPath).find((entry) => entry.active === "two");

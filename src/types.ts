@@ -21,6 +21,8 @@ export const toolDefSchema = z.object({
   loginArgs: z.array(z.string()).optional(),
   loginHint: z.string().optional(),
   resumeArgs: z.array(z.string()).optional(),
+  /** Tool-specific permission presets exposed through `--permissions <preset>`. */
+  permissionArgs: z.record(z.array(z.string())).optional(),
   accountFile: z.string().optional(),
   emailPath: z.array(z.string()).optional(),
 });

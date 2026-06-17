@@ -9,6 +9,9 @@ export {
   isBuiltinTool,
   addCustomTool,
   removeCustomTool,
+  mergeToolArgs,
+  normalizePermissionPreset,
+  permissionArgsFor,
 } from "./lib/tools.js";
 export { profileEnv, formatEnvAssignments, formatExportLines } from "./lib/env.js";
 export { detectEmail } from "./lib/detect.js";

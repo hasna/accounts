@@ -311,6 +311,20 @@ test("switchProfile applies Claude and returns a continue handoff command", () =
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("switchProfile includes Claude dangerous permission preset before resume args", () => {
+  const dir = mkdtempSync(join(tmpdir(), "switch-claude-permissions-"));
+  writeOAuth(dir, "switch@example.com");
+  addProfile({ name: "danger", dir });
+  ensureProfileAuthSnapshot(dir, getTool("claude"));
+
+  const result = switchProfile("danger", { tool: "claude", resume: true, permissions: "dangerous" });
+
+  expect(result.permissions).toBe("dangerous");
+  expect(result.command).toEqual(["claude", "--dangerously-skip-permissions", "--continue"]);
+  expect(result.commandLine).toContain("--dangerously-skip-permissions");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("switchProfile marks Codex active and returns resume command without applying live auth", () => {
   const p = addProfile({ name: "codexer", tool: "codex" });
 
@@ -321,6 +335,21 @@ test("switchProfile marks Codex active and returns resume command without applyi
   expect(result.env.CODEX_HOME).toBe(p.dir);
   expect(currentProfile("codex")?.name).toBe("codexer");
   expect(appliedProfile("codex")).toBeUndefined();
+});
+
+test("switchProfile puts Codex dangerous permissions before the resume subcommand", () => {
+  const p = addProfile({ name: "codexdanger", tool: "codex" });
+
+  const result = switchProfile("codexdanger", { tool: "codex", resume: true, permissions: "dangerous" });
+
+  expect(result.command).toEqual(["codex", "--dangerously-bypass-approvals-and-sandbox", "resume", "--last"]);
+  expect(result.env.CODEX_HOME).toBe(p.dir);
+});
+
+test("switchProfile rejects unsupported permission presets", () => {
+  addProfile({ name: "open", tool: "opencode" });
+
+  expect(() => switchProfile("open", { tool: "opencode", permissions: "dangerous" })).toThrow(AccountsError);
 });
 
 // --- auth persistence regressions (logout-on-switch bugs) ---

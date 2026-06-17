@@ -33,6 +33,7 @@ export type SupervisorRequest =
       mode?: SwitchMode;
       resume?: boolean;
       args?: string[];
+      permissions?: string;
     }
   | { type: "stop" };
 
@@ -415,6 +416,7 @@ export async function runSupervisedTool(
         mode: request.mode ?? "auto",
         resume: request.resume ?? true,
         args: request.args ?? [],
+        permissions: request.permissions,
       });
       log(`accounts supervisor: switching ${tool.id} to ${result.profile.name}`);
       setTimeout(() => void restartWith(result), 0);

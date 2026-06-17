@@ -16,7 +16,16 @@ import {
 } from "./lib/profiles.js";
 import { loadStore, saveStore } from "./storage.js";
 import { detectEmail } from "./lib/detect.js";
-import { getTool, listTools, addCustomTool, removeCustomTool, isBuiltinTool } from "./lib/tools.js";
+import {
+  getTool,
+  listTools,
+  addCustomTool,
+  removeCustomTool,
+  isBuiltinTool,
+  mergeToolArgs,
+  normalizePermissionPreset,
+  permissionArgsFor,
+} from "./lib/tools.js";
 import { formatExportLines, profileEnv } from "./lib/env.js";
 import { AccountsError } from "./types.js";
 
@@ -76,6 +85,37 @@ test("built-in tools cover major coding agents", () => {
   expect(ids).toContain("hermes");
   expect(ids).toContain("kimi");
   expect(ids).toContain("grok");
+});
+
+test("built-in tools expose tool-specific permission presets", () => {
+  expect(permissionArgsFor(getTool("claude"), "dangerous")).toEqual(["--dangerously-skip-permissions"]);
+  expect(permissionArgsFor(getTool("takumi"), "dangerously-skip-permissions")).toEqual(["--dangerously-skip-permissions"]);
+  expect(permissionArgsFor(getTool("codex"), "dangerous")).toEqual(["--dangerously-bypass-approvals-and-sandbox"]);
+  expect(permissionArgsFor(getTool("gemini"), "yolo")).toEqual(["--yolo"]);
+  expect(permissionArgsFor(getTool("hermes"), "danger")).toEqual(["--yolo"]);
+  expect(permissionArgsFor(getTool("kimi"), "auto")).toEqual(["--auto"]);
+  expect(normalizePermissionPreset("bypassPermissions")).toBe("bypass");
+});
+
+test("mergeToolArgs prepends permission args without duplicating explicit flags", () => {
+  const claude = getTool("claude");
+  expect(mergeToolArgs(claude, ["--continue"], { permissions: "dangerous" })).toEqual([
+    "--dangerously-skip-permissions",
+    "--continue",
+  ]);
+  expect(mergeToolArgs(claude, ["--dangerously-skip-permissions"], { permissions: "dangerous" })).toEqual([
+    "--dangerously-skip-permissions",
+  ]);
+  expect(mergeToolArgs(getTool("codex"), ["resume", "--last"], { permissions: "dangerous" })).toEqual([
+    "--dangerously-bypass-approvals-and-sandbox",
+    "resume",
+    "--last",
+  ]);
+});
+
+test("unsupported permission preset fails clearly", () => {
+  expect(() => permissionArgsFor(getTool("opencode"), "dangerous")).toThrow(AccountsError);
+  expect(permissionArgsFor(getTool("opencode"), "none")).toEqual([]);
 });
 
 test("same profile name is allowed across tools and ambiguous without tool", () => {
@@ -219,10 +259,18 @@ test("store persists across loads", () => {
 });
 
 test("custom tools: register, use for a profile, and list", () => {
-  addCustomTool({ id: "windsurf", label: "Windsurf", envVar: "WINDSURF_HOME", defaultDir: "/tmp/.windsurf", bin: "windsurf" });
+  addCustomTool({
+    id: "windsurf",
+    label: "Windsurf",
+    envVar: "WINDSURF_HOME",
+    defaultDir: "/tmp/.windsurf",
+    bin: "windsurf",
+    permissionArgs: { dangerous: ["--yolo"] },
+  });
   expect(listTools().some((t) => t.id === "windsurf")).toBe(true);
   expect(isBuiltinTool("windsurf")).toBe(false);
   expect(getTool("windsurf").label).toBe("Windsurf");
+  expect(permissionArgsFor(getTool("windsurf"), "dangerous")).toEqual(["--yolo"]);
   const p = addProfile({ name: "design", tool: "windsurf", email: "d@example.com" });
   expect(p.tool).toBe("windsurf");
 });

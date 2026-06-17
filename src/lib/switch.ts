@@ -3,7 +3,7 @@ import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
 import { getProfile, useProfile } from "./profiles.js";
-import { getTool } from "./tools.js";
+import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
 
@@ -12,6 +12,7 @@ export interface SwitchOptions {
   mode?: SwitchMode;
   resume?: boolean;
   args?: string[];
+  permissions?: string;
 }
 
 export interface SwitchResult {
@@ -23,6 +24,7 @@ export interface SwitchResult {
   exports: string;
   command: string[];
   commandLine: string;
+  permissions?: string;
   restartRequired: boolean;
   message: string;
 }
@@ -37,7 +39,8 @@ function commandLine(env: Record<string, string>, command: string[]): string {
 }
 
 function commandFor(tool: ToolDef, opts: SwitchOptions): string[] {
-  return [tool.bin, ...(opts.resume ? (tool.resumeArgs ?? []) : []), ...(opts.args ?? [])];
+  const args = [...(opts.resume ? (tool.resumeArgs ?? []) : []), ...(opts.args ?? [])];
+  return [tool.bin, ...mergeToolArgs(tool, args, { permissions: opts.permissions })];
 }
 
 export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchResult {
@@ -72,6 +75,7 @@ export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchRes
     exports: formatExportLines(env),
     command,
     commandLine: commandLine(env, command),
+    ...(opts.permissions ? { permissions: normalizePermissionPreset(opts.permissions) } : {}),
     restartRequired,
     message,
   };

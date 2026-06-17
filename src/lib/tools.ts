@@ -17,6 +17,15 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     bin: "claude",
     loginHint: "run /login inside Claude, then /exit when done",
     resumeArgs: ["--continue"],
+    permissionArgs: {
+      dangerous: ["--dangerously-skip-permissions"],
+      "allow-dangerous": ["--allow-dangerously-skip-permissions"],
+      bypass: ["--permission-mode", "bypassPermissions"],
+      auto: ["--permission-mode", "auto"],
+      "accept-edits": ["--permission-mode", "acceptEdits"],
+      "dont-ask": ["--permission-mode", "dontAsk"],
+      plan: ["--permission-mode", "plan"],
+    },
     accountFile: ".claude.json",
     emailPath: ["oauthAccount", "emailAddress"],
   },
@@ -29,6 +38,9 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     loginArgs: ["login"],
     loginHint: "complete the Codex login flow for this CODEX_HOME",
     resumeArgs: ["resume", "--last"],
+    permissionArgs: {
+      dangerous: ["--dangerously-bypass-approvals-and-sandbox"],
+    },
   },
   {
     id: "takumi",
@@ -38,6 +50,15 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     bin: "takumi",
     loginHint: "complete Takumi auth in this TAKUMI_CONFIG_DIR",
     resumeArgs: ["--continue"],
+    permissionArgs: {
+      dangerous: ["--dangerously-skip-permissions"],
+      "allow-dangerous": ["--allow-dangerously-skip-permissions"],
+      bypass: ["--permission-mode", "bypassPermissions"],
+      auto: ["--permission-mode", "auto"],
+      "accept-edits": ["--permission-mode", "acceptEdits"],
+      "dont-ask": ["--permission-mode", "dontAsk"],
+      plan: ["--permission-mode", "plan"],
+    },
     accountFile: ".claude.json",
     emailPath: ["oauthAccount", "emailAddress"],
   },
@@ -48,6 +69,12 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     defaultDir: join(homedir(), ".gemini"),
     bin: "gemini",
     loginHint: "complete Gemini auth in this GEMINI_CONFIG_DIR",
+    permissionArgs: {
+      dangerous: ["--yolo"],
+      yolo: ["--yolo"],
+      "auto-edit": ["--approval-mode", "auto_edit"],
+      plan: ["--approval-mode", "plan"],
+    },
   },
   {
     id: "opencode",
@@ -87,6 +114,10 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     defaultDir: join(homedir(), ".hermes"),
     bin: "hermes",
     loginHint: "complete Hermes auth in this HERMES_HOME",
+    permissionArgs: {
+      dangerous: ["--yolo"],
+      yolo: ["--yolo"],
+    },
   },
   {
     id: "kimi",
@@ -96,6 +127,12 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     bin: "kimi",
     loginArgs: ["login"],
     loginHint: "complete kimi login for this KIMI_CODE_HOME",
+    permissionArgs: {
+      dangerous: ["--yolo"],
+      yolo: ["--yolo"],
+      auto: ["--auto"],
+      plan: ["--plan"],
+    },
   },
   {
     id: "grok",
@@ -109,6 +146,49 @@ export const BUILTIN_TOOLS: ToolDef[] = [
 ];
 
 export const DEFAULT_TOOL = "claude";
+
+export interface ToolArgOptions {
+  permissions?: string;
+}
+
+const PERMISSION_ALIASES = new Map<string, string>([
+  ["danger", "dangerous"],
+  ["dangerously-skip-permissions", "dangerous"],
+  ["skip-permissions", "dangerous"],
+  ["skip", "dangerous"],
+  ["bypasspermissions", "bypass"],
+  ["bypass-permissions", "bypass"],
+  ["acceptedits", "accept-edits"],
+  ["accept-edit", "accept-edits"],
+  ["autoedit", "auto-edit"],
+  ["auto-edits", "auto-edit"],
+  ["auto_edit", "auto-edit"],
+  ["dontask", "dont-ask"],
+  ["dont-ask-permissions", "dont-ask"],
+]);
+
+export function normalizePermissionPreset(value: string): string {
+  const normalized = value.trim().replace(/^--/, "").replaceAll("_", "-").toLowerCase();
+  return PERMISSION_ALIASES.get(normalized) ?? normalized;
+}
+
+export function permissionArgsFor(tool: ToolDef, permissions?: string): string[] {
+  if (!permissions) return [];
+  const preset = normalizePermissionPreset(permissions);
+  if (preset === "default" || preset === "none" || preset === "off") return [];
+  const args = tool.permissionArgs?.[preset];
+  if (!args) {
+    const supported = Object.keys(tool.permissionArgs ?? {}).sort();
+    const suffix = supported.length > 0 ? ` Supported permissions: ${supported.join(", ")}.` : " No permission presets are configured.";
+    throw new AccountsError(`tool "${tool.id}" does not support permissions "${permissions}".${suffix}`);
+  }
+  return args;
+}
+
+export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOptions = {}): string[] {
+  const permissionArgs = permissionArgsFor(tool, opts.permissions).filter((arg) => !args.includes(arg));
+  return [...permissionArgs, ...args];
+}
 
 const BUILTIN_IDS = new Set(BUILTIN_TOOLS.map((t) => t.id));
 

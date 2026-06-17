@@ -97,8 +97,8 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts login <name> --tool <tool>` | Launch the tool's login flow in an isolated profile dir. |
 | `accounts apply <name> --tool claude` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
-| `accounts switch <name> --tool <tool>` | Switch profile and print a restart/resume command. Add `--resume`; add `--launch` to run it. |
-| `accounts switch <name> --tool <tool> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. |
+| `accounts switch <name> --tool <tool>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. |
+| `accounts switch <name> --tool <tool> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. Supports `--permissions <preset>`. |
 | `accounts use <name> --tool <tool>` | Mark profile active; prints apply/env hints. |
 | `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
 | `accounts show <name> --tool <tool>` | Profile details including active/applied flags. |
@@ -106,8 +106,8 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts active [tool]` | Print active profile name (scripting). |
 | `accounts applied [tool]` | Print applied profile name (scripting). |
 | `accounts env [name] --tool <tool>` | Print one or more `export ...` lines for the profile. |
-| `accounts launch <name> --tool <tool>` | Launch tool once with profile env. |
-| `accounts run <tool> [args...]` | Run a tool under the supervisor so MCP/CLI can switch and restart it. |
+| `accounts launch <name> --tool <tool>` | Launch tool once with profile env. Supports `--permissions <preset>`. |
+| `accounts run <tool> [args...]` | Run a tool under the supervisor so MCP/CLI can switch and restart it. Supports `--permissions <preset>`. |
 | `accounts supervisor status [tool]` | Show running supervisors. |
 | `accounts supervisor switch <name> --tool <tool>` | Switch a running supervisor to another profile. |
 | `accounts supervisor stop <tool>` | Stop a running supervisor and its child process. |
@@ -159,10 +159,17 @@ Human equivalent:
 ```bash
 accounts switch account001 --tool claude --resume
 accounts switch account001 --tool claude --resume --launch
+accounts switch account001 --tool claude --resume --permissions dangerous
 accounts switch account001 --tool claude --supervisor
 accounts switch codex-work --tool codex --resume
 accounts switch ops --tool opencode --resume
 ```
+
+`--permissions <preset>` maps a permission mode to the tool's own flags. For
+example, `--permissions dangerous` launches Claude/Takumi with
+`--dangerously-skip-permissions`, Codex with
+`--dangerously-bypass-approvals-and-sandbox`, and Gemini/Hermes/Kimi with their
+YOLO mode flags. Unsupported tools fail with a list of configured presets.
 
 ## Shell hook (optional)
 
@@ -233,6 +240,7 @@ For Grok Build, prefer `accounts launch` or `accounts shell`; exporting `HOME`
 globally is intentionally not recommended.
 
 Custom tools can join supervised resume switching with `accounts tools add ... --resume-arg <arg>`.
+They can also define permission presets with `--permission-arg preset=--flag`.
 
 ## Library
 

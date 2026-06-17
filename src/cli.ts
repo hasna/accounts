@@ -8,7 +8,16 @@ import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
 import chalk from "chalk";
 import { AccountsError, type Profile } from "./types.js";
-import { DEFAULT_TOOL, getTool, listTools, isBuiltinTool, addCustomTool, removeCustomTool } from "./lib/tools.js";
+import {
+  DEFAULT_TOOL,
+  getTool,
+  listTools,
+  isBuiltinTool,
+  addCustomTool,
+  removeCustomTool,
+  mergeToolArgs,
+  normalizePermissionPreset,
+} from "./lib/tools.js";
 import {
   addProfile,
   currentProfile,
@@ -123,6 +132,19 @@ function printStorageSyncResult(result: AccountsStorageSyncResult, json?: boolea
   }
   console.log(chalk.green(`pushed ${result.pushed}, pulled ${result.pulled}`));
   console.log(chalk.dim(`key: ${result.key}`));
+}
+
+function parsePermissionArgs(entries?: string[]): Record<string, string[]> {
+  const permissionArgs: Record<string, string[]> = {};
+  for (const entry of entries ?? []) {
+    const idx = entry.indexOf("=");
+    if (idx <= 0) die(`invalid --permission-arg ${entry}; expected PRESET=ARG`);
+    const preset = normalizePermissionPreset(entry.slice(0, idx));
+    const arg = entry.slice(idx + 1);
+    if (!arg) die(`invalid --permission-arg ${entry}; expected PRESET=ARG`);
+    (permissionArgs[preset] ??= []).push(arg);
+  }
+  return permissionArgs;
 }
 
 program
@@ -347,6 +369,7 @@ program
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--mode <mode>", "switch mode: auto, apply, env, active", "auto")
   .option("--resume", "include the tool's resume/continue args in the handoff command")
+  .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .option("--launch", "launch the tool after switching")
   .option("--supervisor", "ask a running accounts supervisor to restart the tool")
   .option("--json", "output JSON")
@@ -355,14 +378,30 @@ program
       async (
         name: string,
         args: string[],
-        opts: { tool?: string; mode: SwitchMode; resume?: boolean; launch?: boolean; supervisor?: boolean; json?: boolean },
+        opts: {
+          tool?: string;
+          mode: SwitchMode;
+          resume?: boolean;
+          permissions?: string;
+          launch?: boolean;
+          supervisor?: boolean;
+          json?: boolean;
+        },
       ) => {
         if (opts.supervisor && opts.launch) die("--supervisor and --launch cannot be used together");
         if (opts.supervisor) {
           const profile = getProfile(name, opts.tool);
           const response = await sendSupervisorRequest(
             profile.tool,
-            { type: "switch_profile", name: profile.name, tool: profile.tool, mode: opts.mode, resume: opts.resume ?? true, args },
+            {
+              type: "switch_profile",
+              name: profile.name,
+              tool: profile.tool,
+              mode: opts.mode,
+              resume: opts.resume ?? true,
+              args,
+              permissions: opts.permissions,
+            },
             { allowMissing: true },
           );
           if (!response) {
@@ -380,7 +419,13 @@ program
           return;
         }
 
-        const result = switchProfile(name, { tool: opts.tool, mode: opts.mode, resume: opts.resume, args });
+        const result = switchProfile(name, {
+          tool: opts.tool,
+          mode: opts.mode,
+          resume: opts.resume,
+          args,
+          permissions: opts.permissions,
+        });
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
         } else {
@@ -457,14 +502,16 @@ program
   .argument("[args...]", "extra args passed to the tool binary")
   .description("launch the tool's binary with the profile's config dir active")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
+  .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .action(
-    action((name: string, args: string[], opts: { tool?: string }) => {
+    action((name: string, args: string[], opts: { tool?: string; permissions?: string }) => {
       const profile = getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
       const env = profileEnv(profile, tool);
+      const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions });
       useProfile(name, tool.id); // mark active + bump lastUsedAt
-      console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${args.join(" ")}`));
-      const res = spawnSync(tool.bin, args, {
+      console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${launchArgs.join(" ")}`));
+      const res = spawnSync(tool.bin, launchArgs, {
         stdio: "inherit",
         env: { ...process.env, ...env },
       });
@@ -481,10 +528,13 @@ program
   .option("-p, --profile <name>", "profile to run when target is a tool id")
   .option("-t, --tool <tool>", "tool when target is a profile name")
   .option("--resume", "start with the tool's resume/continue args")
+  .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .action(
-    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean }) => {
+    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string }) => {
       const plan = resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
-      const runArgs = [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args];
+      const runArgs = mergeToolArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
+        permissions: opts.permissions,
+      });
       console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
       console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
@@ -536,13 +586,27 @@ supervisor
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--mode <mode>", "switch mode: auto, apply, env, active", "auto")
   .option("--no-resume", "restart without the tool's resume/continue args")
+  .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .option("--json", "output JSON")
   .action(
-    action(async (name: string, args: string[], opts: { tool?: string; mode: SwitchMode; resume?: boolean; json?: boolean }) => {
+    action(
+      async (
+        name: string,
+        args: string[],
+        opts: { tool?: string; mode: SwitchMode; resume?: boolean; permissions?: string; json?: boolean },
+      ) => {
       const profile = getProfile(name, opts.tool);
       const response = await sendSupervisorRequest(
         profile.tool,
-        { type: "switch_profile", name: profile.name, tool: profile.tool, mode: opts.mode, resume: opts.resume !== false, args },
+        {
+          type: "switch_profile",
+          name: profile.name,
+          tool: profile.tool,
+          mode: opts.mode,
+          resume: opts.resume !== false,
+          args,
+          permissions: opts.permissions,
+        },
         { allowMissing: true },
       );
       if (!response) die(`no running accounts supervisor for ${getTool(profile.tool).label}`);
@@ -555,7 +619,8 @@ supervisor
         console.log(chalk.green(`✓ queued supervisor switch to ${chalk.bold(response.result.profile.name)}`));
         console.log(chalk.dim(`  restart command: ${response.result.commandLine}`));
       }
-    }),
+      },
+    ),
   );
 
 supervisor
@@ -789,7 +854,11 @@ tools
       for (const t of all) {
         const tag = isBuiltinTool(t.id) ? chalk.dim("built-in") : chalk.magenta("custom");
         const envNames = [t.envVar, ...Object.keys(t.extraEnv ?? {})].join(", ");
-        console.log(`${chalk.cyan(t.id.padEnd(10))} ${t.label.padEnd(16)} ${chalk.dim(envNames)} → ${chalk.dim(t.defaultDir)}  ${tag}`);
+        const permissions = Object.keys(t.permissionArgs ?? {});
+        const permissionsHint = permissions.length > 0 ? chalk.dim(` permissions: ${permissions.sort().join(",")}`) : "";
+        console.log(
+          `${chalk.cyan(t.id.padEnd(10))} ${t.label.padEnd(16)} ${chalk.dim(envNames)} → ${chalk.dim(t.defaultDir)}  ${tag}${permissionsHint}`,
+        );
       }
     }),
   );
@@ -805,6 +874,7 @@ tools
   .option("--extra-env <VAR=VALUE...>", "additional env var templates; supports {profileDir}, {profileName}, {toolId}")
   .option("--login-arg <arg...>", "arguments for `accounts login <profile> --tool <id>`")
   .option("--resume-arg <arg...>", "arguments for supervised resume/restart, e.g. --continue")
+  .option("--permission-arg <preset=arg...>", "tool permission preset args, e.g. dangerous=--yolo")
   .option("--account-file <file>", "file inside the config dir holding the email")
   .option("--email-path <path>", "dot-path to the email inside that file (e.g. account.email)")
   .action(
@@ -819,6 +889,7 @@ tools
           extraEnv?: string[];
           loginArg?: string[];
           resumeArg?: string[];
+          permissionArg?: string[];
           accountFile?: string;
           emailPath?: string;
         },
@@ -829,6 +900,7 @@ tools
           if (idx <= 0) die(`invalid --extra-env ${entry}; expected VAR=VALUE`);
           extraEnv[entry.slice(0, idx)] = entry.slice(idx + 1);
         }
+        const permissionArgs = parsePermissionArgs(opts.permissionArg);
         const def = {
           id,
           label: opts.label,
@@ -838,6 +910,7 @@ tools
           ...(Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
           ...(opts.loginArg ? { loginArgs: opts.loginArg } : {}),
           ...(opts.resumeArg ? { resumeArgs: opts.resumeArg } : {}),
+          ...(Object.keys(permissionArgs).length > 0 ? { permissionArgs } : {}),
           ...(opts.accountFile ? { accountFile: opts.accountFile } : {}),
           ...(opts.emailPath ? { emailPath: opts.emailPath.split(".") } : {}),
         };

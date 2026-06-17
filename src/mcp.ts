@@ -18,7 +18,7 @@ function fail(message: string) {
 }
 
 const server = new Server(
-  { name: "accounts", version: "0.1.12" },
+  { name: "accounts", version: "0.1.13" },
   { capabilities: { tools: {} } },
 );
 
@@ -55,6 +55,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           tool: { type: "string" },
           mode: { type: "string", enum: ["auto", "apply", "env", "active"] },
           resume: { type: "boolean" },
+          permissions: { type: "string" },
           args: { type: "array", items: { type: "string" } },
         },
         required: ["name"],
@@ -90,6 +91,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const switchArgs = Array.isArray(args["args"])
           ? args["args"].filter((value): value is string => typeof value === "string")
           : undefined;
+        const permissions = typeof args["permissions"] === "string" ? args["permissions"] : undefined;
         const supervisor = await sendSupervisorRequest(
           profile.tool,
           {
@@ -99,6 +101,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             mode: typeof args["mode"] === "string" ? (args["mode"] as SwitchMode) : "auto",
             resume,
             args: switchArgs,
+            permissions,
           },
           { allowMissing: true },
         );
@@ -116,6 +119,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           mode: typeof args["mode"] === "string" ? (args["mode"] as SwitchMode) : "auto",
           resume,
           args: switchArgs,
+          permissions,
         });
         return ok({
           supervised: false,
