@@ -61,6 +61,25 @@ function readKeychainAccount(): string | undefined {
   }
 }
 
+function bufferText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+  return undefined;
+}
+
+export function keychainWriteFailureMessage(err: unknown): string {
+  const record = err && typeof err === "object" ? (err as Record<string, unknown>) : {};
+  const stderr = bufferText(record.stderr);
+  const stdout = bufferText(record.stdout);
+  const detail = (stderr || stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1);
+  if (detail) return detail;
+  return typeof record.status === "number" ? `security exited with status ${record.status}` : "security command failed";
+}
+
 /** Write Claude Code credentials into the login keychain (replaces existing entry). */
 export function writeClaudeKeychain(cred: KeychainCredential): void {
   if (!keychainSupported()) {
@@ -81,6 +100,6 @@ export function writeClaudeKeychain(cred: KeychainCredential): void {
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (err) {
-    throw new AccountsError(`keychain write failed: ${(err as Error).message}`);
+    throw new AccountsError(`keychain write failed: ${keychainWriteFailureMessage(err)}`);
   }
 }

@@ -6,12 +6,16 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
-## [0.1.13] - 2026-06-17
+## [0.1.14] - 2026-06-17
 
 ### Added
 
 - `--permissions <preset>` for launch, switch, supervised switch, run, and MCP profile switching so tool-specific permission modes can be requested without hand-writing flags.
 - Built-in dangerous permission mappings for Claude, Takumi, Codex, Gemini, Hermes, and Kimi, plus custom tool `--permission-arg preset=flag` support.
+
+### Fixed
+
+- macOS keychain write failures now report sanitized stderr/status instead of command arguments.
 
 
 ## [0.1.12] - 2026-06-17

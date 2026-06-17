@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, existsSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertSafeWritePath } from "./lib/safe-path.js";
-import { assertAllowedKeychainCredential, writeClaudeKeychain } from "./lib/keychain.js";
+import { assertAllowedKeychainCredential, keychainWriteFailureMessage, writeClaudeKeychain } from "./lib/keychain.js";
 import { CLAUDE_KEYCHAIN_SERVICE } from "./lib/claude-layout.js";
 import { saveStore, loadStore } from "./storage.js";
 import { shellQuotePath, hookScript } from "./lib/hook.js";
@@ -79,6 +79,15 @@ test("writeClaudeKeychain rejects non-allowlisted service", () => {
       secret: "secret",
     }),
   ).toThrow(AccountsError);
+});
+
+test("keychain write failure messages do not include command arguments", () => {
+  const message = keychainWriteFailureMessage({
+    message: "Command failed: security add-generic-password -w secret-token",
+    stderr: Buffer.from("security: SecKeychainItemCreateFromContent: User interaction is not allowed.\n"),
+  });
+  expect(message).toBe("security: SecKeychainItemCreateFromContent: User interaction is not allowed.");
+  expect(message).not.toContain("secret-token");
 });
 
 test.skipIf(!existsSync("/var/folders"))("saveStore works when ACCOUNTS_HOME is under /var/folders temp", () => {
