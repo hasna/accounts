@@ -131,6 +131,21 @@ test("ensureProfileForLogin creates profile when missing", () => {
   expect(ensureProfileForLogin("newlogin").dir).toBe(p.dir);
 });
 
+test("ensureProfileForLogin infers an existing profile tool", () => {
+  const p = addProfile({ name: "codexlogin", tool: "codex" });
+
+  expect(ensureProfileForLogin("codexlogin").tool).toBe("codex");
+  expect(ensureProfileForLogin("codexlogin").dir).toBe(p.dir);
+});
+
+test("ensureProfileForLogin requires --tool when an existing profile name is ambiguous", () => {
+  addProfile({ name: "shared", tool: "claude" });
+  addProfile({ name: "shared", tool: "codex" });
+
+  expect(() => ensureProfileForLogin("shared")).toThrow(AccountsError);
+  expect(ensureProfileForLogin("shared", "codex").tool).toBe("codex");
+});
+
 test("apply removes Claude API-helper settings from OAuth profiles and live settings", () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-settings-"));
   writeOAuth(workDir, "work@example.com");

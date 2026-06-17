@@ -167,7 +167,7 @@ program
       console.log(`  config dir: ${p.dir}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none — set with `accounts set " + p.name + " --email ...`)")}`);
       const tool = getTool(p.tool);
-      console.log(chalk.dim(`  launch it:  accounts launch ${p.name} --tool ${p.tool}    (sets ${tool.envVar} and runs ${tool.bin})`));
+      console.log(chalk.dim(`  launch it:  accounts launch ${p.name}    (sets ${tool.envVar} and runs ${tool.bin})`));
     }),
   );
 
@@ -275,7 +275,7 @@ program
       console.log(chalk.green(`✓ imported profile ${chalk.bold(p.name)}`));
       console.log(`  config dir: ${p.dir}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none)")}`);
-      console.log(chalk.dim(`  next: accounts login ${p.name} --tool ${p.tool}  OR  accounts apply ${p.name} --tool ${p.tool}`));
+      console.log(chalk.dim(`  next: accounts login ${p.name}  OR  accounts apply ${p.name}`));
     }),
   );
 
@@ -283,9 +283,9 @@ program
   .command("login")
   .argument("<name>", "profile name")
   .description("launch the tool's login flow inside an isolated profile dir")
-  .option("-t, --tool <tool>", "tool", DEFAULT_TOOL)
+  .option("-t, --tool <tool>", "tool when creating a missing profile or when the profile name is ambiguous")
   .action(
-    action((name: string, opts: { tool: string }) => {
+    action((name: string, opts: { tool?: string }) => {
       const profile = ensureProfileForLogin(name, opts.tool);
       const tool = getTool(profile.tool);
       const env = profileEnv(profile, tool);

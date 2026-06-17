@@ -6,6 +6,14 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-06-17
+
+### Changed
+
+- `accounts login <name>` now infers the tool from an existing unambiguous profile instead of defaulting to Claude before lookup. `--tool` is only needed when creating a missing non-Claude profile or disambiguating duplicate names.
+- README and CLI hints now prefer bare profile commands for unambiguous profiles.
+
+
 ## [0.1.14] - 2026-06-17
 
 ### Added

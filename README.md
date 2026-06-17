@@ -42,23 +42,23 @@ accounts login work        # run /login inside Claude, then /exit; accounts auto
 accounts login personal    # same: login, exit; it becomes the live/default account
 
 # 4. Switch
-accounts apply work --tool claude   # Cursor / VS Code — live ~/.claude auth
+accounts apply work                 # Cursor / VS Code — live ~/.claude auth
 accounts apply personal
 
 # Or terminal-only (parallel sessions OK):
-accounts launch work --tool claude
-eval "$(accounts env personal --tool claude)"   # other terminal
+accounts launch work
+eval "$(accounts env personal)"      # other terminal
 
 # Or supervised: lets MCP switch/restart this Claude process automatically
-accounts use work --tool claude
+accounts use work
 accounts run claude --resume
-accounts switch personal --tool claude --supervisor   # from another terminal
+accounts switch personal --supervisor   # from another terminal
 ```
 
-After `accounts login <name> --tool claude`, `accounts` snapshots the auth Claude
-wrote, updates the detected email, and applies that profile to live `~/.claude`
-paths automatically. `accounts apply` still refuses profiles without auth so live
-OAuth is not wiped.
+After `accounts login <name>`, `accounts` snapshots the auth Claude wrote,
+updates the detected email, and applies that profile to live `~/.claude` paths
+automatically. `accounts apply` still refuses profiles without auth so live OAuth
+is not wiped.
 
 ## Three pointers (active, applied, isolated)
 
@@ -94,24 +94,24 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 |---------|-------------|
 | `accounts add <name>` | Create a profile. `--tool`, `--email`, `--dir`, `--description`. |
 | `accounts import [name]` | Import existing config dir (default `~/.claude`). `--copy` for managed copy. |
-| `accounts login <name> --tool <tool>` | Launch the tool's login flow in an isolated profile dir. |
-| `accounts apply <name> --tool claude` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
+| `accounts login <name>` | Launch the profile's tool login flow in an isolated profile dir. Use `--tool` only for new or ambiguous profiles. |
+| `accounts apply <name>` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
-| `accounts switch <name> --tool <tool>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. |
-| `accounts switch <name> --tool <tool> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. Supports `--permissions <preset>`. |
-| `accounts use <name> --tool <tool>` | Mark profile active; prints apply/env hints. |
+| `accounts switch <name>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. Use `--tool` only when ambiguous. |
+| `accounts switch <name> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. Supports `--permissions <preset>`. |
+| `accounts use <name>` | Mark profile active; prints apply/env hints. |
 | `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
 | `accounts show <name> --tool <tool>` | Profile details including active/applied flags. |
 | `accounts current` | Active profile per tool (with applied hint). |
 | `accounts active [tool]` | Print active profile name (scripting). |
 | `accounts applied [tool]` | Print applied profile name (scripting). |
-| `accounts env [name] --tool <tool>` | Print one or more `export ...` lines for the profile. |
-| `accounts launch <name> --tool <tool>` | Launch tool once with profile env. Supports `--permissions <preset>`. |
+| `accounts env [name]` | Print one or more `export ...` lines for the profile. Use `--tool` only when ambiguous or when no name is passed. |
+| `accounts launch <name>` | Launch tool once with profile env. Supports `--permissions <preset>`. |
 | `accounts run <tool> [args...]` | Run a tool under the supervisor so MCP/CLI can switch and restart it. Supports `--permissions <preset>`. |
 | `accounts supervisor status [tool]` | Show running supervisors. |
-| `accounts supervisor switch <name> --tool <tool>` | Switch a running supervisor to another profile. |
+| `accounts supervisor switch <name>` | Switch a running supervisor to another profile. Use `--tool` only when ambiguous. |
 | `accounts supervisor stop <tool>` | Stop a running supervisor and its child process. |
-| `accounts shell <name> --tool <tool>` | Subshell with profile env. |
+| `accounts shell <name>` | Subshell with profile env. |
 | `accounts hook install` | Install `claude()` wrapper — see [docs/hook.md](docs/hook.md). |
 | `accounts hook uninstall` | Remove hook script. |
 | `accounts hook path` | Print hook script path. |
@@ -140,7 +140,7 @@ Add it to Claude/Codex/opencode/Cursor MCP config as a command server named
 For automatic agent restarts, start the agent through `accounts run`:
 
 ```bash
-accounts use account001 --tool claude
+accounts use account001
 accounts run claude --resume
 ```
 
@@ -157,10 +157,10 @@ handoff behavior and returns a command such as:
 Human equivalent:
 
 ```bash
-accounts switch account001 --tool claude --resume
-accounts switch account001 --tool claude --resume --launch
-accounts switch account001 --tool claude --resume --permissions dangerous
-accounts switch account001 --tool claude --supervisor
+accounts switch account001 --resume
+accounts switch account001 --resume --launch
+accounts switch account001 --resume --permissions dangerous
+accounts switch account001 --supervisor
 accounts switch codex-work --tool codex --resume
 accounts switch ops --tool opencode --resume
 ```

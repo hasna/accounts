@@ -59,13 +59,13 @@ export function importProfile(opts: ImportOptions) {
   return profile;
 }
 
-export function ensureProfileForLogin(name: string, toolId = DEFAULT_TOOL) {
+export function ensureProfileForLogin(name: string, toolId?: string) {
   const existing = findProfileByName(name, toolId);
   if (existing) return existing;
-  return addProfile({ name, tool: toolId, description: "created for login" });
+  return addProfile({ name, tool: toolId ?? DEFAULT_TOOL, description: "created for login" });
 }
 
-function findProfileByName(name: string, toolId: string) {
+function findProfileByName(name: string, toolId?: string) {
   try {
     return getProfile(name, toolId);
   } catch (err) {
