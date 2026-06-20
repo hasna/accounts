@@ -133,6 +133,7 @@ test("same profile name is allowed across tools and ambiguous without tool", () 
   expect(getProfile("work", "codex").tool).toBe("codex");
   useProfile("work", "codex");
   expect(currentProfile("codex")?.name).toBe("work");
+  expect(currentProfile("codex")?.tool).toBe("codex");
   expect(currentProfile("claude")).toBeUndefined();
 });
 

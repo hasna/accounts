@@ -238,5 +238,5 @@ export function currentProfile(toolId: string): Profile | undefined {
   const store = loadStore();
   const name = store.current[toolId];
   if (!name) return undefined;
-  return store.profiles.find((p) => p.name === name);
+  return store.profiles.find((p) => p.name === name && p.tool === toolId);
 }
