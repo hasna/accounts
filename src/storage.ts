@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { type Store, storeSchema, AccountsError, profileNameSchema } from "./types.js";
 import { assertSafeWritePath } from "./lib/safe-path.js";
 
@@ -144,7 +144,9 @@ export function saveStore(store: Store): void {
   const path = storePath();
   assertSafeWritePath(path, { mustStayUnder: accountsHome() });
   mkdirSync(join(path, ".."), { recursive: true });
+  if (existsSync(path)) chmodSync(path, 0o600);
   writeFileSync(path, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(path, 0o600);
 }
 
 function firstEnv(env: NodeJS.ProcessEnv, primary: string, fallback: string): string | undefined {

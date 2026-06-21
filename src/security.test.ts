@@ -110,6 +110,33 @@ test("saveStore refuses writing through symlinked store path", () => {
   expect(() => saveStore(loadStore())).toThrow(AccountsError);
 });
 
+test("saveStore tightens permissions on an existing store file", () => {
+  const path = join(home, "accounts.json");
+  writeFileSync(path, JSON.stringify({ version: 1, profiles: [] }));
+  chmodSync(path, 0o644);
+
+  saveStore({ version: 1, current: {}, applied: {}, profiles: [], tools: [] });
+
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+});
+
+test("saveStore normalizes existing store permissions before writing", () => {
+  const path = join(home, "accounts.json");
+  writeFileSync(path, JSON.stringify({ version: 1, profiles: [] }));
+  chmodSync(path, 0o400);
+
+  saveStore({
+    version: 1,
+    current: { claude: "work" },
+    applied: {},
+    profiles: [{ name: "work", tool: "claude", dir: join(home, "profiles", "work"), createdAt: "2026-01-01T00:00:00.000Z" }],
+    tools: [],
+  });
+
+  expect(loadStore().current.claude).toBe("work");
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+});
+
 test("ACCOUNTS_HOME with newline is rejected on save", () => {
   process.env.ACCOUNTS_HOME = "/tmp/bad\n/home";
   expect(() => saveStore(loadStore())).toThrow(AccountsError);
