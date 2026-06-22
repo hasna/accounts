@@ -161,6 +161,81 @@ test("codex app profile env isolates CODEX_HOME and file credentials", () => {
   expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toContain('cli_auth_credentials_store = "file"');
 });
 
+test("codex app profile env forces existing root credentials store to file", () => {
+  const p = addProfile({ name: "desktop", tool: "codex-app" });
+  writeFileSync(
+    join(p.dir, "config.toml"),
+    ['# existing Codex config', 'cli_auth_credentials_store = "keychain"', 'model = "gpt-5"', ""].join("\n"),
+  );
+
+  profileEnv(p, getTool("codex-app"));
+
+  expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toBe(
+    ['# existing Codex config', 'cli_auth_credentials_store = "file"', 'model = "gpt-5"', ""].join("\n"),
+  );
+});
+
+test("codex app profile env does not duplicate an existing root file credentials store", () => {
+  const p = addProfile({ name: "desktop", tool: "codex-app" });
+  const comments = Array.from({ length: 12 }, (_, index) => `# imported config line ${index + 1}`);
+  writeFileSync(
+    join(p.dir, "config.toml"),
+    [
+      ...comments,
+      'cli_auth_credentials_store = "file"',
+      'model = "gpt-5"',
+      'cli_auth_credentials_store = "file"',
+      "",
+      "[profiles.default]",
+      'model = "gpt-5"',
+      "",
+    ].join("\n"),
+  );
+
+  profileEnv(p, getTool("codex-app"));
+
+  const config = readFileSync(join(p.dir, "config.toml"), "utf8");
+  const rootConfig = config.split("[profiles.default]")[0]!;
+  expect(rootConfig.match(/^cli_auth_credentials_store\s*=/gm)).toEqual(['cli_auth_credentials_store =']);
+  expect(config).toBe(
+    [...comments, 'cli_auth_credentials_store = "file"', 'model = "gpt-5"', "", "[profiles.default]", 'model = "gpt-5"', ""].join(
+      "\n",
+    ),
+  );
+});
+
+test("codex app profile env inserts a root credentials store before tables", () => {
+  const p = addProfile({ name: "desktop", tool: "codex-app" });
+  writeFileSync(
+    join(p.dir, "config.toml"),
+    ['[profiles.default]', 'cli_auth_credentials_store = "keychain"', 'model = "gpt-5"', ""].join("\n"),
+  );
+
+  profileEnv(p, getTool("codex-app"));
+
+  expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toBe(
+    [
+      'cli_auth_credentials_store = "file"',
+      "",
+      "[profiles.default]",
+      'cli_auth_credentials_store = "keychain"',
+      'model = "gpt-5"',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("codex app profile env inserts a root credentials store before array tables", () => {
+  const p = addProfile({ name: "desktop", tool: "codex-app" });
+  writeFileSync(join(p.dir, "config.toml"), ['[[mcp_servers]]', 'command = "node"', ""].join("\n"));
+
+  profileEnv(p, getTool("codex-app"));
+
+  expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toBe(
+    ['cli_auth_credentials_store = "file"', "", "[[mcp_servers]]", 'command = "node"', ""].join("\n"),
+  );
+});
+
 test("getProfile throws for missing", () => {
   expect(() => getProfile("ghost")).toThrow(AccountsError);
 });

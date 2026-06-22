@@ -6,6 +6,27 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-06-22
+
+### Fixed
+
+- Codex App profile preparation now normalizes existing root
+  `cli_auth_credentials_store` settings to `file` without duplicating the TOML
+  key, keeping macOS desktop profile auth isolated from the shared Keychain.
+
+## [0.1.23] - 2026-06-22
+
+### Changed
+
+- Superseded npm release; use `0.1.24` for the Codex App profile config fix.
+
+## [0.1.22] - 2026-06-22
+
+### Fixed
+
+- Profile creation and updates now prevent duplicate config directory ownership
+  across profiles.
+
 ## [0.1.21] - 2026-06-21
 
 ### Added

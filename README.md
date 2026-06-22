@@ -80,9 +80,10 @@ accounts switch work --tool codex-app --launch
 ```
 
 Each `codex-app` profile gets its own `CODEX_HOME` and
-`--user-data-dir=<profile>/electron-user-data`. New profiles also get
-`cli_auth_credentials_store = "file"` in `config.toml` so ChatGPT auth stays in
-that profile directory instead of sharing one macOS Keychain credential.
+`--user-data-dir=<profile>/electron-user-data`. Before login, launch, switch, or
+shell commands, `accounts` ensures the profile root `config.toml` has
+`cli_auth_credentials_store = "file"` so ChatGPT auth stays in that profile
+directory instead of sharing one macOS Keychain credential.
 
 ## Three pointers (active, applied, isolated)
 
