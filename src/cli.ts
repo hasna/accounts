@@ -59,6 +59,12 @@ import {
   sendSupervisorRequest,
   type SupervisorState,
 } from "./lib/supervisor.js";
+import {
+  codexAppBinaryExists,
+  codexAppMenuState,
+  runCodexAppMenuBar,
+  switchCodexAppFromMenu,
+} from "./lib/codex-app-menu.js";
 
 const program = new Command();
 
@@ -181,6 +187,64 @@ program
   .name("accounts")
   .description("Manage and switch between multiple Claude Code (and other AI tool) profiles/accounts.")
   .version(getVersion());
+
+const codexApp = program.command("codex-app").description("macOS Codex.app profile helpers");
+
+codexApp
+  .command("menubar")
+  .description("run a macOS menu-bar profile switcher for Codex.app")
+  .option("--accounts-bin <path>", "accounts executable used by the menu helper", "accounts")
+  .action(
+    action((opts: { accountsBin: string }) => {
+      if (!codexAppBinaryExists()) {
+        console.error(chalk.yellow("warning: Codex.app binary was not found at the configured path"));
+      }
+      runCodexAppMenuBar({ accountsBin: opts.accountsBin });
+    }),
+  );
+
+codexApp
+  .command("menu-state")
+  .description("print Codex.app menu-bar state")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { json?: boolean }) => {
+      const state = codexAppMenuState();
+      if (opts.json) {
+        console.log(JSON.stringify(state, null, 2));
+        return;
+      }
+      if (state.profiles.length === 0) {
+        console.log(chalk.dim("no codex-app profiles yet - create one with `accounts login <name> --tool codex-app`"));
+        return;
+      }
+      for (const profile of state.profiles) {
+        const marker = profile.active ? chalk.green("●") : chalk.dim("○");
+        const label = profile.displayName ?? profile.email ?? chalk.dim("(no email)");
+        console.log(marker + " " + chalk.bold(profile.name) + "  " + label);
+      }
+    }),
+  );
+
+codexApp
+  .command("menu-switch")
+  .argument("<name>", "codex-app profile name")
+  .description("switch Codex.app to a profile, then safely quit and relaunch the desktop app")
+  .option("--no-quit", "do not ask a running Codex.app to quit before launch")
+  .option("--no-launch", "switch active profile without launching Codex.app")
+  .option("--json", "output JSON")
+  .action(
+    action(async (name: string, opts: { quit?: boolean; launch?: boolean; json?: boolean }) => {
+      const result = await switchCodexAppFromMenu(name, { quit: opts.quit, launch: opts.launch });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(chalk.green("✓ " + result.switch.profile.name + " is now the active Codex App profile"));
+      if (result.launchStarted) console.log(chalk.dim("  relaunched: " + result.switch.commandLine));
+      else console.log(chalk.dim("  launch command: " + result.switch.commandLine));
+    }),
+  );
 
 program
   .command("add")

@@ -77,6 +77,9 @@ accounts launch work --tool codex-app
 # Or print/launch the exact handoff command.
 accounts switch work --tool codex-app
 accounts switch work --tool codex-app --launch
+
+# Or run a native macOS menu-bar switcher.
+accounts codex-app menubar
 ```
 
 Each `codex-app` profile gets its own `CODEX_HOME` and
@@ -84,6 +87,11 @@ Each `codex-app` profile gets its own `CODEX_HOME` and
 shell commands, `accounts` ensures the profile root `config.toml` has
 `cli_auth_credentials_store = "file"` so ChatGPT auth stays in that profile
 directory instead of sharing one macOS Keychain credential.
+
+The menu-bar switcher lists `codex-app` profiles, marks the active profile, and
+switches with a button click. A switch marks the selected profile active, asks a
+running Codex.app to quit, waits briefly, and relaunches Codex.app with the
+selected profile's isolated `CODEX_HOME` and Electron user data directory.
 
 ## Three pointers (active, applied, isolated)
 

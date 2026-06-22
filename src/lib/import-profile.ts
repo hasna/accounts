@@ -2,7 +2,7 @@ import { cpSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { profilesDir } from "../storage.js";
 import { AccountsError } from "../types.js";
-import { addProfile, expandPath, getProfile, type AddOptions } from "./profiles.js";
+import { addProfile, expandPath, listProfiles, type AddOptions } from "./profiles.js";
 import { getTool, DEFAULT_TOOL } from "./tools.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
 import { detectEmail } from "./detect.js";
@@ -66,10 +66,16 @@ export function ensureProfileForLogin(name: string, toolId?: string) {
 }
 
 function findProfileByName(name: string, toolId?: string) {
-  try {
-    return getProfile(name, toolId);
-  } catch (err) {
-    if (err instanceof AccountsError) return undefined;
-    throw err;
+  const matches = listProfiles(toolId).filter((profile) => profile.name === name);
+  if (matches.length === 0) return undefined;
+  if (!toolId) {
+    const defaultProfile = matches.find((profile) => profile.tool === DEFAULT_TOOL);
+    if (defaultProfile) return defaultProfile;
   }
+  if (matches.length > 1) {
+    throw new AccountsError(
+      `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
+    );
+  }
+  return matches[0];
 }

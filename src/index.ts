@@ -38,6 +38,21 @@ export type { FinalizeLoginResult } from "./lib/login.js";
 export { switchProfile } from "./lib/switch.js";
 export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
 export {
+  codexAppBinaryExists,
+  codexAppMenuState,
+  codexAppMenuSwiftSource,
+  runCodexAppMenuBar,
+  switchCodexAppFromMenu,
+} from "./lib/codex-app-menu.js";
+export type {
+  CodexAppMenuProfile,
+  CodexAppMenuState,
+  CodexAppMenuSwitchResult,
+  CodexAppProcessRunner,
+  CodexAppRelaunchOptions,
+  RunCodexAppMenuBarOptions,
+} from "./lib/codex-app-menu.js";
+export {
   listSupervisorStates,
   readSupervisorState,
   resolveSupervisorLaunch,

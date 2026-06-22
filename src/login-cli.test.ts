@@ -77,3 +77,35 @@ test("login infers the tool for an existing profile", () => {
   expect(entries[0]?.home).toContain("fake-login/acct");
 });
 
+test("login prefers an existing Claude profile for shared profile names", () => {
+  const fakeBin = join(binDir, "claude");
+  writeFileSync(
+    fakeBin,
+    [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "fs.appendFileSync(process.env.FAKE_LOGIN_LOG, JSON.stringify({",
+      "  args: process.argv.slice(2),",
+      "  home: process.env.CLAUDE_CONFIG_DIR,",
+      "}) + '\\n');",
+      "process.exit(42);",
+    ].join("\n"),
+  );
+  chmodSync(fakeBin, 0o755);
+
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  expect(runCli("add", "acct", "--tool", "codex").status).toBe(0);
+
+  const result = runCli("login", "acct");
+
+  expect(result.status).toBe(42);
+  expect(result.stderr).not.toContain('a claude profile named "acct" already exists');
+  expect(result.stderr).not.toContain('profile "acct" exists for multiple tools');
+  const entries = readFileSync(logPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { args: string[]; home: string });
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.args).toEqual([]);
+  expect(entries[0]?.home).toContain("claude/acct");
+});

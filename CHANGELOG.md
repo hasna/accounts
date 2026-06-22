@@ -6,6 +6,27 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-06-22
+
+### Added
+
+- Native macOS Codex App menu-bar switcher via `accounts codex-app menubar`,
+  backed by JSON state/switch helpers that list `codex-app` profiles, mark the
+  active profile, and safely quit/relaunch Codex.app under the selected profile.
+
+### Fixed
+
+- `accounts login <name>` now prefers an existing Claude profile when a profile
+  name is shared with other tools, so bare Claude account login commands keep
+  working without `--tool`.
+
+## [0.1.25] - 2026-06-22
+
+### Fixed
+
+- `accounts login <name>` now reuses an existing unambiguous profile before
+  creating a login profile, avoiding misleading duplicate Claude profile errors.
+
 ## [0.1.24] - 2026-06-22
 
 ### Fixed

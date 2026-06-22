@@ -138,12 +138,21 @@ test("ensureProfileForLogin infers an existing profile tool", () => {
   expect(ensureProfileForLogin("codexlogin").dir).toBe(p.dir);
 });
 
-test("ensureProfileForLogin requires --tool when an existing profile name is ambiguous", () => {
+test("ensureProfileForLogin prefers Claude when an existing profile name is shared with other tools", () => {
   addProfile({ name: "shared", tool: "claude" });
   addProfile({ name: "shared", tool: "codex" });
 
-  expect(() => ensureProfileForLogin("shared")).toThrow(AccountsError);
+  expect(ensureProfileForLogin("shared").tool).toBe("claude");
   expect(ensureProfileForLogin("shared", "codex").tool).toBe("codex");
+});
+
+test("ensureProfileForLogin requires --tool when an existing profile name is ambiguous without Claude", () => {
+  addProfile({ name: "shared", tool: "codex" });
+  addProfile({ name: "shared", tool: "opencode" });
+
+  expect(() => ensureProfileForLogin("shared")).toThrow(
+    'profile "shared" exists for multiple tools (codex, opencode); pass --tool',
+  );
 });
 
 test("apply removes Claude API-helper settings from OAuth profiles and live settings", () => {
