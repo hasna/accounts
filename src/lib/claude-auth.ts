@@ -103,6 +103,62 @@ function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
   }
 }
 
+function credentialHealth(path: string):
+  | { exists: false }
+  | { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number } {
+  if (!existsSync(path)) return { exists: false };
+  const mtimeMs = statSync(path).mtimeMs;
+  const raw = readJsonFile(path);
+  const oauth = raw?.claudeAiOauth;
+  if (!oauth || typeof oauth !== "object") {
+    return { exists: true, expiresAt: 0, refreshTokenLength: 0, mtimeMs };
+  }
+
+  const record = oauth as JsonRecord;
+  const expiresAtRaw = record.expiresAt;
+  const expiresAt =
+    typeof expiresAtRaw === "number"
+      ? expiresAtRaw
+      : typeof expiresAtRaw === "string"
+        ? Date.parse(expiresAtRaw)
+        : 0;
+  const refreshTokenLength = typeof record.refreshToken === "string" ? record.refreshToken.length : 0;
+  return {
+    exists: true,
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    refreshTokenLength,
+    mtimeMs,
+  };
+}
+
+function betterCredential(
+  a: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number },
+  b: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number },
+): typeof a {
+  const now = Date.now();
+  const aUsable = a.refreshTokenLength > 0 && a.expiresAt > now;
+  const bUsable = b.refreshTokenLength > 0 && b.expiresAt > now;
+  if (aUsable !== bUsable) return aUsable ? a : b;
+  if (a.refreshTokenLength !== b.refreshTokenLength) {
+    return a.refreshTokenLength > b.refreshTokenLength ? a : b;
+  }
+  if (a.expiresAt !== b.expiresAt) return a.expiresAt > b.expiresAt ? a : b;
+  return a.mtimeMs > b.mtimeMs ? a : b;
+}
+
+export function liveCredentialShouldUpdateProfile(profileDir: string): boolean {
+  const live = credentialHealth(liveClaudePaths().credentialsFile);
+  if (!live.exists) return false;
+
+  const profileRoot = credentialHealth(join(profileDir, ".credentials.json"));
+  const profileSnapshot = credentialHealth(profileCredentialsSnapshot(profileDir));
+  const profileCreds = [profileRoot, profileSnapshot].filter((c): c is Exclude<typeof c, { exists: false }> => c.exists);
+  if (profileCreds.length === 0) return true;
+
+  const bestProfileCred = profileCreds.reduce((best, candidate) => betterCredential(best, candidate));
+  return betterCredential(live, bestProfileCred) === live;
+}
+
 function mergeOAuthInto(
   paths: string[],
   oauth: JsonRecord | undefined,

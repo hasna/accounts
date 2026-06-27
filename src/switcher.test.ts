@@ -429,6 +429,19 @@ function writeCreds(dir: string, token: string) {
   writeFileSync(join(dir, ".claude", ".credentials.json"), JSON.stringify({ token }));
 }
 
+function writeClaudeOauthCreds(path: string, accessToken: string, refreshToken: string, expiresAt: number) {
+  writeFileSync(
+    path,
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken,
+        refreshToken,
+        expiresAt,
+      },
+    }),
+  );
+}
+
 test("apply restores fresher profile-root credentials over a stale snapshot", () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-fresh-"));
   writeOAuth(workDir, "work@example.com");
@@ -485,6 +498,26 @@ test("re-applying the same profile preserves rotated live credentials", () => {
 
   const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as { token: string };
   expect(live.token).toBe("live-rotated-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("re-applying the same profile rejects stale live credentials over valid profile credentials", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-reapply-stale-live-"));
+  writeOAuth(workDir, "work@example.com");
+  writeClaudeOauthCreds(join(workDir, ".credentials.json"), "profile-token", "r".repeat(24), Date.now() + 60_000);
+  addProfile({ name: "work", dir: workDir, email: "work@example.com" });
+
+  applyProfile("work");
+  writeClaudeOauthCreds(liveClaudePaths().credentialsFile, "expired-live-token", "", Date.now() - 60_000);
+  const future = new Date(Date.now() + 5000);
+  utimesSync(liveClaudePaths().credentialsFile, future, future);
+
+  applyProfile("work");
+
+  const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as {
+    claudeAiOauth: { accessToken: string };
+  };
+  expect(live.claudeAiOauth.accessToken).toBe("profile-token");
   rmSync(workDir, { recursive: true, force: true });
 });
 
