@@ -1,6 +1,7 @@
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
+import { prepareClaudeProfileKeychain } from "./claude-auth.js";
 import { claudeApiAuthClearingEnv, formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
 import { getProfile, useProfile } from "./profiles.js";
 import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
@@ -61,6 +62,7 @@ export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchRes
 
   const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : profileEnv(profile, tool);
   const command = commandFor(profile, tool, opts);
+  prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
   const restartRequired = opts.resume === true || applied || mode === "env";
   const message = applied
     ? `${profile.name} is now the live/default ${tool.label} profile`

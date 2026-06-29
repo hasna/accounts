@@ -1,6 +1,6 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile, getProfileToolLock } from "./lib/profiles.js";
@@ -8,11 +8,12 @@ import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 import { finalizeLogin } from "./lib/login.js";
 import {
+  claudeKeychainCredentialFromProfile,
   ensureProfileAuthSnapshot,
   hasAuthSnapshot,
   profileHasAuth,
 } from "./lib/claude-auth.js";
-import { liveClaudePaths, profileOAuthSnapshot } from "./lib/claude-layout.js";
+import { liveClaudePaths, profileKeychainSnapshot, profileOAuthSnapshot } from "./lib/claude-layout.js";
 import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook.js";
 import { resolvePickMode } from "./lib/pick.js";
 import { switchProfile } from "./lib/switch.js";
@@ -429,6 +430,129 @@ function writeCreds(dir: string, token: string) {
   writeFileSync(join(dir, ".claude", ".credentials.json"), JSON.stringify({ token }));
 }
 
+function writeClaudeOauthCreds(path: string, accessToken: string, refreshToken: string, expiresAt: number) {
+  writeFileSync(
+    path,
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken,
+        refreshToken,
+        expiresAt,
+      },
+    }),
+  );
+}
+
+function writeFakeSecurity() {
+  const fakeSecurity = join(home, "fake-security");
+  const logPath = join(home, "fake-security.log");
+  const payloadPath = join(home, "fake-security-payload.log");
+  writeFileSync(
+    fakeSecurity,
+    [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}`,
+      `if [ "\${1:-}" = "delete-generic-password" ]; then exit 1; fi`,
+      `if [ "\${1:-}" = "add-generic-password" ]; then`,
+      `  account=""`,
+      `  secret=""`,
+      `  while [ "$#" -gt 0 ]; do`,
+      `    case "$1" in`,
+      `      -a) shift; account="\${1:-}" ;;`,
+      `      -w) shift; secret="\${1:-}" ;;`,
+      `    esac`,
+      `    shift || true`,
+      `  done`,
+      `  printf 'account=%s\\n' "$account" >> ${JSON.stringify(payloadPath)}`,
+      `  printf 'secret=%s\\n' "$secret" >> ${JSON.stringify(payloadPath)}`,
+      `  exit 0`,
+      `fi`,
+      `exit 0`,
+    ].join("\n"),
+  );
+  chmodSync(fakeSecurity, 0o755);
+  return { fakeSecurity, logPath, payloadPath };
+}
+
+test("Claude keychain credential falls back to profile file credentials", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-keychain-fallback-"));
+  writeOAuth(workDir, "work@example.com");
+  addProfile({ name: "work", dir: workDir });
+  ensureProfileAuthSnapshot(workDir, getTool("claude"));
+
+  const cred = claudeKeychainCredentialFromProfile(workDir, "work");
+
+  expect(cred?.service).toBe("Claude Code-credentials");
+  expect(cred?.account).toBe("work");
+  expect(JSON.parse(cred?.secret ?? "{}").claudeAiOauth.accessToken).toBe("work@example.com-access-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("Claude keychain credential prefers fresh file credentials over stale keychain snapshot", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-keychain-stale-"));
+  writeOAuth(workDir, "work@example.com");
+  addProfile({ name: "work", dir: workDir });
+  ensureProfileAuthSnapshot(workDir, getTool("claude"));
+  writeFileSync(
+    profileKeychainSnapshot(workDir),
+    JSON.stringify({
+      service: "Claude Code-credentials",
+      account: "work",
+      secret: JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "stale-keychain-token",
+          refreshToken: "stale-keychain-refresh",
+          expiresAt: Date.now() + 60_000,
+        },
+      }),
+    }),
+  );
+  writeClaudeOauthCreds(join(workDir, ".credentials.json"), "fresh-file-token", "fresh-file-refresh", Date.now() + 120_000);
+  const future = new Date(Date.now() + 5000);
+  utimesSync(join(workDir, ".credentials.json"), future, future);
+  ensureProfileAuthSnapshot(workDir, getTool("claude"));
+
+  const cred = claudeKeychainCredentialFromProfile(workDir, "work");
+
+  expect(cred?.account).toBe("work");
+  expect(JSON.parse(cred?.secret ?? "{}").claudeAiOauth.accessToken).toBe("fresh-file-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("switchProfile env mode prepares Claude keychain for MCP-style handoff", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-switch-env-keychain-"));
+  const { fakeSecurity, logPath, payloadPath } = writeFakeSecurity();
+  writeOAuth(workDir, "work@example.com");
+  addProfile({ name: "work", dir: workDir });
+  ensureProfileAuthSnapshot(workDir, getTool("claude"));
+
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalTestKeychain = process.env.ACCOUNTS_TEST_KEYCHAIN;
+  const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
+  try {
+    process.env.NODE_ENV = "test";
+    process.env.ACCOUNTS_TEST_KEYCHAIN = "1";
+    process.env.ACCOUNTS_TEST_SECURITY_BIN = fakeSecurity;
+
+    const result = switchProfile("work", { tool: "claude", mode: "env" });
+
+    expect(result.applied).toBe(false);
+    expect(result.env.CLAUDE_CONFIG_DIR).toBe(workDir);
+    expect(readFileSync(logPath, "utf8")).toContain("add-generic-password");
+    const payload = readFileSync(payloadPath, "utf8");
+    expect(payload).toContain("account=work");
+    expect(payload).toContain("work@example.com-access-token");
+  } finally {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalTestKeychain === undefined) delete process.env.ACCOUNTS_TEST_KEYCHAIN;
+    else process.env.ACCOUNTS_TEST_KEYCHAIN = originalTestKeychain;
+    if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
+    else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 test("apply restores fresher profile-root credentials over a stale snapshot", () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-fresh-"));
   writeOAuth(workDir, "work@example.com");
@@ -485,6 +609,66 @@ test("re-applying the same profile preserves rotated live credentials", () => {
 
   const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as { token: string };
   expect(live.token).toBe("live-rotated-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("re-applying the same profile rejects stale live credentials over valid profile credentials", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-reapply-stale-live-"));
+  writeOAuth(workDir, "work@example.com");
+  writeClaudeOauthCreds(join(workDir, ".credentials.json"), "profile-token", "r".repeat(24), Date.now() + 60_000);
+  addProfile({ name: "work", dir: workDir, email: "work@example.com" });
+
+  applyProfile("work");
+  writeClaudeOauthCreds(liveClaudePaths().credentialsFile, "expired-live-token", "", Date.now() - 60_000);
+  const future = new Date(Date.now() + 5000);
+  utimesSync(liveClaudePaths().credentialsFile, future, future);
+
+  applyProfile("work");
+
+  const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as {
+    claudeAiOauth: { accessToken: string };
+  };
+  expect(live.claudeAiOauth.accessToken).toBe("profile-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("re-applying the same profile preserves shorter but newer valid live credentials", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-reapply-short-live-"));
+  writeOAuth(workDir, "work@example.com");
+  writeClaudeOauthCreds(join(workDir, ".credentials.json"), "profile-token", "profile-refresh-token-is-long", Date.now() + 60_000);
+  addProfile({ name: "work", dir: workDir, email: "work@example.com" });
+
+  applyProfile("work");
+  writeClaudeOauthCreds(liveClaudePaths().credentialsFile, "fresh-live-token", "short-refresh", Date.now() + 120_000);
+  const future = new Date(Date.now() + 5000);
+  utimesSync(liveClaudePaths().credentialsFile, future, future);
+
+  applyProfile("work");
+
+  const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as {
+    claudeAiOauth: { accessToken: string };
+  };
+  expect(live.claudeAiOauth.accessToken).toBe("fresh-live-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("re-applying the same profile rejects longer but expired live credentials", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-reapply-long-expired-live-"));
+  writeOAuth(workDir, "work@example.com");
+  writeClaudeOauthCreds(join(workDir, ".credentials.json"), "profile-token", "valid-refresh", Date.now() + 60_000);
+  addProfile({ name: "work", dir: workDir, email: "work@example.com" });
+
+  applyProfile("work");
+  writeClaudeOauthCreds(liveClaudePaths().credentialsFile, "expired-live-token", "expired-refresh-token-is-long", Date.now() - 60_000);
+  const future = new Date(Date.now() + 5000);
+  utimesSync(liveClaudePaths().credentialsFile, future, future);
+
+  applyProfile("work");
+
+  const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as {
+    claudeAiOauth: { accessToken: string };
+  };
+  expect(live.claudeAiOauth.accessToken).toBe("profile-token");
   rmSync(workDir, { recursive: true, force: true });
 });
 

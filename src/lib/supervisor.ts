@@ -7,6 +7,7 @@ import { accountsHome } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { appliedProfile } from "./apply.js";
+import { prepareClaudeProfileKeychain } from "./claude-auth.js";
 import { profileEnv } from "./env.js";
 import { currentProfile, getProfile, useProfile } from "./profiles.js";
 import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
@@ -361,6 +362,7 @@ export async function runSupervisedTool(
     useProfile(profile.name, tool.id);
     const env = profileEnv(profile, tool);
     log(`accounts supervisor: starting ${tool.bin} for ${profile.name}`);
+    prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
     const proc = spawn(tool.bin, childArgs, {
       stdio: opts.stdio ?? "inherit",
       env: { ...process.env, ...env, ACCOUNTS_SUPERVISOR: "1", ACCOUNTS_ACTIVE: profile.name },

@@ -32,6 +32,7 @@ function runCliWith(args: string[], opts: RunOptions = {}) {
     input: opts.input,
     env: {
       ...process.env,
+      NODE_ENV: "test",
       ACCOUNTS_HOME: home,
       FAKE_LOGIN_LOG: logPath,
       PATH: opts.path ?? `${binDir}:${process.env.PATH ?? ""}`,
@@ -56,6 +57,49 @@ function writeFakeTool(binName: string, envVar: string, toolName = binName, exit
     ].join("\n"),
   );
   chmodSync(fakeBin, 0o755);
+}
+
+function writeFakeSecurity() {
+  const fakeSecurity = join(binDir, "fake-security");
+  writeFileSync(
+    fakeSecurity,
+    [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "$*" >> "$FAKE_SECURITY_LOG"`,
+      `if [ "\${1:-}" = "delete-generic-password" ]; then exit 1; fi`,
+      `if [ "\${1:-}" = "add-generic-password" ]; then`,
+      `  account=""`,
+      `  secret=""`,
+      `  while [ "$#" -gt 0 ]; do`,
+      `    case "$1" in`,
+      `      -a) shift; account="\${1:-}" ;;`,
+      `      -w) shift; secret="\${1:-}" ;;`,
+      `    esac`,
+      `    shift || true`,
+      `  done`,
+      `  printf 'account=%s\\n' "$account" >> "$FAKE_SECURITY_PAYLOAD"`,
+      `  printf 'secret=%s\\n' "$secret" >> "$FAKE_SECURITY_PAYLOAD"`,
+      `  exit 0`,
+      `fi`,
+      `exit 0`,
+    ].join("\n"),
+  );
+  chmodSync(fakeSecurity, 0o755);
+  return fakeSecurity;
+}
+
+function writeClaudeAuth(profileDir: string, email: string) {
+  writeFileSync(join(profileDir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: email } }));
+  writeFileSync(
+    join(profileDir, ".credentials.json"),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: `${email}-access-token`,
+        refreshToken: `${email}-refresh-token`,
+        expiresAt: Date.now() + 60_000,
+      },
+    }),
+  );
 }
 
 function addFakeLoginTool(id = "fake-login", label = "Fake Login", envVar = "FAKE_LOGIN_HOME", bin = "fake-login-tool") {
@@ -92,6 +136,61 @@ function readStore() {
     profiles?: Array<{ name: string; tool: string; dir: string }>;
   };
 }
+
+test("launch syncs Claude profile credentials into keychain before spawning", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  const fakeSecurity = writeFakeSecurity();
+  const securityLog = join(home, "fake-security.log");
+  const securityPayload = join(home, "fake-security-payload.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
+  expect(profile).toBeTruthy();
+  writeClaudeAuth(profile!.dir, "acct@example.com");
+
+  const result = runCliWith(["launch", "acct", "--tool", "claude", "--", "--version"], {
+    env: {
+      ACCOUNTS_TEST_KEYCHAIN: "1",
+      ACCOUNTS_TEST_SECURITY_BIN: fakeSecurity,
+      FAKE_SECURITY_LOG: securityLog,
+      FAKE_SECURITY_PAYLOAD: securityPayload,
+    },
+  });
+
+  expect(result.status).toBe(0);
+  expect(readLogEntries()[0]?.tool).toBe("claude");
+  const keychainLog = readFileSync(securityLog, "utf8");
+  const keychainPayload = readFileSync(securityPayload, "utf8");
+  expect(keychainLog).toContain("add-generic-password");
+  expect(keychainPayload).toContain("account=acct");
+  expect(keychainPayload).toContain("acct@example.com-access-token");
+});
+
+test("env syncs Claude profile credentials into keychain before printing exports", () => {
+  const fakeSecurity = writeFakeSecurity();
+  const securityLog = join(home, "fake-security.log");
+  const securityPayload = join(home, "fake-security-payload.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
+  expect(profile).toBeTruthy();
+  writeClaudeAuth(profile!.dir, "acct@example.com");
+
+  const result = runCliWith(["env", "acct", "--tool", "claude"], {
+    env: {
+      ACCOUNTS_TEST_KEYCHAIN: "1",
+      ACCOUNTS_TEST_SECURITY_BIN: fakeSecurity,
+      FAKE_SECURITY_LOG: securityLog,
+      FAKE_SECURITY_PAYLOAD: securityPayload,
+    },
+  });
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("export CLAUDE_CONFIG_DIR=");
+  const keychainLog = readFileSync(securityLog, "utf8");
+  const keychainPayload = readFileSync(securityPayload, "utf8");
+  expect(keychainLog).toContain("add-generic-password");
+  expect(keychainPayload).toContain("account=acct");
+  expect(keychainPayload).toContain("acct@example.com-access-token");
+});
 
 test("login infers and locks the tool for an existing unambiguous profile", () => {
   writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");

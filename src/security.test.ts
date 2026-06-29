@@ -175,6 +175,29 @@ test.skipIf(platform() !== "darwin")("keychain commands use the macOS security e
   expect(securityExecutable()).toBe("/usr/bin/security");
 });
 
+test("test security executable override is gated by NODE_ENV=test", () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalTestKeychain = process.env.ACCOUNTS_TEST_KEYCHAIN;
+  const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
+  try {
+    delete process.env.NODE_ENV;
+    process.env.ACCOUNTS_TEST_KEYCHAIN = "1";
+    process.env.ACCOUNTS_TEST_SECURITY_BIN = "/tmp/fake-security";
+
+    expect(securityExecutable()).toBe("/usr/bin/security");
+
+    process.env.NODE_ENV = "test";
+    expect(securityExecutable()).toBe("/tmp/fake-security");
+  } finally {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalTestKeychain === undefined) delete process.env.ACCOUNTS_TEST_KEYCHAIN;
+    else process.env.ACCOUNTS_TEST_KEYCHAIN = originalTestKeychain;
+    if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
+    else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
+  }
+});
+
 test.skipIf(platform() !== "darwin")("keychain reads use macOS security when PATH is shadowed", () => {
   const fakeBinDir = mkdtempSync(join(tmpdir(), "fake-security-bin-"));
   const fakeSecurity = join(fakeBinDir, "security");

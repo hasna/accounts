@@ -17,6 +17,7 @@ import {
   assertAllowedKeychainCredential,
   keychainSupported,
   readClaudeKeychain,
+  type KeychainCredential,
   writeClaudeKeychain,
 } from "./keychain.js";
 import { assertSafeWritePath } from "./safe-path.js";
@@ -101,6 +102,64 @@ function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
   } catch {
     return false;
   }
+}
+
+function credentialHealth(path: string):
+  | { exists: false }
+  | { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number } {
+  if (!existsSync(path)) return { exists: false };
+  const mtimeMs = statSync(path).mtimeMs;
+  const raw = readJsonFile(path);
+  const oauth = raw?.claudeAiOauth;
+  if (!oauth || typeof oauth !== "object") {
+    return { exists: true, expiresAt: 0, refreshTokenLength: 0, mtimeMs };
+  }
+
+  const record = oauth as JsonRecord;
+  const expiresAtRaw = record.expiresAt;
+  const expiresAt =
+    typeof expiresAtRaw === "number"
+      ? expiresAtRaw
+      : typeof expiresAtRaw === "string"
+        ? Date.parse(expiresAtRaw)
+        : 0;
+  const refreshTokenLength = typeof record.refreshToken === "string" ? record.refreshToken.length : 0;
+  return {
+    exists: true,
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    refreshTokenLength,
+    mtimeMs,
+  };
+}
+
+function betterCredential(
+  a: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number },
+  b: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number },
+): typeof a {
+  const now = Date.now();
+  const aHasRefresh = a.refreshTokenLength > 0;
+  const bHasRefresh = b.refreshTokenLength > 0;
+  if (aHasRefresh !== bHasRefresh) return aHasRefresh ? a : b;
+
+  const aUsable = aHasRefresh && a.expiresAt > now;
+  const bUsable = bHasRefresh && b.expiresAt > now;
+  if (aUsable !== bUsable) return aUsable ? a : b;
+  if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs > b.mtimeMs ? a : b;
+  if (a.expiresAt !== b.expiresAt) return a.expiresAt > b.expiresAt ? a : b;
+  return a.mtimeMs > b.mtimeMs ? a : b;
+}
+
+export function liveCredentialShouldUpdateProfile(profileDir: string): boolean {
+  const live = credentialHealth(liveClaudePaths().credentialsFile);
+  if (!live.exists) return false;
+
+  const profileRoot = credentialHealth(profileCredentialFile(profileDir));
+  const profileSnapshot = credentialHealth(profileCredentialsSnapshot(profileDir));
+  const profileCreds = [profileRoot, profileSnapshot].filter((c): c is Exclude<typeof c, { exists: false }> => c.exists);
+  if (profileCreds.length === 0) return true;
+
+  const bestProfileCred = profileCreds.reduce((best, candidate) => betterCredential(best, candidate));
+  return betterCredential(live, bestProfileCred) === live;
 }
 
 function mergeOAuthInto(
@@ -245,6 +304,85 @@ export function profileHasAuth(profileDir: string, tool: ToolDef): boolean {
   return profileHasOAuthAccount(profileDir, tool) && profileHasCredentialPayload(profileDir);
 }
 
+function profileCredentialSource(path: string):
+  | { secret: string; health: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number } }
+  | undefined {
+  if (!existsSync(path) || lstatSync(path).isSymbolicLink()) return undefined;
+  const secret = readFileSync(path, "utf8").trim();
+  if (!secret) return undefined;
+  const health = credentialHealth(path);
+  return health.exists ? { secret, health } : undefined;
+}
+
+function profileFileCredentialSecret(profileDir: string): string | undefined {
+  const sources = [profileCredentialsSnapshot(profileDir), profileCredentialFile(profileDir)]
+    .map((path) => profileCredentialSource(path))
+    .filter((source): source is NonNullable<typeof source> => !!source);
+  if (sources.length === 0) return undefined;
+  return sources.reduce((best, candidate) =>
+    betterCredential(candidate.health, best.health) === candidate.health ? candidate : best,
+  ).secret;
+}
+
+function profileKeychainSnapshotAccount(profileDir: string): string | undefined {
+  const kcRaw = readJsonFile(profileKeychainSnapshot(profileDir));
+  if (!kcRaw || typeof kcRaw.account !== "string") return undefined;
+  try {
+    assertAllowedKeychainCredential({
+      service: CLAUDE_KEYCHAIN_SERVICE,
+      account: kcRaw.account,
+      secret: "metadata-only",
+    });
+    return kcRaw.account;
+  } catch {
+    return undefined;
+  }
+}
+
+function assertKeychainSnapshotAllowed(profileDir: string): KeychainCredential | undefined {
+  const kcRaw = readJsonFile(profileKeychainSnapshot(profileDir));
+  if (!kcRaw || typeof kcRaw.secret !== "string" || typeof kcRaw.account !== "string") return undefined;
+  const cred = {
+    service: typeof kcRaw.service === "string" ? kcRaw.service : CLAUDE_KEYCHAIN_SERVICE,
+    account: kcRaw.account,
+    secret: kcRaw.secret,
+  };
+  assertAllowedKeychainCredential(cred);
+  return {
+    service: CLAUDE_KEYCHAIN_SERVICE,
+    account: cred.account,
+    secret: cred.secret,
+  };
+}
+
+export function claudeKeychainCredentialFromProfile(
+  profileDir: string,
+  profileName?: string,
+): KeychainCredential | undefined {
+  const fileSecret = profileFileCredentialSecret(profileDir);
+  if (!fileSecret) return assertKeychainSnapshotAllowed(profileDir);
+  const cred = {
+    service: CLAUDE_KEYCHAIN_SERVICE,
+    account: profileKeychainSnapshotAccount(profileDir) ?? profileName ?? "claude",
+    secret: fileSecret,
+  };
+  assertAllowedKeychainCredential(cred);
+  return cred;
+}
+
+export function prepareClaudeProfileKeychain(profileDir: string, tool: ToolDef, profileName?: string): boolean {
+  if (tool.id !== "claude" || !keychainSupported()) return false;
+  try {
+    ensureProfileAuthSnapshot(profileDir, tool);
+    const cred = claudeKeychainCredentialFromProfile(profileDir, profileName);
+    if (!cred) return false;
+    writeClaudeKeychain(cred);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Restore profile auth snapshots onto live Claude paths. */
 export function restoreClaudeAuthFromProfile(
   profileDir: string,
@@ -284,28 +422,7 @@ export function restoreClaudeAuthFromProfile(
     if (!lstatSync(live.credentialsFile).isSymbolicLink()) unlinkSync(live.credentialsFile);
   }
 
-  if (keychainSupported()) {
-    const kcRaw = readJsonFile(profileKeychainSnapshot(profileDir));
-    if (kcRaw && typeof kcRaw.secret === "string" && typeof kcRaw.account === "string") {
-      const cred = {
-        service: typeof kcRaw.service === "string" ? kcRaw.service : CLAUDE_KEYCHAIN_SERVICE,
-        account: kcRaw.account,
-        secret: kcRaw.secret,
-      };
-      assertAllowedKeychainCredential(cred);
-      try {
-        writeClaudeKeychain({
-          service: CLAUDE_KEYCHAIN_SERVICE,
-          account: cred.account,
-          secret: cred.secret,
-        });
-      } catch {
-        // Claude Code can authenticate from the restored credentials file.
-        // Some macOS sessions deny non-interactive keychain writes; do not
-        // turn a valid file-credential restore into a failed switch.
-      }
-    }
-  }
+  prepareClaudeProfileKeychain(profileDir, tool, profileName);
 }
 
 export function hasAuthSnapshot(profileDir: string): boolean {

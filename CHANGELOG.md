@@ -6,6 +6,22 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-06-29
+
+### Fixed
+
+- `accounts launch`, `accounts shell`, `accounts env`, `accounts switch`, MCP
+  `switch_profile`, and supervised Claude starts now
+  best-effort sync the selected profile's file credentials into the macOS
+  `Claude Code-credentials` keychain item before spawning Claude. This prevents
+  GUI-launched Claude from preferring a stale global keychain login over the
+  selected profile's valid `CLAUDE_CONFIG_DIR` credentials.
+- Applying a Claude profile now synthesizes the macOS keychain payload from the
+  profile credential snapshot when no explicit keychain snapshot exists.
+- Stale keychain snapshots no longer override fresher profile file credentials.
+- Re-applying the same Claude profile no longer snapshots newer but unusable
+  live credentials over a profile's valid refresh-token credentials.
+
 ## [0.1.29] - 2026-06-26
 
 ### Added

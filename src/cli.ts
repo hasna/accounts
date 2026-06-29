@@ -47,7 +47,7 @@ import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
-import { profileHasAuth } from "./lib/claude-auth.js";
+import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
@@ -433,6 +433,7 @@ program
       if (tool.id === "claude") {
         console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
       }
+      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
         env: { ...process.env, ...env },
@@ -465,6 +466,7 @@ program
         console.log(chalk.dim("  applied to live Claude paths"));
       } else if (result.mode === "env") {
         const tool = getTool(result.profile.tool);
+        prepareClaudeProfileKeychain(result.profile.dir, tool, result.profile.name);
         console.log(formatExportLines(profileEnv(result.profile, tool)));
       }
     }),
@@ -627,6 +629,7 @@ program
       const profile = name ? getProfile(name, opts.tool) : currentProfile(toolId);
       if (!profile) die(`no active profile for "${toolId}". Use \`accounts use <name>\` first.`);
       const tool = getTool(profile.tool);
+      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       console.log(formatExportLines(profileEnv(profile, tool)));
     }),
   );
@@ -646,6 +649,7 @@ program
       const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions, profile });
       useProfile(name, tool.id); // mark active + bump lastUsedAt
       console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${launchArgs.join(" ")}`));
+      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(tool.bin, launchArgs, {
         stdio: "inherit",
         env: { ...process.env, ...env },
@@ -785,6 +789,7 @@ program
       useProfile(name, tool.id);
       const shell = process.env.SHELL || "/bin/sh";
       console.log(chalk.dim(`→ subshell with ${formatEnvAssignments(env)} (exit to leave)`));
+      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(shell, ["-i"], {
         stdio: "inherit",
         env: { ...process.env, ...env, ACCOUNTS_ACTIVE: profile.name },

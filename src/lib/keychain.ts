@@ -4,10 +4,13 @@ import { AccountsError } from "../types.js";
 import { CLAUDE_KEYCHAIN_SERVICE } from "./claude-layout.js";
 
 export function keychainSupported(): boolean {
-  return platform() === "darwin";
+  return process.env.ACCOUNTS_TEST_KEYCHAIN === "1" || platform() === "darwin";
 }
 
 export function securityExecutable(): string {
+  if (process.env["NODE_ENV"] === "test" && process.env.ACCOUNTS_TEST_SECURITY_BIN) {
+    return process.env.ACCOUNTS_TEST_SECURITY_BIN;
+  }
   return keychainSupported() ? "/usr/bin/security" : "security";
 }
 
@@ -98,6 +101,13 @@ export function writeClaudeKeychain(cred: KeychainCredential): void {
     );
   } catch {
     /* not found */
+  }
+  for (let i = 0; i < 5; i += 1) {
+    try {
+      execFileSync(securityExecutable(), ["delete-generic-password", "-s", cred.service], { stdio: "ignore" });
+    } catch {
+      break;
+    }
   }
   try {
     execFileSync(

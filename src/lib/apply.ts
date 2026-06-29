@@ -6,6 +6,7 @@ import { getProfile, useProfile } from "./profiles.js";
 import {
   assertRestorableProfileAuth,
   ensureProfileAuthSnapshot,
+  liveCredentialShouldUpdateProfile,
   liveOAuthEmail,
   restoreClaudeAuthFromProfile,
   snapshotLiveAuthToProfile,
@@ -56,7 +57,13 @@ function applyProfileUnlocked(name: string, toolId?: string): { profile: Profile
     (liveEmail &&
       singleMatch(store.profiles.filter((p) => p.tool === tool.id && p.email === liveEmail))) ||
     (previous ? store.profiles.find((p) => p.name === previous && p.tool === tool.id) : undefined);
-  if (owner) snapshotLiveAuthToProfile(owner.dir, tool);
+  if (
+    owner &&
+    (!(owner.name === profile.name && owner.tool === profile.tool) ||
+      liveCredentialShouldUpdateProfile(profile.dir))
+  ) {
+    snapshotLiveAuthToProfile(owner.dir, tool);
+  }
 
   ensureProfileAuthSnapshot(profile.dir, tool);
   restoreClaudeAuthFromProfile(profile.dir, tool, name);
