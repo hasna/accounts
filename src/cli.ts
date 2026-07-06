@@ -69,6 +69,7 @@ import {
 } from "./lib/codex-app-menu.js";
 import { accountsCapabilityCard, accountsNoCloudEvidencePack, toSupervisorOptionsWorkRun } from "./lib/contracts.js";
 import { createAccountsEventsClient } from "./lib/events.js";
+import { getAccountsReadiness, type AccountsReadiness, type AccountsReadinessStatus } from "./lib/readiness.js";
 
 const program = new Command();
 
@@ -227,6 +228,37 @@ function printStorageSyncResult(result: AccountsStorageSyncResult, json?: boolea
   }
   console.log(chalk.green(`pushed ${result.pushed}, pulled ${result.pulled}`));
   console.log(chalk.dim(`key: ${result.key}`));
+}
+
+function readinessColor(status: AccountsReadinessStatus): (value: string) => string {
+  if (status === "ok") return chalk.green;
+  if (status === "degraded") return chalk.yellow;
+  return chalk.red;
+}
+
+function printReadiness(readiness: AccountsReadiness): void {
+  const status = readinessColor(readiness.status)(readiness.status);
+  console.log(`${chalk.cyan("status")}     ${status}${readiness.ok ? "" : chalk.dim(" (ok=false)")}`);
+  console.log(`${chalk.cyan("generated")}  ${readiness.generatedAt}`);
+  console.log("");
+  for (const item of readiness.checks) {
+    const label = readinessColor(item.status)(item.status.padEnd(8));
+    console.log(`${label} ${chalk.bold(item.label)} — ${item.summary}`);
+    for (const reason of item.reasons.slice(0, 3)) {
+      console.log(chalk.dim(`          ${reason}`));
+    }
+    if (item.reasons.length > 3) console.log(chalk.dim(`          +${item.reasons.length - 3} more`));
+  }
+  if (readiness.degradedModes.length > 0) {
+    console.log("");
+    console.log(chalk.cyan("modes"));
+    for (const mode of readiness.degradedModes) console.log(`  ${mode}`);
+  }
+  if (readiness.nextActions.length > 0) {
+    console.log("");
+    console.log(chalk.cyan("next actions"));
+    for (const action of readiness.nextActions) console.log(`  ${action}`);
+  }
 }
 
 function parsePermissionArgs(entries?: string[]): Record<string, string[]> {
@@ -1008,6 +1040,23 @@ storage
   .action(
     action(async (opts: { json?: boolean }) => {
       printStorageSyncResult(await storageSync(), opts.json);
+    }),
+  );
+
+program
+  .command("health")
+  .alias("readiness")
+  .description("show sanitized account, provider, supervisor, and storage readiness")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { json?: boolean }) => {
+      const readiness = getAccountsReadiness();
+      if (opts.json) {
+        console.log(JSON.stringify(readiness, null, 2));
+      } else {
+        printReadiness(readiness);
+      }
+      if (readiness.status === "unavailable") process.exitCode = 1;
     }),
   );
 
