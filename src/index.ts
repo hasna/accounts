@@ -136,3 +136,12 @@ export {
 export { withApplyLock } from "./lib/apply-lock.js";
 export { isSafeProfileName } from "./lib/hook.js";
 export { readClaudeKeychain, keychainSupported } from "./lib/keychain.js";
+export {
+  accountsCapabilityCard,
+  accountsNoCloudEvidencePack,
+  toAccountsActorRef,
+  toAgentsRunnerWorkRun,
+  toSupervisorOptionsWorkRun,
+  validateEventActorRefs,
+} from "./lib/contracts.js";
+export { AccountsEventsClient, createAccountsEventsClient } from "./lib/events.js";

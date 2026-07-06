@@ -1,0 +1,7 @@
+{
+  "schema": "hasna.actor_ref.v1",
+  "id": "actor_invalid",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "kind": "daemon",
+  "name": "@hasna/accounts"
+}

@@ -67,6 +67,8 @@ import {
   runCodexAppMenuBar,
   switchCodexAppFromMenu,
 } from "./lib/codex-app-menu.js";
+import { accountsCapabilityCard, accountsNoCloudEvidencePack, toSupervisorOptionsWorkRun } from "./lib/contracts.js";
+import { createAccountsEventsClient } from "./lib/events.js";
 
 const program = new Command();
 
@@ -1269,7 +1271,57 @@ program
     }),
   );
 
-registerEventsCommands(program, { source: "accounts" });
+const contracts = program.command("contracts").description("Emit @hasna/contracts-compatible Accounts JSON");
+
+contracts
+  .command("capability-card")
+  .description("Print the Accounts CLI capability card contract")
+  .option("-j, --json", "Print JSON output", false)
+  .action(
+    action((options: { json?: boolean }) => {
+      const card = accountsCapabilityCard();
+      if (options.json) {
+        console.log(JSON.stringify(card, null, 2));
+        return;
+      }
+      console.log(`${card.name}\t${card.schema}\t${card.status}`);
+    }),
+  );
+
+contracts
+  .command("work-run")
+  .description("Print a sample supervisor work_run contract for Accounts")
+  .option("--tool <tool>", "Tool identifier", "claude")
+  .option("--profile <profile>", "Profile name", "current")
+  .option("-j, --json", "Print JSON output", false)
+  .action(
+    action((options: { tool: string; profile: string; json?: boolean }) => {
+      const run = toSupervisorOptionsWorkRun({}, { tool: options.tool, profile: options.profile });
+      if (options.json) {
+        console.log(JSON.stringify(run, null, 2));
+        return;
+      }
+      console.log(`${run.id}\t${run.schema}\t${run.status}`);
+    }),
+  );
+
+contracts
+  .command("no-cloud-scan")
+  .description("Run the contracts no-cloud scan and print the evidence pack")
+  .argument("[target]", "Target path to scan", ".")
+  .option("-j, --json", "Print JSON output", false)
+  .action(
+    action((target: string, options: { json?: boolean }) => {
+      const pack = accountsNoCloudEvidencePack(target);
+      if (options.json) {
+        console.log(JSON.stringify(pack, null, 2));
+        return;
+      }
+      console.log(`${pack.id}\t${pack.schema}\t${pack.verdict}`);
+    }),
+  );
+
+registerEventsCommands(program, { source: "accounts", createClient: () => createAccountsEventsClient() });
 
 program.parseAsync(process.argv);
 

@@ -1,0 +1,21 @@
+{
+  "schema": "hasna.no_cloud_evidence_pack.v1",
+  "id": "no_cloud_hasna_accounts_invalid",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "subject": {
+    "kind": "repo",
+    "id": "open-accounts"
+  },
+  "packageName": "@hasna/accounts",
+  "scanMode": "source_tree",
+  "status": "succeeded",
+  "verdict": "passed",
+  "checks": [
+    {
+      "id": "package_manifest",
+      "kind": "package_manifest",
+      "status": "failed",
+      "target": "package.json"
+    }
+  ]
+}

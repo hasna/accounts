@@ -1,0 +1,29 @@
+{
+  "schema": "hasna.no_cloud_evidence_pack.v1",
+  "id": "no_cloud_hasna_accounts",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "subject": {
+    "kind": "repo",
+    "id": "open-accounts",
+    "uri": "git+https://github.com/hasna/accounts.git"
+  },
+  "packageName": "@hasna/accounts",
+  "packageVersion": "0.1.31",
+  "generatedBy": {
+    "kind": "service",
+    "id": "actor_hasna_accounts",
+    "name": "@hasna/accounts",
+    "provider": "hasna"
+  },
+  "scanMode": "source_tree",
+  "status": "succeeded",
+  "verdict": "passed",
+  "checks": [
+    {
+      "id": "package_manifest",
+      "kind": "package_manifest",
+      "status": "succeeded",
+      "target": "package.json"
+    }
+  ]
+}

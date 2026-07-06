@@ -1,0 +1,30 @@
+{
+  "schema": "hasna.capability_card.v1",
+  "id": "capability_hasna_accounts_cli",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "kind": "tool",
+  "name": "accounts",
+  "version": "0.1.31",
+  "status": "available",
+  "capabilities": [
+    "profile-management",
+    "profile-switching",
+    "agent-session-inspection",
+    "supervisor-control",
+    "local-storage-sync",
+    "event-emission"
+  ],
+  "limitations": [
+    "local-machine state only",
+    "cloud posture for no-cloud-scan remains pending upstream ratification"
+  ],
+  "riskLevel": "medium",
+  "evidenceRefs": [
+    {
+      "id": "package_manifest",
+      "kind": "file",
+      "uri": "file://package.json",
+      "summary": "Package manifest describes accounts CLI entrypoints and dependencies."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "schema": "hasna.actor_ref.v1",
+  "id": "actor_hasna_accounts",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "kind": "service",
+  "name": "@hasna/accounts",
+  "provider": "hasna",
+  "machineId": "spark01",
+  "capabilities": ["profile-management", "agent-supervision", "event-emission"]
+}

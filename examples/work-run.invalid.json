@@ -1,0 +1,11 @@
+{
+  "schema": "hasna.work_run.v1",
+  "id": "work_run_accounts_invalid",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "objective": "List Claude agents for an accounts profile.",
+  "status": "done",
+  "actor": {
+    "kind": "service",
+    "id": "actor_hasna_accounts"
+  }
+}

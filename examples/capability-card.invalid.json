@@ -1,0 +1,8 @@
+{
+  "schema": "hasna.capability_card.v1",
+  "id": "capability_hasna_accounts_invalid",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "kind": "cli",
+  "name": "accounts",
+  "status": "available"
+}

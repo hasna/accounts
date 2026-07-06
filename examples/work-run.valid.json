@@ -1,0 +1,31 @@
+{
+  "schema": "hasna.work_run.v1",
+  "id": "work_run_accounts_agents",
+  "createdAt": "2026-07-06T00:00:00.000Z",
+  "objective": "List Claude agents for an accounts profile.",
+  "status": "succeeded",
+  "actor": {
+    "kind": "service",
+    "id": "actor_hasna_accounts",
+    "name": "@hasna/accounts",
+    "provider": "hasna"
+  },
+  "startedAt": "2026-07-06T00:00:00.000Z",
+  "finishedAt": "2026-07-06T00:00:00.000Z",
+  "resourceRefs": [
+    {
+      "kind": "tool",
+      "id": "claude",
+      "name": "claude",
+      "externalId": "claude",
+      "sourcePackage": "@hasna/accounts"
+    }
+  ],
+  "evidenceRefs": [
+    {
+      "id": "agents_stdout",
+      "kind": "command_output",
+      "summary": "claude agents --json returned a parseable agent list"
+    }
+  ]
+}

@@ -31,12 +31,15 @@
     "docs",
     "hasna.contract.json",
     "docker-compose.yml",
+    "examples",
     "CHANGELOG.md",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node && bun build src/mcp.ts --outdir dist --target node && bun build src/index.ts --outdir dist --target node && bun build src/storage.ts --outdir dist --target node --external @aws-sdk/client-s3 && bun build src/sdk/index.ts --outdir dist/sdk --target node && bun build src/server/index.ts src/server/migrate.ts --outdir dist/server --target bun --packages external && tsc --emitDeclarationOnly --outDir dist",
+    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node --external @hasna/contracts && bun build src/mcp.ts --outdir dist --target node && bun build src/index.ts --outdir dist --target node --external @hasna/contracts && bun build src/storage.ts --outdir dist --target node --external @aws-sdk/client-s3 && bun build src/sdk/index.ts --outdir dist/sdk --target node && bun build src/server/index.ts src/server/migrate.ts --outdir dist/server --target bun --packages external && tsc --emitDeclarationOnly --outDir dist",
+    "contracts:conformance": "contracts conformance examples",
+    "contracts:no-cloud-scan": "contracts no-cloud-scan --json .",
     "dev": "bun run src/cli.ts",
     "sdk:generate": "bun run src/sdk/generate-sdk.ts",
     "vendor-kit:check": "bunx @hasna/contracts vendor-kit --check .",
