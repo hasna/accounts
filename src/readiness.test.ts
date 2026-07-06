@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, useProfile } from "./lib/profiles.js";
@@ -100,6 +100,34 @@ test("fake Claude profile reports sanitized login, provider, storage, and superv
   expect(json).not.toContain("secret-readiness-token");
   expect(json).not.toContain("refreshToken");
   expect(json).not.toContain("accessToken");
+});
+
+test("valid Claude credential wins over an older expired snapshot", () => {
+  writeFakeBin("claude");
+  const profile = addProfile({ name: "mixed", tool: "claude", email: "mixed@example.test" });
+  writeClaudeAuth(profile.dir, "mixed@example.test", Date.now() + 60_000, "valid-secret-token");
+  mkdirSync(join(profile.dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(
+    join(profile.dir, ".accounts-auth", "credentials.json"),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "expired-secret-access",
+        refreshToken: "expired-secret-refresh",
+        expiresAt: Date.now() - 60_000,
+      },
+    }) + "\n",
+  );
+
+  const readiness = getAccountsReadiness({ env: readinessEnv() });
+  const profileReadiness = readiness.profiles.find((entry) => entry.name === "mixed");
+  const json = JSON.stringify(readiness);
+
+  expect(profileReadiness?.login.status).toBe("ok");
+  expect(profileReadiness?.login.authStatus).toBe("ok");
+  expect(profileReadiness?.login.credentialPayloadValid).toBe(true);
+  expect(profileReadiness?.login.credentialPayloadExpired).toBe(false);
+  expect(json).not.toContain("valid-secret-token");
+  expect(json).not.toContain("expired-secret");
 });
 
 test("expired Claude credential is unavailable without leaking credential contents", () => {

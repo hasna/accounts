@@ -397,16 +397,16 @@ export function claudeProfileAuthHealth(profileDir: string, tool: ToolDef): Clau
   const reasons: string[] = [];
   if (!oauthAccountPresent) reasons.push("OAuth account snapshot is missing");
   if (!credentialPayloadPresent) reasons.push("credential payload is missing");
-  if (expiredCredential) reasons.push("credential payload is expired");
-  if (parseableInvalidCredential) reasons.push("credential payload has no refresh token");
+  if (!validCredential && expiredCredential) reasons.push("credential payload is expired");
+  if (!validCredential && parseableInvalidCredential) reasons.push("credential payload has no refresh token");
   if (credentialPayloadPresent && !validCredential && !expiredCredential && !parseableInvalidCredential) {
     reasons.push("credential payload expiry is unknown");
   }
 
   let status: ClaudeProfileAuthStatus = "ok";
   if (!oauthAccountPresent || !credentialPayloadPresent) status = "missing";
-  else if (expiredCredential) status = "expired";
-  else if (parseableInvalidCredential) status = "invalid";
+  else if (!validCredential && expiredCredential) status = "expired";
+  else if (!validCredential && parseableInvalidCredential) status = "invalid";
   else if (!validCredential) status = "unknown";
 
   return {
@@ -415,7 +415,7 @@ export function claudeProfileAuthHealth(profileDir: string, tool: ToolDef): Clau
     oauthAccountPresent,
     credentialPayloadPresent,
     credentialPayloadValid: Boolean(validCredential),
-    credentialPayloadExpired: Boolean(expiredCredential),
+    credentialPayloadExpired: !validCredential && Boolean(expiredCredential),
     ...(validCredential?.expiresAt ?? expiredCredential?.expiresAt
       ? { credentialExpiresAt: validCredential?.expiresAt ?? expiredCredential?.expiresAt }
       : {}),
