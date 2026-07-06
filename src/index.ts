@@ -115,6 +115,17 @@ export type {
   ConfigsPrelaunchStatus,
   ConfigsPrelaunchSummary,
 } from "./lib/configs-prelaunch-status.js";
+export { getAccountsReadiness } from "./lib/readiness.js";
+export type {
+  AccountsProviderReadiness,
+  AccountsProfileLoginReadiness,
+  AccountsProfileReadiness,
+  AccountsReadiness,
+  AccountsReadinessCheck,
+  AccountsReadinessStatus,
+  AccountsStorageReadiness,
+  AccountsSupervisorReadiness,
+} from "./lib/readiness.js";
 export { pickProfile } from "./lib/pick.js";
 export type { PickOptions, PickResult } from "./lib/pick.js";
 export { installHook, uninstallHook, hookPath, hookScript, shellSnippet } from "./lib/hook.js";
@@ -128,11 +139,13 @@ export {
   liveCredentialShouldUpdateProfile,
   hasAuthSnapshot,
   profileHasAuth,
+  claudeProfileAuthHealth,
   sanitizeClaudeProfileApiSettings,
   sanitizeClaudeOAuthProfileSettings,
   sanitizeLiveClaudeOAuthSettings,
   CLAUDE_API_AUTH_ENV_KEYS,
 } from "./lib/claude-auth.js";
+export type { ClaudeProfileAuthHealth, ClaudeProfileAuthStatus } from "./lib/claude-auth.js";
 export { withApplyLock } from "./lib/apply-lock.js";
 export { isSafeProfileName } from "./lib/hook.js";
 export { readClaudeKeychain, keychainSupported } from "./lib/keychain.js";

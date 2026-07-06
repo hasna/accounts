@@ -304,6 +304,127 @@ export function profileHasAuth(profileDir: string, tool: ToolDef): boolean {
   return profileHasOAuthAccount(profileDir, tool) && profileHasCredentialPayload(profileDir);
 }
 
+export type ClaudeProfileAuthStatus = "ok" | "missing" | "expired" | "invalid" | "unknown";
+
+export interface ClaudeProfileAuthHealth {
+  status: ClaudeProfileAuthStatus;
+  valid: boolean;
+  oauthAccountPresent: boolean;
+  credentialPayloadPresent: boolean;
+  credentialPayloadValid: boolean;
+  credentialPayloadExpired: boolean;
+  credentialExpiresAt?: string;
+  keychainSnapshotPresent: boolean;
+  snapshotPresent: boolean;
+  reasons: string[];
+}
+
+interface CredentialPayloadReadiness {
+  exists: boolean;
+  parseableOauth: boolean;
+  refreshTokenPresent: boolean;
+  expired: boolean;
+  expiresAt?: string;
+  valid: boolean;
+}
+
+function credentialPayloadReadiness(path: string): CredentialPayloadReadiness {
+  if (!existsSync(path)) {
+    return {
+      exists: false,
+      parseableOauth: false,
+      refreshTokenPresent: false,
+      expired: false,
+      valid: false,
+    };
+  }
+
+  const health = credentialHealth(path);
+  const raw = readJsonFile(path);
+  const oauth = raw?.claudeAiOauth;
+  if (!oauth || typeof oauth !== "object") {
+    return {
+      exists: true,
+      parseableOauth: false,
+      refreshTokenPresent: false,
+      expired: false,
+      valid: false,
+    };
+  }
+
+  const expiresAtMs = health.exists ? health.expiresAt : 0;
+  const expired = expiresAtMs > 0 && expiresAtMs <= Date.now();
+  const refreshTokenPresent = health.exists && health.refreshTokenLength > 0;
+  const valid = refreshTokenPresent && expiresAtMs > Date.now();
+  return {
+    exists: true,
+    parseableOauth: true,
+    refreshTokenPresent,
+    expired,
+    ...(expiresAtMs > 0 ? { expiresAt: new Date(expiresAtMs).toISOString() } : {}),
+    valid,
+  };
+}
+
+export function claudeProfileAuthHealth(profileDir: string, tool: ToolDef): ClaudeProfileAuthHealth {
+  if (tool.id !== "claude") {
+    return {
+      status: "unknown",
+      valid: false,
+      oauthAccountPresent: false,
+      credentialPayloadPresent: false,
+      credentialPayloadValid: false,
+      credentialPayloadExpired: false,
+      keychainSnapshotPresent: false,
+      snapshotPresent: false,
+      reasons: [`auth validation is only available for Claude profiles, not ${tool.id}`],
+    };
+  }
+
+  const oauthAccountPresent = profileHasOAuthAccount(profileDir, tool);
+  const credentialPaths = [profileCredentialFile(profileDir), profileCredentialsSnapshot(profileDir)];
+  const credentials = credentialPaths.map((path) => credentialPayloadReadiness(path));
+  const existingCredentials = credentials.filter((credential) => credential.exists);
+  const credentialPayloadPresent = existingCredentials.length > 0;
+  const validCredential = existingCredentials.find((credential) => credential.valid);
+  const expiredCredential = existingCredentials.find((credential) => credential.expired);
+  const parseableInvalidCredential = existingCredentials.find(
+    (credential) => credential.parseableOauth && !credential.refreshTokenPresent,
+  );
+  const keychainSnapshotPresent = existsSync(profileKeychainSnapshot(profileDir));
+  const snapshotPresent = hasAuthSnapshot(profileDir);
+
+  const reasons: string[] = [];
+  if (!oauthAccountPresent) reasons.push("OAuth account snapshot is missing");
+  if (!credentialPayloadPresent) reasons.push("credential payload is missing");
+  if (!validCredential && expiredCredential) reasons.push("credential payload is expired");
+  if (!validCredential && parseableInvalidCredential) reasons.push("credential payload has no refresh token");
+  if (credentialPayloadPresent && !validCredential && !expiredCredential && !parseableInvalidCredential) {
+    reasons.push("credential payload expiry is unknown");
+  }
+
+  let status: ClaudeProfileAuthStatus = "ok";
+  if (!oauthAccountPresent || !credentialPayloadPresent) status = "missing";
+  else if (!validCredential && expiredCredential) status = "expired";
+  else if (!validCredential && parseableInvalidCredential) status = "invalid";
+  else if (!validCredential) status = "unknown";
+
+  return {
+    status,
+    valid: status === "ok",
+    oauthAccountPresent,
+    credentialPayloadPresent,
+    credentialPayloadValid: Boolean(validCredential),
+    credentialPayloadExpired: !validCredential && Boolean(expiredCredential),
+    ...(validCredential?.expiresAt ?? expiredCredential?.expiresAt
+      ? { credentialExpiresAt: validCredential?.expiresAt ?? expiredCredential?.expiresAt }
+      : {}),
+    keychainSnapshotPresent,
+    snapshotPresent,
+    reasons,
+  };
+}
+
 function profileCredentialSource(path: string):
   | { secret: string; health: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number } }
   | undefined {
