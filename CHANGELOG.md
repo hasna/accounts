@@ -6,6 +6,25 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-07-06
+
+### Added
+
+- **Cloud service surface (`accounts-serve`)**: an HTTP API for the accounts
+  registry. `GET /health`, `/ready`, `/version` plus API-key-authenticated
+  versioned CRUD under `/v1` (`accounts`, `current` selection, `tools`).
+  PURE REMOTE per Amendment A1 — reads/writes go directly to the app's cloud
+  Postgres via the vendored `@hasna/contracts` storage kit; no local cache.
+- **API-key auth** via `@hasna/contracts/auth` (`verifyApiKey`, `ApiKeyStore`):
+  `accounts:read` for GETs, `accounts:write` for mutations; per-request audit.
+- **Generated SDK (`@hasna/accounts/sdk`)**: a typed, dependency-free fetch
+  client generated from the `accounts-serve` OpenAPI document, plus
+  `createAccountsClientFromEnv()` (`ACCOUNTS_API_URL` + `ACCOUNTS_API_KEY`).
+- **Migrations**: `migrations/*.sql` + the `accounts-migrate` bin/runner
+  (checksum-guarded ledger, privilege-safe readiness probe).
+- **Deploy assets**: ARM64 Bun `Dockerfile`, `docker-compose.yml`, and
+  `hasna.contract.json` service manifest.
+
 ## [0.1.30] - 2026-06-29
 
 ### Fixed
