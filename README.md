@@ -300,10 +300,10 @@ console.log(getAccountsStorageStatus().local.storePath);
 await storagePush();
 ```
 
-Remote sync uses service-owned S3 env names and only syncs the accounts registry
-JSON by default; auth snapshots stay local.
+Cloud sync targets repo-owned AWS S3 using the service-owned env names below and
+only syncs the accounts registry JSON by default; auth snapshots stay local.
 
-- `HASNA_ACCOUNTS_STORAGE_MODE=local|remote|hybrid`
+- `HASNA_ACCOUNTS_STORAGE_MODE=local|cloud` (`cloud` = repo-owned AWS S3)
 - `HASNA_ACCOUNTS_S3_BUCKET=hasna-xyz-opensource-accounts-prod`
 - `HASNA_ACCOUNTS_S3_PREFIX=accounts/`
 - `HASNA_ACCOUNTS_AWS_REGION=us-east-1`
