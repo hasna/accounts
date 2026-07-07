@@ -17,6 +17,7 @@ Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** 
 - **Tool lock-in** — first login/use chooses the tool for a profile name, so
   later bare commands like `accounts launch work` keep using that tool.
 - **Local-first** — registry at `~/.hasna/accounts/`. No network, no telemetry.
+- **Open source** — source, docs, and contribution guidelines live in this repository.
 
 ## Install
 
