@@ -134,4 +134,43 @@ describe("resolveAccountsCloud", () => {
     expect(calls[0]!.url).toBe(`${BASE}/v1/accounts/claude/personal/rename`);
     expect((calls[0]!.body as { name: string }).name).toBe("home");
   });
+
+  // Regression: a stale self-hosted server (older deployed build) lacks the
+  // rename + tools endpoints and returns the generic route-missing 404
+  // (`{ error: "not found" }`). The client must surface an actionable
+  // "redeploy accounts-serve" message, not a raw HTTP failure.
+  const routeMissing = () => ({ status: 404, body: { error: "not found" } });
+
+  test("rename on a stale server (route-missing 404) yields an actionable redeploy error", async () => {
+    const { fetchImpl } = mockFetch(routeMissing);
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    await expect(r.api.rename("personal", "home", "claude")).rejects.toThrow(/older build.*Redeploy accounts-serve/s);
+  });
+
+  test("tools add on a stale server (route-missing 404) yields an actionable redeploy error", async () => {
+    const { fetchImpl } = mockFetch(routeMissing);
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    await expect(r.api.createTool({ id: "x", name: "X", configEnv: "X_DIR" } as never)).rejects.toThrow(
+      /accounts tools add.*Redeploy accounts-serve/s,
+    );
+  });
+
+  test("tools remove on a stale server (route-missing 404) yields an actionable redeploy error", async () => {
+    const { fetchImpl } = mockFetch(routeMissing);
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    await expect(r.api.removeTool("x")).rejects.toThrow(/accounts tools remove.*Redeploy accounts-serve/s);
+  });
+
+  test("tools remove entity-404 (real 'no custom tool') is NOT masked as a redeploy error", async () => {
+    const { fetchImpl } = mockFetch(() => ({ status: 404, body: { error: 'no custom tool "x"' } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    // The entity-404 must pass through as-is (a real 404), never be rewritten
+    // into the "server predates this endpoint / Redeploy" diagnostic.
+    await expect(r.api.removeTool("x")).rejects.toThrow(/404/);
+    await expect(r.api.removeTool("x")).rejects.not.toThrow(/Redeploy/);
+  });
 });

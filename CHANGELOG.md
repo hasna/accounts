@@ -6,6 +6,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-08
+
+### Changed
+
+- **Clear diagnostic when the self-hosted server predates an endpoint.** When a
+  mutating registry call (`accounts rename`, `accounts tools add`, `accounts
+  tools remove`) hits a route-missing `404` (`{ "error": "not found" }`) — the
+  signature of a deployed `accounts-serve` build older than the client — the CLI
+  now surfaces an actionable message instructing the operator to redeploy
+  `accounts-serve`, instead of a raw HTTP failure. Entity-level `404`s (a real
+  "no profile"/"no custom tool") are unchanged and never masked. Local mode is
+  unaffected. (The rename + tools endpoints already exist in `src/server`; the
+  live fix for cloud mode is an ECS redeploy of `accounts-serve` to >= 0.2.4.)
+
 ## [0.1.32] - 2026-07-06
 
 ### Added
