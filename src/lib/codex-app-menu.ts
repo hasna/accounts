@@ -6,7 +6,7 @@ import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { accountsHome } from "../storage.js";
 import { appliedProfile } from "./apply.js";
-import { currentProfile, getProfile, listProfiles } from "./profiles.js";
+import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool } from "./tools.js";
 import { switchProfile, type SwitchResult } from "./switch.js";
 
@@ -79,10 +79,13 @@ function toMenuProfile(profile: Profile, activeName?: string, appliedName?: stri
   };
 }
 
-export function codexAppMenuState(): CodexAppMenuState {
+export async function codexAppMenuState(store: AccountsStore = resolveStore()): Promise<CodexAppMenuState> {
   const tool = getTool("codex-app");
-  const activeName = currentProfile("codex-app")?.name;
+  const activeName = (await store.currentProfile("codex-app"))?.name;
+  // appliedProfile is the machine-local applied-auth map, not the shared
+  // registry — it stays local by design (see store.ts scope notes).
   const appliedName = appliedProfile("codex-app")?.name;
+  const profiles = await store.listProfiles("codex-app");
   return {
     tool: {
       id: "codex-app",
@@ -91,12 +94,12 @@ export function codexAppMenuState(): CodexAppMenuState {
     },
     ...(activeName ? { activeProfileName: activeName } : {}),
     ...(appliedName ? { appliedProfileName: appliedName } : {}),
-    profiles: listProfiles("codex-app").map((profile) => toMenuProfile(profile, activeName, appliedName)),
+    profiles: profiles.map((profile) => toMenuProfile(profile, activeName, appliedName)),
   };
 }
 
-function assertCodexAppProfile(name: string): Profile {
-  const profile = getProfile(name, "codex-app");
+async function assertCodexAppProfile(name: string, store: AccountsStore): Promise<Profile> {
+  const profile = await store.getProfile(name, "codex-app");
   if (profile.tool !== "codex-app") {
     throw new AccountsError(`profile "${name}" is for ${profile.tool}, not codex-app`);
   }
@@ -113,8 +116,9 @@ export async function switchCodexAppFromMenu(
   name: string,
   opts: CodexAppRelaunchOptions = {},
 ): Promise<CodexAppMenuSwitchResult> {
-  assertCodexAppProfile(name);
-  const result = switchProfile(name, { tool: "codex-app", mode: "active", args: opts.args });
+  const store = resolveStore();
+  await assertCodexAppProfile(name, store);
+  const result = await switchProfile(name, { tool: "codex-app", mode: "active", args: opts.args }, store);
   const [bin, ...launchArgs] = result.command;
   if (!bin) throw new AccountsError("codex-app launch command is empty");
 

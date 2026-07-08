@@ -87,7 +87,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "switch_profile": {
         const name = args["name"];
         if (typeof name !== "string") return fail("name is required");
-        const profile = await resolveStore().getProfile(name, typeof args["tool"] === "string" ? args["tool"] : undefined);
+        const store = resolveStore();
+        const profile = await store.getProfile(name, typeof args["tool"] === "string" ? args["tool"] : undefined);
         const resume = args["resume"] !== false;
         const switchArgs = Array.isArray(args["args"])
           ? args["args"].filter((value): value is string => typeof value === "string")
@@ -115,13 +116,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               "Profile switch queued. The accounts supervisor will close this agent process and restart it under the selected profile.",
           });
         }
-        const result = switchProfile(name, {
+        const result = await switchProfile(name, {
           tool: profile.tool,
           mode: typeof args["mode"] === "string" ? (args["mode"] as SwitchMode) : "auto",
           resume,
           args: switchArgs,
           permissions,
-        });
+        }, store);
         return ok({
           supervised: false,
           ...result,

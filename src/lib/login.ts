@@ -6,7 +6,8 @@ import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
-import { addProfile, getProfileToolLock, listProfiles, lockProfileTool, getProfile, redetectEmail, useProfile } from "./profiles.js";
+import { getProfileToolLock, lockProfileTool } from "./profiles.js";
+import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, listTools, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
 import { profilesDir } from "../storage.js";
@@ -44,6 +45,8 @@ export interface PrepareLoginOptions {
   output?: NodeJS.WriteStream;
   env?: NodeJS.ProcessEnv;
   forceInteractive?: boolean;
+  /** Registry store to route reads/writes through (defaults to `resolveStore()`). */
+  store?: AccountsStore;
 }
 
 export interface LoginPreparationReady {
@@ -132,8 +135,14 @@ export function installInstructions(tool: ToolDef): string {
   return `Install ${tool.label} so \`${tool.bin}\` is available on PATH.`;
 }
 
-export function loginToolChoices(name: string, env: NodeJS.ProcessEnv = process.env): LoginToolChoice[] {
-  const existing = new Set(listProfiles().filter((profile) => profile.name === name).map((profile) => profile.tool));
+export async function loginToolChoices(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+  store: AccountsStore = resolveStore(),
+): Promise<LoginToolChoice[]> {
+  const existing = new Set(
+    (await store.listProfiles()).filter((profile) => profile.name === name).map((profile) => profile.tool),
+  );
   return listTools()
     .map((tool) => ({
       tool,
@@ -151,8 +160,8 @@ function managedProfileDir(name: string, toolId: string): string {
   return join(profilesDir(), toolId, name);
 }
 
-function profileDirForLogin(name: string, toolId: string): string {
-  return listProfiles(toolId).find((profile) => profile.name === name)?.dir ?? managedProfileDir(name, toolId);
+async function profileDirForLogin(name: string, toolId: string, store: AccountsStore): Promise<string> {
+  return (await store.listProfiles(toolId)).find((profile) => profile.name === name)?.dir ?? managedProfileDir(name, toolId);
 }
 
 function canPrompt(opts: PrepareLoginOptions): boolean {
@@ -180,11 +189,16 @@ export function nonInteractiveToolSelectionMessage(name: string, choices: LoginT
   ].join("\n");
 }
 
-export function unavailableToolMessage(name: string, tool: ToolDef, availability: ToolAvailability): string {
+export async function unavailableToolMessage(
+  name: string,
+  tool: ToolDef,
+  availability: ToolAvailability,
+  store: AccountsStore = resolveStore(),
+): Promise<string> {
   return [
     `${tool.label} is selected for profile "${name}", but it is unavailable: ${availability.reason ?? "not installed"}.`,
     installInstructions(tool).replace("<name>", name),
-    `Profile dir if kept selected: ${JSON.stringify(profileDirForLogin(name, tool.id))}`,
+    `Profile dir if kept selected: ${JSON.stringify(await profileDirForLogin(name, tool.id, store))}`,
     `To choose another tool, run: accounts login ${name} --tool <tool-id>`,
   ].join("\n");
 }
@@ -226,8 +240,14 @@ function closePrompt(session: PromptSession): void {
   session.rl = undefined;
 }
 
-async function promptForTool(name: string, opts: PrepareLoginOptions, session: PromptSession, reason?: string): Promise<ToolDef> {
-  const choices = loginToolChoices(name, opts.env);
+async function promptForTool(
+  name: string,
+  opts: PrepareLoginOptions,
+  session: PromptSession,
+  store: AccountsStore,
+  reason?: string,
+): Promise<ToolDef> {
+  const choices = await loginToolChoices(name, opts.env, store);
   if (!canPrompt({ ...opts, input: session.input, output: session.output })) {
     throw new AccountsError(nonInteractiveToolSelectionMessage(name, choices));
   }
@@ -257,12 +277,13 @@ async function promptForUnavailableTool(
   availability: ToolAvailability,
   opts: PrepareLoginOptions,
   session: PromptSession,
+  store: AccountsStore,
 ) {
   if (!canPrompt({ ...opts, input: session.input, output: session.output })) {
-    throw new AccountsError(unavailableToolMessage(name, tool, availability));
+    throw new AccountsError(await unavailableToolMessage(name, tool, availability, store));
   }
 
-  session.output.write(`${unavailableToolMessage(name, tool, availability)}\n`);
+  session.output.write(`${await unavailableToolMessage(name, tool, availability, store)}\n`);
   session.output.write("  1. Choose another tool\n");
   session.output.write(`  2. Keep ${tool.label} selected and stop\n`);
   session.output.write("  3. Cancel without changes\n");
@@ -276,20 +297,30 @@ async function promptForUnavailableTool(
   }
 }
 
-function existingOrCreateProfile(name: string, tool: ToolDef): Profile {
-  const existing = listProfiles(tool.id).find((profile) => profile.name === name);
-  const profile = existing ?? addProfile({ name, tool: tool.id, description: "created for login" });
-  lockProfileTool(profile.name, profile.tool);
+async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<Profile> {
+  const existing = await store.findProfile(name, tool.id);
+  const profile = existing ?? (await store.addProfile({ name, tool: tool.id, description: "created for login" }));
+  // The tool lock is a machine-local disambiguation for bare commands; only the
+  // LocalStore keeps it. In api mode the shared registry (+ explicit --tool)
+  // resolves the profile, so there is no local lock to write.
+  if (store.transport === "local") lockProfileTool(profile.name, profile.tool);
   return profile;
 }
 
-async function selectLoginTool(name: string, opts: PrepareLoginOptions, session: PromptSession): Promise<ToolDef> {
+async function selectLoginTool(
+  name: string,
+  opts: PrepareLoginOptions,
+  session: PromptSession,
+  store: AccountsStore,
+): Promise<ToolDef> {
   if (opts.toolId) return getTool(opts.toolId);
 
-  const lockedTool = getProfileToolLock(name);
-  if (lockedTool) return getTool(lockedTool);
+  if (store.transport === "local") {
+    const lockedTool = getProfileToolLock(name);
+    if (lockedTool) return getTool(lockedTool);
+  }
 
-  const matches = listProfiles().filter((profile) => profile.name === name);
+  const matches = (await store.listProfiles()).filter((profile) => profile.name === name);
   if (matches.length === 1) {
     return getTool(matches[0]!.tool);
   }
@@ -298,21 +329,22 @@ async function selectLoginTool(name: string, opts: PrepareLoginOptions, session:
     matches.length > 1
       ? `profile "${name}" exists for multiple tools (${matches.map((profile) => profile.tool).join(", ")}).`
       : undefined;
-  return promptForTool(name, opts, session, reason);
+  return promptForTool(name, opts, session, store, reason);
 }
 
 export async function prepareLogin(name: string, opts: PrepareLoginOptions = {}): Promise<LoginPreparation> {
+  const store = opts.store ?? resolveStore();
   const session: PromptSession = {
     input: opts.input ?? process.stdin,
     output: opts.output ?? process.stderr,
   };
   try {
-    let tool = await selectLoginTool(name, opts, session);
+    let tool = await selectLoginTool(name, opts, session, store);
 
     while (true) {
       const availability = detectToolAvailability(tool, opts.env);
       if (availability.available) {
-        const profile = existingOrCreateProfile(name, tool);
+        const profile = await existingOrCreateProfile(name, tool, store);
         return {
           status: "ready",
           profile,
@@ -321,18 +353,18 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
         };
       }
 
-      const action = await promptForUnavailableTool(name, tool, availability, opts, session);
+      const action = await promptForUnavailableTool(name, tool, availability, opts, session, store);
       if (action === "choose-other") {
-        tool = await promptForTool(name, opts, session, `${tool.label} is unavailable; choose another tool.`);
+        tool = await promptForTool(name, opts, session, store, `${tool.label} is unavailable; choose another tool.`);
         continue;
       }
       if (action === "keep") {
-        const profile = existingOrCreateProfile(name, tool);
+        const profile = await existingOrCreateProfile(name, tool, store);
         return {
           status: "stopped",
           profile,
           tool,
-          message: unavailableToolMessage(name, tool, availability),
+          message: await unavailableToolMessage(name, tool, availability, store),
         };
       }
       throw new AccountsError("cancelled; no profile tool was changed");
@@ -347,17 +379,21 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
  * Claude login becomes the live/default account; other tools are marked active
  * and have metadata re-detected where possible.
  */
-export function finalizeLogin(name: string, toolId?: string): FinalizeLoginResult {
-  const profile = getProfile(name, toolId);
+export async function finalizeLogin(
+  name: string,
+  toolId?: string,
+  store: AccountsStore = resolveStore(),
+): Promise<FinalizeLoginResult> {
+  const profile = await store.getProfile(name, toolId);
   const tool = getTool(profile.tool);
 
   if (tool.id === "claude") {
     ensureProfileAuthSnapshot(profile.dir, tool, { overwrite: true });
-    redetectEmail(name, tool.id);
-    return { profile: applyProfile(name, tool.id).profile, applied: true };
+    await store.redetectEmail(name, tool.id);
+    return { profile: (await applyProfile(name, tool.id, store)).profile, applied: true };
   }
 
-  const updated = redetectEmail(name, tool.id);
-  useProfile(name, tool.id);
+  const updated = await store.redetectEmail(name, tool.id);
+  await store.useProfile(name, tool.id);
   return { profile: updated, applied: false };
 }

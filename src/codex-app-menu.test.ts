@@ -23,13 +23,13 @@ afterEach(() => {
   delete process.env.ACCOUNTS_HOME;
 });
 
-test("codex app menu state lists profiles with active marker", () => {
+test("codex app menu state lists profiles with active marker", async () => {
   addProfile({ name: "personal", tool: "codex-app", email: "personal@example.com" });
   addProfile({ name: "work", tool: "codex-app", displayName: "Work" });
   addProfile({ name: "cli", tool: "codex" });
   useProfile("work", "codex-app");
 
-  const state = codexAppMenuState();
+  const state = await codexAppMenuState();
 
   expect(state.tool.id).toBe("codex-app");
   expect(state.activeProfileName).toBe("work");

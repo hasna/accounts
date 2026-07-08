@@ -2,7 +2,7 @@ import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
-import { listProfiles, currentProfile } from "./profiles.js";
+import { resolveStore, type AccountsStore } from "./store.js";
 import { appliedProfile } from "./apply.js";
 
 export interface PickOptions {
@@ -22,17 +22,27 @@ export interface PickResult {
   mode: "apply" | "env" | "none";
 }
 
-export async function pickProfile(opts: PickOptions = {}): Promise<PickResult | undefined> {
-  const profiles = listProfiles(opts.tool);
+export async function pickProfile(
+  opts: PickOptions = {},
+  store: AccountsStore = resolveStore(),
+): Promise<PickResult | undefined> {
+  const profiles = await store.listProfiles(opts.tool);
   if (profiles.length === 0) {
     throw new AccountsError("no profiles — create one with `accounts add <name>` or `accounts import`");
+  }
+
+  // Resolve the "active" markers through the Store (cloud in api mode); the
+  // "applied" marker is the machine-local live-auth pointer (best-effort).
+  const activeByTool = new Map<string, string | undefined>();
+  for (const tool of new Set(profiles.map((p) => p.tool))) {
+    activeByTool.set(tool, (await store.currentProfile(tool))?.name);
   }
 
   console.log("");
   for (let i = 0; i < profiles.length; i++) {
     const p = profiles[i]!;
     const markers: string[] = [];
-    if (currentProfile(p.tool)?.name === p.name) markers.push("active");
+    if (activeByTool.get(p.tool) === p.name) markers.push("active");
     if (appliedProfile(p.tool)?.name === p.name) markers.push("applied");
     const tag = markers.length ? ` (${markers.join(", ")})` : "";
     const email = p.email ? ` ${p.email}` : "";

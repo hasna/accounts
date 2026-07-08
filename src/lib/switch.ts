@@ -3,7 +3,7 @@ import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
 import { claudeApiAuthClearingEnv, formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
-import { getProfile, useProfile } from "./profiles.js";
+import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
@@ -44,8 +44,12 @@ function commandFor(profile: Profile, tool: ToolDef, opts: SwitchOptions): strin
   return [tool.bin, ...mergeToolArgs(tool, args, { permissions: opts.permissions, profile })];
 }
 
-export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchResult {
-  const profile = getProfile(name, opts.tool);
+export async function switchProfile(
+  name: string,
+  opts: SwitchOptions = {},
+  store: AccountsStore = resolveStore(),
+): Promise<SwitchResult> {
+  const profile = await store.getProfile(name, opts.tool);
   const tool = getTool(profile.tool);
   const mode = opts.mode ?? "auto";
   if (!["auto", "apply", "env", "active"].includes(mode)) {
@@ -54,10 +58,10 @@ export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchRes
   let applied = false;
 
   if (mode === "apply" || (mode === "auto" && tool.id === "claude")) {
-    applyProfile(name, tool.id);
+    await applyProfile(profile.name, tool.id, store);
     applied = true;
   } else {
-    useProfile(name, tool.id);
+    await store.useProfile(profile.name, tool.id);
   }
 
   const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : profileEnv(profile, tool);
@@ -69,7 +73,7 @@ export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchRes
     : `${profile.name} is now the active ${tool.label} profile`;
 
   return {
-    profile: getProfile(name, tool.id),
+    profile: await store.getProfile(profile.name, tool.id),
     tool,
     applied,
     active: true,

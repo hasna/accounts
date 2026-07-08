@@ -1,11 +1,13 @@
 import { cpSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import type { Profile } from "../types.js";
 import { profilesDir } from "../storage.js";
 import { AccountsError } from "../types.js";
-import { addProfile, expandPath, getProfileToolLock, listProfiles, lockProfileTool, type AddOptions } from "./profiles.js";
+import { expandPath, type AddOptions } from "./profiles.js";
 import { getTool, DEFAULT_TOOL } from "./tools.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
 import { detectEmail } from "./detect.js";
+import { resolveStore, type AccountsStore } from "./store.js";
 
 export interface ImportOptions {
   name?: string;
@@ -19,8 +21,13 @@ export interface ImportOptions {
 /**
  * Register an existing Claude (or tool) config directory as a profile.
  * Default source is the tool's default dir (e.g. ~/.claude).
+ *
+ * The registry write goes through the resolved Store, so in self_hosted/cloud
+ * mode the imported profile lands in the cloud registry (visible to
+ * `accounts list`/other machines). The on-disk copy/snapshot work is
+ * machine-local and stays local.
  */
-export function importProfile(opts: ImportOptions) {
+export async function importProfile(opts: ImportOptions, store: AccountsStore = resolveStore()): Promise<Profile> {
   const toolId = opts.tool ?? DEFAULT_TOOL;
   const tool = getTool(toolId);
   const name = opts.name ?? "main";
@@ -44,7 +51,7 @@ export function importProfile(opts: ImportOptions) {
       email: opts.email ?? detectEmail(targetDir, tool),
       description: opts.description ?? "imported copy",
     };
-    return addProfile(addOpts);
+    return store.addProfile(addOpts);
   }
 
   const addOpts: AddOptions = {
@@ -54,36 +61,7 @@ export function importProfile(opts: ImportOptions) {
     email: opts.email ?? detectEmail(sourceDir, tool),
     description: opts.description ?? "imported",
   };
-  const profile = addProfile(addOpts);
+  const profile = await store.addProfile(addOpts);
   if (tool.id === "claude") ensureProfileAuthSnapshot(profile.dir, tool);
   return profile;
-}
-
-export function ensureProfileForLogin(name: string, toolId?: string) {
-  const existing = findProfileByName(name, toolId);
-  if (existing) {
-    lockProfileTool(existing.name, existing.tool);
-    return existing;
-  }
-  const profile = addProfile({ name, tool: toolId ?? DEFAULT_TOOL, description: "created for login" });
-  lockProfileTool(profile.name, profile.tool);
-  return profile;
-}
-
-function findProfileByName(name: string, toolId?: string) {
-  const matches = listProfiles(toolId).filter((profile) => profile.name === name);
-  if (matches.length === 0) return undefined;
-  if (!toolId) {
-    const lockedTool = getProfileToolLock(name);
-    if (lockedTool) {
-      const lockedProfile = matches.find((profile) => profile.tool === lockedTool);
-      if (lockedProfile) return lockedProfile;
-    }
-  }
-  if (matches.length > 1) {
-    throw new AccountsError(
-      `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
-    );
-  }
-  return matches[0];
 }

@@ -3,13 +3,12 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, join } from "node:path";
-import { accountsHome } from "../storage.js";
+import { accountsHome, loadStore } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
-import { appliedProfile } from "./apply.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
 import { profileEnv } from "./env.js";
-import { currentProfile, getProfile, useProfile } from "./profiles.js";
+import { resolveStore, type AccountsStore } from "./store.js";
 import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
 import { getTool } from "./tools.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchOptions, type ConfigsPrelaunchResult } from "./configs-prelaunch.js";
@@ -150,14 +149,27 @@ function knownTool(id: string): ToolDef | undefined {
   }
 }
 
-export function resolveSupervisorLaunch(
+/**
+ * The machine-local `applied` pointer records which profile's auth is currently
+ * live on this box (see apply.ts). The pointer's *name* is genuinely local, but
+ * its full record is resolved through the Store — so in api mode we read the
+ * cloud registry instead of local profile metadata.
+ */
+async function resolveAppliedProfile(toolId: string, store: AccountsStore): Promise<Profile | undefined> {
+  const name = loadStore().applied[toolId];
+  if (!name) return undefined;
+  return store.findProfile(name, toolId);
+}
+
+export async function resolveSupervisorLaunch(
   target: string,
   opts: { profile?: string; tool?: string } = {},
-): SupervisorLaunchPlan {
+  store: AccountsStore = resolveStore(),
+): Promise<SupervisorLaunchPlan> {
   const targetTool = knownTool(target);
 
   if (opts.profile) {
-    const profile = getProfile(opts.profile, opts.tool ?? targetTool?.id);
+    const profile = await store.getProfile(opts.profile, opts.tool ?? targetTool?.id);
     if (targetTool && profile.tool !== targetTool.id) {
       throw new AccountsError(`profile "${profile.name}" belongs to ${profile.tool}, not ${targetTool.id}`);
     }
@@ -165,7 +177,7 @@ export function resolveSupervisorLaunch(
   }
 
   if (targetTool && !opts.tool) {
-    const profile = currentProfile(targetTool.id) ?? appliedProfile(targetTool.id);
+    const profile = (await store.currentProfile(targetTool.id)) ?? (await resolveAppliedProfile(targetTool.id, store));
     if (!profile) {
       throw new AccountsError(
         `no active ${targetTool.label} profile. Run \`accounts use <name> --tool ${targetTool.id}\` or pass --profile.`,
@@ -174,7 +186,7 @@ export function resolveSupervisorLaunch(
     return { profile, tool: targetTool, targetKind: "tool" };
   }
 
-  const profile = getProfile(target, opts.tool);
+  const profile = await store.getProfile(target, opts.tool);
   return { profile, tool: getTool(profile.tool), targetKind: "profile" };
 }
 
@@ -293,6 +305,7 @@ export async function runSupervisedTool(
   const startedAt = nowIso();
   const restartDelayMs = opts.restartDelayMs ?? 350;
   const log = opts.log ?? (() => undefined);
+  const store = resolveStore();
   const server = createServer();
   let profile = initialProfile;
   let childArgs = initialArgs;
@@ -382,13 +395,16 @@ export async function runSupervisedTool(
     }
   };
 
-  const startChild = (nextProfile: Profile, nextArgs: string[], preflightedConfigs?: ConfigsPrelaunchResult): void => {
+  const startChild = async (nextProfile: Profile, nextArgs: string[], preflightedConfigs?: ConfigsPrelaunchResult): Promise<void> => {
     const configOpts = configsOptionsFor();
     const configs = preflightedConfigs ?? runConfigsPrelaunch(nextProfile, tool, configOpts);
     logConfigsResult(configs, nextProfile, configOpts);
     profile = nextProfile;
     childArgs = nextArgs;
-    useProfile(profile.name, tool.id);
+    // Mark this profile as the tool's active selection through the Store so the
+    // shared registry (cloud in api mode) is the single source of truth — never
+    // a local-only write that would diverge from the cloud "current".
+    await store.useProfile(profile.name, tool.id);
     const env = profileEnv(profile, tool);
     log(`accounts supervisor: starting ${tool.bin} for ${profile.name}`);
     prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
@@ -418,7 +434,7 @@ export async function runSupervisedTool(
     try {
       await wait(restartDelayMs);
       await stopChild();
-      startChild(result.profile, result.command.slice(1), preflightedConfigs);
+      await startChild(result.profile, result.command.slice(1), preflightedConfigs);
     } finally {
       restarting = false;
     }
@@ -442,16 +458,17 @@ export async function runSupervisedTool(
       return { ok: false, error: `this supervisor runs ${tool.id}, not ${request.tool}` };
     }
     try {
-      const nextProfile = getProfile(request.name, tool.id);
+      const store = resolveStore();
+      const nextProfile = await store.getProfile(request.name, tool.id);
       const configOpts = configsOptionsFor(request);
       const preflightedConfigs = runConfigsPrelaunch(nextProfile, tool, configOpts);
-      const result = switchProfile(request.name, {
+      const result = await switchProfile(request.name, {
         tool: tool.id,
         mode: request.mode ?? "auto",
         resume: request.resume ?? true,
         args: request.args ?? [],
         permissions: request.permissions,
-      });
+      }, store);
       log(`accounts supervisor: switching ${tool.id} to ${result.profile.name}`);
       setTimeout(() => void restartWith(result, preflightedConfigs), 0);
       return { ok: true, queued: true, result, state: state(), restartDelayMs };
@@ -487,6 +504,6 @@ export async function runSupervisedTool(
   process.once("SIGTERM", onSigterm);
 
   await listen(server, socketPath);
-  startChild(profile, childArgs);
+  await startChild(profile, childArgs);
   return await done;
 }

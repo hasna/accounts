@@ -20,8 +20,6 @@ import {
 } from "./lib/tools.js";
 import {
   expandPath,
-  getProfile,
-  useProfile,
   type ProfileMetadata,
 } from "./lib/profiles.js";
 import { resolveStore } from "./lib/store.js";
@@ -330,8 +328,8 @@ codexApp
   .description("print Codex.app menu-bar state")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
-      const state = codexAppMenuState();
+    action(async (opts: { json?: boolean }) => {
+      const state = await codexAppMenuState();
       if (opts.json) {
         console.log(JSON.stringify(state, null, 2));
         return;
@@ -506,8 +504,8 @@ program
   .description("apply profile auth to live ~/.claude paths (requires login/snapshot; Claude-only)")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string, opts: { tool?: string }) => {
-      const { profile, previous } = applyProfile(name, opts.tool);
+    action(async (name: string, opts: { tool?: string }) => {
+      const { profile, previous } = await applyProfile(name, opts.tool);
       console.log(chalk.green(`✓ applied ${chalk.bold(profile.name)} to live ${getTool(profile.tool).label} paths`));
       if (previous) console.log(chalk.dim(`  previous applied profile "${previous}" was snapshotted`));
       if (profile.email) console.log(chalk.dim(`  email: ${profile.email}`));
@@ -524,15 +522,15 @@ program
   .option("--description <text>", "description")
   .option("--copy", "copy into a managed profile dir instead of referencing the source")
   .action(
-    action((name: string | undefined, opts: { tool: string; dir?: string; email?: string; description?: string; copy?: boolean }) => {
-      const p = importProfile({
+    action(async (name: string | undefined, opts: { tool: string; dir?: string; email?: string; description?: string; copy?: boolean }) => {
+      const p = await importProfile({
         name: name ?? "main",
         tool: opts.tool,
         dir: opts.dir,
         email: opts.email,
         description: opts.description,
         copy: opts.copy,
-      });
+      }, resolveStore());
       console.log(chalk.green(`✓ imported profile ${chalk.bold(p.name)}`));
       console.log(`  config dir: ${p.dir}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none)")}`);
@@ -547,7 +545,8 @@ program
   .option("-t, --tool <tool>", "tool to use for this profile; locks bare commands to that tool")
   .action(
     action(async (name: string, opts: { tool?: string }) => {
-      const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env });
+      const store = resolveStore();
+      const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env, store });
       if (prepared.status === "stopped") {
         console.error(chalk.yellow(prepared.message));
         console.error(chalk.dim(`Selected tool kept: ${prepared.tool.id}`));
@@ -555,7 +554,7 @@ program
       }
       const { profile, tool, args: loginArgs } = prepared;
       const env = profileEnv(profile, tool);
-      useProfile(name, tool.id);
+      await store.useProfile(name, tool.id);
       console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
       console.log(chalk.dim(`  config dir: ${profile.dir}`));
       console.log(chalk.dim(`  env: ${formatEnvAssignments(env)}`));
@@ -570,7 +569,7 @@ program
       });
       if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
       if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
-      const finalized = finalizeLogin(name, tool.id);
+      const finalized = await finalizeLogin(name, tool.id, store);
       if (finalized.applied) {
         console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
       } else {
@@ -587,12 +586,13 @@ program
   .option("--no-act", "only mark active (store current); do not apply or print env")
   .action(
     action(async (opts: { tool: string; env?: boolean; act?: boolean }) => {
-      const result = await pickProfile({ tool: opts.tool, mode: resolvePickMode(opts) });
+      const store = resolveStore();
+      const result = await pickProfile({ tool: opts.tool, mode: resolvePickMode(opts) }, store);
       if (!result) return;
-      useProfile(result.profile.name, result.profile.tool);
+      await store.useProfile(result.profile.name, result.profile.tool);
       console.log(chalk.green(`✓ selected ${chalk.bold(result.profile.name)}`));
       if (result.mode === "apply") {
-        applyProfile(result.profile.name, result.profile.tool);
+        await applyProfile(result.profile.name, result.profile.tool, store);
         console.log(chalk.dim("  applied to live Claude paths"));
       } else if (result.mode === "env") {
         const tool = getTool(result.profile.tool);
@@ -656,8 +656,9 @@ addConfigsOptions(program
         } & ConfigsCliOptions,
       ) => {
         if (opts.supervisor && opts.launch) die("--supervisor and --launch cannot be used together");
+        const store = resolveStore();
         if (opts.supervisor) {
-          const profile = getProfile(name, opts.tool);
+          const profile = await store.getProfile(name, opts.tool);
           const response = await sendSupervisorRequest(
             profile.tool,
             {
@@ -687,13 +688,13 @@ addConfigsOptions(program
           return;
         }
 
-        const result = switchProfile(name, {
+        const result = await switchProfile(name, {
           tool: opts.tool,
           mode: opts.mode,
           resume: opts.resume,
           args,
           permissions: opts.permissions,
-        });
+        }, store);
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
         } else {
@@ -805,7 +806,7 @@ addConfigsOptions(program
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .action(
     action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ConfigsCliOptions) => {
-      const plan = resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
+      const plan = await resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
       const runArgs = mergeToolArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
         permissions: opts.permissions,
         profile: plan.profile,
@@ -873,7 +874,7 @@ addConfigsOptions(supervisor
         args: string[],
         opts: { tool?: string; mode: SwitchMode; resume?: boolean; permissions?: string; json?: boolean } & ConfigsCliOptions,
       ) => {
-      const profile = getProfile(name, opts.tool);
+      const profile = await resolveStore().getProfile(name, opts.tool);
       const response = await sendSupervisorRequest(
         profile.tool,
         {
@@ -964,8 +965,9 @@ program
   .option("-b, --background", "only show background agents")
   .option("--json", "output JSON")
   .action(
-    action((opts: { tool: string; profile?: string; background?: boolean; json?: boolean }) => {
+    action(async (opts: { tool: string; profile?: string; background?: boolean; json?: boolean }) => {
       const results = listAgentsAcrossProfiles({
+        profiles: await resolveStore().listProfiles(opts.tool),
         tool: opts.tool,
         profile: opts.profile,
         backgroundOnly: opts.background,

@@ -3,9 +3,9 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile, getProfileToolLock } from "./lib/profiles.js";
+import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile } from "./lib/profiles.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
-import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
+import { importProfile } from "./lib/import-profile.js";
 import { finalizeLogin } from "./lib/login.js";
 import {
   claudeKeychainCredentialFromProfile,
@@ -54,12 +54,12 @@ function writeOAuth(dir: string, email: string) {
   );
 }
 
-test("import snapshots oauth from profile dir not live", () => {
+test("import snapshots oauth from profile dir not live", async () => {
   const importDir = mkdtempSync(join(tmpdir(), "import-src-"));
   writeOAuth(importDir, "import@example.com");
   writeFileSync(join(liveBase, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "live@wrong.com" } }));
 
-  const p = importProfile({ name: "imp", dir: importDir, email: "import@example.com" });
+  const p = await importProfile({ name: "imp", dir: importDir, email: "import@example.com" });
   const snap = JSON.parse(readFileSync(profileOAuthSnapshot(p.dir), "utf8")) as {
     oauthAccount: { emailAddress: string };
   };
@@ -67,32 +67,32 @@ test("import snapshots oauth from profile dir not live", () => {
   rmSync(importDir, { recursive: true, force: true });
 });
 
-test("apply rejects profile without auth", () => {
+test("apply rejects profile without auth", async () => {
   const emptyDir = mkdtempSync(join(tmpdir(), "empty-"));
   mkdirSync(emptyDir, { recursive: true });
   addProfile({ name: "empty", dir: emptyDir });
-  expect(() => applyProfile("empty")).toThrow(AccountsError);
+  await expect(applyProfile("empty")).rejects.toThrow(AccountsError);
   rmSync(emptyDir, { recursive: true, force: true });
 });
 
-test("apply rejects OAuth-only profiles without restorable Claude credentials", () => {
+test("apply rejects OAuth-only profiles without restorable Claude credentials", async () => {
   const oauthOnlyDir = mkdtempSync(join(tmpdir(), "oauth-only-"));
   writeFileSync(join(oauthOnlyDir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "oauth@example.com" } }));
   addProfile({ name: "oauthonly", dir: oauthOnlyDir });
   ensureProfileAuthSnapshot(oauthOnlyDir, getTool("claude"));
 
-  expect(() => applyProfile("oauthonly")).toThrow("has no Claude credentials to apply");
+  await expect(applyProfile("oauthonly")).rejects.toThrow("has no Claude credentials to apply");
   expect(appliedProfile("claude")).toBeUndefined();
   expect(currentProfile("claude")).toBeUndefined();
   rmSync(oauthOnlyDir, { recursive: true, force: true });
 });
 
-test("apply does not wipe live oauth when profile empty", () => {
+test("apply does not wipe live oauth when profile empty", async () => {
   const emptyDir = mkdtempSync(join(tmpdir(), "empty2-"));
   mkdirSync(emptyDir, { recursive: true });
   writeFileSync(join(liveBase, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "keep@example.com" } }));
   addProfile({ name: "empty2", dir: emptyDir });
-  expect(() => applyProfile("empty2")).toThrow(AccountsError);
+  await expect(applyProfile("empty2")).rejects.toThrow(AccountsError);
   const live = JSON.parse(readFileSync(join(liveBase, ".claude.json"), "utf8")) as {
     oauthAccount: { emailAddress: string };
   };
@@ -100,7 +100,7 @@ test("apply does not wipe live oauth when profile empty", () => {
   rmSync(emptyDir, { recursive: true, force: true });
 });
 
-test("apply snapshots live oauth to previous profile when switching", () => {
+test("apply snapshots live oauth to previous profile when switching", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-snap-"));
   const personalDir = mkdtempSync(join(tmpdir(), "personal-snap-"));
   writeOAuth(workDir, "work@example.com");
@@ -110,8 +110,8 @@ test("apply snapshots live oauth to previous profile when switching", () => {
   const tool = getTool("claude");
   ensureProfileAuthSnapshot(workDir, tool);
   ensureProfileAuthSnapshot(personalDir, tool);
-  applyProfile("work");
-  applyProfile("personal");
+  await applyProfile("work");
+  await applyProfile("personal");
   const snap = JSON.parse(readFileSync(profileOAuthSnapshot(workDir), "utf8")) as {
     oauthAccount: { emailAddress: string };
   };
@@ -124,65 +124,29 @@ test("apply snapshots live oauth to previous profile when switching", () => {
   rmSync(personalDir, { recursive: true, force: true });
 });
 
-test("apply sets applied and active pointers", () => {
+test("apply sets applied and active pointers", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-ptr-"));
   writeOAuth(workDir, "work@example.com");
   addProfile({ name: "work", dir: workDir });
   ensureProfileAuthSnapshot(workDir, getTool("claude"));
-  const { previous } = applyProfile("work");
+  const { previous } = await applyProfile("work");
   expect(previous).toBeUndefined();
   expect(appliedProfile("claude")?.name).toBe("work");
   expect(currentProfile("claude")?.name).toBe("work");
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("import --copy creates managed dir with auth snapshot", () => {
+test("import --copy creates managed dir with auth snapshot", async () => {
   const importDir = mkdtempSync(join(tmpdir(), "import-copy-"));
   writeOAuth(importDir, "copy@example.com");
-  const p = importProfile({ name: "copied", dir: importDir, copy: true });
+  const p = await importProfile({ name: "copied", dir: importDir, copy: true });
   expect(p.dir.startsWith(home)).toBe(true);
   expect(hasAuthSnapshot(p.dir)).toBe(true);
   expect(profileHasAuth(p.dir, getTool("claude"))).toBe(true);
   rmSync(importDir, { recursive: true, force: true });
 });
 
-test("ensureProfileForLogin creates profile when missing", () => {
-  const p = ensureProfileForLogin("newlogin");
-  expect(p.name).toBe("newlogin");
-  expect(p.tool).toBe("claude");
-  expect(getProfileToolLock("newlogin")).toBe("claude");
-  expect(existsSync(p.dir)).toBe(true);
-  expect(ensureProfileForLogin("newlogin").dir).toBe(p.dir);
-});
-
-test("ensureProfileForLogin infers an existing profile tool", () => {
-  const p = addProfile({ name: "codexlogin", tool: "codex" });
-
-  expect(ensureProfileForLogin("codexlogin").tool).toBe("codex");
-  expect(ensureProfileForLogin("codexlogin").dir).toBe(p.dir);
-  expect(getProfileToolLock("codexlogin")).toBe("codex");
-});
-
-test("ensureProfileForLogin uses a lock when an existing profile name is shared with other tools", () => {
-  addProfile({ name: "shared", tool: "claude" });
-  addProfile({ name: "shared", tool: "codex" });
-
-  useProfile("shared", "codex");
-
-  expect(ensureProfileForLogin("shared").tool).toBe("codex");
-  expect(ensureProfileForLogin("shared", "codex").tool).toBe("codex");
-});
-
-test("ensureProfileForLogin requires --tool when an existing profile name is ambiguous without Claude", () => {
-  addProfile({ name: "shared", tool: "codex" });
-  addProfile({ name: "shared", tool: "opencode" });
-
-  expect(() => ensureProfileForLogin("shared")).toThrow(
-    'profile "shared" exists for multiple tools (codex, opencode); pass --tool',
-  );
-});
-
-test("apply removes Claude API-helper settings from OAuth profiles and live settings", () => {
+test("apply removes Claude API-helper settings from OAuth profiles and live settings", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-settings-"));
   writeOAuth(workDir, "work@example.com");
   writeFileSync(
@@ -197,7 +161,7 @@ test("apply removes Claude API-helper settings from OAuth profiles and live sett
   addProfile({ name: "work", dir: workDir });
   ensureProfileAuthSnapshot(workDir, getTool("claude"));
 
-  applyProfile("work");
+  await applyProfile("work");
 
   const profileSettings = JSON.parse(readFileSync(join(workDir, "settings.json"), "utf8")) as {
     apiKeyHelper?: string;
@@ -217,7 +181,7 @@ test("apply removes Claude API-helper settings from OAuth profiles and live sett
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("profileEnv removes Claude API-helper settings before OAuth exists", () => {
+test("profileEnv removes Claude API-helper settings before OAuth exists", async () => {
   const dir = mkdtempSync(join(tmpdir(), "env-preoauth-"));
   writeFileSync(join(dir, "settings.json"), JSON.stringify({ apiKeyHelper: "/tmp/helper" }));
   addProfile({ name: "preoauth", dir });
@@ -230,7 +194,7 @@ test("profileEnv removes Claude API-helper settings before OAuth exists", () => 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("profileEnv clears Claude API auth environment variables", () => {
+test("profileEnv clears Claude API auth environment variables", async () => {
   const dir = mkdtempSync(join(tmpdir(), "env-clean-"));
   writeOAuth(dir, "env@example.com");
   addProfile({ name: "envclean", dir });
@@ -245,24 +209,24 @@ test("profileEnv clears Claude API auth environment variables", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("applyProfile writes oauth to live paths", () => {
+test("applyProfile writes oauth to live paths", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-"));
   writeOAuth(workDir, "work@example.com");
   addProfile({ name: "work", dir: workDir });
   ensureProfileAuthSnapshot(workDir, getTool("claude"));
-  applyProfile("work");
+  await applyProfile("work");
   const live = liveClaudePaths();
   const liveJson = JSON.parse(readFileSync(live.homeJson, "utf8")) as { oauthAccount: { emailAddress: string } };
   expect(liveJson.oauthAccount.emailAddress).toBe("work@example.com");
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("finalizeLogin snapshots and applies a Claude login automatically", () => {
+test("finalizeLogin snapshots and applies a Claude login automatically", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-login-"));
   addProfile({ name: "work", dir: workDir });
   writeOAuth(workDir, "work@example.com");
 
-  const result = finalizeLogin("work", "claude");
+  const result = await finalizeLogin("work", "claude");
 
   expect(result.applied).toBe(true);
   expect(appliedProfile("claude")?.name).toBe("work");
@@ -274,14 +238,14 @@ test("finalizeLogin snapshots and applies a Claude login automatically", () => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("finalizeLogin refreshes a stale auth snapshot from the profile dir", () => {
+test("finalizeLogin refreshes a stale auth snapshot from the profile dir", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-login-refresh-"));
   writeOAuth(workDir, "old@example.com");
   addProfile({ name: "work", dir: workDir });
   ensureProfileAuthSnapshot(workDir, getTool("claude"));
   writeOAuth(workDir, "new@example.com");
 
-  finalizeLogin("work", "claude");
+  await finalizeLogin("work", "claude");
 
   const snap = JSON.parse(readFileSync(profileOAuthSnapshot(workDir), "utf8")) as {
     oauthAccount: { emailAddress: string };
@@ -294,12 +258,12 @@ test("finalizeLogin refreshes a stale auth snapshot from the profile dir", () =>
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("rename and remove keep applied pointer coherent", () => {
+test("rename and remove keep applied pointer coherent", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-"));
   writeOAuth(workDir, "work@example.com");
   addProfile({ name: "work", dir: workDir });
   ensureProfileAuthSnapshot(workDir, getTool("claude"));
-  applyProfile("work");
+  await applyProfile("work");
   renameProfile("work", "job");
   expect(appliedProfile("claude")?.name).toBe("job");
   removeProfile("job");
@@ -307,14 +271,14 @@ test("rename and remove keep applied pointer coherent", () => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("duplicate config dir rejected", () => {
+test("duplicate config dir rejected", async () => {
   const dir = mkdtempSync(join(tmpdir(), "dup-"));
   addProfile({ name: "a", dir });
   expect(() => addProfile({ name: "b", dir })).toThrow(AccountsError);
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("store rejects tampered profile names on load", () => {
+test("store rejects tampered profile names on load", async () => {
   addProfile({ name: "ok" });
   const storePath = join(home, "accounts.json");
   const raw = JSON.parse(readFileSync(storePath, "utf8")) as { profiles: { name: string }[] };
@@ -323,12 +287,12 @@ test("store rejects tampered profile names on load", () => {
   expect(() => loadStore()).toThrow(AccountsError);
 });
 
-test("isSafeProfileName rejects injection patterns", () => {
+test("isSafeProfileName rejects injection patterns", async () => {
   expect(isSafeProfileName("work")).toBe(true);
   expect(isSafeProfileName('x"; evil')).toBe(false);
 });
 
-test("hook install writes script with name validation", () => {
+test("hook install writes script with name validation", async () => {
   const { path, created } = installHook();
   expect(created).toBe(true);
   expect(path).toBe(hookPath());
@@ -336,19 +300,19 @@ test("hook install writes script with name validation", () => {
   expect(hookScript()).toContain("=~ ^[a-z0-9][a-z0-9-]*$");
 });
 
-test("resolvePickMode maps Commander --no-act to none", () => {
+test("resolvePickMode maps Commander --no-act to none", async () => {
   expect(resolvePickMode({ act: false })).toBe("none");
   expect(resolvePickMode({ env: true })).toBe("env");
   expect(resolvePickMode({})).toBe("apply");
 });
 
-test("switchProfile applies Claude and returns a continue handoff command", () => {
+test("switchProfile applies Claude and returns a continue handoff command", async () => {
   const dir = mkdtempSync(join(tmpdir(), "switch-claude-"));
   writeOAuth(dir, "switch@example.com");
   addProfile({ name: "switcher", dir });
   ensureProfileAuthSnapshot(dir, getTool("claude"));
 
-  const result = switchProfile("switcher", { tool: "claude", resume: true });
+  const result = await switchProfile("switcher", { tool: "claude", resume: true });
 
   expect(result.applied).toBe(true);
   expect(result.restartRequired).toBe(true);
@@ -365,13 +329,13 @@ test("switchProfile applies Claude and returns a continue handoff command", () =
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("switchProfile includes Claude dangerous permission preset before resume args", () => {
+test("switchProfile includes Claude dangerous permission preset before resume args", async () => {
   const dir = mkdtempSync(join(tmpdir(), "switch-claude-permissions-"));
   writeOAuth(dir, "switch@example.com");
   addProfile({ name: "danger", dir });
   ensureProfileAuthSnapshot(dir, getTool("claude"));
 
-  const result = switchProfile("danger", { tool: "claude", resume: true, permissions: "dangerous" });
+  const result = await switchProfile("danger", { tool: "claude", resume: true, permissions: "dangerous" });
 
   expect(result.permissions).toBe("dangerous");
   expect(result.command).toEqual(["claude", "--dangerously-skip-permissions", "--continue"]);
@@ -379,10 +343,10 @@ test("switchProfile includes Claude dangerous permission preset before resume ar
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("switchProfile marks Codex active and returns resume command without applying live auth", () => {
+test("switchProfile marks Codex active and returns resume command without applying live auth", async () => {
   const p = addProfile({ name: "codexer", tool: "codex" });
 
-  const result = switchProfile("codexer", { tool: "codex", resume: true });
+  const result = await switchProfile("codexer", { tool: "codex", resume: true });
 
   expect(result.applied).toBe(false);
   expect(result.command).toEqual(["codex", "resume", "--last"]);
@@ -391,10 +355,10 @@ test("switchProfile marks Codex active and returns resume command without applyi
   expect(appliedProfile("codex")).toBeUndefined();
 });
 
-test("switchProfile launches Codex App with isolated app state", () => {
+test("switchProfile launches Codex App with isolated app state", async () => {
   const p = addProfile({ name: "desktop", tool: "codex-app" });
 
-  const result = switchProfile("desktop", { tool: "codex-app" });
+  const result = await switchProfile("desktop", { tool: "codex-app" });
 
   expect(result.applied).toBe(false);
   expect(result.command).toEqual([
@@ -408,19 +372,19 @@ test("switchProfile launches Codex App with isolated app state", () => {
   expect(appliedProfile("codex-app")).toBeUndefined();
 });
 
-test("switchProfile puts Codex dangerous permissions before the resume subcommand", () => {
+test("switchProfile puts Codex dangerous permissions before the resume subcommand", async () => {
   const p = addProfile({ name: "codexdanger", tool: "codex" });
 
-  const result = switchProfile("codexdanger", { tool: "codex", resume: true, permissions: "dangerous" });
+  const result = await switchProfile("codexdanger", { tool: "codex", resume: true, permissions: "dangerous" });
 
   expect(result.command).toEqual(["codex", "--dangerously-bypass-approvals-and-sandbox", "resume", "--last"]);
   expect(result.env.CODEX_HOME).toBe(p.dir);
 });
 
-test("switchProfile rejects unsupported permission presets", () => {
+test("switchProfile rejects unsupported permission presets", async () => {
   addProfile({ name: "open", tool: "opencode" });
 
-  expect(() => switchProfile("open", { tool: "opencode", permissions: "dangerous" })).toThrow(AccountsError);
+  await expect(switchProfile("open", { tool: "opencode", permissions: "dangerous" })).rejects.toThrow(AccountsError);
 });
 
 // --- auth persistence regressions (logout-on-switch bugs) ---
@@ -474,7 +438,7 @@ function writeFakeSecurity() {
   return { fakeSecurity, logPath, payloadPath };
 }
 
-test("Claude keychain credential falls back to profile file credentials", () => {
+test("Claude keychain credential falls back to profile file credentials", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-keychain-fallback-"));
   writeOAuth(workDir, "work@example.com");
   addProfile({ name: "work", dir: workDir });
@@ -488,7 +452,7 @@ test("Claude keychain credential falls back to profile file credentials", () => 
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("Claude keychain credential prefers fresh file credentials over stale keychain snapshot", () => {
+test("Claude keychain credential prefers fresh file credentials over stale keychain snapshot", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-keychain-stale-"));
   writeOAuth(workDir, "work@example.com");
   addProfile({ name: "work", dir: workDir });
@@ -519,7 +483,7 @@ test("Claude keychain credential prefers fresh file credentials over stale keych
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("switchProfile env mode prepares Claude keychain for MCP-style handoff", () => {
+test("switchProfile env mode prepares Claude keychain for MCP-style handoff", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-switch-env-keychain-"));
   const { fakeSecurity, logPath, payloadPath } = writeFakeSecurity();
   writeOAuth(workDir, "work@example.com");
@@ -534,7 +498,7 @@ test("switchProfile env mode prepares Claude keychain for MCP-style handoff", ()
     process.env.ACCOUNTS_TEST_KEYCHAIN = "1";
     process.env.ACCOUNTS_TEST_SECURITY_BIN = fakeSecurity;
 
-    const result = switchProfile("work", { tool: "claude", mode: "env" });
+    const result = await switchProfile("work", { tool: "claude", mode: "env" });
 
     expect(result.applied).toBe(false);
     expect(result.env.CLAUDE_CONFIG_DIR).toBe(workDir);
@@ -553,7 +517,7 @@ test("switchProfile env mode prepares Claude keychain for MCP-style handoff", ()
   }
 });
 
-test("apply restores fresher profile-root credentials over a stale snapshot", () => {
+test("apply restores fresher profile-root credentials over a stale snapshot", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-fresh-"));
   writeOAuth(workDir, "work@example.com");
   writeFileSync(join(workDir, ".credentials.json"), JSON.stringify({ token: "old-token" }));
@@ -566,14 +530,14 @@ test("apply restores fresher profile-root credentials over a stale snapshot", ()
   const future = new Date(Date.now() + 5000);
   utimesSync(join(workDir, ".credentials.json"), future, future);
 
-  applyProfile("work");
+  await applyProfile("work");
 
   const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as { token: string };
   expect(live.token).toBe("rotated-token");
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("apply refreshes a stale oauth snapshot from the profile dir", () => {
+test("apply refreshes a stale oauth snapshot from the profile dir", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-oauth-fresh-"));
   writeOAuth(workDir, "old@example.com");
   addProfile({ name: "work", dir: workDir, email: "old@example.com" });
@@ -584,7 +548,7 @@ test("apply refreshes a stale oauth snapshot from the profile dir", () => {
   const future = new Date(Date.now() + 5000);
   utimesSync(join(workDir, ".claude.json"), future, future);
 
-  applyProfile("work");
+  await applyProfile("work");
 
   const live = JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")) as {
     oauthAccount: { emailAddress: string };
@@ -593,37 +557,37 @@ test("apply refreshes a stale oauth snapshot from the profile dir", () => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("re-applying the same profile preserves rotated live credentials", () => {
+test("re-applying the same profile preserves rotated live credentials", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-reapply-"));
   writeOAuth(workDir, "work@example.com");
   writeFileSync(join(workDir, ".credentials.json"), JSON.stringify({ token: "login-token" }));
   addProfile({ name: "work", dir: workDir });
 
-  applyProfile("work");
+  await applyProfile("work");
   // simulate claude rotating tokens on the live paths while work is applied
   writeCreds(liveBase, "live-rotated-token");
   const future = new Date(Date.now() + 5000);
   utimesSync(liveClaudePaths().credentialsFile, future, future);
 
-  applyProfile("work");
+  await applyProfile("work");
 
   const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as { token: string };
   expect(live.token).toBe("live-rotated-token");
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("re-applying the same profile rejects stale live credentials over valid profile credentials", () => {
+test("re-applying the same profile rejects stale live credentials over valid profile credentials", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-reapply-stale-live-"));
   writeOAuth(workDir, "work@example.com");
   writeClaudeOauthCreds(join(workDir, ".credentials.json"), "profile-token", "r".repeat(24), Date.now() + 60_000);
   addProfile({ name: "work", dir: workDir, email: "work@example.com" });
 
-  applyProfile("work");
+  await applyProfile("work");
   writeClaudeOauthCreds(liveClaudePaths().credentialsFile, "expired-live-token", "", Date.now() - 60_000);
   const future = new Date(Date.now() + 5000);
   utimesSync(liveClaudePaths().credentialsFile, future, future);
 
-  applyProfile("work");
+  await applyProfile("work");
 
   const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as {
     claudeAiOauth: { accessToken: string };
@@ -632,18 +596,18 @@ test("re-applying the same profile rejects stale live credentials over valid pro
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("re-applying the same profile preserves shorter but newer valid live credentials", () => {
+test("re-applying the same profile preserves shorter but newer valid live credentials", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-reapply-short-live-"));
   writeOAuth(workDir, "work@example.com");
   writeClaudeOauthCreds(join(workDir, ".credentials.json"), "profile-token", "profile-refresh-token-is-long", Date.now() + 60_000);
   addProfile({ name: "work", dir: workDir, email: "work@example.com" });
 
-  applyProfile("work");
+  await applyProfile("work");
   writeClaudeOauthCreds(liveClaudePaths().credentialsFile, "fresh-live-token", "short-refresh", Date.now() + 120_000);
   const future = new Date(Date.now() + 5000);
   utimesSync(liveClaudePaths().credentialsFile, future, future);
 
-  applyProfile("work");
+  await applyProfile("work");
 
   const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as {
     claudeAiOauth: { accessToken: string };
@@ -652,18 +616,18 @@ test("re-applying the same profile preserves shorter but newer valid live creden
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("re-applying the same profile rejects longer but expired live credentials", () => {
+test("re-applying the same profile rejects longer but expired live credentials", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-reapply-long-expired-live-"));
   writeOAuth(workDir, "work@example.com");
   writeClaudeOauthCreds(join(workDir, ".credentials.json"), "profile-token", "valid-refresh", Date.now() + 60_000);
   addProfile({ name: "work", dir: workDir, email: "work@example.com" });
 
-  applyProfile("work");
+  await applyProfile("work");
   writeClaudeOauthCreds(liveClaudePaths().credentialsFile, "expired-live-token", "expired-refresh-token-is-long", Date.now() - 60_000);
   const future = new Date(Date.now() + 5000);
   utimesSync(liveClaudePaths().credentialsFile, future, future);
 
-  applyProfile("work");
+  await applyProfile("work");
 
   const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as {
     claudeAiOauth: { accessToken: string };
@@ -672,7 +636,7 @@ test("re-applying the same profile rejects longer but expired live credentials",
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("apply snapshots live auth into the email-matching profile, not the stale applied pointer", () => {
+test("apply snapshots live auth into the email-matching profile, not the stale applied pointer", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-owner-"));
   const personalDir = mkdtempSync(join(tmpdir(), "personal-owner-"));
   const thirdDir = mkdtempSync(join(tmpdir(), "third-owner-"));
@@ -683,7 +647,7 @@ test("apply snapshots live auth into the email-matching profile, not the stale a
   addProfile({ name: "personal", dir: personalDir });
   addProfile({ name: "third", dir: thirdDir });
 
-  applyProfile("personal");
+  await applyProfile("personal");
   // simulate the user logging into "work" directly in the live ~/.claude
   // (registry still believes "personal" is applied)
   writeFileSync(
@@ -692,7 +656,7 @@ test("apply snapshots live auth into the email-matching profile, not the stale a
   );
   writeCreds(liveBase, "work-live-token");
 
-  applyProfile("third");
+  await applyProfile("third");
 
   // work's live tokens must be preserved in work's profile dir
   const workSnap = JSON.parse(
