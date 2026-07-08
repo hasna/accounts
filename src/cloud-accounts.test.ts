@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { resolveAccountsCloud } from "./lib/cloud-accounts.js";
+import { AccountsError } from "./types.js";
 
 const BASE = "https://accounts.hasna.xyz";
 const KEY = "hasna_accounts_testkey_0000";
@@ -87,6 +88,35 @@ describe("resolveAccountsCloud", () => {
     expect(p.name).toBe("work");
     const del = calls.find((c) => c.method === "DELETE")!;
     expect(del.url).toBe(`${BASE}/v1/accounts/claude/work`);
+  });
+
+  test("remove of a nonexistent profile (with tool) throws AccountsError, not a raw Error", async () => {
+    // Entity-level 404 on the lookup: the profile does not exist. This must
+    // surface as an AccountsError so the CLI prints a clean `error: ...` line
+    // (exit 1) instead of dumping an unhandled stack trace leaking cli.js.
+    const { fetchImpl } = mockFetch(() => ({ status: 404, body: { error: "no profile named \"ghost\"" } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    const err = await r.api.remove("ghost", "claude").then(
+      () => { throw new Error("expected remove to reject"); },
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(AccountsError);
+    expect((err as AccountsError).message).toBe('no profile named "ghost" for tool "claude"');
+  });
+
+  test("remove of a nonexistent profile (no tool) throws AccountsError from tool resolution", async () => {
+    // No --tool: resolveSingleTool lists accounts, finds no match, must throw
+    // AccountsError (clean CLI line) rather than a raw Error (stack trace).
+    const { fetchImpl } = mockFetch(() => ({ status: 200, body: { accounts: [] } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    const err = await r.api.remove("ghost").then(
+      () => { throw new Error("expected remove to reject"); },
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(AccountsError);
+    expect((err as AccountsError).message).toBe('no profile named "ghost"');
   });
 
   test("setCurrent PUTs /v1/current/:tool", async () => {

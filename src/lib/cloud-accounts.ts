@@ -257,7 +257,7 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       });
       if (!existing) {
         const suffix = tool ? ` for tool "${tool}"` : "";
-        throw new Error(`no profile named "${name}"${suffix}`);
+        throw new AccountsError(`no profile named "${name}"${suffix}`);
       }
       await t.del(`/accounts/${encodeURIComponent(resolvedTool)}/${encodeURIComponent(name)}`);
       return toProfile(existing);
@@ -311,9 +311,9 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
 
 async function resolveSingleTool(name: string, listAll: (tool?: string) => Promise<CloudAccount[]>): Promise<string> {
   const matches = (await listAll()).filter((a) => a.name === name);
-  if (matches.length === 0) throw new Error(`no profile named "${name}"`);
+  if (matches.length === 0) throw new AccountsError(`no profile named "${name}"`);
   if (matches.length > 1) {
-    throw new Error(`profile "${name}" exists for multiple tools (${matches.map((a) => a.tool).join(", ")}); pass --tool`);
+    throw new AccountsError(`profile "${name}" exists for multiple tools (${matches.map((a) => a.tool).join(", ")}); pass --tool`);
   }
   return matches[0]!.tool;
 }
