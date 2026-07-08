@@ -10,6 +10,7 @@
 // The toggle is the presence of the two env vars (what the fleet flip writes):
 // both set -> cloud; either unset -> local. An explicit
 // `HASNA_ACCOUNTS_STORAGE_MODE=local` forces local even when the vars are set.
+// Any non-canonical mode word (the retired `remote`/`hybrid`/`s3`) is ignored.
 //
 // Registry vs local: the cloud is the source of truth for account metadata
 // (name, tool, email, displayName, identity, cardLast4, metadata, description,
@@ -104,19 +105,48 @@ function toProfile(account: CloudAccount): Profile {
   };
 }
 
+/** The only storage-mode words this client understands. Everything else (incl.
+ * the retired `remote`/`hybrid`/`s3` S3-era words) is treated as unset. */
+const CANONICAL_MODES = new Set(["local", "self_hosted", "cloud"]);
+
+/** Env keys the contracts resolver reads for the storage mode. We compute the
+ * mode ourselves and clear these so no stale/legacy value can reach it. */
+const MODE_ENV_KEYS = ["HASNA_ACCOUNTS_STORAGE_MODE", "ACCOUNTS_STORAGE_MODE", "HASNA_ACCOUNTS_MODE"] as const;
+
 /**
- * Bridge the fleet flip's two-var convention to the contracts resolver: both
- * `HASNA_ACCOUNTS_API_URL` and `HASNA_ACCOUNTS_API_KEY` present (and mode not
- * explicitly `local`) => treat as `self_hosted`.
+ * Bridge the fleet flip's two-var convention to the contracts resolver. The
+ * toggle is the presence of BOTH `HASNA_ACCOUNTS_API_URL` and
+ * `HASNA_ACCOUNTS_API_KEY`: when both are set (and mode is not explicitly
+ * `local`) the client uses the cloud HTTP transport; otherwise local.
+ *
+ * The storage-mode env var is only honored for the canonical `local |
+ * self_hosted | cloud` words, and its sole authority is to force `local`. Any
+ * other value — including a stale `HASNA_ACCOUNTS_STORAGE_MODE=remote|hybrid|s3`
+ * left over from the retired S3 subsystem — is ignored and stripped, so it can
+ * never reach the contracts resolver (where `remote`/`hybrid` normalize to
+ * `cloud` and then throw for a missing key, crashing every registry command on
+ * a machine that has no API key).
  */
 function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const url = env.HASNA_ACCOUNTS_API_URL || env.ACCOUNTS_API_URL;
   const key = env.HASNA_ACCOUNTS_API_KEY || env.ACCOUNTS_API_KEY;
-  const explicitMode = (env.HASNA_ACCOUNTS_STORAGE_MODE || env.HASNA_ACCOUNTS_MODE || "").toLowerCase();
-  if (url && key && explicitMode !== "local") {
-    return { ...env, HASNA_ACCOUNTS_STORAGE_MODE: "self_hosted" };
+  const rawMode = (env.HASNA_ACCOUNTS_STORAGE_MODE || env.HASNA_ACCOUNTS_MODE || "").toLowerCase();
+  const explicitMode = CANONICAL_MODES.has(rawMode) ? rawMode : "";
+
+  const next: NodeJS.ProcessEnv = { ...env };
+  for (const k of MODE_ENV_KEYS) delete next[k];
+
+  if (explicitMode === "local") {
+    // Force local even when URL+KEY are present.
+    next.HASNA_ACCOUNTS_STORAGE_MODE = "local";
+  } else if (url && key) {
+    // Both self_hosted and cloud use the identical cloud-http transport; the
+    // canonical runtime word contracts expects is `cloud`.
+    next.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
   }
-  return env;
+  // Otherwise leave the mode unset so contracts defaults to local — a stale
+  // legacy word can never force (and crash) a cloud resolution without a key.
+  return next;
 }
 
 /**

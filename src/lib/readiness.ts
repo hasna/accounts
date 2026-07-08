@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import type { Profile, Store, ToolDef } from "../types.js";
-import { getAccountsStorageStatus, loadStore } from "../storage.js";
+import { accountsHome, loadStore, profilesDir, storePath } from "../storage.js";
+import { resolveAccountsCloud } from "./cloud-accounts.js";
 import { claudeProfileAuthHealth, type ClaudeProfileAuthStatus } from "./claude-auth.js";
 import { configsSessionToolFor } from "./configs-prelaunch.js";
 import {
@@ -91,7 +92,10 @@ export interface AccountsSupervisorReadiness {
 
 export interface AccountsStorageReadiness {
   status: AccountsReadinessStatus;
-  mode: string;
+  /** `local` (on-box JSON registry) or `self_hosted` (cloud HTTP `/v1` API). */
+  mode: "local" | "self_hosted";
+  /** Store transport in effect: `local` (fs) or `api` (contracts HTTP client). */
+  transport: "local" | "api";
   configured: boolean;
   local: {
     home: string;
@@ -99,12 +103,9 @@ export interface AccountsStorageReadiness {
     profilesDir: string;
     storeExists: boolean;
   };
-  sync: {
-    remoteConfigured: boolean;
-    bucketEnv: string;
-    prefix: string;
-    regionEnv: string;
-    endpointConfigured: boolean;
+  /** Present only in api mode: the `<url>/v1` base the client reads/writes. */
+  api?: {
+    baseUrl: string;
   };
   reasons: string[];
   nextActions: string[];
@@ -362,40 +363,54 @@ function supervisorReadiness(toolId: string, state: SupervisorState | undefined,
 }
 
 function storageReadiness(env: NodeJS.ProcessEnv): AccountsStorageReadiness {
-  const storage = getAccountsStorageStatus(env);
-  const reasons: string[] = [];
-  const nextActions: string[] = [];
-  let status: AccountsReadinessStatus = "ok";
+  const local = {
+    home: accountsHome(),
+    storePath: storePath(),
+    profilesDir: profilesDir(),
+    storeExists: existsSync(storePath()),
+  };
 
-  if (!storage.remote.configured && storage.mode !== "local") {
-    status = "unavailable";
-    reasons.push(`${storage.mode} storage mode requires an S3 bucket`);
-    nextActions.push(`Set ${storage.remote.bucketEnv} before using ${storage.mode} storage mode.`);
-  } else if (!storage.remote.configured) {
-    status = "degraded";
-    reasons.push("remote storage sync is not configured; state is local-only");
-    nextActions.push(`Set ${storage.remote.bucketEnv} if this machine should sync account state through S3.`);
+  let cloud: ReturnType<typeof resolveAccountsCloud> | undefined;
+  try {
+    cloud = resolveAccountsCloud(env);
+  } catch (err) {
+    // Cloud was requested but is misconfigured (e.g. URL without a key). Surface
+    // it without leaking the key or a raw stack trace.
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      status: "unavailable",
+      mode: "self_hosted",
+      transport: "api",
+      configured: false,
+      local,
+      reasons: [`self_hosted storage is misconfigured: ${message}`],
+      nextActions: [
+        "Set both HASNA_ACCOUNTS_API_URL and HASNA_ACCOUNTS_API_KEY, or unset them to use local storage.",
+      ],
+    };
+  }
+
+  if (cloud.transport === "cloud-http") {
+    return {
+      status: "ok",
+      mode: "self_hosted",
+      transport: "api",
+      configured: true,
+      local,
+      api: { baseUrl: cloud.api.baseUrl },
+      reasons: [],
+      nextActions: [],
+    };
   }
 
   return {
-    status,
-    mode: storage.mode,
-    configured: storage.configured,
-    local: {
-      home: storage.local.home,
-      storePath: storage.local.storePath,
-      profilesDir: storage.local.profilesDir,
-      storeExists: existsSync(storage.local.storePath),
-    },
-    sync: {
-      remoteConfigured: storage.remote.configured,
-      bucketEnv: storage.remote.bucketEnv,
-      prefix: storage.remote.prefix,
-      regionEnv: storage.remote.regionEnv,
-      endpointConfigured: storage.remote.endpointConfigured,
-    },
-    reasons,
-    nextActions,
+    status: "ok",
+    mode: "local",
+    transport: "local",
+    configured: true,
+    local,
+    reasons: [],
+    nextActions: [],
   };
 }
 
@@ -407,7 +422,7 @@ function degradedModesFrom(readiness: {
 }): string[] {
   const modes: string[] = [];
   if (readiness.storage.status !== "ok") {
-    modes.push(readiness.storage.status === "unavailable" ? "storage.remote_missing" : "storage.local_only");
+    modes.push("storage.misconfigured");
   }
   for (const provider of readiness.providers) {
     if (provider.status !== "ok") modes.push(`provider.${provider.id}.unavailable`);
@@ -431,7 +446,7 @@ function unavailableReadiness(generatedAt: string, env: NodeJS.ProcessEnv, err: 
   const storage = storageReadiness(env);
   const checks = [
     check("store", "Profile registry", "unavailable", "accounts store could not be loaded", [message], ["Fix the accounts store JSON before checking readiness again."]),
-    check("storage", "Storage sync", storage.status, storage.status === "ok" ? "storage is configured" : "storage has degraded sync", storage.reasons, storage.nextActions),
+    check("storage", "Registry storage", storage.status, storage.status === "ok" ? `registry storage is ${storage.mode}` : "registry storage is misconfigured", storage.reasons, storage.nextActions),
   ];
   const status = worst(checks.map((item) => item.status));
   return {
@@ -444,7 +459,7 @@ function unavailableReadiness(generatedAt: string, env: NodeJS.ProcessEnv, err: 
     providers: [],
     supervisors: [],
     storage,
-    degradedModes: unique(["store.unreadable", ...(storage.status !== "ok" ? ["storage.local_only"] : [])]),
+    degradedModes: unique(["store.unreadable", ...(storage.status !== "ok" ? ["storage.misconfigured"] : [])]),
     nextActions: unique(checks.flatMap((item) => item.nextActions)),
   };
 }
@@ -513,9 +528,9 @@ export function getAccountsReadiness(opts: AccountsReadinessOptions = {}): Accou
     ),
     check(
       "storage",
-      "Storage sync",
+      "Registry storage",
       storage.status,
-      storage.status === "ok" ? "storage sync is configured" : "storage sync is degraded",
+      storage.status === "ok" ? `registry storage is ${storage.mode}` : "registry storage is misconfigured",
       storage.reasons,
       storage.nextActions,
     ),

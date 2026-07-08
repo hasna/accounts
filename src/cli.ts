@@ -23,17 +23,7 @@ import {
   type ProfileMetadata,
 } from "./lib/profiles.js";
 import { resolveStore } from "./lib/store.js";
-import {
-  accountsHome,
-  getAccountsStorageStatus,
-  loadStore,
-  storagePull,
-  storagePush,
-  storageSync,
-  storePath,
-  type AccountsStorageStatus,
-  type AccountsStorageSyncResult,
-} from "./storage.js";
+import { accountsHome, loadStore, storePath } from "./storage.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -193,36 +183,6 @@ function parseMetadataPairs(pairs: string[] | undefined): ProfileMetadata | unde
     metadata[key] = parseMetadataValue(value);
   }
   return metadata;
-}
-
-function printStorageStatus(status: AccountsStorageStatus, json?: boolean): void {
-  if (json) {
-    console.log(JSON.stringify(status, null, 2));
-    return;
-  }
-  console.log(`${chalk.cyan("mode")}       ${status.mode}`);
-  console.log(`${chalk.cyan("local")}      ${status.local.storePath}`);
-  console.log(
-    `${chalk.cyan("remote")}     ${
-      status.remote.configured
-        ? `${status.remote.bucket}/${status.remote.prefix}`
-        : chalk.dim(`not configured (${status.remote.bucketEnv})`)
-    }`,
-  );
-}
-
-function printStorageSyncResult(result: AccountsStorageSyncResult, json?: boolean): void {
-  if (json) {
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
-  if (result.skipped) {
-    console.log(chalk.yellow(`skipped: ${result.reason ?? "storage sync is not configured"}`));
-    console.log(chalk.dim(`key: ${result.key}`));
-    return;
-  }
-  console.log(chalk.green(`pushed ${result.pushed}, pulled ${result.pulled}`));
-  console.log(chalk.dim(`key: ${result.key}`));
 }
 
 function readinessColor(status: AccountsReadinessStatus): (value: string) => string {
@@ -1007,48 +967,6 @@ program
           console.log(`  ${kind} ${stateFmt.padEnd(8)}${session}${chalk.bold(name)}${cwd}`);
         }
       }
-    }),
-  );
-
-const storage = program.command("storage").description("inspect and sync the accounts storage snapshot");
-
-storage
-  .command("status", { isDefault: true })
-  .description("show local and optional S3 snapshot storage status")
-  .option("--json", "output JSON")
-  .action(
-    action((opts: { json?: boolean }) => {
-      printStorageStatus(getAccountsStorageStatus(), opts.json);
-    }),
-  );
-
-storage
-  .command("push")
-  .description("push the local accounts snapshot to S3 when configured")
-  .option("--json", "output JSON")
-  .action(
-    action(async (opts: { json?: boolean }) => {
-      printStorageSyncResult(await storagePush(), opts.json);
-    }),
-  );
-
-storage
-  .command("pull")
-  .description("pull the accounts snapshot from S3 when configured")
-  .option("--json", "output JSON")
-  .action(
-    action(async (opts: { json?: boolean }) => {
-      printStorageSyncResult(await storagePull(), opts.json);
-    }),
-  );
-
-storage
-  .command("sync")
-  .description("pull then push the accounts snapshot when S3 is configured")
-  .option("--json", "output JSON")
-  .action(
-    action(async (opts: { json?: boolean }) => {
-      printStorageSyncResult(await storageSync(), opts.json);
     }),
   );
 
