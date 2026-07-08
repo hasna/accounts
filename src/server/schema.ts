@@ -68,3 +68,6 @@ export const updateAccountSchema = z
 export type UpdateAccountInput = z.infer<typeof updateAccountSchema>;
 
 export const setCurrentSchema = z.object({ name: profileNameSchema });
+
+export const renameAccountSchema = z.object({ name: profileNameSchema });
+export type RenameAccountInput = z.infer<typeof renameAccountSchema>;

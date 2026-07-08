@@ -2,7 +2,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { currentProfile, getProfile, listProfiles } from "./lib/profiles.js";
+import { resolveStore } from "./lib/store.js";
 import { appliedProfile } from "./lib/apply.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { listTools } from "./lib/tools.js";
@@ -71,11 +71,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "list_tools":
         return ok(listTools());
       case "list_profiles":
-        return ok(listProfiles(typeof args["tool"] === "string" ? args["tool"] : undefined));
+        return ok(await resolveStore().listProfiles(typeof args["tool"] === "string" ? args["tool"] : undefined));
       case "current_profile": {
         const tool = args["tool"];
         if (typeof tool !== "string") return fail("tool is required");
-        return ok({ tool, active: currentProfile(tool) ?? null, applied: appliedProfile(tool) ?? null });
+        const active = (await resolveStore().currentProfile(tool)) ?? null;
+        return ok({ tool, active, applied: appliedProfile(tool) ?? null });
       }
       case "supervisor_status": {
         const tool = args["tool"];
@@ -86,7 +87,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "switch_profile": {
         const name = args["name"];
         if (typeof name !== "string") return fail("name is required");
-        const profile = getProfile(name, typeof args["tool"] === "string" ? args["tool"] : undefined);
+        const profile = await resolveStore().getProfile(name, typeof args["tool"] === "string" ? args["tool"] : undefined);
         const resume = args["resume"] !== false;
         const switchArgs = Array.isArray(args["args"])
           ? args["args"].filter((value): value is string => typeof value === "string")

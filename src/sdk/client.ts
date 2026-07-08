@@ -26,6 +26,8 @@ export interface CurrentSelectionList { "current": Array<CurrentSelection> }
 
 export interface SetCurrentInput { "name": string }
 
+export interface RenameAccountInput { "name": string }
+
 export interface Tool { "id": string; "label": string; "envVar"?: string; "bin"?: string; "builtin"?: boolean }
 
 export interface ToolList { "tools": Array<Tool> }
@@ -142,6 +144,15 @@ export class AccountsClient {
     /** Update an account */
     async updateAccount(tool: string, name: string, body: UpdateAccountInput, init?: RequestInit): Promise<Account> {
       return this.request("PATCH", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Rename an account */
+    async renameAccount(tool: string, name: string, body: RenameAccountInput, init?: RequestInit): Promise<Account> {
+      return this.request("POST", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/rename`, {
         body,
         query: undefined,
         init,

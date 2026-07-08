@@ -6,7 +6,7 @@
       "name": "@hasna/accounts",
       "dependencies": {
         "@aws-sdk/client-s3": "^3.985.0",
-        "@hasna/contracts": "^0.4.1",
+        "@hasna/contracts": "file:/home/hasna/.hasna/fleet-dist/hasna-contracts-0.5.2.tgz",
         "@hasna/events": "^0.1.7",
         "@modelcontextprotocol/sdk": "^1.27.1",
         "chalk": "^5.4.1",
@@ -76,7 +76,7 @@
 
     "@aws/lambda-invoke-store": ["@aws/lambda-invoke-store@0.2.4", "", {}, "sha512-iY8yvjE0y651BixKNPgmv1WrQc+GZ142sb0z4gYnChDDY2YqI4P/jsSopBWrKfAt7LOJAkOXt7rC/hms+WclQQ=="],
 
-    "@hasna/contracts": ["@hasna/contracts@0.4.1", "", { "dependencies": { "commander": "^13.1.0", "zod": "^3.25.76" }, "bin": { "contracts": "dist/cli/index.js", "contracts-cli": "dist/cli/index.js" } }, "sha512-oubsu1FFyVvxbt5d+85iBXEK6M81ZsaeODycoQGZuFNqQ3ecfXFujlQz3cL+NHwHJPVmy4wBGLPcaXcRTjO/IQ=="],
+    "@hasna/contracts": ["@hasna/contracts@/home/hasna/.hasna/fleet-dist/hasna-contracts-0.5.2.tgz", { "dependencies": { "commander": "^13.1.0", "zod": "^3.25.76" }, "bin": { "contracts": "dist/cli/index.js", "contracts-cli": "dist/cli/index.js" } }, "sha512-R7NBm91oMOWQVnfIyh7QTEPuWbVycGaObzKFJd1je5RNjXsLuPASqCfr9heJ7nuugn9xxFBCCRQCxHg9/VeJrg=="],
 
     "@hasna/events": ["@hasna/events@0.1.7", "", { "dependencies": { "commander": "^13.1.0" }, "bin": { "events": "dist/cli/index.js", "hasna-events": "dist/cli/index.js" } }, "sha512-o6Qn/HTb5hGDDEd7E71GNVn2XvJ2Uy/dHzsZLQzczy9O9oXyOvm9I5y+zU0x8lA1TJLxcFERqS+QO7oiXsR/vA=="],
 

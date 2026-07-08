@@ -106,4 +106,32 @@ describe("resolveAccountsCloud", () => {
     if (r.transport !== "cloud-http") throw new Error("expected cloud");
     expect(await r.api.getCurrent("claude")).toBeNull();
   });
+
+  test("update PATCHes /v1/accounts/:tool/:name with only provided fields", async () => {
+    const { calls, fetchImpl } = mockFetch((c) => {
+      expect(c.method).toBe("PATCH");
+      return { status: 200, body: { tool: "claude", name: "work", description: "d", createdAt: "2020-01-01T00:00:00Z" } };
+    });
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    const p = await r.api.update("work", "claude", { description: "d" });
+    expect(p.description).toBe("d");
+    expect(calls[0]!.url).toBe(`${BASE}/v1/accounts/claude/work`);
+    expect(calls[0]!.body).toEqual({ description: "d" });
+    expect((calls[0]!.body as Record<string, unknown>).email).toBeUndefined();
+  });
+
+  test("rename POSTs /v1/accounts/:tool/:name/rename with the new name", async () => {
+    const { calls, fetchImpl } = mockFetch(() => ({
+      status: 200,
+      body: { tool: "claude", name: "home", createdAt: "2020-01-01T00:00:00Z" },
+    }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    const p = await r.api.rename("personal", "home", "claude");
+    expect(p.name).toBe("home");
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url).toBe(`${BASE}/v1/accounts/claude/personal/rename`);
+    expect((calls[0]!.body as { name: string }).name).toBe("home");
+  });
 });

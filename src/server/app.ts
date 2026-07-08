@@ -16,7 +16,7 @@ import { AccountsError } from "../types.js";
 import { listTools, isBuiltinTool } from "../lib/tools.js";
 import { AccountsRepo, type AccountsStore } from "./repo.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
-import { createAccountSchema, updateAccountSchema, setCurrentSchema, toolIdSchema } from "./schema.js";
+import { createAccountSchema, updateAccountSchema, renameAccountSchema, setCurrentSchema, toolIdSchema } from "./schema.js";
 import { APP_SLUG, API_KEYS_TABLE, SCOPES, resolveSigningSecret } from "./config.js";
 import { packageVersion } from "./version.js";
 
@@ -189,6 +189,20 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
         const created = await ctx.repo.create(input.data);
         return json(created, 201);
+      }
+
+      const renameMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)\/rename$/);
+      if (renameMatch && method === "POST") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const tool = decodeURIComponent(renameMatch[1]!);
+        const name = decodeURIComponent(renameMatch[2]!);
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = renameAccountSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        const renamed = await ctx.repo.rename(tool, name, input.data.name);
+        return json(renamed, 200);
       }
 
       const accountMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)$/);

@@ -58,12 +58,26 @@ export interface CloudCreateInput {
   description?: string;
 }
 
+/** Fields updatable through `PATCH /v1/accounts/:tool/:name`. */
+export interface CloudUpdateInput {
+  email?: string;
+  displayName?: string;
+  identity?: string;
+  cardLast4?: string;
+  metadata?: Record<string, string | number | boolean | null>;
+  dir?: string;
+  description?: string;
+  lastUsedAt?: string;
+}
+
 /** Registry surface backed by `<API_URL>/v1`. */
 export interface AccountsCloudApi {
   readonly baseUrl: string;
   list(tool?: string): Promise<Profile[]>;
   get(name: string, tool?: string): Promise<Profile | undefined>;
   create(input: CloudCreateInput): Promise<Profile>;
+  update(name: string, tool: string, input: CloudUpdateInput): Promise<Profile>;
+  rename(oldName: string, newName: string, tool: string): Promise<Profile>;
   remove(name: string, tool?: string): Promise<Profile>;
   listCurrent(): Promise<CloudCurrentSelection[]>;
   getCurrent(tool: string): Promise<CloudCurrentSelection | null>;
@@ -164,6 +178,31 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       if (input.description) body.description = input.description;
       const created = await client.create<CloudAccount>("accounts", body);
       return toProfile(created);
+    },
+
+    async update(name: string, tool: string, input: CloudUpdateInput): Promise<Profile> {
+      const body: Record<string, unknown> = {};
+      if (input.email !== undefined) body.email = input.email;
+      if (input.displayName !== undefined) body.displayName = input.displayName;
+      if (input.identity !== undefined) body.identity = input.identity;
+      if (input.cardLast4 !== undefined) body.cardLast4 = input.cardLast4;
+      if (input.metadata !== undefined) body.metadata = input.metadata;
+      if (input.dir !== undefined) body.dir = input.dir;
+      if (input.description !== undefined) body.description = input.description;
+      if (input.lastUsedAt !== undefined) body.lastUsedAt = input.lastUsedAt;
+      const updated = await t.patch<CloudAccount>(
+        `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}`,
+        body,
+      );
+      return toProfile(updated);
+    },
+
+    async rename(oldName: string, newName: string, tool: string): Promise<Profile> {
+      const renamed = await t.post<CloudAccount>(
+        `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(oldName)}/rename`,
+        { name: newName },
+      );
+      return toProfile(renamed);
     },
 
     async remove(name: string, tool?: string): Promise<Profile> {

@@ -146,6 +146,11 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           required: ["name"],
           properties: { name: { type: "string" } },
         },
+        RenameAccountInput: {
+          type: "object",
+          required: ["name"],
+          properties: { name: { type: "string" } },
+        },
         Tool: {
           type: "object",
           required: ["id", "label"],
@@ -253,6 +258,24 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           responses: {
             "204": { description: "Deleted" },
             "404": jsonResponse("Not found", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
+      "/v1/accounts/{tool}/{name}/rename": {
+        post: {
+          operationId: "renameAccount",
+          summary: "Rename an account",
+          security: [{ apiKey: [] }],
+          parameters: [
+            { name: "tool", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: jsonBody(ref("RenameAccountInput")),
+          responses: {
+            "200": jsonResponse("Renamed", ref("Account")),
+            "404": jsonResponse("Not found", ref("ErrorResponse")),
+            "409": jsonResponse("Already exists", ref("ErrorResponse")),
             ...errorResponses,
           },
         },

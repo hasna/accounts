@@ -36,6 +36,7 @@ export interface AccountsStore {
   get(tool: string, name: string): Promise<Account | null>;
   create(input: CreateAccountInput): Promise<Account>;
   update(tool: string, name: string, input: UpdateAccountInput): Promise<Account>;
+  rename(tool: string, oldName: string, newName: string): Promise<Account>;
   remove(tool: string, name: string): Promise<boolean>;
   listCurrent(): Promise<CurrentSelection[]>;
   getCurrent(tool: string): Promise<CurrentSelection | null>;
@@ -170,6 +171,25 @@ export class AccountsRepo implements AccountsStore {
     const row = await this.client.one<AccountRow>(
       `UPDATE accounts SET ${sets.join(", ")} WHERE tool = $${i} AND name = $${i + 1} RETURNING *`,
       params,
+    );
+    return rowToAccount(row);
+  }
+
+  async rename(tool: string, oldName: string, newName: string): Promise<Account> {
+    const existing = await this.get(tool, oldName);
+    if (!existing) throw new AccountsError(`no profile named "${oldName}" for tool "${tool}"`);
+    if (oldName !== newName) {
+      const dupe = await this.get(tool, newName);
+      if (dupe) throw new AccountsError(`a ${tool} profile named "${newName}" already exists`);
+    }
+    const row = await this.client.one<AccountRow>(
+      "UPDATE accounts SET name = $1 WHERE tool = $2 AND name = $3 RETURNING *",
+      [newName, tool, oldName],
+    );
+    // Keep the current selection pointing at the renamed account.
+    await this.client.execute(
+      "UPDATE current_selections SET name = $1 WHERE tool = $2 AND name = $3",
+      [newName, tool, oldName],
     );
     return rowToAccount(row);
   }
