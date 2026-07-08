@@ -22,6 +22,7 @@
 // inside the contracts transport.
 
 import type { Profile, ToolDef } from "../types.js";
+import { AccountsError } from "../types.js";
 import { resolveStorageClient, type HasnaStorageClient } from "@hasna/contracts";
 
 const APP_SLUG = "accounts";
@@ -234,11 +235,16 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
     },
 
     async rename(oldName: string, newName: string, tool: string): Promise<Profile> {
-      const renamed = await t.post<CloudAccount>(
-        `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(oldName)}/rename`,
-        { name: newName },
-      );
-      return toProfile(renamed);
+      try {
+        const renamed = await t.post<CloudAccount>(
+          `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(oldName)}/rename`,
+          { name: newName },
+        );
+        return toProfile(renamed);
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts rename");
+        throw err;
+      }
     },
 
     async remove(name: string, tool?: string): Promise<Profile> {
@@ -281,13 +287,23 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
     },
 
     async createTool(def: ToolDef): Promise<ToolDef> {
-      const created = await t.post<CloudTool>("/tools", def);
-      const { builtin: _builtin, ...toolDef } = created;
-      return toolDef;
+      try {
+        const created = await t.post<CloudTool>("/tools", def);
+        const { builtin: _builtin, ...toolDef } = created;
+        return toolDef;
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts tools add");
+        throw err;
+      }
     },
 
     async removeTool(id: string): Promise<void> {
-      await t.del(`/tools/${encodeURIComponent(id)}`);
+      try {
+        await t.del(`/tools/${encodeURIComponent(id)}`);
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts tools remove");
+        throw err;
+      }
     },
   };
   return api;
@@ -304,4 +320,44 @@ async function resolveSingleTool(name: string, listAll: (tool?: string) => Promi
 
 function isNotFound(err: unknown): boolean {
   return Boolean(err && typeof err === "object" && (err as { status?: number }).status === 404);
+}
+
+/** Pull the `error` message out of a JSON error body (object or JSON string). */
+function errorMessageOf(body: unknown): string | undefined {
+  if (typeof body === "string") {
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown };
+      if (parsed && typeof parsed === "object" && typeof parsed.error === "string") return parsed.error;
+      return undefined;
+    } catch {
+      return body;
+    }
+  }
+  if (body && typeof body === "object") {
+    const msg = (body as { error?: unknown }).error;
+    return typeof msg === "string" ? msg : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * True for a *route-missing* 404 — the generic `{ "error": "not found" }` the
+ * server returns when no route matches — as opposed to an entity-level 404
+ * (`no profile named ...`, `no custom tool ...`). A route-missing 404 on a
+ * mutating call means the connected self-hosted server is running an older
+ * build that predates this endpoint.
+ */
+function isEndpointMissing(err: unknown): boolean {
+  if (!(err && typeof err === "object")) return false;
+  const e = err as { status?: number; body?: unknown };
+  if (e.status !== 404) return false;
+  return errorMessageOf(e.body) === "not found";
+}
+
+/** Actionable error for a mutating op whose endpoint is absent on the server. */
+function endpointMissingError(op: string): AccountsError {
+  return new AccountsError(
+    `the self-hosted accounts server does not support \`${op}\` — it is running an older build that predates this endpoint. ` +
+      `Redeploy accounts-serve to the cloud (ECS) so the API exposes it, then retry. (Local mode is unaffected.)`,
+  );
 }
