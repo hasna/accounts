@@ -20,7 +20,7 @@ import {
   type ProfileMetadata,
 } from "./lib/profiles.js";
 import { resolveStore } from "./lib/store.js";
-import { accountsHome, loadStore, storePath } from "./storage.js";
+import { accountsHome, loadAppliedMap, storePath } from "./storage.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -973,8 +973,8 @@ program
   .description("show sanitized account, provider, supervisor, and storage readiness")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
-      const readiness = getAccountsReadiness();
+    action(async (opts: { json?: boolean }) => {
+      const readiness = await getAccountsReadiness();
       if (opts.json) {
         console.log(JSON.stringify(readiness, null, 2));
       } else {
@@ -1196,8 +1196,14 @@ program
   .action(
     action(async () => {
       console.log(chalk.bold(`store: ${storePath()}`));
-      const localState = loadStore();
-      const profiles = await resolveStore().listProfiles();
+      const store = resolveStore();
+      const profiles = await store.listProfiles();
+      // `current` is the shared, cloud-owned selection in api mode — read it
+      // through the Store, never the local file. `applied` is machine-local.
+      const current: Record<string, string> = Object.fromEntries(
+        (await store.listCurrent()).map((entry) => [entry.tool, entry.name]),
+      );
+      const applied = loadAppliedMap();
       let problems = 0;
       for (const p of profiles) {
         const missing = !existsSync(p.dir);
@@ -1213,13 +1219,13 @@ program
           console.log(chalk.yellow(`  ! ${p.name}: no email recorded`));
         }
       }
-      for (const [toolId, appliedName] of Object.entries(localState.applied)) {
+      for (const [toolId, appliedName] of Object.entries(applied)) {
         if (!profiles.some((p) => p.name === appliedName && p.tool === toolId)) {
           console.log(chalk.red(`  ✗ stale applied.${toolId}: "${appliedName}" (profile missing)`));
           problems++;
         }
       }
-      for (const [toolId, currentName] of Object.entries(localState.current)) {
+      for (const [toolId, currentName] of Object.entries(current)) {
         if (!profiles.some((p) => p.name === currentName && p.tool === toolId)) {
           console.log(chalk.red(`  ✗ stale current.${toolId}: "${currentName}" (profile missing)`));
           problems++;
@@ -1227,13 +1233,13 @@ program
       }
       const driftWarned = new Set<string>();
       for (const p of profiles) {
-        const active = localState.current[p.tool];
-        const applied = localState.applied[p.tool];
-        if (active && applied && active !== applied && !driftWarned.has(p.tool)) {
+        const active = current[p.tool];
+        const appliedName = applied[p.tool];
+        if (active && appliedName && active !== appliedName && !driftWarned.has(p.tool)) {
           driftWarned.add(p.tool);
           console.log(
             chalk.yellow(
-              `  ! ${p.tool}: active (${active}) ≠ applied (${applied}) — Cursor/IDE use applied; run \`accounts apply ${active}\``,
+              `  ! ${p.tool}: active (${active}) ≠ applied (${appliedName}) — Cursor/IDE use applied; run \`accounts apply ${active}\``,
             ),
           );
         }

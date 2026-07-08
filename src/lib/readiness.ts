@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
-import type { Profile, Store, ToolDef } from "../types.js";
-import { accountsHome, loadStore, profilesDir, storePath } from "../storage.js";
+import type { Profile, ToolDef } from "../types.js";
+import { accountsHome, loadAppliedMap, profilesDir, storePath } from "../storage.js";
+import { resolveStore, type AccountsStore } from "./store.js";
 import { resolveAccountsCloud } from "./cloud-accounts.js";
 import { claudeProfileAuthHealth, type ClaudeProfileAuthStatus } from "./claude-auth.js";
 import { configsSessionToolFor } from "./configs-prelaunch.js";
@@ -11,7 +12,6 @@ import {
 } from "./configs-prelaunch-status.js";
 import { detectToolAvailability } from "./login.js";
 import { listSupervisorStates, readSupervisorState, type SupervisorState } from "./supervisor.js";
-import { BUILTIN_TOOLS } from "./tools.js";
 
 export type AccountsReadinessStatus = "ok" | "degraded" | "unavailable";
 
@@ -128,6 +128,8 @@ export interface AccountsReadiness {
 export interface AccountsReadinessOptions {
   env?: NodeJS.ProcessEnv;
   now?: Date;
+  /** Registry store to route reads through (defaults to `resolveStore(env)`). */
+  store?: AccountsStore;
 }
 
 function rank(status: AccountsReadinessStatus): number {
@@ -153,13 +155,6 @@ function check(
   nextActions: string[] = [],
 ): AccountsReadinessCheck {
   return { id, label, status, summary, reasons: unique(reasons), nextActions: unique(nextActions) };
-}
-
-function toolsFromStore(store: Store): ToolDef[] {
-  const byId = new Map<string, ToolDef>();
-  for (const tool of BUILTIN_TOOLS) byId.set(tool.id, tool);
-  for (const tool of store.tools) byId.set(tool.id, tool);
-  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function processAlive(pid: number): boolean {
@@ -231,7 +226,8 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
 function profileReadiness(
   profile: Profile,
   tool: ToolDef | undefined,
-  store: Store,
+  current: Record<string, string>,
+  applied: Record<string, string>,
   providerStatus: AccountsReadinessStatus,
 ): AccountsProfileReadiness {
   const dirExists = existsSync(profile.dir);
@@ -262,8 +258,8 @@ function profileReadiness(
     name: profile.name,
     tool: profile.tool,
     status: worst(statuses),
-    active: store.current[profile.tool] === profile.name,
-    applied: store.applied[profile.tool] === profile.name,
+    active: current[profile.tool] === profile.name,
+    applied: applied[profile.tool] === profile.name,
     emailRecorded: Boolean(profile.email),
     dir: { exists: dirExists },
     login,
@@ -285,12 +281,13 @@ function profileReadiness(
 function providerReadiness(
   tool: ToolDef,
   profiles: Profile[],
-  store: Store,
+  current: Record<string, string>,
+  appliedMap: Record<string, string>,
   env: NodeJS.ProcessEnv,
 ): AccountsProviderReadiness {
   const availability = detectToolAvailability(tool, env);
-  const activeProfile = store.current[tool.id];
-  const applied = store.applied[tool.id];
+  const activeProfile = current[tool.id];
+  const applied = appliedMap[tool.id];
   const required = profiles.length > 0 || Boolean(activeProfile) || Boolean(applied);
   const status: AccountsReadinessStatus = availability.available || !required ? "ok" : "unavailable";
   const reasons = availability.available
@@ -464,34 +461,50 @@ function unavailableReadiness(generatedAt: string, env: NodeJS.ProcessEnv, err: 
   };
 }
 
-export function getAccountsReadiness(opts: AccountsReadinessOptions = {}): AccountsReadiness {
+export async function getAccountsReadiness(opts: AccountsReadinessOptions = {}): Promise<AccountsReadiness> {
   const env = opts.env ?? process.env;
   const generatedAt = (opts.now ?? new Date()).toISOString();
 
-  let store: Store;
+  // Route the shared registry (profiles, custom tools, and the cloud-owned
+  // `current` selection) through the Store so api mode reads the cloud, not a
+  // stale local file. `applied` is genuinely machine-local (which profile's
+  // auth is restored to the tool's live paths on THIS box), so it is read from
+  // the on-box registry regardless of mode.
+  let allProfiles: Profile[];
+  let tools: ToolDef[];
+  let current: Record<string, string>;
+  let applied: Record<string, string>;
   try {
-    store = loadStore();
+    const store = opts.store ?? resolveStore(env);
+    const [listedProfiles, listedTools, currentEntries] = await Promise.all([
+      store.listProfiles(),
+      store.listTools(),
+      store.listCurrent(),
+    ]);
+    allProfiles = listedProfiles;
+    tools = listedTools;
+    current = Object.fromEntries(currentEntries.map((entry) => [entry.tool, entry.name]));
+    applied = loadAppliedMap();
   } catch (err) {
     return unavailableReadiness(generatedAt, env, err);
   }
 
-  const tools = toolsFromStore(store);
   const toolById = new Map(tools.map((tool) => [tool.id, tool]));
   const profilesByTool = new Map<string, Profile[]>();
-  for (const profile of store.profiles) {
+  for (const profile of allProfiles) {
     const profiles = profilesByTool.get(profile.tool) ?? [];
     profiles.push(profile);
     profilesByTool.set(profile.tool, profiles);
   }
 
-  const providers = tools.map((tool) => providerReadiness(tool, profilesByTool.get(tool.id) ?? [], store, env));
+  const providers = tools.map((tool) => providerReadiness(tool, profilesByTool.get(tool.id) ?? [], current, applied, env));
   const providerStatusById = new Map(providers.map((provider) => [provider.id, provider.status]));
-  const profiles = store.profiles
+  const profiles = allProfiles
     .slice()
     .sort((a, b) => a.tool.localeCompare(b.tool) || a.name.localeCompare(b.name))
-    .map((profile) => profileReadiness(profile, toolById.get(profile.tool), store, providerStatusById.get(profile.tool) ?? "unavailable"));
+    .map((profile) => profileReadiness(profile, toolById.get(profile.tool), current, applied, providerStatusById.get(profile.tool) ?? "unavailable"));
 
-  const activeOrAppliedTools = unique([...Object.keys(store.current), ...Object.keys(store.applied)]);
+  const activeOrAppliedTools = unique([...Object.keys(current), ...Object.keys(applied)]);
   const supervisorToolIds = unique([
     ...activeOrAppliedTools,
     ...listSupervisorStates().map((state) => state.tool),

@@ -43,7 +43,16 @@ export function profilesDir(): string {
 
 const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
 
-export function loadStore(): Store {
+/**
+ * Parse and schema-validate the on-box registry file WITHOUT the profile
+ * cross-pruning that `loadStore()` applies. Returns the empty store when the
+ * file is absent. Used by both `loadStore()` (which then prunes against the
+ * local profile list) and the machine-local pointer readers, which must NOT
+ * prune: in api mode the profile records live in the cloud, so pruning a
+ * machine-local `applied`/`current` pointer against the (empty) local profile
+ * list would wrongly erase a valid pointer.
+ */
+function parseStoreFile(): Store {
   const path = storePath();
   if (!existsSync(path)) return structuredClone(EMPTY_STORE);
   let raw: unknown;
@@ -56,7 +65,27 @@ export function loadStore(): Store {
   if (!parsed.success) {
     throw new AccountsError(`invalid store at ${path}: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
   }
-  const store = parsed.data;
+  return parsed.data;
+}
+
+/**
+ * The machine-local `applied` pointer map (toolId -> profile name): which
+ * profile's auth is currently restored to each tool's live default paths on
+ * THIS machine. This is genuinely machine-local state (never in the shared
+ * cloud registry), so readiness/doctor read it here regardless of storage mode.
+ * Entries are validated for name shape only — a pointer to a profile that no
+ * longer exists is preserved so `accounts doctor` can flag it as stale.
+ */
+export function loadAppliedMap(): Record<string, string> {
+  const applied: Record<string, string> = {};
+  for (const [toolId, name] of Object.entries(parseStoreFile().applied)) {
+    if (name && profileNameSchema.safeParse(name).success) applied[toolId] = name;
+  }
+  return applied;
+}
+
+export function loadStore(): Store {
+  const store = parseStoreFile();
   for (const p of store.profiles) {
     const check = profileNameSchema.safeParse(p.name);
     if (!check.success) {
