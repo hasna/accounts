@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tgz
+.artifacts/
+.tmp/
+coverage/
+*.db
+*.db-shm
+*.db-wal
