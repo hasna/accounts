@@ -1,5 +1,8 @@
 # @hasna/accounts (clean V1 foundation)
 
+Contract pin: `accounts-v1-contract.md` SHA-256
+`0d2b45c286f56452312b251b7622e009c486e2fe71fe8f2a5a59c01472eb8b2a`.
+
 Accounts is a capacity-metadata SDK and CLI for Hasna `local` and
 `self_hosted` deployments. This clean implementation owns provider-account,
 entitlement, capacity-pool, access-method, credential-binding, and
@@ -19,6 +22,11 @@ The implemented persistence adapters are:
 The public repository interface intentionally leaves a Postgres adapter as a
 future self-hosted implementation. No Postgres conformance claim is made by
 this development build.
+
+The public development factory is read/query-only. Positive evidence ingestion,
+ownership claims, recovery-frontier reconciliation, credential-handle ingestion,
+terminal tombstones, and local owner ceremonies remain deliberately unavailable;
+the internal catalog mutation harness exists only for reference/conformance tests.
 
 ```sh
 bun install

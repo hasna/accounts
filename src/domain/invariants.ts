@@ -32,12 +32,12 @@ export async function assertInsertInvariants<K extends EntityKind>(
   switch (kind) {
     case "account": {
       const item = record as EntityMap["account"];
-      if (item.providerSubjectRef !== undefined) {
+      if (item.status !== "pending" && item.providerSubjectRef !== undefined) {
         const accounts = await repository.list("account");
         if (
           accounts.some(
             (candidate) =>
-              candidate.status !== "revoked" &&
+              candidate.status !== "pending" &&
               candidate.providerKey === item.providerKey &&
               candidate.providerSubjectRef === item.providerSubjectRef,
           )
@@ -51,25 +51,28 @@ export async function assertInsertInvariants<K extends EntityKind>(
       const item = record as EntityMap["entitlement"];
       const account = await repository.get("account", item.accountId);
       if (account === undefined) throw parentMissing("account", item.accountId);
-      if (item.fundingKind === "subscription" && !account.ownerRef.startsWith("principal:human:")) {
+      if (item.fundingKind === "subscription" && !account.ownerRef.startsWith("principal:human:hasna:")) {
         throw new AccountsError("POLICY_DENIED", "Subscription entitlement requires a human owner");
       }
       return;
     }
     case "capacity_pool": {
       const item = record as EntityMap["capacity_pool"];
-      if ((await repository.get("account", item.accountId)) === undefined) {
+      const account = await repository.get("account", item.accountId);
+      if (account === undefined) {
         throw parentMissing("account", item.accountId);
       }
       const pools = await repository.list("capacity_pool");
-      if (
-        pools.some(
-          (candidate) =>
-            candidate.capacityDomainRef === item.capacityDomainRef ||
-            candidate.serializationKey === item.serializationKey,
-        )
-      ) {
-        throw new AccountsError("CAPACITY_DOMAIN_CONFLICT", "Capacity domain already exists");
+      for (const candidate of pools) {
+        if (candidate.serializationKey === item.serializationKey) {
+          throw new AccountsError("CAPACITY_DOMAIN_CONFLICT", "Serialization key already exists");
+        }
+        if (candidate.capacityDomainRef === item.capacityDomainRef) {
+          const candidateAccount = await repository.get("account", candidate.accountId);
+          if (candidateAccount?.providerKey === account.providerKey) {
+            throw new AccountsError("CAPACITY_DOMAIN_CONFLICT", "Capacity domain already exists");
+          }
+        }
       }
       if (item.denyState !== "denied") {
         throw new AccountsError("CURRENT_DENY", "Pending capacity must remain denied");
@@ -148,7 +151,9 @@ export async function assertInsertInvariants<K extends EntityKind>(
         bindings.some(
           (candidate) =>
             candidate.credentialFamilyId === item.credentialFamilyId &&
-            candidate.capacityPoolId !== item.capacityPoolId,
+            (candidate.capacityPoolId !== item.capacityPoolId ||
+              candidate.purpose !== item.purpose ||
+              candidate.resolver !== item.resolver),
         )
       ) {
         throw new AccountsError("CAPACITY_DOMAIN_CONFLICT", "Credential family belongs to another pool");

@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  createInMemoryAccounts,
   parseCounter,
   type EligibilityRequest,
 } from "../../src/index";
@@ -29,7 +28,7 @@ function requestFor(methodId: ReturnType<typeof makeFixtureGraph>["method"]["id"
 
 describe("non-reservational slot eligibility", () => {
   test("returns complete native metadata without creating a reservation", async () => {
-    const catalog = createInMemoryAccounts({ clock });
+    const catalog = referenceCatalog();
     const graph = makeFixtureGraph("native_session");
     await seedActiveCatalog(catalog, graph);
     const before = await catalog.list("access_method");
@@ -50,7 +49,7 @@ describe("non-reservational slot eligibility", () => {
   test.each(["api_key", "workload_identity"] as const)(
     "supports brokered %s transport without an AuthCapsule",
     async (transport) => {
-      const catalog = createInMemoryAccounts({ clock });
+      const catalog = referenceCatalog();
       const graph = makeFixtureGraph(transport);
       await seedActiveCatalog(catalog, graph, transport);
       const result = await catalog.eligibility(requestFor(graph.method.id));
@@ -62,7 +61,7 @@ describe("non-reservational slot eligibility", () => {
   );
 
   test("current deny wins over still-unexpired positive evidence", async () => {
-    const catalog = createInMemoryAccounts({ clock });
+    const catalog = referenceCatalog();
     const graph = makeFixtureGraph();
     await seedActiveCatalog(catalog, graph);
     const request = requestFor(graph.method.id);
@@ -117,7 +116,8 @@ describe("non-reservational slot eligibility", () => {
 
   test("stale terms and policy evidence fail closed with stable reasons", async () => {
     let observed = new Date(NOW);
-    const catalog = createInMemoryAccounts({ clock: () => new Date(observed) });
+    const repository = new InMemoryAccountsRepository();
+    const catalog = new AccountsCatalog(repository, () => new Date(observed));
     const graph = makeFixtureGraph();
     await seedActiveCatalog(catalog, graph);
     observed = new Date("2026-07-10T14:00:00.000Z");
@@ -140,7 +140,7 @@ describe("non-reservational slot eligibility", () => {
   });
 
   test("native mutation remains unavailable after metadata drain", async () => {
-    const catalog = createInMemoryAccounts({ clock });
+    const catalog = referenceCatalog();
     const graph = makeFixtureGraph();
     await seedActiveCatalog(catalog, graph);
     await catalog.transition(
@@ -168,4 +168,108 @@ describe("non-reservational slot eligibility", () => {
     ).rejects.toMatchObject({ code: "NOT_IMPLEMENTED" });
     await catalog.close();
   });
+
+  test("stale capsule health cannot transition to ready", async () => {
+    const catalog = referenceCatalog();
+    const source = makeFixtureGraph();
+    const graph = {
+      ...source,
+      capsule: {
+        ...source.capsule!,
+        lastHealthAt: "2000-01-01T00:00:00.000Z",
+      },
+    };
+    await catalog.add("account", graph.account, mutationContext("stale-health:account:add"));
+    await catalog.transition(
+      "account",
+      graph.account.id,
+      "active",
+      parseCounter("0"),
+      mutationContext("stale-health:account:active"),
+    );
+    await catalog.add(
+      "entitlement",
+      graph.entitlement,
+      mutationContext("stale-health:entitlement:add"),
+    );
+    await catalog.transition(
+      "entitlement",
+      graph.entitlement.id,
+      "active",
+      parseCounter("0"),
+      mutationContext("stale-health:entitlement:active"),
+    );
+    await catalog.add("capacity_pool", graph.pool, mutationContext("stale-health:pool:add"));
+    await catalog.transition(
+      "capacity_pool",
+      graph.pool.id,
+      "active",
+      parseCounter("0"),
+      mutationContext("stale-health:pool:active"),
+    );
+    await catalog.add("access_method", graph.method, mutationContext("stale-health:method:add"));
+    await catalog.transition(
+      "access_method",
+      graph.method.id,
+      "ready",
+      parseCounter("0"),
+      mutationContext("stale-health:method:ready"),
+    );
+    await catalog.add("auth_capsule", graph.capsule, mutationContext("stale-health:capsule:add"));
+    await catalog.transition(
+      "auth_capsule",
+      graph.capsule.id,
+      "bootstrapping",
+      parseCounter("0"),
+      mutationContext("stale-health:capsule:bootstrapping"),
+    );
+    await expect(
+      catalog.transition(
+        "auth_capsule",
+        graph.capsule.id,
+        "ready",
+        parseCounter("1"),
+        mutationContext("stale-health:capsule:ready"),
+      ),
+    ).rejects.toMatchObject({ code: "CAPSULE_NOT_READY" });
+    await catalog.close();
+  });
+
+  test("central native revoke is unavailable without an atomic terminal barrier", async () => {
+    const catalog = referenceCatalog();
+    const graph = makeFixtureGraph();
+    await seedActiveCatalog(catalog, graph, "revoke-unavailable");
+    await expect(
+      catalog.transition(
+        "auth_capsule",
+        graph.capsule!.id,
+        "revoked",
+        parseCounter("2"),
+        mutationContext("revoke-unavailable:capsule"),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_IMPLEMENTED" });
+    await expect(
+      catalog.transition(
+        "credential_binding",
+        graph.binding.id,
+        "revoked",
+        parseCounter("1"),
+        mutationContext("revoke-unavailable:binding"),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_IMPLEMENTED" });
+    await expect(
+      catalog.transition(
+        "account",
+        graph.account.id,
+        "suspended",
+        parseCounter("1"),
+        mutationContext("revoke-unavailable:account"),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_IMPLEMENTED" });
+    await catalog.close();
+  });
 });
+
+function referenceCatalog(): AccountsCatalog {
+  return new AccountsCatalog(new InMemoryAccountsRepository(), clock);
+}

@@ -1,6 +1,15 @@
 import type { Counter } from "../domain/counter";
 import type { AccountEventId, EntityId } from "../domain/ids";
-import type { EntityKind, EntityMap } from "../domain/models";
+import type {
+  Account,
+  AccessMethod,
+  AuthCapsule,
+  CapacityPool,
+  CredentialBinding,
+  EntityKind,
+  EntityMap,
+  Entitlement,
+} from "../domain/models";
 
 export interface MutationContext {
   readonly actorRef: string;
@@ -31,11 +40,24 @@ export interface RepositoryDoctor {
   readonly foreignKeys: boolean | "not_applicable";
   readonly journalMode: "memory" | "wal";
   readonly integrity: "ok";
+  readonly readiness: "metadata_only";
+  readonly recoveryFrontier: "unavailable";
+  readonly positiveEligibility: false;
+}
+
+export interface EligibilitySnapshot {
+  readonly method?: AccessMethod;
+  readonly entitlement?: Entitlement;
+  readonly account?: Account;
+  readonly pool?: CapacityPool;
+  readonly capsules: readonly AuthCapsule[];
+  readonly bindings: readonly CredentialBinding[];
 }
 
 export interface AccountsRepository {
   get<K extends EntityKind>(kind: K, id: EntityMap[K]["id"]): Promise<EntityMap[K] | undefined>;
   list<K extends EntityKind>(kind: K): Promise<readonly EntityMap[K][]>;
+  readEligibilitySnapshot(accessMethodId: AccessMethod["id"]): Promise<EligibilitySnapshot>;
   insert<K extends EntityKind>(
     kind: K,
     record: EntityMap[K],
@@ -47,6 +69,13 @@ export interface AccountsRepository {
     expectedRevision: Counter,
     context: MutationContext,
   ): Promise<MutationResult<EntityMap[K]>>;
+  findReplacementReplay<K extends EntityKind>(
+    kind: K,
+    id: EntityMap[K]["id"],
+    to: EntityMap[K]["status"],
+    expectedRevision: Counter,
+    context: MutationContext,
+  ): Promise<MutationResult<EntityMap[K]> | undefined>;
   events(): Promise<readonly AccountEvent[]>;
   doctor(): Promise<RepositoryDoctor>;
   close(): Promise<void>;

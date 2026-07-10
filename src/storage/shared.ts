@@ -1,7 +1,8 @@
 import { AccountsError } from "../errors";
-import { incrementCounter, type Counter } from "../domain/counter";
+import { compareCounters, incrementCounter, type Counter } from "../domain/counter";
 import type { EntityKind, EntityMap } from "../domain/models";
-import { canonicalSha256 } from "../serialization/json";
+import { assertTransition } from "../domain/state";
+import { canonicalJson, canonicalSha256 } from "../serialization/json";
 import {
   deserializeRecordEnvelope,
   serializeRecordEnvelope,
@@ -9,7 +10,7 @@ import {
 } from "../serialization/dto";
 import type { MutationContext } from "./repository";
 
-const ACTOR_PATTERN = /^principal:(?:human|service):[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const ACTOR_PATTERN = /^principal:(?:human|service):hasna:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const IDEMPOTENCY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REASON_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
@@ -94,4 +95,40 @@ export function assertReplacement<K extends EntityKind>(
       },
     });
   }
+  assertTransition(kind, previous.status, next.status);
+  if (canonicalJson(stableFields(kind, previous)) !== canonicalJson(stableFields(kind, next))) {
+    throw new AccountsError("VALIDATION_FAILED", "Immutable aggregate fields changed", {
+      details: { aggregateKind: kind, aggregateId: previous.id },
+    });
+  }
+  if (kind === "capacity_pool") {
+    const before = previous as EntityMap["capacity_pool"];
+    const after = next as EntityMap["capacity_pool"];
+    if (
+      compareCounters(after.capacityGeneration, before.capacityGeneration) < 0 ||
+      compareCounters(after.denyGeneration, before.denyGeneration) < 0
+    ) {
+      throw new AccountsError("CURRENT_DENY", "Capacity generations cannot move backward");
+    }
+    if (
+      before.denyState === "allowed" &&
+      after.denyState === "denied" &&
+      compareCounters(after.denyGeneration, before.denyGeneration) <= 0
+    ) {
+      throw new AccountsError("CURRENT_DENY", "A denial transition must advance deny generation");
+    }
+  }
+}
+
+function stableFields<K extends EntityKind>(kind: K, entity: EntityMap[K]): unknown {
+  const common = entity as EntityMap[EntityKind];
+  const { status: _status, revision: _revision, updatedAt: _updatedAt, ...base } = common;
+  if (kind !== "capacity_pool") return base;
+  const {
+    capacityGeneration: _capacityGeneration,
+    denyGeneration: _denyGeneration,
+    denyState: _denyState,
+    ...stable
+  } = base as Omit<EntityMap["capacity_pool"], "status" | "revision" | "updatedAt">;
+  return stable;
 }

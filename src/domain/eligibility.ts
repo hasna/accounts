@@ -15,6 +15,8 @@ import type {
 import { canonicalJson, canonicalSha256 } from "../serialization/json";
 import { validateSlotEligibility } from "../serialization/dto";
 
+const CAPSULE_HEALTH_TTL_MS = 5 * 60 * 1_000;
+
 export async function evaluateSlotEligibility(
   repository: AccountsRepository,
   request: EligibilityRequest,
@@ -36,24 +38,23 @@ export async function evaluateSlotEligibility(
   let capsule: AuthCapsule | undefined;
   let binding: CredentialBinding | undefined;
   try {
-    method = await repository.get("access_method", request.accessMethodId);
+    const snapshot = await repository.readEligibilitySnapshot(request.accessMethodId);
+    method = snapshot.method;
     if (method === undefined) {
       throw new AccountsError("NOT_FOUND", "Access method was not found", {
         details: { aggregateKind: "access_method", aggregateId: request.accessMethodId },
       });
     }
-    entitlement = await repository.get("entitlement", method.entitlementId);
-    pool = await repository.get("capacity_pool", method.capacityPoolId);
-    if (entitlement !== undefined) account = await repository.get("account", entitlement.accountId);
-    const bindings = await repository.list("credential_binding");
-    const matchingBindings = bindings.filter(
+    entitlement = snapshot.entitlement;
+    pool = snapshot.pool;
+    account = snapshot.account;
+    const matchingBindings = snapshot.bindings.filter(
       (candidate) =>
         candidate.accessMethodId === method!.id && candidate.capacityPoolId === method!.capacityPoolId,
     );
     binding = chooseBinding(matchingBindings);
     if (method.accessTransport === "native_session") {
-      const capsules = await repository.list("auth_capsule");
-      capsule = capsules.find(
+      capsule = snapshot.capsules.find(
         (candidate) =>
           candidate.accessMethodId === method!.id &&
           candidate.capacityPoolId === method!.capacityPoolId &&
@@ -132,6 +133,12 @@ export async function evaluateSlotEligibility(
       if (capsule.status !== "ready") reasons.push("CAPSULE_NOT_READY");
       if (account !== undefined && capsule.ownerRef !== account.ownerRef) reasons.push("CAPSULE_OWNER_MISMATCH");
       if (capsule.placementKind !== "enrolled_node") reasons.push("CAPSULE_PLACEMENT_INVALID");
+      if (
+        capsule.lastHealthAt === undefined ||
+        Date.parse(capsule.lastHealthAt) + CAPSULE_HEALTH_TTL_MS <= now.getTime()
+      ) {
+        reasons.push("HEALTH_STALE");
+      }
       if (capsule.isolationPolicyDigest !== method.requiredIsolationPolicyDigest) {
         reasons.push("POLICY_DIGEST_MISMATCH");
       }
@@ -150,6 +157,9 @@ export async function evaluateSlotEligibility(
     if (binding.status === "retiring") reasons.push("CREDENTIAL_BINDING_RETIRING");
     else if (binding.status !== "active") reasons.push("CREDENTIAL_BINDING_NOT_ACTIVE");
     if (binding.expiresAt !== undefined && Date.parse(binding.expiresAt) <= now.getTime()) {
+      reasons.push("CREDENTIAL_BINDING_EXPIRED");
+    }
+    if (Date.parse(binding.bindingEvidenceExpiresAt) <= now.getTime()) {
       reasons.push("CREDENTIAL_BINDING_EXPIRED");
     }
     const expectedResolver =
@@ -286,6 +296,7 @@ function buildResult(input: {
           method.executionPolicyExpiresAt,
           capsule?.attestation?.expiresAt,
           binding?.expiresAt,
+          binding?.bindingEvidenceExpiresAt,
         ]
           .filter((value): value is string => value !== undefined)
           .map(Date.parse)

@@ -7,6 +7,13 @@ const MAX_JSON_DEPTH = 32;
 const MAX_CONTAINER_ITEMS = 10_000;
 const FORBIDDEN_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SENSITIVE_KEYS = /^(?:access[_-]?token|api[_-]?key|auth(?:entication|orization)?|authorization|bearer|client[_-]?secret|cookie|credentials?|credential[_-]?handle|credential[_-]?value|id[_-]?token|password|private[_-]?key|refresh[_-]?token|secret(?:[_-]?key|[_-]?ref)?|session[_-]?token|setup[_-]?token|token|vault[_-]?path|role[_-]?arn|local[_-]?path)$/i;
+const SUSPECT_VALUE_PATTERNS = [
+  /-----BEGIN [A-Z ]+PRIVATE KEY-----/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bgh[oprsu]_[A-Za-z0-9]{20,}\b/,
+  /\b(?:sk|rk|pk|token|secret)[-_][A-Za-z0-9_-]{16,}\b/i,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+] as const;
 
 function hasInvalidUnicode(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -152,6 +159,9 @@ class ClosedJsonParser {
     if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
       return this.fail("Unsafe JSON number; counters must use decimal strings");
     }
+    if (Object.is(value, -0) || JSON.stringify(value) !== match[0]) {
+      return this.fail("JSON number is not in canonical form");
+    }
     return value;
   }
 
@@ -177,22 +187,40 @@ export function parseClosedJson(source: string): unknown {
   return new ClosedJsonParser(source).parse();
 }
 
-function assertJsonValue(value: unknown, depth: number, seen: Set<object>): void {
+export function parseClosedJsonBytes(source: Uint8Array): unknown {
+  if (source.byteLength > MAX_JSON_BYTES) {
+    throw new AccountsError("VALIDATION_FAILED", "JSON document is too large");
+  }
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(source);
+  } catch {
+    throw new AccountsError("VALIDATION_FAILED", "JSON must be valid UTF-8");
+  }
+  return parseClosedJson(decoded);
+}
+
+function snapshotJson(value: unknown, depth: number, seen: Set<object>): unknown {
   if (depth > MAX_JSON_DEPTH) {
     throw new AccountsError("VALIDATION_FAILED", "JSON nesting is too deep");
   }
-  if (value === null || typeof value === "boolean") return;
+  if (value === null || typeof value === "boolean") return value;
   if (typeof value === "string") {
     if (hasInvalidUnicode(value)) {
       throw new AccountsError("VALIDATION_FAILED", "Invalid Unicode in JSON string");
     }
-    return;
+    assertNoSecretLikeString(value);
+    return value;
   }
   if (typeof value === "number") {
-    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
-      throw new AccountsError("VALIDATION_FAILED", "JSON number must be finite");
+    if (
+      !Number.isFinite(value) ||
+      Object.is(value, -0) ||
+      (Number.isInteger(value) && !Number.isSafeInteger(value))
+    ) {
+      throw new AccountsError("VALIDATION_FAILED", "JSON number is not safely canonicalizable");
     }
-    return;
+    return value;
   }
   if (typeof value !== "object") {
     throw new AccountsError("VALIDATION_FAILED", "Value is not JSON serializable");
@@ -203,41 +231,57 @@ function assertJsonValue(value: unknown, depth: number, seen: Set<object>): void
     if (value.length > MAX_CONTAINER_ITEMS) {
       throw new AccountsError("VALIDATION_FAILED", "JSON array is too large");
     }
-    for (const item of value) assertJsonValue(item, depth + 1, seen);
+    const result = value.map((item) => snapshotJson(item, depth + 1, seen));
+    seen.delete(value);
+    return result;
   } else {
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {
       throw new AccountsError("VALIDATION_FAILED", "Only plain JSON objects are accepted");
     }
-    const entries = Object.entries(value as Record<string, unknown>);
-    if (entries.length > MAX_CONTAINER_ITEMS) {
+    if (Object.getOwnPropertySymbols(value).length !== 0) {
+      throw new AccountsError("VALIDATION_FAILED", "Symbol properties are forbidden in JSON");
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Object.keys(descriptors);
+    if (keys.length > MAX_CONTAINER_ITEMS) {
       throw new AccountsError("VALIDATION_FAILED", "JSON object is too large");
     }
-    for (const [key, item] of entries) {
+    const result = Object.create(null) as Record<string, unknown>;
+    for (const key of keys.sort()) {
+      const descriptor = descriptors[key]!;
       if (FORBIDDEN_KEYS.has(key)) {
         throw new AccountsError("VALIDATION_FAILED", "Reserved object key is forbidden");
       }
-      assertJsonValue(item, depth + 1, seen);
+      if (!descriptor.enumerable) continue;
+      if (!("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+        throw new AccountsError("VALIDATION_FAILED", "Accessor properties are forbidden in JSON");
+      }
+      if (hasInvalidUnicode(key)) {
+        throw new AccountsError("VALIDATION_FAILED", "Invalid Unicode in JSON object key");
+      }
+      result[key] = snapshotJson(descriptor.value, depth + 1, seen);
     }
-  }
-  seen.delete(value);
-}
-
-function sorted(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sorted);
-  if (value !== null && typeof value === "object") {
-    const result = Object.create(null) as Record<string, unknown>;
-    for (const key of Object.keys(value).sort()) {
-      result[key] = sorted((value as Record<string, unknown>)[key]);
-    }
+    seen.delete(value);
     return result;
   }
-  return value;
+}
+
+function serializeCanonical(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(serializeCanonical).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${serializeCanonical(record[key])}`)
+    .join(",")}}`;
 }
 
 export function canonicalJson(value: unknown): string {
-  assertJsonValue(value, 0, new Set());
-  return JSON.stringify(sorted(value));
+  return serializeCanonical(snapshotJson(value, 0, new Set()));
 }
 
 export function canonicalSha256(value: unknown): string {
@@ -252,20 +296,38 @@ export function assertNoSensitiveFields(value: unknown, path = "$", seen = new S
     seen.delete(value);
     return;
   }
+  if (typeof value === "string") {
+    assertNoSecretLikeString(value);
+    return;
+  }
   if (value === null || typeof value !== "object") return;
   if (seen.has(value)) throw new AccountsError("VALIDATION_FAILED", "Cyclic JSON is forbidden");
   seen.add(value);
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new AccountsError("VALIDATION_FAILED", "Symbol properties are forbidden in DTOs");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (!descriptor.enumerable) continue;
+    if (!("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+      throw new AccountsError("VALIDATION_FAILED", "Accessor properties are forbidden in DTOs");
+    }
     if (SENSITIVE_KEYS.test(key)) {
       throw new AccountsError("VALIDATION_FAILED", "Credential material or locator fields are forbidden", {
         details: { field: key },
       });
     }
-    assertNoSensitiveFields(item, `${path}.${key}`, seen);
+    assertNoSensitiveFields(descriptor.value, `${path}.${key}`, seen);
   }
   seen.delete(value);
 }
 
 export function isSensitiveFieldName(key: string): boolean {
   return SENSITIVE_KEYS.test(key);
+}
+
+export function assertNoSecretLikeString(value: string): void {
+  if (SUSPECT_VALUE_PATTERNS.some((pattern) => pattern.test(value))) {
+    throw new AccountsError("VALIDATION_FAILED", "A value resembles credential material");
+  }
 }

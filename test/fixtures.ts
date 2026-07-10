@@ -2,27 +2,26 @@ import {
   newAccessMethodId,
   newAccountId,
   newAuthCapsuleId,
-  newCanonicalNodeId,
   newCapacityPoolId,
   newCredentialBindingId,
   newEntitlementId,
   parseCounter,
+  parseCanonicalNodeId,
   type Account,
   type AccessMethod,
   type AccessTransport,
-  type AccountsCapacity,
   type AuthCapsule,
   type CapacityPool,
   type CredentialBinding,
   type Entitlement,
 } from "../src/index";
+import type { AccountsCatalog } from "../src/domain/catalog";
 import type { MutationContext } from "../src/storage/repository";
 
 export const NOW = new Date("2026-07-10T12:00:00.000Z");
 export const CREATED_AT = "2026-07-10T11:59:00.000Z";
 export const FUTURE = "2026-07-10T13:00:00.000Z";
-export const ACTOR_REF = "principal:human:owner-a";
-export const SERVICE_REF = "principal:service:capsule-host-a";
+export const ACTOR_REF = "principal:human:hasna:owner-a";
 export const C0 = parseCounter("0");
 export const C1 = parseCounter("1");
 export const C2 = parseCounter("2");
@@ -151,21 +150,26 @@ export function makeFixtureGraph(
     createdAt: CREATED_AT,
     updatedAt: CREATED_AT,
   };
+  const capsuleId = newAuthCapsuleId(NOW.getTime() + offset * 100 + 5);
   const capsule =
     transport === "native_session"
       ? ({
-          id: newAuthCapsuleId(NOW.getTime() + offset * 100 + 5),
+          id: capsuleId,
           accessMethodId,
           capacityPoolId,
           kind: "native_session",
           ownerRef: ACTOR_REF,
           placementKind: "enrolled_node",
-          placementRef: newCanonicalNodeId(NOW.getTime() + offset * 100 + 6),
+          placementRef: parseCanonicalNodeId(
+            `018f0f0${(offset % 10).toString()}-7b6d-7a10-8a00-${(offset + 1)
+              .toString(16)
+              .padStart(12, "0")}`,
+          ),
           hardwareKeyThumbprint: digest("4"),
           nodeGeneration: C1,
           placementGeneration: C1,
           status: "unprovisioned",
-          refreshOwnerRef: SERVICE_REF,
+          refreshOwnerRef: `principal:service:hasna:capsule-host:${capsuleId}`,
           refreshMode: "provider_native",
           authGeneration: C0,
           authStateRevision: C0,
@@ -208,6 +212,10 @@ export function makeFixtureGraph(
       : { authStateRevision: C0 }),
     status: "pending",
     policyDigest: executionPolicyDigest,
+    bindingEvidenceRef: `evidence:binding-${offset}`,
+    bindingEvidenceIssuerRef: "authority:credential-issuer-1",
+    bindingEvidenceDigest: digest("6"),
+    bindingEvidenceExpiresAt: FUTURE,
     expiresAt: FUTURE,
     revision: C0,
     createdAt: CREATED_AT,
@@ -224,7 +232,7 @@ export function makeFixtureGraph(
 }
 
 export async function seedActiveCatalog(
-  catalog: AccountsCapacity,
+  catalog: AccountsCatalog,
   graph: FixtureGraph,
   prefix = "seed",
 ): Promise<void> {

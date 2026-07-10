@@ -221,6 +221,7 @@ export function validateNativeReauthenticationCandidate(
     retiringBinding.status === "retiring" &&
     replacementBinding.resolver === "capsule_local_native" &&
     replacementBinding.status === "pending" &&
+    retiringBinding.id !== replacementBinding.id &&
     beforeCapsule.id === afterCapsule.id &&
     beforeCapsule.accessMethodId === method.id &&
     afterCapsule.accessMethodId === method.id &&

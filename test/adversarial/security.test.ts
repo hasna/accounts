@@ -29,6 +29,7 @@ describe("adversarial public-boundary checks", () => {
     ]) {
       expect(exported).not.toContain(forbidden);
     }
+    expect(publicApi).not.toHaveProperty("newCanonicalNodeId");
   });
 
   test("marks Postgres as reserved with no implementation or conformance claim", () => {
@@ -39,6 +40,26 @@ describe("adversarial public-boundary checks", () => {
       target: "self_hosted",
     });
     expect(publicApi).not.toHaveProperty("createPostgresAccounts");
+  });
+
+  test("pins the finalized Accounts V1 contract and advertises metadata-only readiness", async () => {
+    expect(publicApi.ACCOUNTS_V1_CONTRACT_SHA256).toBe(
+      "0d2b45c286f56452312b251b7622e009c486e2fe71fe8f2a5a59c01472eb8b2a",
+    );
+    const capacity = publicApi.createInMemoryAccounts();
+    await expect(capacity.doctor()).resolves.toMatchObject({
+      readiness: "metadata_only",
+      recoveryFrontier: "unavailable",
+      positiveEligibility: false,
+    });
+    await capacity.close();
+  });
+
+  test("public factories expose no caller-authored positive mutation surface", async () => {
+    const capacity = publicApi.createInMemoryAccounts();
+    expect(capacity).not.toHaveProperty("add");
+    expect(capacity).not.toHaveProperty("transition");
+    await capacity.close();
   });
 
   test("normal binding serialization contains metadata only", () => {

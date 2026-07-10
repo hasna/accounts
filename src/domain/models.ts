@@ -185,9 +185,15 @@ export interface CredentialBinding extends RecordBase<CredentialBindingId> {
   readonly refreshMode?: "broker_serialized";
   readonly status: CredentialBindingStatus;
   readonly policyDigest: string;
+  readonly bindingEvidenceRef: string;
+  readonly bindingEvidenceIssuerRef: string;
+  readonly bindingEvidenceDigest: string;
+  readonly bindingEvidenceExpiresAt: string;
   readonly rotatedAt?: string;
   readonly expiresAt?: string;
 }
+
+export type CredentialBindingMetadata = CredentialBinding;
 
 export type EntityKind =
   | "account"

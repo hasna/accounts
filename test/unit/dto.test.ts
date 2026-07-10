@@ -7,6 +7,7 @@ import {
   deserializeRecordEnvelope,
   encodeRecordEnvelope,
   parseClosedJson,
+  parseClosedJsonBytes,
   serializeRecordEnvelope,
   toErrorEnvelope,
   validateEligibilityRequest,
@@ -59,16 +60,45 @@ describe("closed versioned record DTOs", () => {
     );
   });
 
+  test("rejects token-shaped values even when placed under an otherwise allowed field", () => {
+    const envelope = structuredClone(encodeRecordEnvelope("account", graph.account)) as unknown as {
+      data: { displayLabel: string };
+    };
+    envelope.data.displayLabel = `sk-${"x".repeat(24)}`;
+    expect(() => decodeRecordEnvelope(envelope)).toThrow(
+      expect.objectContaining({ code: "VALIDATION_FAILED" }),
+    );
+  });
+
   test("rejects duplicate keys, prototype keys, non-RFC whitespace, unsafe numbers, and lone surrogates", () => {
     expect(() => parseClosedJson('{"kind":"a","kind":"b"}')).toThrow(AccountsError);
     expect(() => parseClosedJson('{"__proto__":{}}')).toThrow(AccountsError);
     expect(() => parseClosedJson("{\u00a0\"a\":1}")).toThrow(AccountsError);
     expect(() => parseClosedJson('{"value":9007199254740993}')).toThrow(AccountsError);
     expect(() => parseClosedJson('{"value":"\\ud800"}')).toThrow(AccountsError);
+    for (const number of ["-0", "1.0", "1e0", "1E+0"]) {
+      expect(() => parseClosedJson(`{"value":${number}}`)).toThrow(AccountsError);
+    }
+    expect(() => parseClosedJsonBytes(Uint8Array.of(0x7b, 0x22, 0x78, 0x22, 0x3a, 0xff, 0x7d))).toThrow(
+      AccountsError,
+    );
   });
 
-  test("canonical JSON is stable for safe local hashing", () => {
+  test("canonical JSON uses lexicographic key ordering and rejects accessors", () => {
     expect(canonicalJson({ z: 1, a: { y: 2, x: 3 } })).toBe('{"a":{"x":3,"y":2},"z":1}');
+    expect(canonicalJson({ "2": "second", "10": "first" })).toBe(
+      '{"10":"first","2":"second"}',
+    );
+    let invoked = false;
+    const accessor = Object.defineProperty({}, "value", {
+      enumerable: true,
+      get() {
+        invoked = true;
+        return "changed";
+      },
+    });
+    expect(() => canonicalJson(accessor)).toThrow(AccountsError);
+    expect(invoked).toBe(false);
   });
 
   test("positive eligibility cannot omit critical chain fields or use unresolved target", () => {

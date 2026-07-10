@@ -42,7 +42,7 @@ const ENTITY_KINDS = [
 const REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/;
 const KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
-const OWNER_PATTERN = /^principal:(?:human|service):[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const OWNER_PATTERN = /^principal:(?:human|service):hasna:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 type JsonObject = Record<string, unknown>;
@@ -476,7 +476,13 @@ function validateAuthCapsule(input: unknown): AuthCapsule {
   if (refreshMode === "interactive_owner" && refreshOwnerRef !== value.ownerRef) {
     throw invalid("refreshOwnerRef");
   }
-  if (refreshMode === "provider_native" && !refreshOwnerRef.startsWith("principal:service:")) {
+  if (refreshMode === "provider_native" && !refreshOwnerRef.startsWith("principal:service:hasna:")) {
+    throw invalid("refreshOwnerRef");
+  }
+  if (
+    refreshMode === "provider_native" &&
+    refreshOwnerRef !== `principal:service:hasna:capsule-host:${String(value.id)}`
+  ) {
     throw invalid("refreshOwnerRef");
   }
   parseCounter(value.authGeneration, "authGeneration");
@@ -506,6 +512,10 @@ function validateCredentialBinding(input: unknown): CredentialBinding {
       "credentialGeneration",
       "status",
       "policyDigest",
+      "bindingEvidenceRef",
+      "bindingEvidenceIssuerRef",
+      "bindingEvidenceDigest",
+      "bindingEvidenceExpiresAt",
       "revision",
       "createdAt",
       "updatedAt",
@@ -525,6 +535,11 @@ function validateCredentialBinding(input: unknown): CredentialBinding {
   parseCounter(value.credentialGeneration, "credentialGeneration");
   enumValue(value.status, ["pending", "active", "retiring", "revoked"], "status");
   digest(value.policyDigest, "policyDigest");
+  reference(value.bindingEvidenceRef, "bindingEvidenceRef");
+  reference(value.bindingEvidenceIssuerRef, "bindingEvidenceIssuerRef");
+  digest(value.bindingEvidenceDigest, "bindingEvidenceDigest");
+  timestamp(value.bindingEvidenceExpiresAt, "bindingEvidenceExpiresAt");
+  ordered(value.createdAt, value.bindingEvidenceExpiresAt, "bindingEvidenceExpiresAt");
   if (value.rotatedAt !== undefined) timestamp(value.rotatedAt, "rotatedAt");
   if (value.expiresAt !== undefined) timestamp(value.expiresAt, "expiresAt");
   if (value.expiresAt !== undefined) ordered(value.createdAt, value.expiresAt, "expiresAt");
@@ -750,6 +765,7 @@ export function validateSlotEligibility(input: unknown): SlotEligibilityMetadata
       if (value[field] === undefined) throw invalid(field);
     }
     if (value.denyState !== "allowed") throw invalid("denyState");
+    if (value.maxConcurrency === "0") throw invalid("maxConcurrency");
     const target = value.accessTarget as {
       kind?: unknown;
       resolver?: unknown;

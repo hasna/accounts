@@ -16,7 +16,17 @@ CREATE TABLE provider_accounts (
 );
 CREATE UNIQUE INDEX provider_accounts_active_subject
   ON provider_accounts(provider_key, provider_subject_ref)
-  WHERE provider_subject_ref IS NOT NULL AND status <> 'revoked';
+  WHERE provider_subject_ref IS NOT NULL AND status <> 'pending';
+
+CREATE TABLE provider_subject_claims (
+  provider_key TEXT NOT NULL,
+  provider_subject_ref TEXT NOT NULL,
+  owner_ref TEXT NOT NULL,
+  provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE RESTRICT,
+  claimed_at TEXT NOT NULL,
+  PRIMARY KEY (provider_key, provider_subject_ref),
+  UNIQUE (provider_account_id)
+);
 
 CREATE TABLE entitlements (
   id TEXT PRIMARY KEY,
@@ -31,7 +41,8 @@ CREATE TABLE entitlements (
 CREATE TABLE capacity_pools (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE RESTRICT,
-  capacity_domain_ref TEXT NOT NULL UNIQUE,
+  provider_key TEXT NOT NULL,
+  capacity_domain_ref TEXT NOT NULL,
   serialization_key TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL CHECK (status IN ('pending','active','draining','denied','retired')),
   deny_state TEXT NOT NULL CHECK (deny_state IN ('allowed','denied')),
@@ -41,6 +52,19 @@ CREATE TABLE capacity_pools (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   payload_json TEXT NOT NULL
+);
+CREATE UNIQUE INDEX capacity_pools_provider_domain
+  ON capacity_pools(provider_key, capacity_domain_ref);
+
+CREATE TABLE capacity_domain_claims (
+  provider_key TEXT NOT NULL,
+  capacity_domain_ref TEXT NOT NULL,
+  serialization_key TEXT NOT NULL UNIQUE,
+  owner_ref TEXT NOT NULL,
+  capacity_pool_id TEXT NOT NULL REFERENCES capacity_pools(id) ON DELETE RESTRICT,
+  claimed_at TEXT NOT NULL,
+  PRIMARY KEY (provider_key, capacity_domain_ref),
+  UNIQUE (capacity_pool_id)
 );
 
 CREATE TABLE access_methods (
@@ -72,6 +96,15 @@ CREATE TABLE auth_capsules (
 CREATE UNIQUE INDEX auth_capsules_one_live_per_pool
   ON auth_capsules(capacity_pool_id)
   WHERE status <> 'revoked';
+
+CREATE TABLE credential_family_claims (
+  credential_family_id TEXT PRIMARY KEY,
+  capacity_pool_id TEXT NOT NULL REFERENCES capacity_pools(id) ON DELETE RESTRICT,
+  owner_ref TEXT NOT NULL,
+  purpose TEXT NOT NULL CHECK (purpose IN ('provider_session','api_key','workload_identity')),
+  resolver TEXT NOT NULL CHECK (resolver IN ('brokered_secret','workload_identity','capsule_local_native')),
+  claimed_at TEXT NOT NULL
+);
 
 CREATE TABLE credential_bindings (
   id TEXT PRIMARY KEY,

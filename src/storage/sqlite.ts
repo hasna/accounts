@@ -1,16 +1,17 @@
 import { Database } from "bun:sqlite";
 import {
   chmodSync,
+  closeSync,
+  constants,
   existsSync,
   lstatSync,
   mkdirSync,
-  realpathSync,
-  statSync,
+  openSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 
 import { AccountsError } from "../errors";
-import type { Counter } from "../domain/counter";
+import { incrementCounter, type Counter } from "../domain/counter";
 import { newAccountEventId } from "../domain/ids";
 import type { EntityKind, EntityMap } from "../domain/models";
 import { deserializeRecordEnvelope, serializeRecordEnvelope } from "../serialization/dto";
@@ -20,6 +21,7 @@ import type {
   MutationContext,
   MutationResult,
   RepositoryDoctor,
+  EligibilitySnapshot,
 } from "./repository";
 import {
   assertReplacement,
@@ -70,7 +72,12 @@ export class SQLiteAccountsRepository implements AccountsRepository {
 
   constructor(readonly filename: string) {
     if (filename !== ":memory:") prepareDatabasePath(filename);
-    this.database = new Database(filename, { create: true, strict: true, safeIntegers: true });
+    const previousUmask = process.umask(0o077);
+    try {
+      this.database = new Database(filename, { create: true, strict: true, safeIntegers: true });
+    } finally {
+      process.umask(previousUmask);
+    }
     this.database.exec("PRAGMA foreign_keys = ON");
     this.database.exec("PRAGMA busy_timeout = 5000");
     if (filename !== ":memory:") this.database.exec("PRAGMA journal_mode = WAL");
@@ -92,6 +99,36 @@ export class SQLiteAccountsRepository implements AccountsRepository {
       .query(`SELECT payload_json FROM ${TABLES[kind]} ORDER BY id COLLATE BINARY ASC`)
       .all() as PayloadRow[];
     return rows.map((row) => decodePayload(kind, row.payload_json));
+  }
+
+  async readEligibilitySnapshot(
+    accessMethodId: EntityMap["access_method"]["id"],
+  ): Promise<EligibilitySnapshot> {
+    this.assertOpen();
+    const transaction = this.database.transaction(() => {
+      const method = this.readOne("access_method", accessMethodId);
+      const entitlement =
+        method === undefined ? undefined : this.readOne("entitlement", method.entitlementId);
+      const account =
+        entitlement === undefined ? undefined : this.readOne("account", entitlement.accountId);
+      const pool =
+        method === undefined ? undefined : this.readOne("capacity_pool", method.capacityPoolId);
+      const capsuleRows = this.database
+        .query("SELECT payload_json FROM auth_capsules WHERE access_method_id = ? ORDER BY id COLLATE BINARY ASC")
+        .all(accessMethodId) as PayloadRow[];
+      const bindingRows = this.database
+        .query("SELECT payload_json FROM credential_bindings WHERE access_method_id = ? ORDER BY id COLLATE BINARY ASC")
+        .all(accessMethodId) as PayloadRow[];
+      return {
+        ...(method === undefined ? {} : { method }),
+        ...(entitlement === undefined ? {} : { entitlement }),
+        ...(account === undefined ? {} : { account }),
+        ...(pool === undefined ? {} : { pool }),
+        capsules: capsuleRows.map((row) => decodePayload("auth_capsule", row.payload_json)),
+        bindings: bindingRows.map((row) => decodePayload("credential_binding", row.payload_json)),
+      } satisfies EligibilitySnapshot;
+    });
+    return transaction.deferred();
   }
 
   async insert<K extends EntityKind>(
@@ -159,7 +196,7 @@ export class SQLiteAccountsRepository implements AccountsRepository {
     this.assertOpen();
     const rows = this.database
       .query(
-        "SELECT id, aggregate_kind, aggregate_id, aggregate_revision, actor_ref, reason_code, occurred_at FROM account_events ORDER BY id COLLATE BINARY ASC",
+        "SELECT id, aggregate_kind, aggregate_id, aggregate_revision, actor_ref, reason_code, occurred_at FROM account_events ORDER BY rowid ASC",
       )
       .all() as EventRow[];
     return rows.map((row) => ({
@@ -173,12 +210,52 @@ export class SQLiteAccountsRepository implements AccountsRepository {
     }));
   }
 
+  async findReplacementReplay<K extends EntityKind>(
+    kind: K,
+    id: EntityMap[K]["id"],
+    to: EntityMap[K]["status"],
+    expectedRevision: Counter,
+    context: MutationContext,
+  ): Promise<MutationResult<EntityMap[K]> | undefined> {
+    this.assertOpen();
+    validateMutationContext(context);
+    const scope = idempotencyScope("replace", kind, context);
+    const row = this.database
+      .query("SELECT request_hash, aggregate_kind, event_id, response_json FROM idempotency_records WHERE scope = ?")
+      .get(scope) as IdempotencyRow | null;
+    if (row === null) return undefined;
+    if (row.aggregate_kind !== kind) throw new AccountsError("IDEMPOTENCY_CONFLICT", "Stored replay kind changed");
+    const record = decodePayload(kind, row.response_json);
+    const expectedHash = mutationHash("replace", kind, record, context, expectedRevision);
+    if (
+      row.request_hash !== expectedHash ||
+      record.id !== id ||
+      record.status !== to ||
+      record.revision !== incrementCounter(expectedRevision)
+    ) {
+      throw new AccountsError("IDEMPOTENCY_CONFLICT", "Idempotent transition input changed");
+    }
+    return {
+      record,
+      eventId: row.event_id as AccountEvent["id"],
+      replayed: true,
+    };
+  }
+
   async doctor(): Promise<RepositoryDoctor> {
     this.assertOpen();
     const foreignKeys = this.database.query("PRAGMA foreign_keys").values()[0]?.[0] === 1n;
     const journal = this.database.query("PRAGMA journal_mode").values()[0]?.[0];
     const integrity = this.database.query("PRAGMA integrity_check").values()[0]?.[0];
-    if (foreignKeys !== true || integrity !== "ok") {
+    const migration = this.database
+      .query("SELECT checksum FROM accounts_schema_migrations WHERE version = ?")
+      .get(BigInt(SQLITE_SCHEMA_VERSION)) as { checksum: string } | null;
+    if (
+      foreignKeys !== true ||
+      integrity !== "ok" ||
+      migration?.checksum !== SQLITE_MIGRATION_CHECKSUM ||
+      (this.filename !== ":memory:" && journal !== "wal")
+    ) {
       throw new AccountsError("DEPENDENCY_UNAVAILABLE", "SQLite integrity checks failed", {
         details: { adapter: "sqlite" },
       });
@@ -190,6 +267,9 @@ export class SQLiteAccountsRepository implements AccountsRepository {
       foreignKeys: true,
       journalMode: journal === "wal" ? "wal" : "memory",
       integrity: "ok",
+      readiness: "metadata_only",
+      recoveryFrontier: "unavailable",
+      positiveEligibility: false,
     };
   }
 
@@ -202,36 +282,43 @@ export class SQLiteAccountsRepository implements AccountsRepository {
   }
 
   private migrate(): void {
-    this.database.exec(`
-      CREATE TABLE IF NOT EXISTS accounts_schema_migrations (
-        version INTEGER PRIMARY KEY,
-        checksum TEXT NOT NULL,
-        applied_at TEXT NOT NULL
-      )
-    `);
-    const rows = this.database
-      .query("SELECT version, checksum FROM accounts_schema_migrations ORDER BY version ASC")
-      .all() as Array<{ version: bigint; checksum: string }>;
-    if (rows.some((row) => row.version > BigInt(SQLITE_SCHEMA_VERSION))) {
-      throw new AccountsError("SCHEMA_VERSION_UNSUPPORTED", "Database schema is newer than this build", {
-        details: { schemaVersion: "newer" },
-      });
-    }
-    const current = rows.find((row) => row.version === 1n);
-    if (current !== undefined && current.checksum !== SQLITE_MIGRATION_CHECKSUM) {
-      throw new AccountsError("SCHEMA_CHECKSUM_MISMATCH", "Database schema checksum mismatch", {
-        details: { adapter: "sqlite" },
-      });
-    }
-    if (current === undefined) {
-      const transaction = this.database.transaction(() => {
+    const transaction = this.database.transaction(() => {
+      this.database.exec(`
+        CREATE TABLE IF NOT EXISTS accounts_schema_migrations (
+          version INTEGER PRIMARY KEY,
+          checksum TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        )
+      `);
+      const rows = this.database
+        .query("SELECT version, checksum FROM accounts_schema_migrations ORDER BY version ASC")
+        .all() as Array<{ version: bigint; checksum: string }>;
+      if (rows.some((row) => row.version > BigInt(SQLITE_SCHEMA_VERSION))) {
+        throw new AccountsError("SCHEMA_VERSION_UNSUPPORTED", "Database schema is newer than this build", {
+          details: { schemaVersion: "newer" },
+        });
+      }
+      const current = rows.find((row) => row.version === 1n);
+      if (current !== undefined && current.checksum !== SQLITE_MIGRATION_CHECKSUM) {
+        throw new AccountsError("SCHEMA_CHECKSUM_MISMATCH", "Database schema checksum mismatch", {
+          details: { adapter: "sqlite" },
+        });
+      }
+      if (current === undefined) {
         this.database.exec(SQLITE_MIGRATION_V1);
         this.database
-          .query("INSERT INTO accounts_schema_migrations(version, checksum, applied_at) VALUES (?, ?, ?)")
-          .run(1n, SQLITE_MIGRATION_CHECKSUM, new Date().toISOString());
-      });
-      transaction.exclusive();
-    }
+          .query("INSERT INTO accounts_schema_migrations(version, checksum, applied_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+          .run(1n, SQLITE_MIGRATION_CHECKSUM);
+      }
+    });
+    transaction.exclusive();
+  }
+
+  private readOne<K extends EntityKind>(kind: K, id: EntityMap[K]["id"]): EntityMap[K] | undefined {
+    const row = this.database
+      .query(`SELECT payload_json FROM ${TABLES[kind]} WHERE id = ?`)
+      .get(id) as PayloadRow | null;
+    return row === null ? undefined : decodePayload(kind, row.payload_json);
   }
 
   private insertRecord<K extends EntityKind>(kind: K, record: EntityMap[K]): void {
@@ -254,9 +341,30 @@ export class SQLiteAccountsRepository implements AccountsRepository {
       }
       case "capacity_pool": {
         const item = record as EntityMap["capacity_pool"];
+        const lineage = this.database
+          .query("SELECT provider_key, owner_ref FROM provider_accounts WHERE id = ?")
+          .get(item.accountId) as { provider_key: string; owner_ref: string } | null;
+        if (lineage === null) throw new AccountsError("NOT_FOUND", "Capacity account was not found");
         this.database
-          .query("INSERT INTO capacity_pools(id, account_id, capacity_domain_ref, serialization_key, status, deny_state, revision, capacity_generation, deny_generation, created_at, updated_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-          .run(item.id, item.accountId, item.capacityDomainRef, item.serializationKey, item.status, item.denyState, BigInt(item.revision), BigInt(item.capacityGeneration), BigInt(item.denyGeneration), item.createdAt, item.updatedAt, payload);
+          .query("INSERT INTO capacity_pools(id, account_id, provider_key, capacity_domain_ref, serialization_key, status, deny_state, revision, capacity_generation, deny_generation, created_at, updated_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .run(item.id, item.accountId, lineage.provider_key, item.capacityDomainRef, item.serializationKey, item.status, item.denyState, BigInt(item.revision), BigInt(item.capacityGeneration), BigInt(item.denyGeneration), item.createdAt, item.updatedAt, payload);
+        this.database
+          .query("INSERT OR IGNORE INTO capacity_domain_claims(provider_key, capacity_domain_ref, serialization_key, owner_ref, capacity_pool_id, claimed_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .run(lineage.provider_key, item.capacityDomainRef, item.serializationKey, lineage.owner_ref, item.id, item.createdAt);
+        const claim = this.database
+          .query("SELECT serialization_key, owner_ref, capacity_pool_id FROM capacity_domain_claims WHERE provider_key = ? AND capacity_domain_ref = ?")
+          .get(lineage.provider_key, item.capacityDomainRef) as {
+            serialization_key: string;
+            owner_ref: string;
+            capacity_pool_id: string;
+          };
+        if (
+          claim.serialization_key !== item.serializationKey ||
+          claim.owner_ref !== lineage.owner_ref ||
+          claim.capacity_pool_id !== item.id
+        ) {
+          throw new AccountsError("CAPACITY_DOMAIN_CONFLICT", "Capacity domain lineage is permanently claimed");
+        }
         return;
       }
       case "access_method": {
@@ -278,6 +386,29 @@ export class SQLiteAccountsRepository implements AccountsRepository {
         this.database
           .query("INSERT INTO credential_bindings(id, access_method_id, capacity_pool_id, auth_capsule_id, credential_family_id, resolver, purpose, status, credential_generation, auth_state_revision, revision, created_at, updated_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
           .run(item.id, item.accessMethodId, item.capacityPoolId, item.authCapsuleId ?? null, item.credentialFamilyId, item.resolver, item.purpose, item.status, BigInt(item.credentialGeneration), item.authStateRevision === undefined ? null : BigInt(item.authStateRevision), BigInt(item.revision), item.createdAt, item.updatedAt, payload);
+        const ownerRow = this.database
+          .query("SELECT pa.owner_ref FROM capacity_pools cp JOIN provider_accounts pa ON pa.id = cp.account_id WHERE cp.id = ?")
+          .get(item.capacityPoolId) as { owner_ref: string } | null;
+        if (ownerRow === null) throw new AccountsError("NOT_FOUND", "Credential capacity owner was not found");
+        this.database
+          .query("INSERT OR IGNORE INTO credential_family_claims(credential_family_id, capacity_pool_id, owner_ref, purpose, resolver, claimed_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .run(item.credentialFamilyId, item.capacityPoolId, ownerRow.owner_ref, item.purpose, item.resolver, item.createdAt);
+        const familyClaim = this.database
+          .query("SELECT capacity_pool_id, owner_ref, purpose, resolver FROM credential_family_claims WHERE credential_family_id = ?")
+          .get(item.credentialFamilyId) as {
+            capacity_pool_id: string;
+            owner_ref: string;
+            purpose: string;
+            resolver: string;
+          };
+        if (
+          familyClaim.capacity_pool_id !== item.capacityPoolId ||
+          familyClaim.owner_ref !== ownerRow.owner_ref ||
+          familyClaim.purpose !== item.purpose ||
+          familyClaim.resolver !== item.resolver
+        ) {
+          throw new AccountsError("CAPACITY_DOMAIN_CONFLICT", "Credential family lineage is permanently claimed");
+        }
       }
     }
   }
@@ -291,6 +422,20 @@ export class SQLiteAccountsRepository implements AccountsRepository {
         changes = this.database
           .query("UPDATE provider_accounts SET provider_key=?, owner_ref=?, provider_subject_ref=?, status=?, revision=?, updated_at=?, payload_json=? WHERE id=? AND revision=?")
           .run(item.providerKey, item.ownerRef, item.providerSubjectRef ?? null, item.status, BigInt(item.revision), item.updatedAt, payload, item.id, BigInt(expected)).changes;
+        if (changes === 1 && item.status !== "pending" && item.providerSubjectRef !== undefined) {
+          this.database
+            .query("INSERT OR IGNORE INTO provider_subject_claims(provider_key, provider_subject_ref, owner_ref, provider_account_id, claimed_at) VALUES (?, ?, ?, ?, ?)")
+            .run(item.providerKey, item.providerSubjectRef, item.ownerRef, item.id, item.updatedAt);
+          const claim = this.database
+            .query("SELECT owner_ref, provider_account_id FROM provider_subject_claims WHERE provider_key = ? AND provider_subject_ref = ?")
+            .get(item.providerKey, item.providerSubjectRef) as {
+              owner_ref: string;
+              provider_account_id: string;
+            };
+          if (claim.owner_ref !== item.ownerRef || claim.provider_account_id !== item.id) {
+            throw new AccountsError("CONFLICT", "Provider subject is permanently claimed");
+          }
+        }
         break;
       }
       case "entitlement": {
@@ -377,7 +522,6 @@ export class SQLiteAccountsRepository implements AccountsRepository {
     for (const path of [this.filename, `${this.filename}-wal`, `${this.filename}-shm`]) {
       if (existsSync(path)) chmodSync(path, 0o600);
     }
-    chmodSync(dirname(this.filename), 0o700);
   }
 
   private assertOpen(): void {
@@ -407,32 +551,72 @@ function prepareDatabasePath(input: string): void {
   }
   const filename = resolve(input);
   const parent = dirname(filename);
-  if (!existsSync(parent)) mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const root = parse(filename).root;
-  const relative = filename.slice(root.length).split("/").filter(Boolean);
-  let current = root;
-  for (const component of relative) {
-    current = join(current, component);
-    if (!existsSync(current)) continue;
-    const status = lstatSync(current);
-    if (status.isSymbolicLink()) {
-      throw new AccountsError("DATABASE_PATH_UNSAFE", "SQLite path contains a symbolic link", {
-        details: { adapter: "sqlite" },
-      });
+  const uid = process.getuid?.();
+  if (uid === undefined) {
+    throw new AccountsError("DATABASE_PATH_UNSAFE", "Cannot verify SQLite path ownership");
+  }
+  const missing: string[] = [];
+  let existing = parent;
+  while (!existsSync(existing)) {
+    missing.unshift(existing);
+    const next = dirname(existing);
+    if (next === existing) break;
+    existing = next;
+  }
+  validateExistingPath(existing, uid);
+  for (const directory of missing) {
+    mkdirSync(directory, { mode: 0o700 });
+    const status = lstatSync(directory);
+    if (!status.isDirectory() || status.uid !== uid || (status.mode & 0o077) !== 0) {
+      throw new AccountsError("DATABASE_PATH_UNSAFE", "Created SQLite directory is unsafe");
     }
   }
-  const parentStatus = statSync(realpathSync(parent));
-  if (parentStatus.uid !== process.getuid?.() || (parentStatus.mode & 0o077) !== 0) {
+  const parentStatus = lstatSync(parent);
+  if (!parentStatus.isDirectory() || parentStatus.uid !== uid || (parentStatus.mode & 0o077) !== 0) {
     throw new AccountsError("DATABASE_PATH_UNSAFE", "SQLite parent directory is not owner-only", {
       details: { adapter: "sqlite" },
     });
   }
   if (existsSync(filename)) {
-    const fileStatus = statSync(filename);
-    if (fileStatus.uid !== process.getuid?.() || (fileStatus.mode & 0o077) !== 0) {
+    const fileStatus = lstatSync(filename);
+    if (
+      fileStatus.isSymbolicLink() ||
+      !fileStatus.isFile() ||
+      fileStatus.uid !== uid ||
+      (fileStatus.mode & 0o077) !== 0
+    ) {
       throw new AccountsError("DATABASE_PATH_UNSAFE", "SQLite database is not owner-only", {
         details: { adapter: "sqlite" },
       });
+    }
+  } else {
+    const descriptor = openSync(
+      filename,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    closeSync(descriptor);
+  }
+}
+
+function validateExistingPath(path: string, uid: number): void {
+  const absolute = resolve(path);
+  const root = parse(absolute).root;
+  const components = absolute.slice(root.length).split("/").filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = join(current, component);
+    const status = lstatSync(current);
+    if (status.isSymbolicLink() || !status.isDirectory()) {
+      throw new AccountsError("DATABASE_PATH_UNSAFE", "SQLite path contains an unsafe component");
+    }
+    const writableByOthers = (status.mode & 0o022) !== 0;
+    const rootStickyDirectory = status.uid === 0 && (status.mode & 0o1000) !== 0;
+    if (status.uid !== uid && status.uid !== 0) {
+      throw new AccountsError("DATABASE_PATH_UNSAFE", "SQLite path component has an unexpected owner");
+    }
+    if (status.uid !== uid && writableByOthers && !rootStickyDirectory) {
+      throw new AccountsError("DATABASE_PATH_UNSAFE", "SQLite path component is writable by another user");
     }
   }
 }

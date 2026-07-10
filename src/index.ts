@@ -2,6 +2,7 @@ import type { AccountsCatalog as AccountsCatalogType } from "./domain/catalog";
 import { AccountsCatalog } from "./domain/catalog";
 import { InMemoryAccountsRepository } from "./storage/memory";
 import { SQLiteAccountsRepository } from "./storage/sqlite";
+import { validateSlotEligibility as validateSlotEligibilityForFacade } from "./serialization/dto";
 
 export {
   ACCOUNT_ERROR_CODES,
@@ -31,7 +32,6 @@ export {
   newAccountId,
   newAccountLaneId,
   newAuthCapsuleId,
-  newCanonicalNodeId,
   newCapacityPoolId,
   newCredentialBindingId,
   newEligibilityEvidenceId,
@@ -79,6 +79,7 @@ export type {
   CapacityPool,
   CapacityPoolStatus,
   CredentialBinding,
+  CredentialBindingMetadata,
   CredentialBindingStatus,
   CredentialPurpose,
   CredentialResolver,
@@ -115,9 +116,9 @@ export {
   validateSlotEligibility,
 } from "./serialization/dto";
 export type { RecordEnvelope } from "./serialization/dto";
-export { canonicalJson, parseClosedJson } from "./serialization/json";
+export { canonicalJson, parseClosedJson, parseClosedJsonBytes } from "./serialization/json";
 export { POSTGRES_ADAPTER_STATUS } from "./storage/repository";
-export { PACKAGE_VERSION } from "./version";
+export { ACCOUNTS_V1_CONTRACT_SHA256, PACKAGE_VERSION } from "./version";
 
 export interface CatalogFactoryOptions {
   readonly clock?: () => Date;
@@ -129,13 +130,37 @@ export interface SQLiteCatalogFactoryOptions extends CatalogFactoryOptions {
 
 export type AccountsCapacity = Pick<
   AccountsCatalogType,
-  "get" | "list" | "add" | "transition" | "eligibility" | "checkCurrent" | "doctor" | "close"
+  "get" | "list" | "eligibility" | "checkCurrent" | "doctor" | "close"
 >;
 
 export function createInMemoryAccounts(options: CatalogFactoryOptions = {}): AccountsCapacity {
-  return new AccountsCatalog(new InMemoryAccountsRepository(), options.clock);
+  return readonlyFacade(new AccountsCatalog(new InMemoryAccountsRepository(), options.clock));
 }
 
 export function createSQLiteAccounts(options: SQLiteCatalogFactoryOptions): AccountsCapacity {
-  return new AccountsCatalog(new SQLiteAccountsRepository(options.path), options.clock);
+  return readonlyFacade(new AccountsCatalog(new SQLiteAccountsRepository(options.path), options.clock));
+}
+
+function readonlyFacade(catalog: AccountsCatalogType): AccountsCapacity {
+  return Object.freeze({
+    get: catalog.get.bind(catalog),
+    list: catalog.list.bind(catalog),
+    eligibility: async (...arguments_: Parameters<AccountsCatalogType["eligibility"]>) =>
+      disablePositiveEligibility(await catalog.eligibility(...arguments_)),
+    checkCurrent: async (...arguments_: Parameters<AccountsCatalogType["checkCurrent"]>) =>
+      disablePositiveEligibility(await catalog.checkCurrent(...arguments_)),
+    doctor: catalog.doctor.bind(catalog),
+    close: catalog.close.bind(catalog),
+  });
+}
+
+function disablePositiveEligibility(
+  result: Awaited<ReturnType<AccountsCatalogType["eligibility"]>>,
+) {
+  if (!result.eligible) return result;
+  return validateSlotEligibilityForFacade({
+    ...result,
+    eligible: false,
+    reasonCodes: ["DEPENDENCY_UNAVAILABLE"],
+  });
 }

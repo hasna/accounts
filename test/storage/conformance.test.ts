@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   AccountsError,
   MAX_COUNTER,
+  createSQLiteAccounts,
   parseCounter,
   type Account,
 } from "../../src/index";
@@ -163,18 +164,175 @@ for (const [adapterName, factory] of adapters) {
       const first = makeFixtureGraph("native_session", 31).account;
       const secondSource = makeFixtureGraph("native_session", 32).account;
       const second = { ...secondSource, providerSubjectRef: first.providerSubjectRef! };
+      await catalog.add("account", first, mutationContext(`${adapterName}:race:first:add`));
+      await catalog.add("account", second, mutationContext(`${adapterName}:race:second:add`));
       const outcomes = await Promise.allSettled([
-        catalog.add("account", first, mutationContext(`${adapterName}:race:first`)),
-        catalog.add("account", second, mutationContext(`${adapterName}:race:second`)),
+        catalog.transition(
+          "account",
+          first.id,
+          "active",
+          C0,
+          mutationContext(`${adapterName}:race:first:active`),
+        ),
+        catalog.transition(
+          "account",
+          second.id,
+          "active",
+          C0,
+          mutationContext(`${adapterName}:race:second:active`),
+        ),
       ]);
       expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
       expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+      await catalog.close();
+    });
+
+    test("keeps credential-family purpose lineage immutable across generations", async () => {
+      const { repository, catalog } = factory();
+      const graph = makeFixtureGraph("api_key", 41);
+      await seedActiveCatalog(catalog, graph, `${adapterName}:family`);
+      const conflicting = {
+        ...graph.binding,
+        id: makeFixtureGraph("workload_identity", 42).binding.id,
+        purpose: "workload_identity" as const,
+        resolver: "workload_identity" as const,
+        credentialGeneration: parseCounter("1"),
+        revision: C0,
+        status: "pending" as const,
+      };
+      await expect(
+        repository.insert(
+          "credential_binding",
+          conflicting,
+          mutationContext(`${adapterName}:family:conflict`),
+        ),
+      ).rejects.toMatchObject({ code: "CAPACITY_DOMAIN_CONFLICT" });
+      await catalog.close();
+    });
+
+    test("preserves provider-subject ownership after terminal revocation", async () => {
+      const { repository } = factory();
+      const firstPending = makeFixtureGraph("native_session", 51).account;
+      await repository.insert(
+        "account",
+        firstPending,
+        mutationContext(`${adapterName}:subject:first:add`),
+      );
+      const firstActive = transitionEntity("account", firstPending, "active", NOW.toISOString());
+      await repository.replace(
+        "account",
+        firstActive,
+        firstPending.revision,
+        mutationContext(`${adapterName}:subject:first:active`),
+      );
+      const firstRevoked = transitionEntity(
+        "account",
+        firstActive,
+        "revoked",
+        new Date(NOW.getTime() + 1).toISOString(),
+      );
+      await repository.replace(
+        "account",
+        firstRevoked,
+        firstActive.revision,
+        mutationContext(`${adapterName}:subject:first:revoked`),
+      );
+      const secondSource = makeFixtureGraph("native_session", 52).account;
+      const secondPending: Account = {
+        ...secondSource,
+        ownerRef: "principal:human:hasna:owner-b",
+        providerKey: firstPending.providerKey,
+        providerSubjectRef: firstPending.providerSubjectRef!,
+      };
+      await repository.insert(
+        "account",
+        secondPending,
+        mutationContext(`${adapterName}:subject:second:add`),
+      );
+      const secondActive = transitionEntity(
+        "account",
+        secondPending,
+        "active",
+        new Date(NOW.getTime() + 2).toISOString(),
+      );
+      await expect(
+        repository.replace(
+          "account",
+          secondActive,
+          secondPending.revision,
+          mutationContext(`${adapterName}:subject:second:active`),
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      await repository.close();
+    });
+
+    test("replays an earlier transition after subsequent state changes", async () => {
+      const { catalog } = factory();
+      const graph = makeFixtureGraph("api_key", 61);
+      await seedActiveCatalog(catalog, graph, `${adapterName}:replay-parents`);
+      const draft = {
+        ...makeFixtureGraph("api_key", 62).method,
+        entitlementId: graph.entitlement.id,
+        capacityPoolId: graph.pool.id,
+      };
+      await catalog.add(
+        "access_method",
+        draft,
+        mutationContext(`${adapterName}:replay:add`),
+      );
+      const firstContext = mutationContext(`${adapterName}:replay:disable`);
+      const first = await catalog.transition(
+        "access_method",
+        draft.id,
+        "disabled",
+        C0,
+        firstContext,
+      );
+      await catalog.transition(
+        "access_method",
+        draft.id,
+        "draft",
+        first.record.revision,
+        mutationContext(`${adapterName}:replay:draft`),
+      );
+      const replay = await catalog.transition(
+        "access_method",
+        draft.id,
+        "disabled",
+        C0,
+        firstContext,
+      );
+      expect(replay.replayed).toBe(true);
+      expect(replay.record.revision).toBe(first.record.revision);
       await catalog.close();
     });
   });
 }
 
 describe("SQLite migration and filesystem hardening", () => {
+  test("public local evaluation stays denied without a recovery frontier", async () => {
+    const directory = mkdtempSync(join(TEMP_ROOT, "public-deny-"));
+    cleanup.push(directory);
+    const filename = join(directory, "accounts.db");
+    const repository = new SQLiteAccountsRepository(filename);
+    const internalCatalog = new AccountsCatalog(repository, clock);
+    const graph = makeFixtureGraph();
+    await seedActiveCatalog(internalCatalog, graph, "public-deny");
+    await internalCatalog.close();
+
+    const publicCapacity = createSQLiteAccounts({ path: filename, clock });
+    const result = await publicCapacity.eligibility({
+      accessMethodId: graph.method.id,
+      operation: "responses.create",
+      model: "model.example",
+      dataClassification: "internal",
+      destinationPolicyClass: "default",
+    });
+    expect(result.eligible).toBe(false);
+    expect(result.reasonCodes).toEqual(["DEPENDENCY_UNAVAILABLE"]);
+    await publicCapacity.close();
+  });
+
   test("creates owner-only database files and WAL mode", async () => {
     const directory = mkdtempSync(join(TEMP_ROOT, "permissions-"));
     cleanup.push(directory);

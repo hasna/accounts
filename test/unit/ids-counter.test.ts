@@ -57,5 +57,12 @@ describe("signed-64-bit decimal counters", () => {
   test("constructs counters from bigint only within range", () => {
     expect(String(counter(42n))).toBe("42");
     expect(() => counter(-1n)).toThrow(AccountsError);
+    expect(() => (counter as unknown as (value: unknown) => unknown)(1)).toThrow(AccountsError);
+    expect(() =>
+      (incrementCounter as unknown as (value: unknown) => unknown)(9007199254740992),
+    ).toThrow(AccountsError);
+    expect(() =>
+      (compareCounters as unknown as (left: unknown, right: unknown) => unknown)("01", "1"),
+    ).toThrow(AccountsError);
   });
 });

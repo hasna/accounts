@@ -22,7 +22,7 @@ export function parseCounter(value: unknown, field = "counter"): Counter {
 }
 
 export function counter(value: bigint): Counter {
-  if (value < 0n || value > MAX_COUNTER) {
+  if (typeof value !== "bigint" || value < 0n || value > MAX_COUNTER) {
     throw new AccountsError("VALIDATION_FAILED", "Counter is outside signed 64-bit range", {
       details: { field: "counter" },
     });
@@ -31,7 +31,7 @@ export function counter(value: bigint): Counter {
 }
 
 export function incrementCounter(value: Counter): Counter {
-  const next = BigInt(value) + 1n;
+  const next = BigInt(parseCounter(value)) + 1n;
   if (next > MAX_COUNTER) {
     throw new AccountsError("COUNTER_EXHAUSTED", "Counter cannot advance safely");
   }
@@ -39,7 +39,7 @@ export function incrementCounter(value: Counter): Counter {
 }
 
 export function compareCounters(left: Counter, right: Counter): -1 | 0 | 1 {
-  const leftValue = BigInt(left);
-  const rightValue = BigInt(right);
+  const leftValue = BigInt(parseCounter(left));
+  const rightValue = BigInt(parseCounter(right));
   return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
 }

@@ -107,8 +107,6 @@ export const newAccessMethodId = (nowMs?: number): AccessMethodId =>
 export const newAccountLaneId = newAccessMethodId;
 export const newAuthCapsuleId = (nowMs?: number): AuthCapsuleId =>
   newId<"AuthCapsuleId">("auth_capsule", nowMs);
-export const newCanonicalNodeId = (nowMs?: number): CanonicalNodeId =>
-  newId<"CanonicalNodeId">("canonical_node", nowMs);
 export const newCredentialBindingId = (nowMs?: number): CredentialBindingId =>
   newId<"CredentialBindingId">("credential_binding", nowMs);
 export const newEligibilityEvidenceId = (nowMs?: number): EligibilityEvidenceId =>

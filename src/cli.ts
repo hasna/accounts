@@ -15,7 +15,7 @@ import {
   parseAccountId,
   parseAuthCapsuleId,
   parseCapacityPoolId,
-  parseClosedJson,
+  parseClosedJsonBytes,
   parseCredentialBindingId,
   parseEntitlementId,
   PACKAGE_VERSION,
@@ -154,8 +154,11 @@ async function validateCommand(
   jsonRequested: boolean,
 ): Promise<number> {
   requirePositionals(positionals, 1, "validate");
-  const source = positionals[0] === "-" ? await Bun.stdin.text() : await Bun.file(resolve(positionals[0]!)).text();
-  const parsed = parseClosedJson(source);
+  const bytes =
+    positionals[0] === "-"
+      ? new Uint8Array(await Bun.stdin.arrayBuffer())
+      : new Uint8Array(await Bun.file(resolve(positionals[0]!)).arrayBuffer());
+  const parsed = parseClosedJsonBytes(bytes);
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw usageError("Expected a DTO object");
   const schemaVersion = (parsed as Record<string, unknown>).schemaVersion;
   let documentKind: string;
