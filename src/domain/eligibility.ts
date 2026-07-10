@@ -12,6 +12,7 @@ import type {
   Entitlement,
   SlotEligibilityMetadata,
 } from "./models";
+import type { RecoverySnapshot } from "../storage/repository";
 import { canonicalJson, canonicalSha256 } from "../serialization/json";
 import { validateSlotEligibility } from "../serialization/dto";
 
@@ -24,11 +25,12 @@ export async function evaluateSlotEligibility(
 ): Promise<SlotEligibilityMetadata> {
   const now = clock();
   const requestDigest = canonicalSha256({
-    accessMethodId: request.accessMethodId,
-    operation: request.operation,
+    schema_version: "accounts.eligibility-request.v1",
+    account_lane_id: request.accessMethodId,
+    data_classification: request.dataClassification,
+    destination_policy_class: request.destinationPolicyClass,
     model: request.model,
-    dataClassification: request.dataClassification,
-    destinationPolicyClass: request.destinationPolicyClass,
+    operation: request.operation,
   });
 
   let method: AccessMethod | undefined;
@@ -37,8 +39,10 @@ export async function evaluateSlotEligibility(
   let pool: CapacityPool | undefined;
   let capsule: AuthCapsule | undefined;
   let binding: CredentialBinding | undefined;
+  let recovery: RecoverySnapshot | undefined;
   try {
     const snapshot = await repository.readEligibilitySnapshot(request.accessMethodId);
+    recovery = snapshot.recovery;
     method = snapshot.method;
     if (method === undefined) {
       throw new AccountsError("NOT_FOUND", "Access method was not found", {
@@ -77,30 +81,39 @@ export async function evaluateSlotEligibility(
       pool,
       capsule,
       binding,
+      recovery,
       reasons: ["CURRENT_DENY"],
     });
   }
 
   const reasons: EligibilityReasonCode[] = [];
+  if (recovery?.matched !== true || recovery.hold || recovery.frontier === undefined) {
+    reasons.push("RECOVERY_HOLD");
+  }
   if (account?.status !== "active") reasons.push("ACCOUNT_NOT_ACTIVE");
   if (entitlement?.status !== "active") reasons.push("ENTITLEMENT_NOT_ACTIVE");
   if (entitlement !== undefined) {
-    if (entitlement.termsDecision.decision !== "allowed") reasons.push("TERMS_NOT_ALLOWED");
+    const terms = entitlement.termsDecision;
+    if (terms?.decision !== "allowed") reasons.push("TERMS_NOT_ALLOWED");
     if (
-      Date.parse(entitlement.termsDecision.expiresAt) <= now.getTime() ||
+      terms?.decision !== "allowed" ||
+      Date.parse(terms.expiresAt) <= now.getTime() ||
+      entitlement.capabilityExpiresAt === undefined ||
       Date.parse(entitlement.capabilityExpiresAt) <= now.getTime() ||
+      entitlement.executionPolicyDecisionExpiresAt === undefined ||
       Date.parse(entitlement.executionPolicyDecisionExpiresAt) <= now.getTime() ||
+      entitlement.dataPolicyExpiresAt === undefined ||
       Date.parse(entitlement.dataPolicyExpiresAt) <= now.getTime()
     ) {
       reasons.push("TERMS_STALE");
     }
-    if (!entitlement.capabilitySet.operations.includes(request.operation)) reasons.push("OPERATION_NOT_ALLOWED");
-    if (!entitlement.capabilitySet.models.includes(request.model)) reasons.push("MODEL_NOT_ALLOWED");
-    if (!entitlement.dataPolicy.allowedClassifications.includes(request.dataClassification)) {
+    if (!entitlement.capabilitySet?.operations.includes(request.operation)) reasons.push("OPERATION_NOT_ALLOWED");
+    if (!entitlement.capabilitySet?.models.includes(request.model)) reasons.push("MODEL_NOT_ALLOWED");
+    if (!entitlement.dataPolicy?.allowedClassifications.includes(request.dataClassification)) {
       reasons.push("DATA_CLASSIFICATION_NOT_ALLOWED");
     }
   }
-  if (!method.allowedDestinationPolicyClasses.includes(request.destinationPolicyClass)) {
+  if (!method.allowedDestinationPolicyClasses?.includes(request.destinationPolicyClass)) {
     reasons.push("DESTINATION_POLICY_NOT_ALLOWED");
   }
   if (
@@ -111,7 +124,7 @@ export async function evaluateSlotEligibility(
     reasons.push("POLICY_DIGEST_MISMATCH");
   }
   if (pool?.status !== "active") reasons.push("CAPACITY_POOL_NOT_ACTIVE");
-  if (pool !== undefined && Date.parse(pool.evidenceExpiresAt) <= now.getTime()) {
+  if (pool !== undefined && Date.parse(pool.capacityEvidenceExpiresAt) <= now.getTime()) {
     reasons.push("CAPACITY_EVIDENCE_STALE");
   }
   if (method.status !== "ready") reasons.push("ACCESS_METHOD_NOT_READY");
@@ -120,6 +133,8 @@ export async function evaluateSlotEligibility(
     reasons.push("HEALTH_STALE");
   }
   if (
+    method.isolationEvidenceExpiresAt === undefined ||
+    method.executionPolicyExpiresAt === undefined ||
     Date.parse(method.isolationEvidenceExpiresAt) <= now.getTime() ||
     Date.parse(method.executionPolicyExpiresAt) <= now.getTime()
   ) {
@@ -156,11 +171,13 @@ export async function evaluateSlotEligibility(
   } else {
     if (binding.status === "retiring") reasons.push("CREDENTIAL_BINDING_RETIRING");
     else if (binding.status !== "active") reasons.push("CREDENTIAL_BINDING_NOT_ACTIVE");
-    if (binding.expiresAt !== undefined && Date.parse(binding.expiresAt) <= now.getTime()) {
-      reasons.push("CREDENTIAL_BINDING_EXPIRED");
-    }
-    if (Date.parse(binding.bindingEvidenceExpiresAt) <= now.getTime()) {
-      reasons.push("CREDENTIAL_BINDING_EXPIRED");
+    if (binding.status !== "revoked") {
+      if (binding.expiresAt !== undefined && Date.parse(binding.expiresAt) <= now.getTime()) {
+        reasons.push("CREDENTIAL_BINDING_EXPIRED");
+      }
+      if (Date.parse(binding.bindingEvidenceExpiresAt) <= now.getTime()) {
+        reasons.push("CREDENTIAL_BINDING_EXPIRED");
+      }
     }
     const expectedResolver =
       method.accessTransport === "native_session"
@@ -194,6 +211,7 @@ export async function evaluateSlotEligibility(
     pool,
     capsule,
     binding,
+    recovery,
     reasons: uniqueReasons(reasons),
   });
 }
@@ -221,6 +239,9 @@ export async function checkCurrentEligibility(
     previous.denyState === fresh.denyState &&
     previous.credentialFamilyId === fresh.credentialFamilyId &&
     previous.credentialGeneration === fresh.credentialGeneration &&
+    previous.catalogIncarnation === fresh.catalogIncarnation &&
+    previous.recoveryFrontierSequence === fresh.recoveryFrontierSequence &&
+    previous.recoveryFrontierHash === fresh.recoveryFrontierHash &&
     canonicalJson(previous.accessTarget) === canonicalJson(fresh.accessTarget) &&
     canonicalJson(previous.recordRevisionSet) === canonicalJson(fresh.recordRevisionSet);
   if (unchanged) return fresh;
@@ -250,9 +271,22 @@ function buildResult(input: {
   pool: CapacityPool | undefined;
   capsule: AuthCapsule | undefined;
   binding: CredentialBinding | undefined;
+  recovery: RecoverySnapshot | undefined;
   reasons: readonly EligibilityReasonCode[];
 }): SlotEligibilityMetadata {
-  const { request, requestDigest, now, method, entitlement, account, pool, capsule, binding, reasons } = input;
+  const {
+    request,
+    requestDigest,
+    now,
+    method,
+    entitlement,
+    account,
+    pool,
+    capsule,
+    binding,
+    recovery,
+    reasons,
+  } = input;
   const accessTarget =
     method.accessTransport === "native_session" && capsule !== undefined
       ? {
@@ -286,17 +320,21 @@ function buildResult(input: {
       Math.min(
         now.getTime() + 30_000,
         ...[
-          entitlement?.termsDecision.expiresAt,
+          entitlement?.termsDecision?.decision === "allowed"
+            ? entitlement.termsDecision.expiresAt
+            : undefined,
           entitlement?.capabilityExpiresAt,
           entitlement?.executionPolicyDecisionExpiresAt,
           entitlement?.dataPolicyExpiresAt,
-          pool?.evidenceExpiresAt,
+          pool?.capacityEvidenceExpiresAt,
           method.health?.expiresAt,
           method.isolationEvidenceExpiresAt,
           method.executionPolicyExpiresAt,
           capsule?.attestation?.expiresAt,
-          binding?.expiresAt,
-          binding?.bindingEvidenceExpiresAt,
+          binding !== undefined && binding.status !== "revoked" ? binding.expiresAt : undefined,
+          binding !== undefined && binding.status !== "revoked"
+            ? binding.bindingEvidenceExpiresAt
+            : undefined,
         ]
           .filter((value): value is string => value !== undefined)
           .map(Date.parse)
@@ -330,6 +368,13 @@ function buildResult(input: {
       : {
           credentialFamilyId: binding.credentialFamilyId,
           credentialGeneration: binding.credentialGeneration,
+        }),
+    ...(recovery?.frontier === undefined
+      ? {}
+      : {
+          catalogIncarnation: recovery.frontier.catalogIncarnation,
+          recoveryFrontierSequence: recovery.frontier.sequence,
+          recoveryFrontierHash: recovery.frontier.hash,
         }),
     recordRevisionSet,
     eligibilityRequestDigest: requestDigest,
@@ -365,5 +410,5 @@ function ineligibleBase(
 }
 
 function uniqueReasons(reasons: readonly EligibilityReasonCode[]): readonly EligibilityReasonCode[] {
-  return [...new Set(reasons)];
+  return [...new Set(reasons)].sort();
 }

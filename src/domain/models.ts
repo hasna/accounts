@@ -6,6 +6,7 @@ import type {
   CanonicalNodeId,
   CapacityPoolId,
   CredentialBindingId,
+  CredentialOperationId,
   EligibilityEvidenceId,
   EntitlementId,
 } from "./ids";
@@ -26,6 +27,14 @@ export interface Account extends RecordBase<AccountId> {
   readonly ownerRef: string;
   readonly displayLabel: string;
   readonly providerSubjectRef?: string;
+  readonly providerSubjectCandidateRef?: string;
+  readonly ownershipEvidenceRef?: string;
+  readonly ownershipEvidenceIssuerRef?: string;
+  readonly ownershipEvidenceVersion?: string;
+  readonly ownershipEvidenceDigest?: string;
+  readonly ownershipEvidenceIssuedAt?: string;
+  readonly ownershipEvidenceExpiresAt?: string;
+  readonly ownershipGeneration?: Counter;
   readonly providerDisplayHint?: string;
   readonly status: AccountStatus;
 }
@@ -42,7 +51,7 @@ export type FundingKind =
 export type EntitlementStatus = "pending" | "active" | "paused" | "expired" | "revoked";
 
 export interface TermsDecision {
-  readonly decision: "allowed" | "denied" | "unknown";
+  readonly decision: "allowed" | "denied";
   readonly useCase: string;
   readonly evidenceRef: string;
   readonly verifiedBy: string;
@@ -50,6 +59,12 @@ export interface TermsDecision {
   readonly expiresAt: string;
   readonly termsVersion: string;
   readonly termsDigest: string;
+}
+
+export interface UnknownTermsDecision {
+  readonly decision: "unknown";
+  readonly useCase: string;
+  readonly reasonCode: string;
 }
 
 export interface DataPolicy {
@@ -67,19 +82,19 @@ export interface Entitlement extends RecordBase<EntitlementId> {
   readonly accountId: AccountId;
   readonly fundingKind: FundingKind;
   readonly status: EntitlementStatus;
-  readonly capabilitySet: CapabilitySet;
-  readonly capabilityEvidenceRef: string;
-  readonly capabilityDigest: string;
-  readonly capabilityExpiresAt: string;
-  readonly executionPolicyDecisionRef: string;
-  readonly executionPolicyDecisionDigest: string;
-  readonly executionPolicyDecisionExpiresAt: string;
-  readonly termsDecision: TermsDecision;
-  readonly dataPolicy: DataPolicy;
-  readonly dataPolicyEvidenceRef: string;
-  readonly dataPolicyDigest: string;
-  readonly dataPolicyExpiresAt: string;
-  readonly lastVerifiedAt: string;
+  readonly capabilitySet?: CapabilitySet;
+  readonly capabilityEvidenceRef?: string;
+  readonly capabilityDigest?: string;
+  readonly capabilityExpiresAt?: string;
+  readonly executionPolicyDecisionRef?: string;
+  readonly executionPolicyDecisionDigest?: string;
+  readonly executionPolicyDecisionExpiresAt?: string;
+  readonly termsDecision?: TermsDecision | UnknownTermsDecision;
+  readonly dataPolicy?: DataPolicy;
+  readonly dataPolicyEvidenceRef?: string;
+  readonly dataPolicyDigest?: string;
+  readonly dataPolicyExpiresAt?: string;
+  readonly lastVerifiedAt?: string;
 }
 
 export type CapacityPoolStatus = "pending" | "active" | "draining" | "denied" | "retired";
@@ -88,8 +103,14 @@ export type DenyState = "allowed" | "denied";
 export interface CapacityPool extends RecordBase<CapacityPoolId> {
   readonly accountId: AccountId;
   readonly capacityDomainRef: string;
-  readonly evidenceRef: string;
-  readonly evidenceExpiresAt: string;
+  readonly capacityEvidenceRef: string;
+  readonly capacityEvidenceIssuerRef: string;
+  readonly capacityEvidenceVersion: string;
+  readonly capacityEvidenceDigest: string;
+  readonly capacityEvidenceIssuedAt: string;
+  readonly capacityEvidenceExpiresAt: string;
+  readonly capacityEvidenceGeneration: Counter;
+  readonly capacityPolicyVersion: string;
   readonly serializationKey: string;
   readonly maxConcurrency: Counter;
   readonly status: CapacityPoolStatus;
@@ -116,15 +137,15 @@ export interface AccessMethod extends RecordBase<AccessMethodId> {
   readonly adapterVersion: string;
   readonly accessTransport: AccessTransport;
   readonly status: AccessMethodStatus;
-  readonly requiredIsolationPolicyRef: string;
-  readonly requiredIsolationPolicyDigest: string;
-  readonly isolationEvidenceExpiresAt: string;
-  readonly allowedDestinationPolicyClasses: readonly string[];
-  readonly parentPolicyDecisionRef: string;
-  readonly parentPolicyDecisionDigest: string;
-  readonly executionPolicyEvidenceRef: string;
-  readonly executionPolicyDigest: string;
-  readonly executionPolicyExpiresAt: string;
+  readonly requiredIsolationPolicyRef?: string;
+  readonly requiredIsolationPolicyDigest?: string;
+  readonly isolationEvidenceExpiresAt?: string;
+  readonly allowedDestinationPolicyClasses?: readonly string[];
+  readonly parentPolicyDecisionRef?: string;
+  readonly parentPolicyDecisionDigest?: string;
+  readonly executionPolicyEvidenceRef?: string;
+  readonly executionPolicyDigest?: string;
+  readonly executionPolicyExpiresAt?: string;
   readonly health?: HealthObservation;
 }
 
@@ -173,7 +194,7 @@ export type CredentialResolver =
   | "capsule_local_native";
 export type CredentialPurpose = "provider_session" | "api_key" | "workload_identity";
 
-export interface CredentialBinding extends RecordBase<CredentialBindingId> {
+export interface CredentialBindingBase extends RecordBase<CredentialBindingId> {
   readonly accessMethodId: AccessMethodId;
   readonly capacityPoolId: CapacityPoolId;
   readonly authCapsuleId?: AuthCapsuleId;
@@ -183,17 +204,80 @@ export interface CredentialBinding extends RecordBase<CredentialBindingId> {
   readonly credentialGeneration: Counter;
   readonly authStateRevision?: Counter;
   readonly refreshMode?: "broker_serialized";
-  readonly status: CredentialBindingStatus;
   readonly policyDigest: string;
+  readonly rotatedAt?: string;
+}
+
+export interface CredentialBindingEvidence {
   readonly bindingEvidenceRef: string;
   readonly bindingEvidenceIssuerRef: string;
   readonly bindingEvidenceDigest: string;
   readonly bindingEvidenceExpiresAt: string;
-  readonly rotatedAt?: string;
   readonly expiresAt?: string;
 }
 
+export interface NonterminalCredentialBinding
+  extends CredentialBindingBase,
+    CredentialBindingEvidence {
+  readonly status: "pending" | "active" | "retiring";
+}
+
+export interface RetiredHandleCredentialBinding
+  extends CredentialBindingBase,
+    CredentialBindingEvidence {
+  readonly status: "revoked";
+  readonly terminalKind: "retired_handle_generation";
+  readonly credentialHandleAuditDigest: string;
+  readonly revocationBarrierReceiptDigest: string;
+  readonly revokedAt: string;
+}
+
+export interface RevocationBarrierCredentialBinding extends CredentialBindingBase {
+  readonly status: "revoked";
+  readonly terminalKind: "revocation_barrier";
+  readonly lastUsableCredentialGeneration: Counter;
+  readonly revocationBarrierReceiptDigest: string;
+  readonly revokedAt: string;
+}
+
+export type CredentialBinding =
+  | NonterminalCredentialBinding
+  | RetiredHandleCredentialBinding
+  | RevocationBarrierCredentialBinding;
+
 export type CredentialBindingMetadata = CredentialBinding;
+
+export type CredentialOperationKind =
+  | "refresh"
+  | "reauthentication"
+  | "rotation"
+  | "revocation";
+export type CredentialOperationState =
+  | "requested"
+  | "quiescing"
+  | "applying"
+  | "verifying"
+  | "completed"
+  | "failed_before_dispatch"
+  | "failed"
+  | "quarantined";
+
+export interface CredentialOperation extends RecordBase<CredentialOperationId> {
+  readonly kind: CredentialOperationKind;
+  readonly sourceBindingId?: CredentialBindingId;
+  readonly targetBindingId?: CredentialBindingId;
+  readonly credentialFamilyId: string;
+  readonly capacityPoolId: CapacityPoolId;
+  readonly serializationKey: string;
+  readonly expectedSourceGeneration: Counter;
+  readonly expectedAuthStateRevision?: Counter;
+  readonly proposedTargetGeneration: Counter;
+  readonly proposedAuthStateRevision?: Counter;
+  readonly state: CredentialOperationState;
+  readonly idempotencyRequestHash: string;
+  readonly barrierReceiptDigest?: string;
+  readonly completionReceiptDigest?: string;
+}
 
 export type EntityKind =
   | "account"
@@ -243,6 +327,7 @@ export const ELIGIBILITY_REASON_CODES = [
   "INVALID_ACCESS_TARGET",
   "GENERATION_MISMATCH",
   "DEPENDENCY_UNAVAILABLE",
+  "RECOVERY_HOLD",
 ] as const;
 
 export type EligibilityReasonCode = (typeof ELIGIBILITY_REASON_CODES)[number];
@@ -282,6 +367,9 @@ interface SlotEligibilityBase {
   readonly accessMethodId: AccessMethodId;
   readonly accessTarget: EligibilityAccessTarget;
   readonly eligibilityRequestDigest: string;
+  readonly catalogIncarnation?: string;
+  readonly recoveryFrontierSequence?: Counter;
+  readonly recoveryFrontierHash?: string;
   readonly issuedAt: string;
   readonly expiresAt: string;
 }
@@ -302,6 +390,9 @@ export interface EligibleSlotEligibility extends SlotEligibilityBase {
   readonly denyState: "allowed";
   readonly credentialFamilyId: string;
   readonly credentialGeneration: Counter;
+  readonly catalogIncarnation: string;
+  readonly recoveryFrontierSequence: Counter;
+  readonly recoveryFrontierHash: string;
   readonly recordRevisionSet: Readonly<
     Record<Exclude<EntityKind, "auth_capsule">, Counter> &
       Partial<Record<"auth_capsule", Counter>>

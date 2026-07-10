@@ -42,6 +42,7 @@ const ENTITY_KINDS = [
 const REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/;
 const KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const KEYED_DIGEST_PATTERN = /^hmac-sha256:[0-9a-f]{64}$/;
 const OWNER_PATTERN = /^principal:(?:human|service):hasna:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -114,6 +115,10 @@ function digest(value: unknown, field: string): string {
   return string(value, field, { pattern: DIGEST_PATTERN, max: 71 });
 }
 
+function keyedDigest(value: unknown, field: string): string {
+  return string(value, field, { pattern: KEYED_DIGEST_PATTERN, max: 76 });
+}
+
 function reference(value: unknown, field: string): string {
   return string(value, field, { pattern: REF_PATTERN });
 }
@@ -184,7 +189,18 @@ function validateAccount(input: unknown): Account {
   exactKeys(
     value,
     ["id", "providerKey", "ownerRef", "displayLabel", "status", "revision", "createdAt", "updatedAt"],
-    ["providerSubjectRef", "providerDisplayHint"],
+    [
+      "providerSubjectRef",
+      "providerSubjectCandidateRef",
+      "providerDisplayHint",
+      "ownershipEvidenceRef",
+      "ownershipEvidenceIssuerRef",
+      "ownershipEvidenceVersion",
+      "ownershipEvidenceDigest",
+      "ownershipEvidenceIssuedAt",
+      "ownershipEvidenceExpiresAt",
+      "ownershipGeneration",
+    ],
   );
   validateBase(value, "account");
   string(value.providerKey, "providerKey", { pattern: KEY_PATTERN });
@@ -192,8 +208,41 @@ function validateAccount(input: unknown): Account {
   string(value.displayLabel, "displayLabel", { max: 128 });
   const status = enumValue(value.status, ["pending", "active", "suspended", "revoked"], "status");
   if (value.providerSubjectRef !== undefined) reference(value.providerSubjectRef, "providerSubjectRef");
-  if ((status === "active" || status === "suspended") && value.providerSubjectRef === undefined) {
-    throw invalid("providerSubjectRef");
+  if (value.providerSubjectCandidateRef !== undefined) {
+    reference(value.providerSubjectCandidateRef, "providerSubjectCandidateRef");
+  }
+  const ownershipFields = [
+    "ownershipEvidenceRef",
+    "ownershipEvidenceIssuerRef",
+    "ownershipEvidenceVersion",
+    "ownershipEvidenceDigest",
+    "ownershipEvidenceIssuedAt",
+    "ownershipEvidenceExpiresAt",
+    "ownershipGeneration",
+  ] as const;
+  const ownershipCount = ownershipFields.filter((field) => value[field] !== undefined).length;
+  if (status === "pending") {
+    if (value.providerSubjectRef !== undefined || ownershipCount !== 0) throw invalid("ownershipEvidenceRef");
+  } else if (status === "active" || status === "suspended") {
+    if (value.providerSubjectRef === undefined || ownershipCount !== ownershipFields.length) {
+      throw invalid("ownershipEvidenceRef");
+    }
+  } else if (ownershipCount !== 0 && ownershipCount !== ownershipFields.length) {
+    throw invalid("ownershipEvidenceRef");
+  }
+  if (ownershipCount === ownershipFields.length) {
+    reference(value.ownershipEvidenceRef, "ownershipEvidenceRef");
+    reference(value.ownershipEvidenceIssuerRef, "ownershipEvidenceIssuerRef");
+    reference(value.ownershipEvidenceVersion, "ownershipEvidenceVersion");
+    digest(value.ownershipEvidenceDigest, "ownershipEvidenceDigest");
+    timestamp(value.ownershipEvidenceIssuedAt, "ownershipEvidenceIssuedAt");
+    timestamp(value.ownershipEvidenceExpiresAt, "ownershipEvidenceExpiresAt");
+    ordered(value.ownershipEvidenceIssuedAt, value.ownershipEvidenceExpiresAt, "ownershipEvidenceExpiresAt");
+    const generation = parseCounter(value.ownershipGeneration, "ownershipGeneration");
+    if (generation === "0") throw invalid("ownershipGeneration");
+    if (value.providerSubjectRef === undefined || value.providerSubjectCandidateRef !== undefined) {
+      throw invalid("providerSubjectRef");
+    }
   }
   if (value.providerDisplayHint !== undefined) {
     string(value.providerDisplayHint, "providerDisplayHint", { max: 128 });
@@ -203,6 +252,16 @@ function validateAccount(input: unknown): Account {
 
 function validateTermsDecision(input: unknown): void {
   const value = object(input, "termsDecision");
+  const decision = enumValue(value.decision, ["allowed", "denied", "unknown"], "termsDecision.decision");
+  if (decision === "unknown") {
+    exactKeys(value, ["decision", "useCase", "reasonCode"], [], "termsDecision");
+    reference(value.useCase, "termsDecision.useCase");
+    string(value.reasonCode, "termsDecision.reasonCode", {
+      pattern: /^[A-Z][A-Z0-9_]{0,63}$/,
+      max: 64,
+    });
+    return;
+  }
   exactKeys(value, [
     "decision",
     "useCase",
@@ -213,7 +272,6 @@ function validateTermsDecision(input: unknown): void {
     "termsVersion",
     "termsDigest",
   ], [], "termsDecision");
-  enumValue(value.decision, ["allowed", "denied", "unknown"], "termsDecision.decision");
   reference(value.useCase, "termsDecision.useCase");
   reference(value.evidenceRef, "termsDecision.evidenceRef");
   reference(value.verifiedBy, "termsDecision.verifiedBy");
@@ -248,11 +306,7 @@ function validateDataPolicy(input: unknown): void {
 function validateEntitlement(input: unknown): Entitlement {
   const value = object(input, "data");
   assertNoSensitiveFields(value);
-  exactKeys(value, [
-    "id",
-    "accountId",
-    "fundingKind",
-    "status",
+  const positiveFields = [
     "capabilitySet",
     "capabilityEvidenceRef",
     "capabilityDigest",
@@ -260,16 +314,21 @@ function validateEntitlement(input: unknown): Entitlement {
     "executionPolicyDecisionRef",
     "executionPolicyDecisionDigest",
     "executionPolicyDecisionExpiresAt",
-    "termsDecision",
     "dataPolicy",
     "dataPolicyEvidenceRef",
     "dataPolicyDigest",
     "dataPolicyExpiresAt",
     "lastVerifiedAt",
+  ] as const;
+  exactKeys(value, [
+    "id",
+    "accountId",
+    "fundingKind",
+    "status",
     "revision",
     "createdAt",
     "updatedAt",
-  ]);
+  ], ["termsDecision", ...positiveFields]);
   validateBase(value, "entitlement");
   parseAccountId(value.accountId);
   enumValue(
@@ -277,31 +336,39 @@ function validateEntitlement(input: unknown): Entitlement {
     ["subscription", "metered", "credit", "contract", "externally_managed"],
     "fundingKind",
   );
-  enumValue(value.status, ["pending", "active", "paused", "expired", "revoked"], "status");
-  const capabilitySet = object(value.capabilitySet, "capabilitySet");
-  exactKeys(capabilitySet, ["operations", "models"], [], "capabilitySet");
-  stringList(capabilitySet.operations, "capabilitySet.operations");
-  stringList(capabilitySet.models, "capabilitySet.models");
-  reference(value.capabilityEvidenceRef, "capabilityEvidenceRef");
-  digest(value.capabilityDigest, "capabilityDigest");
-  timestamp(value.capabilityExpiresAt, "capabilityExpiresAt");
-  reference(value.executionPolicyDecisionRef, "executionPolicyDecisionRef");
-  digest(value.executionPolicyDecisionDigest, "executionPolicyDecisionDigest");
-  timestamp(value.executionPolicyDecisionExpiresAt, "executionPolicyDecisionExpiresAt");
-  validateTermsDecision(value.termsDecision);
-  validateDataPolicy(value.dataPolicy);
-  reference(value.dataPolicyEvidenceRef, "dataPolicyEvidenceRef");
-  digest(value.dataPolicyDigest, "dataPolicyDigest");
-  timestamp(value.dataPolicyExpiresAt, "dataPolicyExpiresAt");
-  timestamp(value.lastVerifiedAt, "lastVerifiedAt");
-  ordered(value.lastVerifiedAt, value.dataPolicyExpiresAt, "dataPolicyExpiresAt");
-  ordered(value.lastVerifiedAt, value.capabilityExpiresAt, "capabilityExpiresAt");
-  ordered(value.lastVerifiedAt, value.executionPolicyDecisionExpiresAt, "executionPolicyDecisionExpiresAt");
-  if (
-    value.capabilityEvidenceRef !== value.executionPolicyDecisionRef ||
-    value.dataPolicyEvidenceRef !== value.executionPolicyDecisionRef
-  ) {
-    throw invalid("executionPolicyDecisionRef");
+  const status = enumValue(value.status, ["pending", "active", "paused", "expired", "revoked"], "status");
+  const positiveCount = positiveFields.filter((field) => value[field] !== undefined).length;
+  if (value.termsDecision !== undefined) validateTermsDecision(value.termsDecision);
+  const termsDecision = value.termsDecision as { decision?: unknown } | undefined;
+  if (status === "pending") {
+    if (positiveCount !== 0 || termsDecision?.decision === "allowed") throw invalid("capabilitySet");
+  } else if (status === "active") {
+    if (positiveCount !== positiveFields.length || termsDecision?.decision !== "allowed") {
+      throw invalid("capabilitySet");
+    }
+  } else if (positiveCount !== 0 && positiveCount !== positiveFields.length) {
+    throw invalid("capabilitySet");
+  }
+  if (positiveCount === positiveFields.length) {
+    const capabilitySet = object(value.capabilitySet, "capabilitySet");
+    exactKeys(capabilitySet, ["operations", "models"], [], "capabilitySet");
+    stringList(capabilitySet.operations, "capabilitySet.operations");
+    stringList(capabilitySet.models, "capabilitySet.models");
+    reference(value.capabilityEvidenceRef, "capabilityEvidenceRef");
+    digest(value.capabilityDigest, "capabilityDigest");
+    timestamp(value.capabilityExpiresAt, "capabilityExpiresAt");
+    reference(value.executionPolicyDecisionRef, "executionPolicyDecisionRef");
+    digest(value.executionPolicyDecisionDigest, "executionPolicyDecisionDigest");
+    timestamp(value.executionPolicyDecisionExpiresAt, "executionPolicyDecisionExpiresAt");
+    if (termsDecision === undefined) throw invalid("termsDecision");
+    validateDataPolicy(value.dataPolicy);
+    reference(value.dataPolicyEvidenceRef, "dataPolicyEvidenceRef");
+    digest(value.dataPolicyDigest, "dataPolicyDigest");
+    timestamp(value.dataPolicyExpiresAt, "dataPolicyExpiresAt");
+    timestamp(value.lastVerifiedAt, "lastVerifiedAt");
+    ordered(value.lastVerifiedAt, value.dataPolicyExpiresAt, "dataPolicyExpiresAt");
+    ordered(value.lastVerifiedAt, value.capabilityExpiresAt, "capabilityExpiresAt");
+    ordered(value.lastVerifiedAt, value.executionPolicyDecisionExpiresAt, "executionPolicyDecisionExpiresAt");
   }
   return value as unknown as Entitlement;
 }
@@ -313,8 +380,14 @@ function validateCapacityPool(input: unknown): CapacityPool {
     "id",
     "accountId",
     "capacityDomainRef",
-    "evidenceRef",
-    "evidenceExpiresAt",
+    "capacityEvidenceRef",
+    "capacityEvidenceIssuerRef",
+    "capacityEvidenceVersion",
+    "capacityEvidenceDigest",
+    "capacityEvidenceIssuedAt",
+    "capacityEvidenceExpiresAt",
+    "capacityEvidenceGeneration",
+    "capacityPolicyVersion",
     "serializationKey",
     "maxConcurrency",
     "status",
@@ -328,9 +401,23 @@ function validateCapacityPool(input: unknown): CapacityPool {
   validateBase(value, "capacity_pool");
   parseAccountId(value.accountId);
   reference(value.capacityDomainRef, "capacityDomainRef");
-  reference(value.evidenceRef, "evidenceRef");
-  timestamp(value.evidenceExpiresAt, "evidenceExpiresAt");
-  ordered(value.updatedAt, value.evidenceExpiresAt, "evidenceExpiresAt");
+  reference(value.capacityEvidenceRef, "capacityEvidenceRef");
+  reference(value.capacityEvidenceIssuerRef, "capacityEvidenceIssuerRef");
+  reference(value.capacityEvidenceVersion, "capacityEvidenceVersion");
+  digest(value.capacityEvidenceDigest, "capacityEvidenceDigest");
+  timestamp(value.capacityEvidenceIssuedAt, "capacityEvidenceIssuedAt");
+  timestamp(value.capacityEvidenceExpiresAt, "capacityEvidenceExpiresAt");
+  ordered(
+    value.capacityEvidenceIssuedAt,
+    value.capacityEvidenceExpiresAt,
+    "capacityEvidenceExpiresAt",
+  );
+  const capacityEvidenceGeneration = parseCounter(
+    value.capacityEvidenceGeneration,
+    "capacityEvidenceGeneration",
+  );
+  if (capacityEvidenceGeneration === "0") throw invalid("capacityEvidenceGeneration");
+  reference(value.capacityPolicyVersion, "capacityPolicyVersion");
   reference(value.serializationKey, "serializationKey");
   const max = parseCounter(value.maxConcurrency, "maxConcurrency");
   if (max === "0") throw invalid("maxConcurrency");
@@ -363,6 +450,18 @@ function validateHealth(input: unknown): void {
 function validateAccessMethod(input: unknown): AccessMethod {
   const value = object(input, "data");
   assertNoSensitiveFields(value);
+  const positiveFields = [
+    "requiredIsolationPolicyRef",
+    "requiredIsolationPolicyDigest",
+    "isolationEvidenceExpiresAt",
+    "allowedDestinationPolicyClasses",
+    "parentPolicyDecisionRef",
+    "parentPolicyDecisionDigest",
+    "executionPolicyEvidenceRef",
+    "executionPolicyDigest",
+    "executionPolicyExpiresAt",
+    "health",
+  ] as const;
   exactKeys(
     value,
     [
@@ -373,20 +472,11 @@ function validateAccessMethod(input: unknown): AccessMethod {
       "adapterVersion",
       "accessTransport",
       "status",
-      "requiredIsolationPolicyRef",
-      "requiredIsolationPolicyDigest",
-      "isolationEvidenceExpiresAt",
-      "allowedDestinationPolicyClasses",
-      "parentPolicyDecisionRef",
-      "parentPolicyDecisionDigest",
-      "executionPolicyEvidenceRef",
-      "executionPolicyDigest",
-      "executionPolicyExpiresAt",
       "revision",
       "createdAt",
       "updatedAt",
     ],
-    ["health"],
+    positiveFields,
   );
   validateBase(value, "access_method");
   parseEntitlementId(value.entitlementId);
@@ -395,19 +485,32 @@ function validateAccessMethod(input: unknown): AccessMethod {
   reference(value.adapterVersion, "adapterVersion");
   enumValue(value.accessTransport, ["native_session", "api_key", "workload_identity"], "accessTransport");
   const status = enumValue(value.status, ["draft", "ready", "draining", "disabled", "retired"], "status");
-  reference(value.requiredIsolationPolicyRef, "requiredIsolationPolicyRef");
-  digest(value.requiredIsolationPolicyDigest, "requiredIsolationPolicyDigest");
-  timestamp(value.isolationEvidenceExpiresAt, "isolationEvidenceExpiresAt");
-  ordered(value.updatedAt, value.isolationEvidenceExpiresAt, "isolationEvidenceExpiresAt");
-  stringList(value.allowedDestinationPolicyClasses, "allowedDestinationPolicyClasses");
-  reference(value.parentPolicyDecisionRef, "parentPolicyDecisionRef");
-  digest(value.parentPolicyDecisionDigest, "parentPolicyDecisionDigest");
-  reference(value.executionPolicyEvidenceRef, "executionPolicyEvidenceRef");
-  digest(value.executionPolicyDigest, "executionPolicyDigest");
-  timestamp(value.executionPolicyExpiresAt, "executionPolicyExpiresAt");
-  ordered(value.updatedAt, value.executionPolicyExpiresAt, "executionPolicyExpiresAt");
-  if (value.health !== undefined) validateHealth(value.health);
-  if ((status === "ready" || status === "draining") && value.health === undefined) throw invalid("health");
+  const positiveCount = positiveFields.filter((field) => value[field] !== undefined).length;
+  if (status === "draft" && positiveCount !== 0) throw invalid("requiredIsolationPolicyRef");
+  if ((status === "ready" || status === "draining") && positiveCount !== positiveFields.length) {
+    throw invalid("requiredIsolationPolicyRef");
+  }
+  if (
+    (status === "disabled" || status === "retired") &&
+    positiveCount !== 0 &&
+    positiveCount !== positiveFields.length
+  ) {
+    throw invalid("requiredIsolationPolicyRef");
+  }
+  if (positiveCount === positiveFields.length) {
+    reference(value.requiredIsolationPolicyRef, "requiredIsolationPolicyRef");
+    digest(value.requiredIsolationPolicyDigest, "requiredIsolationPolicyDigest");
+    timestamp(value.isolationEvidenceExpiresAt, "isolationEvidenceExpiresAt");
+    ordered(value.updatedAt, value.isolationEvidenceExpiresAt, "isolationEvidenceExpiresAt");
+    stringList(value.allowedDestinationPolicyClasses, "allowedDestinationPolicyClasses");
+    reference(value.parentPolicyDecisionRef, "parentPolicyDecisionRef");
+    digest(value.parentPolicyDecisionDigest, "parentPolicyDecisionDigest");
+    reference(value.executionPolicyEvidenceRef, "executionPolicyEvidenceRef");
+    digest(value.executionPolicyDigest, "executionPolicyDigest");
+    timestamp(value.executionPolicyExpiresAt, "executionPolicyExpiresAt");
+    ordered(value.updatedAt, value.executionPolicyExpiresAt, "executionPolicyExpiresAt");
+    validateHealth(value.health);
+  }
   return value as unknown as AccessMethod;
 }
 
@@ -500,27 +603,54 @@ function validateAuthCapsule(input: unknown): AuthCapsule {
 function validateCredentialBinding(input: unknown): CredentialBinding {
   const value = object(input, "data");
   assertNoSensitiveFields(value);
+  const status = enumValue(value.status, ["pending", "active", "retiring", "revoked"], "status");
+  const terminalKind =
+    status === "revoked"
+      ? enumValue(
+          value.terminalKind,
+          ["retired_handle_generation", "revocation_barrier"],
+          "terminalKind",
+        )
+      : undefined;
+  const commonRequired = [
+    "id",
+    "accessMethodId",
+    "capacityPoolId",
+    "credentialFamilyId",
+    "purpose",
+    "resolver",
+    "credentialGeneration",
+    "status",
+    "policyDigest",
+    "revision",
+    "createdAt",
+    "updatedAt",
+  ] as const;
+  const evidenceRequired = [
+    "bindingEvidenceRef",
+    "bindingEvidenceIssuerRef",
+    "bindingEvidenceDigest",
+    "bindingEvidenceExpiresAt",
+  ] as const;
+  const terminalRequired = [
+    "terminalKind",
+    "revocationBarrierReceiptDigest",
+    "revokedAt",
+  ] as const;
   exactKeys(
     value,
+    terminalKind === "revocation_barrier"
+      ? [...commonRequired, ...terminalRequired, "lastUsableCredentialGeneration"]
+      : terminalKind === "retired_handle_generation"
+        ? [...commonRequired, ...evidenceRequired, ...terminalRequired, "credentialHandleAuditDigest"]
+        : [...commonRequired, ...evidenceRequired],
     [
-      "id",
-      "accessMethodId",
-      "capacityPoolId",
-      "credentialFamilyId",
-      "purpose",
-      "resolver",
-      "credentialGeneration",
-      "status",
-      "policyDigest",
-      "bindingEvidenceRef",
-      "bindingEvidenceIssuerRef",
-      "bindingEvidenceDigest",
-      "bindingEvidenceExpiresAt",
-      "revision",
-      "createdAt",
-      "updatedAt",
+      "authCapsuleId",
+      "authStateRevision",
+      "refreshMode",
+      "rotatedAt",
+      ...(terminalKind === "revocation_barrier" ? [] : ["expiresAt"]),
     ],
-    ["authCapsuleId", "authStateRevision", "refreshMode", "rotatedAt", "expiresAt"],
   );
   validateBase(value, "credential_binding");
   parseAccessMethodId(value.accessMethodId);
@@ -533,16 +663,31 @@ function validateCredentialBinding(input: unknown): CredentialBinding {
     "resolver",
   );
   parseCounter(value.credentialGeneration, "credentialGeneration");
-  enumValue(value.status, ["pending", "active", "retiring", "revoked"], "status");
   digest(value.policyDigest, "policyDigest");
-  reference(value.bindingEvidenceRef, "bindingEvidenceRef");
-  reference(value.bindingEvidenceIssuerRef, "bindingEvidenceIssuerRef");
-  digest(value.bindingEvidenceDigest, "bindingEvidenceDigest");
-  timestamp(value.bindingEvidenceExpiresAt, "bindingEvidenceExpiresAt");
-  ordered(value.createdAt, value.bindingEvidenceExpiresAt, "bindingEvidenceExpiresAt");
+  if (terminalKind !== "revocation_barrier") {
+    reference(value.bindingEvidenceRef, "bindingEvidenceRef");
+    reference(value.bindingEvidenceIssuerRef, "bindingEvidenceIssuerRef");
+    digest(value.bindingEvidenceDigest, "bindingEvidenceDigest");
+    timestamp(value.bindingEvidenceExpiresAt, "bindingEvidenceExpiresAt");
+    ordered(value.createdAt, value.bindingEvidenceExpiresAt, "bindingEvidenceExpiresAt");
+  }
   if (value.rotatedAt !== undefined) timestamp(value.rotatedAt, "rotatedAt");
   if (value.expiresAt !== undefined) timestamp(value.expiresAt, "expiresAt");
   if (value.expiresAt !== undefined) ordered(value.createdAt, value.expiresAt, "expiresAt");
+
+  if (status === "revoked") {
+    digest(value.revocationBarrierReceiptDigest, "revocationBarrierReceiptDigest");
+    timestamp(value.revokedAt, "revokedAt");
+    if (Date.parse(value.revokedAt as string) !== Date.parse(value.updatedAt as string)) {
+      throw invalid("revokedAt");
+    }
+    if (terminalKind === "retired_handle_generation") {
+      keyedDigest(value.credentialHandleAuditDigest, "credentialHandleAuditDigest");
+    } else {
+      parseCounter(value.lastUsableCredentialGeneration, "lastUsableCredentialGeneration");
+      if (value.expiresAt !== undefined) throw invalid("expiresAt");
+    }
+  }
 
   if (resolver === "capsule_local_native") {
     if (purpose !== "provider_session" || value.authCapsuleId === undefined) throw invalid("resolver");
@@ -704,6 +849,9 @@ export function validateSlotEligibility(input: unknown): SlotEligibilityMetadata
       "denyState",
       "credentialFamilyId",
       "credentialGeneration",
+      "catalogIncarnation",
+      "recoveryFrontierSequence",
+      "recoveryFrontierHash",
     ],
     "eligibility",
   );
@@ -732,6 +880,13 @@ export function validateSlotEligibility(input: unknown): SlotEligibilityMetadata
   }
   if (value.denyState !== undefined) enumValue(value.denyState, ["allowed", "denied"], "denyState");
   if (value.credentialFamilyId !== undefined) reference(value.credentialFamilyId, "credentialFamilyId");
+  if (value.catalogIncarnation !== undefined) reference(value.catalogIncarnation, "catalogIncarnation");
+  if (value.recoveryFrontierSequence !== undefined) {
+    parseCounter(value.recoveryFrontierSequence, "recoveryFrontierSequence");
+  }
+  if (value.recoveryFrontierHash !== undefined) {
+    digest(value.recoveryFrontierHash, "recoveryFrontierHash");
+  }
   const revisions = object(value.recordRevisionSet, "recordRevisionSet");
   exactKeys(revisions, [], ENTITY_KINDS, "recordRevisionSet");
   for (const [kind, revision] of Object.entries(revisions)) parseCounter(revision, `recordRevisionSet.${kind}`);
@@ -744,6 +899,9 @@ export function validateSlotEligibility(input: unknown): SlotEligibilityMetadata
     enumValue(reason, ELIGIBILITY_REASON_CODES, `reasonCodes.${index}`),
   );
   if (new Set(reasons).size !== reasons.length) throw invalid("reasonCodes");
+  if (reasons.some((reason, index) => index > 0 && reasons[index - 1]! > reason)) {
+    throw invalid("reasonCodes");
+  }
   if (value.eligible === true && reasons.length !== 0) throw invalid("reasonCodes");
   if (value.eligible === false && reasons.length === 0) throw invalid("reasonCodes");
   if (value.eligible === true) {
@@ -760,6 +918,9 @@ export function validateSlotEligibility(input: unknown): SlotEligibilityMetadata
       "denyState",
       "credentialFamilyId",
       "credentialGeneration",
+      "catalogIncarnation",
+      "recoveryFrontierSequence",
+      "recoveryFrontierHash",
     ] as const;
     for (const field of requiredPositive) {
       if (value[field] === undefined) throw invalid(field);

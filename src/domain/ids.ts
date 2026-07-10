@@ -14,8 +14,10 @@ export type AccountLaneId = AccessMethodId;
 export type AuthCapsuleId = Brand<string, "AuthCapsuleId">;
 export type CanonicalNodeId = Brand<string, "CanonicalNodeId">;
 export type CredentialBindingId = Brand<string, "CredentialBindingId">;
+export type CredentialOperationId = Brand<string, "CredentialOperationId">;
 export type EligibilityEvidenceId = Brand<string, "EligibilityEvidenceId">;
 export type AccountEventId = Brand<string, "AccountEventId">;
+export type OutboxId = Brand<string, "OutboxId">;
 
 export type EntityId =
   | AccountId
@@ -33,8 +35,10 @@ export type IdKind =
   | "auth_capsule"
   | "canonical_node"
   | "credential_binding"
+  | "credential_operation"
   | "eligibility_evidence"
-  | "account_event";
+  | "account_event"
+  | "outbox";
 
 const UUID_V7 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -90,10 +94,14 @@ export const parseCanonicalNodeId = (value: unknown): CanonicalNodeId =>
   parseId<"CanonicalNodeId">("canonical_node", value);
 export const parseCredentialBindingId = (value: unknown): CredentialBindingId =>
   parseId<"CredentialBindingId">("credential_binding", value);
+export const parseCredentialOperationId = (value: unknown): CredentialOperationId =>
+  parseId<"CredentialOperationId">("credential_operation", value);
 export const parseEligibilityEvidenceId = (value: unknown): EligibilityEvidenceId =>
   parseId<"EligibilityEvidenceId">("eligibility_evidence", value);
 export const parseAccountEventId = (value: unknown): AccountEventId =>
   parseId<"AccountEventId">("account_event", value);
+export const parseOutboxId = (value: unknown): OutboxId =>
+  parseId<"OutboxId">("outbox", value);
 
 export const newAccountId = (nowMs?: number): AccountId =>
   newId<"AccountId">("account", nowMs);
@@ -109,7 +117,11 @@ export const newAuthCapsuleId = (nowMs?: number): AuthCapsuleId =>
   newId<"AuthCapsuleId">("auth_capsule", nowMs);
 export const newCredentialBindingId = (nowMs?: number): CredentialBindingId =>
   newId<"CredentialBindingId">("credential_binding", nowMs);
+export const newCredentialOperationId = (nowMs?: number): CredentialOperationId =>
+  newId<"CredentialOperationId">("credential_operation", nowMs);
 export const newEligibilityEvidenceId = (nowMs?: number): EligibilityEvidenceId =>
   newId<"EligibilityEvidenceId">("eligibility_evidence", nowMs);
 export const newAccountEventId = (nowMs?: number): AccountEventId =>
   newId<"AccountEventId">("account_event", nowMs);
+export const newOutboxId = (nowMs?: number): OutboxId =>
+  newId<"OutboxId">("outbox", nowMs);

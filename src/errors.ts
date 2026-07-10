@@ -16,6 +16,7 @@ export const ACCOUNT_ERROR_CODES = [
   "CURRENT_DENY",
   "INVALID_ACCESS_TARGET",
   "DEPENDENCY_UNAVAILABLE",
+  "RECOVERY_HOLD",
   "COUNTER_EXHAUSTED",
   "SCHEMA_VERSION_UNSUPPORTED",
   "SCHEMA_CHECKSUM_MISMATCH",
@@ -46,6 +47,7 @@ const PUBLIC_MESSAGES: Readonly<Record<AccountErrorCode, string>> = {
   CURRENT_DENY: "Current denial state blocks the operation",
   INVALID_ACCESS_TARGET: "The access target is invalid",
   DEPENDENCY_UNAVAILABLE: "A required dependency is unavailable",
+  RECOVERY_HOLD: "Recovery state blocks the operation",
   COUNTER_EXHAUSTED: "A monotonic counter cannot advance safely",
   SCHEMA_VERSION_UNSUPPORTED: "The schema version is not supported",
   SCHEMA_CHECKSUM_MISMATCH: "The database schema checksum does not match",
@@ -177,6 +179,7 @@ export function exitCodeForError(error: AccountsError): number {
     case "FORBIDDEN":
       return 5;
     case "DEPENDENCY_UNAVAILABLE":
+    case "RECOVERY_HOLD":
     case "NOT_IMPLEMENTED":
     case "SCHEMA_CHECKSUM_MISMATCH":
     case "DATABASE_PATH_UNSAFE":

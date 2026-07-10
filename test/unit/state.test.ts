@@ -58,7 +58,7 @@ describe("closed lifecycle state machines", () => {
 
 describe("native metadata candidate fencing", () => {
   const graph = makeFixtureGraph();
-  const method = { ...graph.method, status: "draining" } satisfies AccessMethod;
+  const method = { ...graph.readyMethod, status: "draining" } satisfies AccessMethod;
   const activePool = transitionEntity("capacity_pool", graph.pool, "active", NOW.toISOString());
   const pool = transitionEntity(
     "capacity_pool",

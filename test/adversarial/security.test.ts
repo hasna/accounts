@@ -32,24 +32,25 @@ describe("adversarial public-boundary checks", () => {
     expect(publicApi).not.toHaveProperty("newCanonicalNodeId");
   });
 
-  test("marks Postgres as reserved with no implementation or conformance claim", () => {
+  test("exports the implemented self-hosted Postgres adapter without mutation authority", () => {
     expect(POSTGRES_ADAPTER_STATUS).toEqual({
       adapter: "postgres",
-      implemented: false,
-      conformanceClaim: false,
+      implemented: true,
+      conformanceClaim: true,
       target: "self_hosted",
     });
-    expect(publicApi).not.toHaveProperty("createPostgresAccounts");
+    expect(publicApi).toHaveProperty("createPostgresAccounts");
   });
 
-  test("pins the finalized Accounts V1 contract and advertises metadata-only readiness", async () => {
+  test("pins the finalized Accounts V1 contract and fails closed without recovery", async () => {
     expect(publicApi.ACCOUNTS_V1_CONTRACT_SHA256).toBe(
       "0d2b45c286f56452312b251b7622e009c486e2fe71fe8f2a5a59c01472eb8b2a",
     );
     const capacity = publicApi.createInMemoryAccounts();
     await expect(capacity.doctor()).resolves.toMatchObject({
-      readiness: "metadata_only",
+      readiness: "recovery_hold",
       recoveryFrontier: "unavailable",
+      recoveryHold: true,
       positiveEligibility: false,
     });
     await capacity.close();

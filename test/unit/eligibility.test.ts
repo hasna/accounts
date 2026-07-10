@@ -6,6 +6,7 @@ import {
 } from "../../src/index";
 import { AccountsCatalog } from "../../src/domain/catalog";
 import { transitionEntity } from "../../src/domain/state";
+import { canonicalSha256 } from "../../src/serialization/json";
 import { InMemoryAccountsRepository } from "../../src/storage/memory";
 import {
   C1,
@@ -14,6 +15,9 @@ import {
   makeFixtureGraph,
   mutationContext,
   seedActiveCatalog,
+  TEST_CREDENTIAL_VERIFIER,
+  makeTestRecoveryLedger,
+  TEST_AUTHORITY_POLICY,
 } from "../fixtures";
 
 function requestFor(methodId: ReturnType<typeof makeFixtureGraph>["method"]["id"]): EligibilityRequest {
@@ -40,6 +44,14 @@ describe("non-reservational slot eligibility", () => {
     expect(result.authority).toBe("none");
     expect(result.reservation).toBe("none");
     expect(result.accessTarget.kind).toBe("native");
+    expect(result.eligibilityRequestDigest).toBe(canonicalSha256({
+      schema_version: "accounts.eligibility-request.v1",
+      account_lane_id: graph.method.id,
+      data_classification: "internal",
+      destination_policy_class: "default",
+      model: "model.example",
+      operation: "responses.create",
+    }));
     expect(Object.keys(result)).not.toContain("holder");
     expect(Object.keys(result)).not.toContain("leaseId");
     expect(after).toEqual(before);
@@ -91,8 +103,11 @@ describe("non-reservational slot eligibility", () => {
   });
 
   test("a retiring binding is never eligible even if corrupted storage leaves capacity allowed", async () => {
-    const repository = new InMemoryAccountsRepository();
-    const catalog = new AccountsCatalog(repository, clock);
+    const repository = new InMemoryAccountsRepository(
+      TEST_CREDENTIAL_VERIFIER,
+      makeTestRecoveryLedger(),
+    );
+    const catalog = new AccountsCatalog(repository, clock, TEST_AUTHORITY_POLICY);
     const graph = makeFixtureGraph();
     await seedActiveCatalog(catalog, graph);
     const activeBinding = await catalog.get("credential_binding", graph.binding.id);
@@ -116,8 +131,15 @@ describe("non-reservational slot eligibility", () => {
 
   test("stale terms and policy evidence fail closed with stable reasons", async () => {
     let observed = new Date(NOW);
-    const repository = new InMemoryAccountsRepository();
-    const catalog = new AccountsCatalog(repository, () => new Date(observed));
+    const repository = new InMemoryAccountsRepository(
+      TEST_CREDENTIAL_VERIFIER,
+      makeTestRecoveryLedger(),
+    );
+    const catalog = new AccountsCatalog(
+      repository,
+      () => new Date(observed),
+      TEST_AUTHORITY_POLICY,
+    );
     const graph = makeFixtureGraph();
     await seedActiveCatalog(catalog, graph);
     observed = new Date("2026-07-10T14:00:00.000Z");
@@ -130,8 +152,11 @@ describe("non-reservational slot eligibility", () => {
   });
 
   test("repository unavailability becomes a denial, not cached success", async () => {
-    const repository = new InMemoryAccountsRepository();
-    const catalog = new AccountsCatalog(repository, clock);
+    const repository = new InMemoryAccountsRepository(
+      TEST_CREDENTIAL_VERIFIER,
+      makeTestRecoveryLedger(),
+    );
+    const catalog = new AccountsCatalog(repository, clock, TEST_AUTHORITY_POLICY);
     const graph = makeFixtureGraph();
     await repository.close();
     const result = await catalog.eligibility(requestFor(graph.method.id));
@@ -180,10 +205,10 @@ describe("non-reservational slot eligibility", () => {
       },
     };
     await catalog.add("account", graph.account, mutationContext("stale-health:account:add"));
-    await catalog.transition(
-      "account",
-      graph.account.id,
-      "active",
+    await catalog.activateProviderAccount(
+      graph.activeAccount,
+      graph.ownershipEvidence,
+      graph.ownershipFence,
       parseCounter("0"),
       mutationContext("stale-health:account:active"),
     );
@@ -192,14 +217,18 @@ describe("non-reservational slot eligibility", () => {
       graph.entitlement,
       mutationContext("stale-health:entitlement:add"),
     );
-    await catalog.transition(
-      "entitlement",
-      graph.entitlement.id,
-      "active",
+    await catalog.activateEntitlement(
+      graph.activeEntitlement,
+      graph.entitlementEvidence,
       parseCounter("0"),
       mutationContext("stale-health:entitlement:active"),
     );
-    await catalog.add("capacity_pool", graph.pool, mutationContext("stale-health:pool:add"));
+    await catalog.addCapacityPoolFromEvidence(
+      graph.pool,
+      graph.capacityEvidence,
+      graph.capacityFence,
+      mutationContext("stale-health:pool:add"),
+    );
     await catalog.transition(
       "capacity_pool",
       graph.pool.id,
@@ -208,10 +237,9 @@ describe("non-reservational slot eligibility", () => {
       mutationContext("stale-health:pool:active"),
     );
     await catalog.add("access_method", graph.method, mutationContext("stale-health:method:add"));
-    await catalog.transition(
-      "access_method",
-      graph.method.id,
-      "ready",
+    await catalog.activateAccessMethod(
+      graph.readyMethod,
+      graph.laneEvidence,
       parseCounter("0"),
       mutationContext("stale-health:method:ready"),
     );
@@ -271,5 +299,9 @@ describe("non-reservational slot eligibility", () => {
 });
 
 function referenceCatalog(): AccountsCatalog {
-  return new AccountsCatalog(new InMemoryAccountsRepository(), clock);
+  return new AccountsCatalog(
+    new InMemoryAccountsRepository(TEST_CREDENTIAL_VERIFIER, makeTestRecoveryLedger()),
+    clock,
+    TEST_AUTHORITY_POLICY,
+  );
 }

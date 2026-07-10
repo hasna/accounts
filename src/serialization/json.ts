@@ -209,7 +209,6 @@ function snapshotJson(value: unknown, depth: number, seen: Set<object>): unknown
     if (hasInvalidUnicode(value)) {
       throw new AccountsError("VALIDATION_FAILED", "Invalid Unicode in JSON string");
     }
-    assertNoSecretLikeString(value);
     return value;
   }
   if (typeof value === "number") {

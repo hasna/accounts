@@ -1,57 +1,70 @@
-# @hasna/accounts (clean V1 foundation)
+# @hasna/accounts
 
-Contract pin: `accounts-v1-contract.md` SHA-256
-`0d2b45c286f56452312b251b7622e009c486e2fe71fe8f2a5a59c01472eb8b2a`.
+> **WIP CHECKPOINT — NO-GO.** This branch is preserved for local review only.
+> The Accounts V1 successor contract is not independently approved or pinned,
+> and the credential-effect journal still targets an obsolete candidate. Do not
+> deploy, merge to `main`, publish, or treat `ACCOUNTS_V1_CONTRACT_SHA256` as a
+> successor attestation until the exact contract, implementation, and final
+> adversarial gates all pass.
 
-Accounts is a capacity-metadata SDK and CLI for Hasna `local` and
-`self_hosted` deployments. This clean implementation owns provider-account,
-entitlement, capacity-pool, access-method, credential-binding, and
-AuthCapsule metadata. It evaluates non-reservational slot eligibility.
+Accounts is the fail-closed provider-capacity metadata boundary for Hasna
+`local` and `self_hosted` deployments. It models provider accounts,
+entitlements, capacity pools, account lanes, credential bindings, native
+AuthCapsule metadata, signed authority evidence, and non-reservational slot
+eligibility.
 
-It does **not** reserve capacity, issue a run/resource lease, execute a task,
-resolve credential material, start a provider process, or provide SaaS tenant,
-signup, billing, organization, or hosted-product features. Credential bindings
-contain safe issuer metadata only; raw values and resolver locators are rejected
-at DTO boundaries.
+Implemented adapters and surfaces:
 
-The implemented persistence adapters are:
+- deterministic in-memory and owner-only SQLite repositories for local use;
+- RLS-isolated PostgreSQL for Hasna-owned AWS self-hosting;
+- persistent signed recovery and credential-effect journals outside the
+  restorable catalog;
+- closed Ed25519 authority evidence and online generation-check receipts;
+- local/self-hosted SDK selection with no fallback;
+- authenticated HTTP handlers and generated OpenAPI 3.1;
+- a safe local read/diagnostic CLI.
 
-- in-memory, as the deterministic reference model;
-- SQLite through `bun:sqlite`, for local operation.
+Accounts does not issue Infinity resource leases, schedule work, run provider
+calls, return raw credential handles, launch processes, or provide SaaS tenant,
+signup, billing, or public registration features. Ordinary model-call effects
+remain broker/Run-Authority owned. Credential lifecycle execution requires the
+separate one-use capsule-maintenance authority and external effect journal.
 
-The public repository interface intentionally leaves a Postgres adapter as a
-future self-hosted implementation. No Postgres conformance claim is made by
-this development build.
-
-The public development factory is read/query-only. Positive evidence ingestion,
-ownership claims, recovery-frontier reconciliation, credential-handle ingestion,
-terminal tombstones, and local owner ceremonies remain deliberately unavailable;
-the internal catalog mutation harness exists only for reference/conformance tests.
+## Build and verify locally
 
 ```sh
 bun install
 bun test
 bun run typecheck
 bun run build
+```
 
+The live PostgreSQL conformance test is opt-in and expects an empty disposable
+database:
+
+```sh
+ACCOUNTS_TEST_POSTGRES_URL='postgresql://user@127.0.0.1/accounts_test?sslmode=disable' \
+  bun test test/storage/postgres-live.test.ts
+```
+
+Plaintext PostgreSQL is accepted only by this explicit loopback test path.
+Self-hosted connections require `sslmode=verify-full`.
+
+## Local CLI
+
+```sh
 HASNA_ACCOUNTS_DEPLOYMENT=local accounts doctor --json
 accounts validate ./record.json --json
 HASNA_ACCOUNTS_DEPLOYMENT=local accounts list access-methods --json
 HASNA_ACCOUNTS_DEPLOYMENT=local accounts get access-methods <uuidv7> --json
-HASNA_ACCOUNTS_DEPLOYMENT=local accounts eligibility <access-method-uuidv7> \
+HASNA_ACCOUNTS_DEPLOYMENT=local accounts eligibility <account-lane-uuidv7> \
   --operation responses.create \
   --model model.example \
   --data-classification internal \
   --json
 ```
 
-Eligibility output is marked `local_diagnostic` and `non_reservational`; it is
-not production Infinity authority. Current denial always wins over previously
-positive evidence.
-
-Local list/get output is intentionally owner-only metadata for the trusted OS
-user. It is not a self-hosted reader projection and must not be reused without
-authenticated owner scoping and redaction. Native credential mutation is also
-fail-closed in this slice: drain metadata is not proof of zero live Infinity
-resource leases, so reauthentication execution remains unimplemented until a
-trusted Run Authority verifier is integrated.
+Positive local evaluation requires an explicitly configured, owner-only signed
+recovery ledger through the SDK/factory. Without it, readiness and eligibility
+stay on recovery hold. CLI output is local diagnostic evidence only and never a
+reservation or production Infinity authority.

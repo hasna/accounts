@@ -126,8 +126,8 @@ export function validateRoutineNativeRefreshCandidate(
   pool: CapacityPool,
   beforeCapsule: AuthCapsule,
   afterCapsule: AuthCapsule,
-  beforeBinding: CredentialBinding,
-  afterBinding: CredentialBinding,
+  beforeBinding: Extract<CredentialBinding, { readonly status: "pending" | "active" | "retiring" }>,
+  afterBinding: Extract<CredentialBinding, { readonly status: "pending" | "active" | "retiring" }>,
 ): void {
   const beforeState = beforeBinding.authStateRevision;
   if (beforeState === undefined) {
@@ -208,8 +208,8 @@ export function validateNativeReauthenticationCandidate(
   pool: CapacityPool,
   beforeCapsule: AuthCapsule,
   afterCapsule: AuthCapsule,
-  retiringBinding: CredentialBinding,
-  replacementBinding: CredentialBinding,
+  retiringBinding: Extract<CredentialBinding, { readonly status: "pending" | "active" | "retiring" }>,
+  replacementBinding: Extract<CredentialBinding, { readonly status: "pending" | "active" | "retiring" }>,
 ): void {
   const nextGeneration = incrementCounter(beforeCapsule.authGeneration);
   const valid =

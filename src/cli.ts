@@ -132,8 +132,8 @@ function createLocalCatalog() {
   }
   if (deployment !== "local") {
     if (deployment === "self_hosted") {
-      throw new AccountsError("NOT_IMPLEMENTED", "The Postgres/self-hosted adapter is reserved, not implemented", {
-        details: { adapter: "postgres" },
+      throw new AccountsError("NOT_IMPLEMENTED", "The self-hosted CLI client is not configured", {
+        details: { adapter: "http" },
       });
     }
     throw usageError("HASNA_ACCOUNTS_DEPLOYMENT must be local or self_hosted");
