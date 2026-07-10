@@ -6,6 +6,10 @@
 > deploy, merge to `main`, publish, or treat `ACCOUNTS_V1_CONTRACT_SHA256` as a
 > successor attestation until the exact contract, implementation, and final
 > adversarial gates all pass.
+>
+> The current immutable but unpinned review pair is preserved under
+> [`contracts/accounts-v1`](contracts/accounts-v1/README.md). Its presence on
+> this branch is provenance only, not approval.
 
 Accounts is the fail-closed provider-capacity metadata boundary for Hasna
 `local` and `self_hosted` deployments. It models provider accounts,
