@@ -1,5 +1,6 @@
 import { AccountsError } from "../errors";
 import { incrementCounter } from "./counter";
+import { canonicalJson } from "../serialization/json";
 import type {
   AccessMethod,
   AnyEntity,
@@ -163,7 +164,38 @@ export function validateRoutineNativeRefreshCandidate(
     afterCapsule.authStateRevision === incrementCounter(beforeCapsule.authStateRevision) &&
     afterBinding.authStateRevision === incrementCounter(beforeState) &&
     afterCapsule.authStateRevision === afterBinding.authStateRevision;
-  if (!valid) {
+  const {
+    authStateRevision: _beforeCapsuleState,
+    revision: _beforeCapsuleRevision,
+    updatedAt: _beforeCapsuleUpdated,
+    ...beforeCapsuleStable
+  } = beforeCapsule;
+  const {
+    authStateRevision: _afterCapsuleState,
+    revision: _afterCapsuleRevision,
+    updatedAt: _afterCapsuleUpdated,
+    ...afterCapsuleStable
+  } = afterCapsule;
+  const {
+    authStateRevision: _beforeBindingState,
+    revision: _beforeBindingRevision,
+    updatedAt: _beforeBindingUpdated,
+    ...beforeBindingStable
+  } = beforeBinding;
+  const {
+    authStateRevision: _afterBindingState,
+    revision: _afterBindingRevision,
+    updatedAt: _afterBindingUpdated,
+    ...afterBindingStable
+  } = afterBinding;
+  const stable =
+    canonicalJson(beforeCapsuleStable) === canonicalJson(afterCapsuleStable) &&
+    canonicalJson(beforeBindingStable) === canonicalJson(afterBindingStable) &&
+    afterCapsule.revision === incrementCounter(beforeCapsule.revision) &&
+    afterBinding.revision === incrementCounter(beforeBinding.revision) &&
+    Date.parse(afterCapsule.updatedAt) > Date.parse(beforeCapsule.updatedAt) &&
+    Date.parse(afterBinding.updatedAt) > Date.parse(beforeBinding.updatedAt);
+  if (!valid || !stable) {
     throw new AccountsError("STALE_AUTH_STATE_REVISION", "Native refresh update violates generation fencing", {
       details: { operation: "native_refresh" },
     });
@@ -208,7 +240,56 @@ export function validateNativeReauthenticationCandidate(
     replacementBinding.credentialGeneration === nextGeneration &&
     afterCapsule.authStateRevision === "0" &&
     replacementBinding.authStateRevision === "0";
-  if (!valid) {
+  const {
+    authGeneration: _beforeAuthGeneration,
+    authStateRevision: _beforeAuthState,
+    status: _beforeStatus,
+    attestation: _beforeAttestation,
+    lastHealthAt: _beforeHealth,
+    revision: _beforeRevision,
+    updatedAt: _beforeUpdated,
+    ...beforeCapsuleStable
+  } = beforeCapsule;
+  const {
+    authGeneration: _afterAuthGeneration,
+    authStateRevision: _afterAuthState,
+    status: _afterStatus,
+    attestation: _afterAttestation,
+    lastHealthAt: _afterHealth,
+    revision: _afterRevision,
+    updatedAt: _afterUpdated,
+    ...afterCapsuleStable
+  } = afterCapsule;
+  const {
+    id: _retiringId,
+    credentialGeneration: _retiringGeneration,
+    authStateRevision: _retiringState,
+    status: _retiringStatus,
+    revision: _retiringRevision,
+    createdAt: _retiringCreated,
+    updatedAt: _retiringUpdated,
+    rotatedAt: _retiringRotated,
+    expiresAt: _retiringExpires,
+    ...retiringStable
+  } = retiringBinding;
+  const {
+    id: _replacementId,
+    credentialGeneration: _replacementGeneration,
+    authStateRevision: _replacementState,
+    status: _replacementStatus,
+    revision: _replacementRevision,
+    createdAt: _replacementCreated,
+    updatedAt: _replacementUpdated,
+    rotatedAt: _replacementRotated,
+    expiresAt: _replacementExpires,
+    ...replacementStable
+  } = replacementBinding;
+  const stable =
+    canonicalJson(beforeCapsuleStable) === canonicalJson(afterCapsuleStable) &&
+    canonicalJson(retiringStable) === canonicalJson(replacementStable) &&
+    afterCapsule.revision === incrementCounter(beforeCapsule.revision) &&
+    Date.parse(afterCapsule.updatedAt) > Date.parse(beforeCapsule.updatedAt);
+  if (!valid || !stable) {
     throw new AccountsError("STALE_CREDENTIAL_GENERATION", "Native reauthentication violates generation fencing", {
       details: { operation: "native_reauthentication" },
     });

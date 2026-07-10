@@ -3,7 +3,6 @@ import { AccountsCatalog } from "./domain/catalog";
 import { InMemoryAccountsRepository } from "./storage/memory";
 import { SQLiteAccountsRepository } from "./storage/sqlite";
 
-export { AccountsCatalog } from "./domain/catalog";
 export {
   ACCOUNT_ERROR_CODES,
   AccountsError,
@@ -112,11 +111,13 @@ export {
   encodeRecordEnvelope,
   serializeRecordEnvelope,
   validateEntity,
+  validateEligibilityRequest,
   validateSlotEligibility,
 } from "./serialization/dto";
 export type { RecordEnvelope } from "./serialization/dto";
 export { canonicalJson, parseClosedJson } from "./serialization/json";
 export { POSTGRES_ADAPTER_STATUS } from "./storage/repository";
+export { PACKAGE_VERSION } from "./version";
 
 export interface CatalogFactoryOptions {
   readonly clock?: () => Date;
@@ -126,10 +127,15 @@ export interface SQLiteCatalogFactoryOptions extends CatalogFactoryOptions {
   readonly path: string;
 }
 
-export function createInMemoryAccounts(options: CatalogFactoryOptions = {}): AccountsCatalogType {
+export type AccountsCapacity = Pick<
+  AccountsCatalogType,
+  "get" | "list" | "add" | "transition" | "eligibility" | "checkCurrent" | "doctor" | "close"
+>;
+
+export function createInMemoryAccounts(options: CatalogFactoryOptions = {}): AccountsCapacity {
   return new AccountsCatalog(new InMemoryAccountsRepository(), options.clock);
 }
 
-export function createSQLiteAccounts(options: SQLiteCatalogFactoryOptions): AccountsCatalogType {
+export function createSQLiteAccounts(options: SQLiteCatalogFactoryOptions): AccountsCapacity {
   return new AccountsCatalog(new SQLiteAccountsRepository(options.path), options.clock);
 }

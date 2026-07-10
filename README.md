@@ -26,11 +26,11 @@ bun test
 bun run typecheck
 bun run build
 
-accounts doctor --json
+HASNA_ACCOUNTS_DEPLOYMENT=local accounts doctor --json
 accounts validate ./record.json --json
-accounts list access-methods --json
-accounts get access-methods <uuidv7> --json
-accounts eligibility <access-method-uuidv7> \
+HASNA_ACCOUNTS_DEPLOYMENT=local accounts list access-methods --json
+HASNA_ACCOUNTS_DEPLOYMENT=local accounts get access-methods <uuidv7> --json
+HASNA_ACCOUNTS_DEPLOYMENT=local accounts eligibility <access-method-uuidv7> \
   --operation responses.create \
   --model model.example \
   --data-classification internal \
@@ -40,3 +40,10 @@ accounts eligibility <access-method-uuidv7> \
 Eligibility output is marked `local_diagnostic` and `non_reservational`; it is
 not production Infinity authority. Current denial always wins over previously
 positive evidence.
+
+Local list/get output is intentionally owner-only metadata for the trusted OS
+user. It is not a self-hosted reader projection and must not be reused without
+authenticated owner scoping and redaction. Native credential mutation is also
+fail-closed in this slice: drain metadata is not proof of zero live Infinity
+resource leases, so reauthentication execution remains unimplemented until a
+trusted Run Authority verifier is integrated.

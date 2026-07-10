@@ -68,6 +68,12 @@ export interface Entitlement extends RecordBase<EntitlementId> {
   readonly fundingKind: FundingKind;
   readonly status: EntitlementStatus;
   readonly capabilitySet: CapabilitySet;
+  readonly capabilityEvidenceRef: string;
+  readonly capabilityDigest: string;
+  readonly capabilityExpiresAt: string;
+  readonly executionPolicyDecisionRef: string;
+  readonly executionPolicyDecisionDigest: string;
+  readonly executionPolicyDecisionExpiresAt: string;
   readonly termsDecision: TermsDecision;
   readonly dataPolicy: DataPolicy;
   readonly dataPolicyEvidenceRef: string;
@@ -113,6 +119,12 @@ export interface AccessMethod extends RecordBase<AccessMethodId> {
   readonly requiredIsolationPolicyRef: string;
   readonly requiredIsolationPolicyDigest: string;
   readonly isolationEvidenceExpiresAt: string;
+  readonly allowedDestinationPolicyClasses: readonly string[];
+  readonly parentPolicyDecisionRef: string;
+  readonly parentPolicyDecisionDigest: string;
+  readonly executionPolicyEvidenceRef: string;
+  readonly executionPolicyDigest: string;
+  readonly executionPolicyExpiresAt: string;
   readonly health?: HealthObservation;
 }
 
@@ -205,11 +217,14 @@ export const ELIGIBILITY_REASON_CODES = [
   "OPERATION_NOT_ALLOWED",
   "MODEL_NOT_ALLOWED",
   "DATA_CLASSIFICATION_NOT_ALLOWED",
+  "DESTINATION_POLICY_NOT_ALLOWED",
   "CAPACITY_POOL_NOT_ACTIVE",
   "CAPACITY_EVIDENCE_STALE",
   "ACCESS_METHOD_NOT_READY",
   "HEALTH_NOT_HEALTHY",
   "HEALTH_STALE",
+  "POLICY_EVIDENCE_STALE",
+  "POLICY_DIGEST_MISMATCH",
   "CAPSULE_REQUIRED",
   "CAPSULE_NOT_READY",
   "CAPSULE_OWNER_MISMATCH",
@@ -281,7 +296,10 @@ export interface EligibleSlotEligibility extends SlotEligibilityBase {
   readonly denyState: "allowed";
   readonly credentialFamilyId: string;
   readonly credentialGeneration: Counter;
-  readonly recordRevisionSet: Readonly<Record<EntityKind, Counter>>;
+  readonly recordRevisionSet: Readonly<
+    Record<Exclude<EntityKind, "auth_capsule">, Counter> &
+      Partial<Record<"auth_capsule", Counter>>
+  >;
 }
 
 export interface IneligibleSlotEligibility extends SlotEligibilityBase {

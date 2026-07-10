@@ -1,13 +1,16 @@
 import { AccountsError } from "../errors";
 import type { AccountsRepository, MutationContext, MutationResult } from "../storage/repository";
-import type { Counter } from "./counter";
+import { incrementCounter, type Counter } from "./counter";
 import type { EntityKind, EntityMap } from "./models";
 import { assertInsertInvariants } from "./invariants";
 import { assertBindingMayRetire, transitionEntity } from "./state";
-import { evaluateSlotEligibility } from "./eligibility";
+import { checkCurrentEligibility, evaluateSlotEligibility } from "./eligibility";
 import type { EligibilityRequest, SlotEligibilityMetadata } from "./models";
+import { validateEligibilityRequest } from "../serialization/dto";
 
 export class AccountsCatalog {
+  private mutationTail: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly repository: AccountsRepository,
     private readonly now: () => Date = () => new Date(),
@@ -32,8 +35,12 @@ export class AccountsCatalog {
     record: EntityMap[K],
     context: MutationContext,
   ): Promise<MutationResult<EntityMap[K]>> {
-    await assertInsertInvariants(this.repository, kind, record);
-    return this.repository.insert(kind, record, context);
+    return this.runMutation(async () => {
+      const existing = await this.repository.get(kind, record.id);
+      if (existing !== undefined) return this.repository.insert(kind, record, context);
+      await assertInsertInvariants(this.repository, kind, record);
+      return this.repository.insert(kind, record, context);
+    });
   }
 
   async transition<K extends EntityKind>(
@@ -43,24 +50,41 @@ export class AccountsCatalog {
     expectedRevision: Counter,
     context: MutationContext,
   ): Promise<MutationResult<EntityMap[K]>> {
-    const current = await this.get(kind, id);
-    if (current.revision !== expectedRevision) {
-      throw new AccountsError("STALE_REVISION", "Expected revision does not match current state", {
-        details: {
-          aggregateKind: kind,
-          aggregateId: id,
-          expectedRevision,
-          actualRevision: current.revision,
-        },
-      });
-    }
-    await this.assertTransitionPreconditions(kind, current, to);
-    const next = transitionEntity(kind, current, to, this.nextTimestamp(current.updatedAt));
-    return this.repository.replace(kind, next, expectedRevision, context);
+    return this.runMutation(async () => {
+      const current = await this.get(kind, id);
+      if (current.revision !== expectedRevision) {
+        if (current.revision === incrementCounter(expectedRevision) && current.status === to) {
+          return this.repository.replace(kind, current, expectedRevision, context);
+        }
+        throw new AccountsError("STALE_REVISION", "Expected revision does not match current state", {
+          details: {
+            aggregateKind: kind,
+            aggregateId: id,
+            expectedRevision,
+            actualRevision: current.revision,
+          },
+        });
+      }
+      await this.assertTransitionPreconditions(kind, current, to);
+      const next = transitionEntity(kind, current, to, this.nextTimestamp(current.updatedAt));
+      return this.repository.replace(kind, next, expectedRevision, context);
+    });
   }
 
   eligibility(request: EligibilityRequest): Promise<SlotEligibilityMetadata> {
-    return evaluateSlotEligibility(this.repository, request, this.now);
+    return evaluateSlotEligibility(this.repository, validateEligibilityRequest(request), this.now);
+  }
+
+  checkCurrent(
+    evidence: SlotEligibilityMetadata,
+    request: EligibilityRequest,
+  ): Promise<SlotEligibilityMetadata> {
+    return checkCurrentEligibility(
+      this.repository,
+      evidence,
+      validateEligibilityRequest(request),
+      this.now,
+    );
   }
 
   doctor() {
@@ -93,6 +117,8 @@ export class AccountsCatalog {
           account.status !== "active" ||
           entitlement.termsDecision.decision !== "allowed" ||
           Date.parse(entitlement.termsDecision.expiresAt) <= now ||
+          Date.parse(entitlement.capabilityExpiresAt) <= now ||
+          Date.parse(entitlement.executionPolicyDecisionExpiresAt) <= now ||
           Date.parse(entitlement.dataPolicyExpiresAt) <= now
         ) {
           throw new AccountsError("TERMS_NOT_ALLOWED", "Entitlement evidence does not allow activation");
@@ -129,9 +155,12 @@ export class AccountsCatalog {
           entitlement.status !== "active" ||
           pool.status !== "active" ||
           pool.denyState !== "allowed" ||
+          method.parentPolicyDecisionRef !== entitlement.executionPolicyDecisionRef ||
+          method.parentPolicyDecisionDigest !== entitlement.executionPolicyDecisionDigest ||
           method.health?.state !== "healthy" ||
           Date.parse(method.health.expiresAt) <= now ||
-          Date.parse(method.isolationEvidenceExpiresAt) <= now
+          Date.parse(method.isolationEvidenceExpiresAt) <= now ||
+          Date.parse(method.executionPolicyExpiresAt) <= now
         ) {
           throw new AccountsError("POLICY_DENIED", "Access-method evidence does not allow readiness");
         }
@@ -150,7 +179,8 @@ export class AccountsCatalog {
           pool.status !== "active" ||
           pool.denyState !== "allowed" ||
           capsule.attestation === undefined ||
-          Date.parse(capsule.attestation.expiresAt) <= now
+          Date.parse(capsule.attestation.expiresAt) <= now ||
+          capsule.isolationPolicyDigest !== method.requiredIsolationPolicyDigest
         ) {
           throw new AccountsError("CAPSULE_NOT_READY", "Capsule evidence does not allow readiness");
         }
@@ -171,6 +201,9 @@ export class AccountsCatalog {
         if (binding.expiresAt !== undefined && Date.parse(binding.expiresAt) <= now) {
           throw new AccountsError("POLICY_DENIED", "Credential binding is expired");
         }
+        if (binding.policyDigest !== method.executionPolicyDigest) {
+          throw new AccountsError("POLICY_DENIED", "Credential policy does not match access method");
+        }
         if (binding.resolver === "capsule_local_native") {
           const capsule = await this.get("auth_capsule", binding.authCapsuleId!);
           if (
@@ -188,5 +221,19 @@ export class AccountsCatalog {
   private nextTimestamp(previous: string): string {
     const current = this.now().getTime();
     return new Date(Math.max(current, Date.parse(previous) + 1)).toISOString();
+  }
+
+  private async runMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 }

@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import {
   AccountsError,
@@ -18,6 +18,7 @@ import {
   parseClosedJson,
   parseCredentialBindingId,
   parseEntitlementId,
+  PACKAGE_VERSION,
   toErrorEnvelope,
   validateSlotEligibility,
   type EntityKind,
@@ -49,10 +50,10 @@ export async function runAccountsCli(argv: readonly string[]): Promise<number> {
       return 0;
     }
     if (command === "version" || parsed.flags.version === true) {
-      output(jsonRequested, "version", { package: "@hasna/accounts", version: "1.0.0-dev.0" });
+      output(jsonRequested, "version", { package: "@hasna/accounts", version: PACKAGE_VERSION });
       return 0;
     }
-    if (command === "validate") return validateCommand(positionals, parsed.flags, jsonRequested);
+    if (command === "validate") return await validateCommand(positionals, parsed.flags, jsonRequested);
 
     const catalog = createLocalCatalog();
     try {
@@ -122,6 +123,13 @@ export async function runAccountsCli(argv: readonly string[]): Promise<number> {
 
 function createLocalCatalog() {
   const deployment = Bun.env.HASNA_ACCOUNTS_DEPLOYMENT;
+  const localPath = Bun.env.HASNA_ACCOUNTS_DATABASE_PATH;
+  const serviceConfigPresent =
+    Bun.env.HASNA_ACCOUNTS_CAPACITY_API_URL !== undefined ||
+    Bun.env.HASNA_ACCOUNTS_CAPACITY_AUTH_REF !== undefined;
+  if (deployment === "self_hosted" && localPath !== undefined) {
+    throw usageError("Self-hosted deployment cannot use a local database path");
+  }
   if (deployment !== "local") {
     if (deployment === "self_hosted") {
       throw new AccountsError("NOT_IMPLEMENTED", "The Postgres/self-hosted adapter is reserved, not implemented", {
@@ -130,14 +138,13 @@ function createLocalCatalog() {
     }
     throw usageError("HASNA_ACCOUNTS_DEPLOYMENT must be local or self_hosted");
   }
-  if (
-    Bun.env.HASNA_ACCOUNTS_CAPACITY_API_URL !== undefined ||
-    Bun.env.HASNA_ACCOUNTS_CAPACITY_AUTH_REF !== undefined
-  ) {
+  if (serviceConfigPresent) {
     throw usageError("Local deployment cannot use self-hosted capacity configuration");
   }
-  const configured = Bun.env.HASNA_ACCOUNTS_DATABASE_PATH;
-  const path = configured === undefined ? join(homedir(), ".hasna", "accounts", "accounts.db") : resolve(configured);
+  if (localPath !== undefined && !isAbsolute(localPath)) {
+    throw usageError("HASNA_ACCOUNTS_DATABASE_PATH must be absolute");
+  }
+  const path = localPath === undefined ? join(homedir(), ".hasna", "accounts", "accounts.db") : localPath;
   return createSQLiteAccounts({ path });
 }
 

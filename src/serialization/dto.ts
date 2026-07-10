@@ -21,6 +21,7 @@ import {
   type EntityKind,
   type EntityMap,
   type Entitlement,
+  type EligibilityRequest,
   type SlotEligibilityMetadata,
 } from "../domain/models";
 import {
@@ -253,6 +254,12 @@ function validateEntitlement(input: unknown): Entitlement {
     "fundingKind",
     "status",
     "capabilitySet",
+    "capabilityEvidenceRef",
+    "capabilityDigest",
+    "capabilityExpiresAt",
+    "executionPolicyDecisionRef",
+    "executionPolicyDecisionDigest",
+    "executionPolicyDecisionExpiresAt",
     "termsDecision",
     "dataPolicy",
     "dataPolicyEvidenceRef",
@@ -275,6 +282,12 @@ function validateEntitlement(input: unknown): Entitlement {
   exactKeys(capabilitySet, ["operations", "models"], [], "capabilitySet");
   stringList(capabilitySet.operations, "capabilitySet.operations");
   stringList(capabilitySet.models, "capabilitySet.models");
+  reference(value.capabilityEvidenceRef, "capabilityEvidenceRef");
+  digest(value.capabilityDigest, "capabilityDigest");
+  timestamp(value.capabilityExpiresAt, "capabilityExpiresAt");
+  reference(value.executionPolicyDecisionRef, "executionPolicyDecisionRef");
+  digest(value.executionPolicyDecisionDigest, "executionPolicyDecisionDigest");
+  timestamp(value.executionPolicyDecisionExpiresAt, "executionPolicyDecisionExpiresAt");
   validateTermsDecision(value.termsDecision);
   validateDataPolicy(value.dataPolicy);
   reference(value.dataPolicyEvidenceRef, "dataPolicyEvidenceRef");
@@ -282,6 +295,14 @@ function validateEntitlement(input: unknown): Entitlement {
   timestamp(value.dataPolicyExpiresAt, "dataPolicyExpiresAt");
   timestamp(value.lastVerifiedAt, "lastVerifiedAt");
   ordered(value.lastVerifiedAt, value.dataPolicyExpiresAt, "dataPolicyExpiresAt");
+  ordered(value.lastVerifiedAt, value.capabilityExpiresAt, "capabilityExpiresAt");
+  ordered(value.lastVerifiedAt, value.executionPolicyDecisionExpiresAt, "executionPolicyDecisionExpiresAt");
+  if (
+    value.capabilityEvidenceRef !== value.executionPolicyDecisionRef ||
+    value.dataPolicyEvidenceRef !== value.executionPolicyDecisionRef
+  ) {
+    throw invalid("executionPolicyDecisionRef");
+  }
   return value as unknown as Entitlement;
 }
 
@@ -355,6 +376,12 @@ function validateAccessMethod(input: unknown): AccessMethod {
       "requiredIsolationPolicyRef",
       "requiredIsolationPolicyDigest",
       "isolationEvidenceExpiresAt",
+      "allowedDestinationPolicyClasses",
+      "parentPolicyDecisionRef",
+      "parentPolicyDecisionDigest",
+      "executionPolicyEvidenceRef",
+      "executionPolicyDigest",
+      "executionPolicyExpiresAt",
       "revision",
       "createdAt",
       "updatedAt",
@@ -372,6 +399,13 @@ function validateAccessMethod(input: unknown): AccessMethod {
   digest(value.requiredIsolationPolicyDigest, "requiredIsolationPolicyDigest");
   timestamp(value.isolationEvidenceExpiresAt, "isolationEvidenceExpiresAt");
   ordered(value.updatedAt, value.isolationEvidenceExpiresAt, "isolationEvidenceExpiresAt");
+  stringList(value.allowedDestinationPolicyClasses, "allowedDestinationPolicyClasses");
+  reference(value.parentPolicyDecisionRef, "parentPolicyDecisionRef");
+  digest(value.parentPolicyDecisionDigest, "parentPolicyDecisionDigest");
+  reference(value.executionPolicyEvidenceRef, "executionPolicyEvidenceRef");
+  digest(value.executionPolicyDigest, "executionPolicyDigest");
+  timestamp(value.executionPolicyExpiresAt, "executionPolicyExpiresAt");
+  ordered(value.updatedAt, value.executionPolicyExpiresAt, "executionPolicyExpiresAt");
   if (value.health !== undefined) validateHealth(value.health);
   if ((status === "ready" || status === "draining") && value.health === undefined) throw invalid("health");
   return value as unknown as AccessMethod;
@@ -526,6 +560,23 @@ export function validateEntity<K extends EntityKind>(kind: K, input: unknown): E
     case "credential_binding":
       return validateCredentialBinding(input) as EntityMap[K];
   }
+}
+
+export function validateEligibilityRequest(input: unknown): EligibilityRequest {
+  const value = object(input, "eligibilityRequest");
+  assertNoSensitiveFields(value);
+  exactKeys(
+    value,
+    ["accessMethodId", "operation", "model", "dataClassification", "destinationPolicyClass"],
+    [],
+    "eligibilityRequest",
+  );
+  parseAccessMethodId(value.accessMethodId);
+  reference(value.operation, "operation");
+  reference(value.model, "model");
+  reference(value.dataClassification, "dataClassification");
+  reference(value.destinationPolicyClass, "destinationPolicyClass");
+  return value as unknown as EligibilityRequest;
 }
 
 export interface RecordEnvelope<K extends EntityKind = EntityKind> {
@@ -713,8 +764,13 @@ export function validateSlotEligibility(input: unknown): SlotEligibilityMetadata
     } else if (value.accessTransport === "workload_identity") {
       if (target.kind !== "brokered" || target.resolver !== "workload_identity") throw invalid("accessTarget");
     }
-    for (const kind of ENTITY_KINDS) {
+    const requiredRevisionKinds =
+      target.kind === "native" ? ENTITY_KINDS : ENTITY_KINDS.filter((kind) => kind !== "auth_capsule");
+    for (const kind of requiredRevisionKinds) {
       if (revisions[kind] === undefined) throw invalid(`recordRevisionSet.${kind}`);
+    }
+    if (target.kind === "brokered" && revisions.auth_capsule !== undefined) {
+      throw invalid("recordRevisionSet.auth_capsule");
     }
   }
   timestamp(value.issuedAt, "issuedAt");

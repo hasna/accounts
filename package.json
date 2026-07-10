@@ -24,9 +24,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun run build:js && bun run build:types",
+    "build": "rm -rf dist && bun run build:js && bun run build:types",
     "build:js": "bun build src/index.ts --outdir dist --target bun --format esm && bun build src/cli.ts --outfile dist/cli.js --target bun --format esm",
-    "build:types": "tsc --emitDeclarationOnly --declaration --outDir dist",
+    "build:types": "tsc -p tsconfig.build.json",
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:storage": "bun test test/storage",

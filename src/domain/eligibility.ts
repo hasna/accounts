@@ -12,7 +12,7 @@ import type {
   Entitlement,
   SlotEligibilityMetadata,
 } from "./models";
-import { canonicalSha256 } from "../serialization/json";
+import { canonicalJson, canonicalSha256 } from "../serialization/json";
 import { validateSlotEligibility } from "../serialization/dto";
 
 export async function evaluateSlotEligibility(
@@ -87,6 +87,8 @@ export async function evaluateSlotEligibility(
     if (entitlement.termsDecision.decision !== "allowed") reasons.push("TERMS_NOT_ALLOWED");
     if (
       Date.parse(entitlement.termsDecision.expiresAt) <= now.getTime() ||
+      Date.parse(entitlement.capabilityExpiresAt) <= now.getTime() ||
+      Date.parse(entitlement.executionPolicyDecisionExpiresAt) <= now.getTime() ||
       Date.parse(entitlement.dataPolicyExpiresAt) <= now.getTime()
     ) {
       reasons.push("TERMS_STALE");
@@ -97,18 +99,30 @@ export async function evaluateSlotEligibility(
       reasons.push("DATA_CLASSIFICATION_NOT_ALLOWED");
     }
   }
+  if (!method.allowedDestinationPolicyClasses.includes(request.destinationPolicyClass)) {
+    reasons.push("DESTINATION_POLICY_NOT_ALLOWED");
+  }
+  if (
+    entitlement !== undefined &&
+    (method.parentPolicyDecisionRef !== entitlement.executionPolicyDecisionRef ||
+      method.parentPolicyDecisionDigest !== entitlement.executionPolicyDecisionDigest)
+  ) {
+    reasons.push("POLICY_DIGEST_MISMATCH");
+  }
   if (pool?.status !== "active") reasons.push("CAPACITY_POOL_NOT_ACTIVE");
   if (pool !== undefined && Date.parse(pool.evidenceExpiresAt) <= now.getTime()) {
     reasons.push("CAPACITY_EVIDENCE_STALE");
   }
   if (method.status !== "ready") reasons.push("ACCESS_METHOD_NOT_READY");
   if (method.health?.state !== "healthy") reasons.push("HEALTH_NOT_HEALTHY");
-  if (
-    method.health === undefined ||
-    Date.parse(method.health.expiresAt) <= now.getTime() ||
-    Date.parse(method.isolationEvidenceExpiresAt) <= now.getTime()
-  ) {
+  if (method.health === undefined || Date.parse(method.health.expiresAt) <= now.getTime()) {
     reasons.push("HEALTH_STALE");
+  }
+  if (
+    Date.parse(method.isolationEvidenceExpiresAt) <= now.getTime() ||
+    Date.parse(method.executionPolicyExpiresAt) <= now.getTime()
+  ) {
+    reasons.push("POLICY_EVIDENCE_STALE");
   }
 
   if (method.accessTransport === "native_session") {
@@ -118,6 +132,9 @@ export async function evaluateSlotEligibility(
       if (capsule.status !== "ready") reasons.push("CAPSULE_NOT_READY");
       if (account !== undefined && capsule.ownerRef !== account.ownerRef) reasons.push("CAPSULE_OWNER_MISMATCH");
       if (capsule.placementKind !== "enrolled_node") reasons.push("CAPSULE_PLACEMENT_INVALID");
+      if (capsule.isolationPolicyDigest !== method.requiredIsolationPolicyDigest) {
+        reasons.push("POLICY_DIGEST_MISMATCH");
+      }
       if (
         capsule.attestation === undefined ||
         Date.parse(capsule.attestation.expiresAt) <= now.getTime()
@@ -142,6 +159,7 @@ export async function evaluateSlotEligibility(
           ? "brokered_secret"
           : "workload_identity";
     if (binding.resolver !== expectedResolver) reasons.push("INVALID_ACCESS_TARGET");
+    if (binding.policyDigest !== method.executionPolicyDigest) reasons.push("POLICY_DIGEST_MISMATCH");
     if (
       capsule !== undefined &&
       method.accessTransport === "native_session" &&
@@ -167,6 +185,39 @@ export async function evaluateSlotEligibility(
     capsule,
     binding,
     reasons: uniqueReasons(reasons),
+  });
+}
+
+export async function checkCurrentEligibility(
+  repository: AccountsRepository,
+  previous: SlotEligibilityMetadata,
+  request: EligibilityRequest,
+  clock: () => Date = () => new Date(),
+): Promise<SlotEligibilityMetadata> {
+  const fresh = await evaluateSlotEligibility(repository, request, clock);
+  if (!previous.eligible || !fresh.eligible) return fresh;
+  const unchanged =
+    previous.eligibilityRequestDigest === fresh.eligibilityRequestDigest &&
+    previous.accessMethodId === fresh.accessMethodId &&
+    previous.accountId === fresh.accountId &&
+    previous.entitlementId === fresh.entitlementId &&
+    previous.capacityPoolId === fresh.capacityPoolId &&
+    previous.ownerRef === fresh.ownerRef &&
+    previous.accessTransport === fresh.accessTransport &&
+    previous.serializationKey === fresh.serializationKey &&
+    previous.maxConcurrency === fresh.maxConcurrency &&
+    previous.capacityGeneration === fresh.capacityGeneration &&
+    previous.denyGeneration === fresh.denyGeneration &&
+    previous.denyState === fresh.denyState &&
+    previous.credentialFamilyId === fresh.credentialFamilyId &&
+    previous.credentialGeneration === fresh.credentialGeneration &&
+    canonicalJson(previous.accessTarget) === canonicalJson(fresh.accessTarget) &&
+    canonicalJson(previous.recordRevisionSet) === canonicalJson(fresh.recordRevisionSet);
+  if (unchanged) return fresh;
+  return validateSlotEligibility({
+    ...fresh,
+    eligible: false,
+    reasonCodes: ["GENERATION_MISMATCH"],
   });
 }
 
@@ -226,10 +277,13 @@ function buildResult(input: {
         now.getTime() + 30_000,
         ...[
           entitlement?.termsDecision.expiresAt,
+          entitlement?.capabilityExpiresAt,
+          entitlement?.executionPolicyDecisionExpiresAt,
           entitlement?.dataPolicyExpiresAt,
           pool?.evidenceExpiresAt,
           method.health?.expiresAt,
           method.isolationEvidenceExpiresAt,
+          method.executionPolicyExpiresAt,
           capsule?.attestation?.expiresAt,
           binding?.expiresAt,
         ]

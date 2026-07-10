@@ -123,7 +123,7 @@ export class AccountsError extends Error {
       details?: SafeErrorDetails;
     } = {},
   ) {
-    super(message);
+    super(PUBLIC_MESSAGES[code]);
     this.name = "AccountsError";
     this.code = code;
     this.retryable = options.retryable ?? false;
