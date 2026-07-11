@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import {
   closeSync,
+  chmodSync,
   constants,
   existsSync,
   fstatSync,
@@ -60,7 +61,12 @@ export class SQLiteAccountsSlotEligibilitySource implements AccountsSlotEligibil
   constructor(options: SQLiteAccountsSlotEligibilitySourceOptions) {
     this.recoveryFrontier = options.recoveryFrontier;
     const path = prepareDatabasePath(options.path);
-    this.database = new Database(path, { create: false, strict: true });
+    const previousUmask = process.umask(0o077);
+    try {
+      this.database = new Database(path, { create: false, strict: true });
+    } finally {
+      process.umask(previousUmask);
+    }
     this.database.exec("PRAGMA journal_mode=WAL");
     this.database.exec("PRAGMA synchronous=FULL");
     this.database.exec("PRAGMA foreign_keys=ON");
@@ -81,6 +87,7 @@ export class SQLiteAccountsSlotEligibilitySource implements AccountsSlotEligibil
         current_deny INTEGER NOT NULL CHECK (current_deny IN (0,1))
       ) STRICT;
     `);
+    secureSqliteFiles(path);
   }
 
   async getSlotEligibility(request: unknown): Promise<Uint8Array> {
@@ -225,11 +232,13 @@ function prepareDatabasePath(input: string): string {
     throw new AccountsError("DATABASE_PATH_UNSAFE", "Accounts database directory is unsafe");
   }
   const parentMetadata = lstatSync(parent);
+  const uid = process.getuid?.();
   if (
+    uid === undefined ||
     realParent !== parent ||
     !parentMetadata.isDirectory() ||
     parentMetadata.isSymbolicLink() ||
-    (typeof process.getuid === "function" && parentMetadata.uid !== process.getuid()) ||
+    parentMetadata.uid !== uid ||
     (parentMetadata.mode & 0o077) !== 0
   ) {
     throw new AccountsError("DATABASE_PATH_UNSAFE", "Accounts database directory is unsafe");
@@ -262,7 +271,7 @@ function prepareDatabasePath(input: string): string {
     if (
       !metadata.isFile() ||
       metadata.nlink !== 1 ||
-      (typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
+      metadata.uid !== uid ||
       (metadata.mode & 0o077) !== 0
     ) {
       throw new AccountsError("DATABASE_PATH_UNSAFE", "Accounts database file is unsafe");
@@ -271,4 +280,15 @@ function prepareDatabasePath(input: string): string {
     closeSync(descriptor);
   }
   return path;
+}
+
+function secureSqliteFiles(path: string): void {
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+    if (!existsSync(candidate)) continue;
+    const metadata = lstatSync(candidate);
+    if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink !== 1) {
+      throw new AccountsError("DATABASE_PATH_UNSAFE", "Accounts SQLite sidecar is unsafe");
+    }
+    chmodSync(candidate, 0o600);
+  }
 }

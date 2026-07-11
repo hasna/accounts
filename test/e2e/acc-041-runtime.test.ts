@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -119,6 +119,9 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
     expect(await production.checkOnlineGeneration(query)).toEqual(
       await deterministic.checkOnlineGeneration(query),
     );
+    for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+      if (existsSync(candidate)) expect(lstatSync(candidate).mode & 0o777).toBe(0o600);
+    }
     source.close();
   });
 
