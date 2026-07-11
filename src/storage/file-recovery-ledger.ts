@@ -93,12 +93,46 @@ export interface SignedLogSnapshot<T> {
   readonly records: readonly SignedLogRecord<T>[];
 }
 
+export interface SignedLogCoordination {
+  runExclusive<R>(operation: () => R): R;
+}
+
+export interface SignedLogSession<T> {
+  readSnapshot(): SignedLogSnapshot<T>;
+  append(expected: SignedLogFrontier, payload: T): SignedLogRecord<T>;
+}
+
 export interface OwnerOnlySignedAppendLogOptions<T> {
   readonly path: string;
   readonly catalogIncarnation: string;
   readonly signingKey: Uint8Array;
   readonly logKind: string;
   readonly validatePayload: (value: unknown) => T;
+}
+
+const trustedSignedLogCoordinations = new WeakMap<object, SignedLogCoordination>();
+
+/** @internal Package composition hook; intentionally not re-exported at the package root. */
+export function createCoordinatedOwnerOnlySignedAppendLog<T>(
+  options: OwnerOnlySignedAppendLogOptions<T>,
+  coordination: SignedLogCoordination,
+): OwnerOnlySignedAppendLog<T> {
+  if (
+    coordination === null ||
+    typeof coordination !== "object" ||
+    typeof coordination.runExclusive !== "function"
+  ) {
+    throw new AccountsError("VALIDATION_FAILED", "Signed log coordination is invalid");
+  }
+  const trustedOptions = Object.freeze({
+    path: options.path,
+    catalogIncarnation: options.catalogIncarnation,
+    signingKey: options.signingKey,
+    logKind: options.logKind,
+    validatePayload: options.validatePayload,
+  });
+  trustedSignedLogCoordinations.set(trustedOptions, coordination);
+  return new OwnerOnlySignedAppendLog(trustedOptions);
 }
 
 function failHold(): never {
@@ -374,6 +408,7 @@ export class OwnerOnlySignedAppendLog<T> {
   private readonly catalogIncarnation: string;
   private readonly logKind: string;
   private readonly validatePayload: (value: unknown) => T;
+  private readonly coordinate: <R>(operation: () => R) => R;
   private lastObserved?: SignedLogFrontier;
 
   constructor(options: OwnerOnlySignedAppendLogOptions<T>) {
@@ -397,9 +432,14 @@ export class OwnerOnlySignedAppendLog<T> {
     this.catalogIncarnation = options.catalogIncarnation;
     this.logKind = options.logKind;
     this.validatePayload = options.validatePayload;
+    const trustedCoordination = trustedSignedLogCoordinations.get(options as object);
+    this.coordinate =
+      trustedCoordination === undefined
+        ? <R>(operation: () => R): R => this.withLock(operation)
+        : <R>(operation: () => R): R => trustedCoordination.runExclusive(operation);
 
     assertOwnerOnlyDirectory(this.parentPath);
-    this.withLock(() => {
+    this.coordinate(() => {
       const ledgerExists = existsSync(this.path);
       const anchorExists = existsSync(this.anchorPath);
       if (
@@ -418,7 +458,32 @@ export class OwnerOnlySignedAppendLog<T> {
   }
 
   readSnapshot(): SignedLogSnapshot<T> {
-    return this.withLock(() => this.scan());
+    return this.withCoordinatedSession((session) => session.readSnapshot());
+  }
+
+  withCoordinatedSession<R>(operation: (session: SignedLogSession<T>) => R): R {
+    assertOwnerOnlyDirectory(this.parentPath);
+    return this.coordinate(() => {
+      let active = true;
+      const assertActive = (): void => {
+        if (!active) failHold();
+      };
+      const session = Object.freeze({
+        readSnapshot: (): SignedLogSnapshot<T> => {
+          assertActive();
+          return this.scan();
+        },
+        append: (expected: SignedLogFrontier, payload: T): SignedLogRecord<T> => {
+          assertActive();
+          return this.appendUnderCoordination(expected, payload);
+        },
+      }) satisfies SignedLogSession<T>;
+      try {
+        return operation(session);
+      } finally {
+        active = false;
+      }
+    });
   }
 
   verifyFrontier(frontier: SignedLogFrontier): boolean {
@@ -445,79 +510,84 @@ export class OwnerOnlySignedAppendLog<T> {
   }
 
   append(expected: SignedLogFrontier, payload: T): SignedLogRecord<T> {
-    return this.withLock(() => {
-      const snapshot = this.scan();
-      if (
-        !this.verifyFrontier(expected) ||
-        expected.catalogIncarnation !== snapshot.frontier.catalogIncarnation ||
-        expected.sequence !== snapshot.frontier.sequence ||
-        !digestEqual(expected.hash, snapshot.frontier.hash) ||
-        !digestEqual(expected.signatureDigest, snapshot.frontier.signatureDigest)
-      ) {
-        failHold();
-      }
-      const validated = this.validatePayload(payload);
-      const sequence = incrementCounter(snapshot.frontier.sequence);
-      const payloadDigest = canonicalSha256(validated);
-      const hash = canonicalSha256({
-        catalogIncarnation: this.catalogIncarnation,
-        logKind: this.logKind,
-        sequence,
-        previousHash: snapshot.frontier.hash,
-        payloadDigest,
-      });
-      const signatureDigest = this.signFrontier({
-        catalogIncarnation: this.catalogIncarnation,
-        sequence,
-        hash,
-      });
-      const unsigned = {
-        schema_version: SIGNED_LOG_SCHEMA,
-        log_kind: this.logKind,
-        catalog_incarnation: this.catalogIncarnation,
-        sequence,
-        previous_hash: snapshot.frontier.hash,
-        payload: validated,
-        payload_digest: payloadDigest,
-        hash,
-        signature_digest: signatureDigest,
-      } as const;
-      const receiptDigest = this.hmac(unsigned);
-      const stored: SignedLogStoredRecord<T> = {
-        ...unsigned,
-        receipt_digest: receiptDigest,
-      };
-      const line = Buffer.from(`${canonicalJson(stored)}\n`, "utf8");
-      if (line.byteLength > MAX_RECORD_BYTES) {
-        throw new AccountsError("VALIDATION_FAILED", "Signed append log record is too large");
-      }
+    return this.withCoordinatedSession((session) => session.append(expected, payload));
+  }
 
-      const descriptor = openExistingSecure(
-        this.path,
-        constants.O_WRONLY | constants.O_APPEND,
-      );
-      try {
-        writeAll(descriptor, line);
-        fsyncSync(descriptor);
-      } finally {
-        closeSync(descriptor);
-      }
+  private appendUnderCoordination(
+    expected: SignedLogFrontier,
+    payload: T,
+  ): SignedLogRecord<T> {
+    const snapshot = this.scan();
+    if (
+      !this.verifyFrontier(expected) ||
+      expected.catalogIncarnation !== snapshot.frontier.catalogIncarnation ||
+      expected.sequence !== snapshot.frontier.sequence ||
+      !digestEqual(expected.hash, snapshot.frontier.hash) ||
+      !digestEqual(expected.signatureDigest, snapshot.frontier.signatureDigest)
+    ) {
+      failHold();
+    }
+    const validated = this.validatePayload(payload);
+    const sequence = incrementCounter(snapshot.frontier.sequence);
+    const payloadDigest = canonicalSha256(validated);
+    const hash = canonicalSha256({
+      catalogIncarnation: this.catalogIncarnation,
+      logKind: this.logKind,
+      sequence,
+      previousHash: snapshot.frontier.hash,
+      payloadDigest,
+    });
+    const signatureDigest = this.signFrontier({
+      catalogIncarnation: this.catalogIncarnation,
+      sequence,
+      hash,
+    });
+    const unsigned = {
+      schema_version: SIGNED_LOG_SCHEMA,
+      log_kind: this.logKind,
+      catalog_incarnation: this.catalogIncarnation,
+      sequence,
+      previous_hash: snapshot.frontier.hash,
+      payload: validated,
+      payload_digest: payloadDigest,
+      hash,
+      signature_digest: signatureDigest,
+    } as const;
+    const receiptDigest = this.hmac(unsigned);
+    const stored: SignedLogStoredRecord<T> = {
+      ...unsigned,
+      receipt_digest: receiptDigest,
+    };
+    const line = Buffer.from(`${canonicalJson(stored)}\n`, "utf8");
+    if (line.byteLength > MAX_RECORD_BYTES) {
+      throw new AccountsError("VALIDATION_FAILED", "Signed append log record is too large");
+    }
 
-      const frontier = {
-        catalogIncarnation: this.catalogIncarnation,
-        sequence,
-        hash,
-        signatureDigest,
-      } satisfies SignedLogFrontier;
-      this.writeAnchor(frontier);
-      this.lastObserved = frontier;
-      return Object.freeze({
-        ...frontier,
-        previousHash: snapshot.frontier.hash,
-        payload: structuredClone(validated),
-        payloadDigest,
-        receiptDigest,
-      });
+    const descriptor = openExistingSecure(
+      this.path,
+      constants.O_WRONLY | constants.O_APPEND,
+    );
+    try {
+      writeAll(descriptor, line);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+
+    const frontier = {
+      catalogIncarnation: this.catalogIncarnation,
+      sequence,
+      hash,
+      signatureDigest,
+    } satisfies SignedLogFrontier;
+    this.writeAnchor(frontier);
+    this.lastObserved = frontier;
+    return Object.freeze({
+      ...frontier,
+      previousHash: snapshot.frontier.hash,
+      payload: structuredClone(validated),
+      payloadDigest,
+      receiptDigest,
     });
   }
 

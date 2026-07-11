@@ -11,7 +11,8 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { AccountsError } from "../errors";
 import { parseCounter, type Counter } from "../domain/counter";
 import {
-  OwnerOnlySignedAppendLog,
+  createCoordinatedOwnerOnlySignedAppendLog,
+  type OwnerOnlySignedAppendLog,
   type SignedLogRecord,
   type SignedLogSnapshot,
 } from "../storage/file-recovery-ledger";
@@ -341,6 +342,7 @@ export class NonRewindableCapabilityUseLedger {
 
   private readonly log: OwnerOnlySignedAppendLog<CapabilityUseLedgerPayload>;
   private readonly database: Database;
+  private readonly coordinationDatabase: Database;
   private readonly catalogIncarnation: string;
   private closed = false;
 
@@ -350,17 +352,27 @@ export class NonRewindableCapabilityUseLedger {
       options.catalogIncarnation,
       "catalogIncarnation",
     );
-    this.log = new OwnerOnlySignedAppendLog({
-      path: options.ledgerPath,
-      catalogIncarnation: this.catalogIncarnation,
-      signingKey: options.signingKey,
-      logKind: LOG_KIND,
-      validatePayload: validatePayload,
-    });
-    const mirrorPath = prepareMirrorPath(options.mirrorPath);
+    if (!isAbsolute(options.ledgerPath)) {
+      throw new AccountsError("VALIDATION_FAILED", "Capability-use ledger path must be absolute");
+    }
+    const ledgerPath = resolve(options.ledgerPath);
+    const mirrorPath = prepareOwnerOnlySQLitePath(
+      options.mirrorPath,
+      "Capability-use mirror",
+    );
+    const coordinationPath = prepareOwnerOnlySQLitePath(
+      `${ledgerPath}.coordination.sqlite`,
+      "Capability-use coordination",
+    );
+    if (mirrorPath === coordinationPath) {
+      throw new AccountsError(
+        "VALIDATION_FAILED",
+        "Capability-use mirror and coordination paths must differ",
+      );
+    }
     const previousUmask = process.umask(0o077);
     try {
-      this.database = new Database(mirrorPath, {
+      this.coordinationDatabase = new Database(coordinationPath, {
         create: true,
         strict: true,
         safeIntegers: true,
@@ -368,12 +380,51 @@ export class NonRewindableCapabilityUseLedger {
     } finally {
       process.umask(previousUmask);
     }
+    chmodSync(coordinationPath, 0o600);
+    this.coordinationDatabase.exec("PRAGMA busy_timeout = 5000");
+    this.coordinationDatabase.exec("PRAGMA journal_mode = WAL");
+    try {
+      this.initializeCoordinationBinding(
+        canonicalSha256({
+          kind: "accounts-capability-use-coordination",
+          ledgerPath,
+          mirrorPath,
+        }),
+      );
+    } catch (error) {
+      this.coordinationDatabase.close();
+      throw error;
+    }
+
+    const mirrorUmask = process.umask(0o077);
+    try {
+      this.database = new Database(mirrorPath, {
+        create: true,
+        strict: true,
+        safeIntegers: true,
+      });
+    } finally {
+      process.umask(mirrorUmask);
+    }
     chmodSync(mirrorPath, 0o600);
     this.database.exec("PRAGMA foreign_keys = ON");
     this.database.exec("PRAGMA busy_timeout = 5000");
     this.database.exec("PRAGMA journal_mode = WAL");
-    this.migrateMirror();
+    this.runCoordinated(() => this.migrateMirror());
+    this.log = createCoordinatedOwnerOnlySignedAppendLog(
+      {
+        path: ledgerPath,
+        catalogIncarnation: this.catalogIncarnation,
+        signingKey: options.signingKey,
+        logKind: LOG_KIND,
+        validatePayload: validatePayload,
+      },
+      {
+        runExclusive: <R>(operation: () => R): R => this.runCoordinated(operation),
+      },
+    );
     secureSQLiteSidecars(mirrorPath);
+    secureSQLiteSidecars(coordinationPath);
     this.initialReconciliation = this.reconcile();
   }
 
@@ -383,60 +434,59 @@ export class NonRewindableCapabilityUseLedger {
       throw new AccountsError("FORBIDDEN", "Capability-use evidence was not verified");
     }
     const payload = payloadFromEvidence(evidence);
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const snapshot = this.log.readSnapshot();
+    return this.log.withCoordinatedSession((session) => {
+      const snapshot = session.readSnapshot();
       const indexes = buildIndexes(snapshot);
       const existing = resolveExisting(indexes, payload);
       if (existing !== undefined) {
-        this.reconcile();
+        this.reconcileUnderCoordination(snapshot);
         return Object.freeze({ kind: "REPLAYED", record: toPublicRecord(existing) });
       }
       if (payload.catalog_incarnation !== this.catalogIncarnation) {
         throw new AccountsError("CONFLICT", "Capability-use catalog incarnation conflicts");
       }
-      let appended: SignedLogRecord<CapabilityUseLedgerPayload>;
-      try {
-        appended = this.log.append(snapshot.frontier, payload);
-      } catch (error) {
-        if (
-          attempt === 0 &&
-          error instanceof AccountsError &&
-          error.code === "RECOVERY_HOLD"
-        ) {
-          continue;
-        }
-        throw error;
-      }
-      this.reconcile();
+      const appended = session.append(snapshot.frontier, payload);
+      this.reconcileUnderCoordination(session.readSnapshot());
       return Object.freeze({ kind: "APPENDED", record: toPublicRecord(appended) });
-    }
-    throw new AccountsError("RECOVERY_HOLD", "Capability-use append could not converge");
+    });
   }
 
   lookup(query: CapabilityUseLookup): CapabilityUseLedgerRecord | undefined {
     this.assertOpen();
-    this.reconcile();
     const parsed = validateLookup(query);
-    const indexes = buildIndexes(this.log.readSnapshot());
-    const record =
-      parsed.kind === "request"
-        ? indexes.byRequestId.get(parsed.value)
-        : parsed.kind === "idempotency"
-          ? indexes.byIdempotency.get(parsed.value)
-          : parsed.kind === "capability_nonce"
-            ? indexes.byCapabilityNonce.get(capabilityNonceKey(parsed.capabilityId, parsed.nonce))
-            : indexes.byUseId.get(parsed.value);
-    return record === undefined ? undefined : toPublicRecord(record);
+    return this.log.withCoordinatedSession((session) => {
+      const snapshot = session.readSnapshot();
+      this.reconcileUnderCoordination(snapshot);
+      const indexes = buildIndexes(snapshot);
+      const record =
+        parsed.kind === "request"
+          ? indexes.byRequestId.get(parsed.value)
+          : parsed.kind === "idempotency"
+            ? indexes.byIdempotency.get(parsed.value)
+            : parsed.kind === "capability_nonce"
+              ? indexes.byCapabilityNonce.get(
+                  capabilityNonceKey(parsed.capabilityId, parsed.nonce),
+                )
+              : indexes.byUseId.get(parsed.value);
+      return record === undefined ? undefined : toPublicRecord(record);
+    });
   }
 
   reconcile(): CapabilityUseReconciliation {
     this.assertOpen();
-    const snapshot = this.log.readSnapshot();
+    return this.log.withCoordinatedSession((session) =>
+      this.reconcileUnderCoordination(session.readSnapshot()),
+    );
+  }
+
+  private reconcileUnderCoordination(
+    snapshot: SignedLogSnapshot<CapabilityUseLedgerPayload>,
+  ): CapabilityUseReconciliation {
     buildIndexes(snapshot);
     if (this.mirrorMatches(snapshot)) return reconciliation("CURRENT", snapshot);
     this.assertMirrorNotAhead(snapshot);
 
-    const rebuild = this.database.transaction(() => {
+    try {
       this.database.exec("DELETE FROM capability_use_mirror");
       this.database.exec("DELETE FROM capability_use_mirror_meta");
       const insert = this.database.query(`
@@ -466,9 +516,6 @@ export class NonRewindableCapabilityUseLedger {
         snapshot.frontier.hash,
         snapshot.frontier.signatureDigest,
       );
-    });
-    try {
-      rebuild.immediate();
     } catch {
       throw new AccountsError("RECOVERY_HOLD", "Capability-use mirror reconciliation failed");
     }
@@ -478,10 +525,58 @@ export class NonRewindableCapabilityUseLedger {
     return reconciliation("REBUILT", snapshot);
   }
 
+  private runCoordinated<R>(operation: () => R): R {
+    try {
+      return this.coordinationDatabase.transaction(() =>
+        this.database.transaction(operation).immediate(),
+      ).immediate();
+    } catch (error) {
+      if (error instanceof AccountsError) throw error;
+      throw new AccountsError("RECOVERY_HOLD", "Capability-use coordination failed");
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.database.close();
+    this.coordinationDatabase.close();
+  }
+
+  private initializeCoordinationBinding(bindingDigest: string): void {
+    try {
+      this.coordinationDatabase.transaction(() => {
+        this.coordinationDatabase.exec(`
+          CREATE TABLE IF NOT EXISTS capability_use_coordination (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version TEXT NOT NULL CHECK (
+              schema_version = 'accounts.capability-use-coordination/v1'
+            ),
+            binding_digest TEXT NOT NULL CHECK (length(binding_digest) = 71)
+          ) STRICT;
+        `);
+        const existing = this.coordinationDatabase.query(`
+          SELECT binding_digest
+          FROM capability_use_coordination
+          WHERE singleton = 1
+        `).get() as { readonly binding_digest: string } | null;
+        if (existing === null) {
+          this.coordinationDatabase.query(`
+            INSERT INTO capability_use_coordination (
+              singleton, schema_version, binding_digest
+            ) VALUES (1, 'accounts.capability-use-coordination/v1', ?)
+          `).run(bindingDigest);
+        } else if (existing.binding_digest !== bindingDigest) {
+          throw new AccountsError(
+            "RECOVERY_HOLD",
+            "Capability-use coordination binding conflicts",
+          );
+        }
+      }).immediate();
+    } catch (error) {
+      if (error instanceof AccountsError) throw error;
+      throw new AccountsError("RECOVERY_HOLD", "Capability-use coordination failed");
+    }
   }
 
   private migrateMirror(): void {
@@ -1016,10 +1111,10 @@ function canonicalBase64url(value: unknown, field: string): string {
   return value;
 }
 
-function prepareMirrorPath(path: string): string {
+function prepareOwnerOnlySQLitePath(path: string, purpose: string): string {
   const uid = currentUid();
   if (!isAbsolute(path)) {
-    throw new AccountsError("VALIDATION_FAILED", "Capability-use mirror path must be absolute");
+    throw new AccountsError("VALIDATION_FAILED", `${purpose} path must be absolute`);
   }
   const normalized = resolve(path);
   const parent = dirname(normalized);
@@ -1027,7 +1122,7 @@ function prepareMirrorPath(path: string): string {
   try {
     realParent = realpathSync.native(parent);
   } catch {
-    throw new AccountsError("DATABASE_PATH_UNSAFE", "Capability-use mirror parent is unsafe");
+    throw new AccountsError("DATABASE_PATH_UNSAFE", `${purpose} parent is unsafe`);
   }
   const parentMetadata = lstatSync(parent);
   if (
@@ -1037,7 +1132,7 @@ function prepareMirrorPath(path: string): string {
     parentMetadata.uid !== uid ||
     (parentMetadata.mode & 0o077) !== 0
   ) {
-    throw new AccountsError("DATABASE_PATH_UNSAFE", "Capability-use mirror parent is unsafe");
+    throw new AccountsError("DATABASE_PATH_UNSAFE", `${purpose} parent is unsafe`);
   }
   if (existsSync(normalized)) {
     const metadata = lstatSync(normalized);
@@ -1048,7 +1143,7 @@ function prepareMirrorPath(path: string): string {
       metadata.uid !== uid ||
       (metadata.mode & 0o077) !== 0
     ) {
-      throw new AccountsError("DATABASE_PATH_UNSAFE", "Capability-use mirror path is unsafe");
+      throw new AccountsError("DATABASE_PATH_UNSAFE", `${purpose} path is unsafe`);
     }
   }
   return normalized;

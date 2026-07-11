@@ -12,7 +12,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { canonicalJson } from "../../src/serialization/json";
-import { FileRecoveryLedger } from "../../src/storage/file-recovery-ledger";
+import {
+  FileRecoveryLedger,
+  OwnerOnlySignedAppendLog,
+  type OwnerOnlySignedAppendLogOptions,
+} from "../../src/storage/file-recovery-ledger";
 
 const cleanup: string[] = [];
 const KEY = new Uint8Array(32).fill(0x37);
@@ -275,6 +279,25 @@ describe("owner-only file recovery ledger", () => {
       flag: "wx",
     });
     expect(() => ledgerAt(malformedPath)).toThrow(
+      expect.objectContaining({ code: "RECOVERY_HOLD" }),
+    );
+  });
+
+  test("rejects a forged structural coordinator and retains the mandatory file lock", () => {
+    const path = join(directory(), "forged-coordinator.log");
+    writeFileSync(`${path}.lock`, "", { mode: 0o600, flag: "wx" });
+    const forged = {
+      path,
+      catalogIncarnation: CATALOG,
+      signingKey: KEY,
+      logKind: "forged-coordinator",
+      validatePayload: (value: unknown): unknown => value,
+      coordination: {
+        runExclusive: <R>(operation: () => R): R => operation(),
+      },
+    } as unknown as OwnerOnlySignedAppendLogOptions<unknown>;
+
+    expect(() => new OwnerOnlySignedAppendLog(forged)).toThrow(
       expect.objectContaining({ code: "RECOVERY_HOLD" }),
     );
   });

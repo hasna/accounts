@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -105,6 +107,27 @@ function ledgerAt(path: string) {
     catalogIncarnation: "accounts-v10-ledger-test",
     signingKey: KEY,
   });
+}
+
+async function waitForFile(path: string, description: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
+    await Bun.sleep(10);
+  }
+}
+
+async function waitForWorker(
+  worker: ReturnType<typeof Bun.spawn>,
+  description: string,
+): Promise<void> {
+  const exitCode = await worker.exited;
+  if (exitCode === 0) return;
+  const stderr =
+    worker.stderr instanceof ReadableStream
+      ? await new Response(worker.stderr).text()
+      : "stderr unavailable";
+  throw new Error(`${description} exited ${exitCode}: ${stderr}`);
 }
 
 describe("v10 non-rewindable capability-use ledger", () => {
@@ -388,6 +411,104 @@ describe("v10 non-rewindable capability-use ledger", () => {
     expect(() => ledgerAt(original)).toThrow(
       expect.objectContaining({ code: "RECOVERY_HOLD" }),
     );
+  });
+
+  test("ignores empty and partial legacy file-lock publications under SQLite coordination", () => {
+    for (const [name, bytes] of [
+      ["empty", ""],
+      ["partial", '{"schema_version":"accounts.signed-log-lock.v2"'],
+    ] as const) {
+      const directory = root();
+      const ledger = ledgerAt(directory);
+      ledger.close();
+      const lockPath = join(directory, "capability-use.log.lock");
+      writeFileSync(lockPath, bytes, { mode: 0o600, flag: "wx" });
+
+      const reopened = ledgerAt(directory);
+      expect(String(reopened.initialReconciliation.frontierSequence), name).toBe("0");
+      reopened.close();
+    }
+  });
+
+  test("binds one canonical mirror to the ledger-derived coordination database", () => {
+    const directory = root();
+    const ledgerPath = join(directory, "capability-use.log");
+    const ledger = ledgerAt(directory);
+    ledger.close();
+    const coordinationPath = `${ledgerPath}.coordination.sqlite`;
+    expect(lstatSync(coordinationPath).mode & 0o777).toBe(0o600);
+
+    const alternateMirror = join(directory, "alternate-capability-use.sqlite");
+    expect(() =>
+      new NonRewindableCapabilityUseLedger({
+        ledgerPath,
+        mirrorPath: alternateMirror,
+        catalogIncarnation: "accounts-v10-ledger-test",
+        signingKey: KEY,
+      }),
+    ).toThrow(expect.objectContaining({ code: "RECOVERY_HOLD" }));
+    expect(existsSync(alternateMirror)).toBe(false);
+  });
+
+  test("holds one signed snapshot through mirror rebuild so a second process cannot rewind it", async () => {
+    const directory = root();
+    const signals = root();
+    const ledger = ledgerAt(directory);
+    ledger.append(await verifiedEvidence(claims()));
+    ledger.close();
+
+    const workerPath = join(import.meta.dir, "fixtures", "capability-use-ledger-worker.ts");
+    const appendWorker = Bun.spawn(
+      [process.execPath, workerPath, "append-wait", directory, signals],
+      { stderr: "pipe", stdout: "pipe" },
+    );
+    let reconcileWorker: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      await waitForFile(join(signals, "append-ready"), "append worker readiness");
+
+      const mirror = new Database(join(directory, "capability-use.sqlite"), {
+        strict: true,
+        safeIntegers: true,
+      });
+      mirror.query(`
+        UPDATE capability_use_mirror
+        SET payload_json = '{"corrupt":true}'
+        WHERE sequence = 1
+      `).run();
+      mirror.close();
+
+      reconcileWorker = Bun.spawn(
+        [process.execPath, workerPath, "reconcile-pause", directory, signals],
+        { stderr: "pipe", stdout: "pipe" },
+      );
+      await waitForFile(join(signals, "reconcile-snapshot"), "held reconciliation snapshot");
+      writeFileSync(join(signals, "append-go"), "go\n", { mode: 0o600, flag: "wx" });
+      await waitForFile(join(signals, "append-started"), "append attempt");
+      await Bun.sleep(250);
+      expect(existsSync(join(signals, "append-done"))).toBe(false);
+    } finally {
+      if (!existsSync(join(signals, "append-go"))) {
+        writeFileSync(join(signals, "append-go"), "go\n", { mode: 0o600, flag: "wx" });
+      }
+      if (!existsSync(join(signals, "reconcile-release"))) {
+        writeFileSync(join(signals, "reconcile-release"), "go\n", {
+          mode: 0o600,
+          flag: "wx",
+        });
+      }
+      if (reconcileWorker !== undefined) {
+        await waitForWorker(reconcileWorker, "reconcile worker");
+      }
+      await waitForWorker(appendWorker, "append worker");
+    }
+
+    expect(existsSync(join(signals, "append-done"))).toBe(true);
+    const converged = ledgerAt(directory);
+    expect(converged.lookup({ useId: digest("8") })?.consumeRequestId).toBe(
+      "0198a0a0-0000-7000-8000-000000000902",
+    );
+    expect(String(converged.initialReconciliation.frontierSequence)).toBe("2");
+    converged.close();
   });
 
   test("pins v11 consume identities from sole planning commit and preserves tombstone identity", () => {
