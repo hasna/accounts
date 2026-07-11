@@ -1,0 +1,13 @@
+{
+  "schema_version": "accounts.runtime-contract-pin/v1",
+  "source_commit": "80054c36b10111765a18b89743214679c58ad7c6",
+  "accounts_source_commit": "7873b8b6bae5d4a388a34add2feaea612bbaa4ee",
+  "contract_sha256": "662842e91a4b58475b92f28eec8caeead4cd7955a485f3d20b16032ab4fa9167",
+  "redteam_sha256": "24b05c49676a9d0d8bed430619942997de2a8d6eaf6f481536d5cc5fdc33b3b4",
+  "transition_trace_sha256": "763fc966acc32d1585ac96ad45051577e50b63f3cf11a78bdee5bdf8be9b1873",
+  "review_pin_sha256": "33e19b22cb6c1687f8f85e883e73bf1ecdec88b75eccd5203d16a7f9ff2d93dc",
+  "implementation_status": "IN_PROGRESS",
+  "integration_authorized": false,
+  "publish_authorized": false,
+  "deploy_authorized": false
+}
