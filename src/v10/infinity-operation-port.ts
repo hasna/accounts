@@ -7,6 +7,10 @@
 export type InfinitySha256Digest = `sha256:${string}`;
 export type InfinityCounter = string;
 
+/** Exact dual-reviewed Infinity integration consumed by this Accounts boundary. */
+export const INFINITY_INTEGRATION_COMMIT =
+  "6c2ba3d490cd58c7192d6e274514a9d849575ab8" as const;
+
 export const INFINITY_MODEL_CALL_PREPARED_ANCHOR_SCHEMA_DIGEST =
   "sha256:39f247a54d025353bdb2cf98907ccfe9ad49d8c03ba4244bf66c72da667e924e" as const;
 export const INFINITY_MODEL_CALL_CONSUME_BINDING_SCHEMA_DIGEST =

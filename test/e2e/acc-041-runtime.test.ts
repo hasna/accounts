@@ -7,7 +7,11 @@ import { tmpdir } from "node:os";
 
 import { AccountsError } from "../../src/errors";
 import { parseCounter } from "../../src/domain/counter";
-import { canonicalJson } from "../../src/serialization/json";
+import {
+  canonicalJson,
+  canonicalSha256,
+  parseClosedJsonBytes,
+} from "../../src/serialization/json";
 import * as publicApi from "../../src/index";
 import {
   ONLINE_GENERATION_CONTEXT_FIELDS_V1,
@@ -27,6 +31,17 @@ import {
   type AccountsRecoveryFrontierPort,
   type AccountsRecoveryFrontierV1,
 } from "../../src/v10/sqlite-slot-source";
+import {
+  CAPABILITY_USE_CONSUME_RECEIPT_DESCRIPTOR,
+  CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+  CAPABILITY_USE_CONSUME_REQUEST_DESCRIPTOR,
+  CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
+  NonRewindableCapabilityUseLedger,
+  verifyCapabilityUseEvidence,
+  type CapabilityUseEvidenceVerifier,
+  type CapabilityUseVerifiedClaims,
+} from "../../src/v10/capability-use-ledger";
+import { INFINITY_INTEGRATION_COMMIT } from "../../src/v10/infinity-operation-port";
 
 interface Fixture {
   readonly wire: Record<string, unknown>;
@@ -223,6 +238,171 @@ function onlineCheckRequest(
   return { context, expectedSlotEligibility } as const;
 }
 
+function stringField(record: Record<string, unknown>, field: string): string {
+  const value = record[field];
+  if (typeof value !== "string") throw new Error(`fixture ${field} must be a string`);
+  return value;
+}
+
+function exactFields(
+  value: unknown,
+  fields: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new AccountsError("VALIDATION_FAILED", `${label} must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  const actual = Object.keys(record).sort();
+  const expected = [...fields].sort();
+  if (actual.length !== expected.length || actual.some((field, index) => field !== expected[index])) {
+    throw new AccountsError("VALIDATION_FAILED", `${label} fields differ from v11 descriptor`);
+  }
+  return record;
+}
+
+function consumePair(
+  onlineBytes: Uint8Array,
+  variant: "first" | "second",
+): {
+  readonly requestBytes: Uint8Array;
+  readonly receiptBytes: Uint8Array;
+  readonly verifier: CapabilityUseEvidenceVerifier;
+} {
+  const online = parseClosedJsonBytes(onlineBytes) as Record<string, unknown>;
+  const modelCallAnchorDigest = `sha256:${"9".repeat(64)}` as const;
+  const channelBindingDigest = stringField(online, "sender_constraint_confirmation");
+  const useId = canonicalSha256({
+    capability_id: stringField(online, "capability_id"),
+    channel_binding_digest: channelBindingDigest,
+    model_call_anchor_digest: modelCallAnchorDigest,
+    nonce: stringField(online, "nonce"),
+    operation_id: stringField(online, "operation_id"),
+    resource_lease_id: stringField(online, "resource_lease_id"),
+    schema_version: "accounts.capability-use.v1",
+    sender_key_thumbprint: stringField(online, "sender_key_thumbprint"),
+    use_ordinal: "1",
+  });
+  const requestId = variant === "first"
+    ? "0198a0a0-0000-7000-8000-000000000921"
+    : "0198a0a0-0000-7000-8000-000000000922";
+  const request = {
+    schema_version: "accounts.capability-use-consume-request.v1",
+    schema_digest: CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
+    consume_request_id: requestId,
+    capability_id: stringField(online, "capability_id"),
+    capability_digest: stringField(online, "capability_digest"),
+    nonce: stringField(online, "nonce"),
+    subject: stringField(online, "subject"),
+    actor_principal: stringField(online, "actor_principal"),
+    effect_namespace_id: stringField(online, "effect_namespace_id"),
+    account_lane_id: stringField(online, "account_lane_id"),
+    capacity_pool_id: stringField(online, "capacity_pool_id"),
+    capacity_domain_ref: stringField(online, "capacity_domain_ref"),
+    serialization_key_digest: stringField(online, "serialization_key_digest"),
+    credential_family_id: stringField(online, "credential_family_id"),
+    resource_lease_id: stringField(online, "resource_lease_id"),
+    resource_id: stringField(online, "resource_id"),
+    resource_lifecycle_generation: stringField(online, "resource_lifecycle_generation"),
+    operation_id: stringField(online, "operation_id"),
+    operation_digest: stringField(online, "operation_digest"),
+    operation_execution_epoch: stringField(online, "operation_execution_epoch"),
+    sender_key_thumbprint: stringField(online, "sender_key_thumbprint"),
+    channel_binding_digest: channelBindingDigest,
+    canonical_request_digest: stringField(online, "canonical_request_digest"),
+    provider_destination_policy_digest: stringField(online, "provider_destination_policy_digest"),
+    online_receipt_id: stringField(online, "receipt_id"),
+    online_receipt_digest: sha256(onlineBytes),
+    model_call_anchor_digest: modelCallAnchorDigest,
+    expected_use_count: "0",
+    max_uses: "1",
+    not_after: stringField(online, "expires_at"),
+    idempotency_key_digest: `sha256:${(variant === "first" ? "a" : "b").repeat(64)}`,
+  };
+  const receipt = {
+    schema_version: "accounts.capability-use-consume-receipt.v1",
+    schema_digest: CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+    consume_request_id: requestId,
+    consume_receipt_id: variant === "first"
+      ? "0198a0a0-0000-7000-8000-000000000931"
+      : "0198a0a0-0000-7000-8000-000000000932",
+    issuer: signedEvidence.signerHistory.issuer,
+    issuer_incarnation: signedEvidence.signerHistory.issuer_incarnation,
+    key_id: signedEvidence.signerHistory.current_key_id,
+    audience: signedEvidence.signerHistory.audience,
+    capability_id: request.capability_id,
+    capability_digest: request.capability_digest,
+    nonce: request.nonce,
+    subject: request.subject,
+    actor_principal: request.actor_principal,
+    effect_namespace_id: request.effect_namespace_id,
+    account_lane_id: request.account_lane_id,
+    capacity_pool_id: request.capacity_pool_id,
+    serialization_key_digest: request.serialization_key_digest,
+    resource_lease_id: request.resource_lease_id,
+    operation_id: request.operation_id,
+    operation_execution_epoch: request.operation_execution_epoch,
+    sender_key_thumbprint: request.sender_key_thumbprint,
+    channel_binding_digest: request.channel_binding_digest,
+    canonical_request_digest: request.canonical_request_digest,
+    online_receipt_digest: request.online_receipt_digest,
+    model_call_anchor_digest: request.model_call_anchor_digest,
+    max_uses: "1",
+    prior_use_count: "0",
+    next_use_count: "1",
+    use_ordinal: "1",
+    use_id: useId,
+    committed_at: "2026-07-11T10:00:15.000Z",
+    expires_at: "2026-07-11T10:01:15.000Z",
+    catalog_incarnation: "accounts-v11-consume-e2e",
+    recovery_frontier_sequence: stringField(online, "recovery_frontier_sequence"),
+    recovery_frontier_hash: stringField(online, "recovery_frontier_hash"),
+    signature: `test-preverified-${variant}-receipt-signature`,
+  };
+  const requestBytes = new TextEncoder().encode(canonicalJson(request));
+  const receiptBytes = new TextEncoder().encode(canonicalJson(receipt));
+  const verifier: CapabilityUseEvidenceVerifier = {
+    verify: async (input): Promise<CapabilityUseVerifiedClaims> => {
+      const parsedRequest = exactFields(
+        parseClosedJsonBytes(input.consumeRequestBytes),
+        CAPABILITY_USE_CONSUME_REQUEST_DESCRIPTOR.fields,
+        "consume request",
+      );
+      const parsedReceipt = exactFields(
+        parseClosedJsonBytes(input.consumeReceiptBytes),
+        CAPABILITY_USE_CONSUME_RECEIPT_DESCRIPTOR.fields,
+        "consume receipt",
+      );
+      if (
+        canonicalJson(parsedRequest) !== canonicalJson(request) ||
+        canonicalJson(parsedReceipt) !== canonicalJson(receipt) ||
+        parsedRequest.schema_digest !== CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST ||
+        parsedReceipt.schema_digest !== CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST
+      ) {
+        throw new AccountsError("VALIDATION_FAILED", "consume evidence differs from preverified bytes");
+      }
+      return {
+        consumeRequestId: request.consume_request_id,
+        idempotencyKeyDigest: request.idempotency_key_digest as `sha256:${string}`,
+        effectNamespaceId: request.effect_namespace_id,
+        serializationKeyDigest: request.serialization_key_digest as `sha256:${string}`,
+        capabilityId: request.capability_id,
+        capabilityDigest: request.capability_digest as `sha256:${string}`,
+        nonce: request.nonce,
+        onlineReceiptDigest: request.online_receipt_digest,
+        modelCallAnchorDigest: request.model_call_anchor_digest,
+        useId: receipt.use_id as `sha256:${string}`,
+        committedAt: receipt.committed_at,
+        consumeReceiptExpiresAt: receipt.expires_at,
+        catalogIncarnation: receipt.catalog_incarnation,
+        recoveryFrontierSequence: parseCounter(receipt.recovery_frontier_sequence),
+        recoveryFrontierHash: receipt.recovery_frontier_hash as `sha256:${string}`,
+      };
+    },
+  };
+  return { requestBytes, receiptBytes, verifier };
+}
+
 function installSignedEvidence(path: string): void {
   const database = new Database(path);
   try {
@@ -265,8 +445,19 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
       integration_authorized: false,
       publish_authorized: false,
     });
+    expect(INFINITY_INTEGRATION_COMMIT).toBe(
+      "6c2ba3d490cd58c7192d6e274514a9d849575ab8",
+    );
     expect(publicApi).toHaveProperty("createSQLiteAccountsSlotEligibilityPort");
     expect(publicApi).not.toHaveProperty("SQLiteAccountsSlotEligibilitySource");
+    expect(publicApi).toMatchObject({
+      CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
+      CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+      INFINITY_INTEGRATION_COMMIT,
+    });
+    expect(publicApi).not.toHaveProperty("NonRewindableCapabilityUseLedger");
+    expect(publicApi).not.toHaveProperty("verifyCapabilityUseEvidence");
+    expect(publicApi).not.toHaveProperty("createCoordinatedOwnerOnlySignedAppendLog");
   });
 
   test("uses the same exact codecs for deterministic and production SQLite sources", async () => {
@@ -424,6 +615,88 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
     ));
     expect(denied.allowed).toBe(false);
     source.close();
+  });
+
+  test("consumes one preverified v11 use, exhausts a second consume, and replays after reopen", async () => {
+    const root = mkdtempSync(join(tmpdir(), "accounts-v11-consume-e2e-"));
+    chmodSync(root, 0o700);
+    roots.push(root);
+    const path = join(root, "accounts.sqlite");
+    const port = publicApi.createSQLiteAccountsSlotEligibilityPort({
+      path,
+      recoveryFrontier: new MutableRecoveryFrontier(),
+      trust: {
+        signerHistory: signedEvidence.signerHistory,
+        clock: () => new Date(NOW),
+        expectedEffectNamespaceId: "effect-namespace-1",
+      },
+    });
+    installSignedEvidence(path);
+    const slot = await port.getSlotEligibility(SLOT_REQUEST);
+    if (!slot.eligible) throw new Error("signed E2E SlotEligibility must be positive");
+    const online = await port.checkOnlineGeneration(onlineCheckRequest(slot));
+    expect(online.allowed).toBe(true);
+    expect(sha256(new TextEncoder().encode(canonicalJson(online)))).toBe(
+      sha256(signedEvidence.onlineAllow),
+    );
+
+    const ledgerOptions = {
+      ledgerPath: join(root, "capability-use.log"),
+      mirrorPath: join(root, "capability-use.sqlite"),
+      catalogIncarnation: "accounts-v11-consume-e2e",
+      signingKey: new Uint8Array(32).fill(0x61),
+    } as const;
+    const ledger = new NonRewindableCapabilityUseLedger(ledgerOptions);
+    const firstPair = consumePair(signedEvidence.onlineAllow, "first");
+    const firstEvidence = await verifyCapabilityUseEvidence(
+      {
+        consumeRequestBytes: firstPair.requestBytes,
+        consumeReceiptBytes: firstPair.receiptBytes,
+      },
+      firstPair.verifier,
+    );
+    const first = ledger.append(firstEvidence);
+    expect(first.kind).toBe("APPENDED");
+
+    const secondPair = consumePair(signedEvidence.onlineAllow, "second");
+    const secondEvidence = await verifyCapabilityUseEvidence(
+      {
+        consumeRequestBytes: secondPair.requestBytes,
+        consumeReceiptBytes: secondPair.receiptBytes,
+      },
+      secondPair.verifier,
+    );
+    expect(() => ledger.append(secondEvidence)).toThrow(
+      expect.objectContaining({ code: "CONFLICT" }),
+    );
+    ledger.close();
+
+    const reopened = new NonRewindableCapabilityUseLedger(ledgerOptions);
+    const replayEvidence = await verifyCapabilityUseEvidence(
+      {
+        consumeRequestBytes: firstPair.requestBytes,
+        consumeReceiptBytes: firstPair.receiptBytes,
+      },
+      firstPair.verifier,
+    );
+    expect(reopened.append(replayEvidence).kind).toBe("REPLAYED");
+    expect(reopened.lookup({ useId: firstEvidence.useId })?.consumeRequestId).toBe(
+      firstEvidence.consumeRequestId,
+    );
+
+    const writer = new Database(path);
+    writer.query(
+      "UPDATE accounts_v10_runtime_state SET current_deny=1 WHERE account_lane_id=?",
+    ).run(LANE_ID);
+    writer.close();
+    const denied = await port.checkOnlineGeneration(onlineCheckRequest(
+      slot,
+      onlineContext("online_generation_check_resolved_negative"),
+    ));
+    expect(denied.allowed).toBe(false);
+    expect(reopened.lookup({ useId: firstEvidence.useId })).toBeDefined();
+    reopened.close();
+    port.close();
   });
 
   test("SQLite source rejects obsolete, extra, and accessor-backed request shapes", async () => {
