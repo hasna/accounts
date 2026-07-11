@@ -21,6 +21,7 @@ export {
   createAccountsSlotEligibilityAdapter,
   createDeterministicAccountsSlotEligibilitySource,
 } from "./adapter";
+export { createSQLiteAccountsSlotEligibilityPort } from "./sqlite-slot-source";
 export {
   encodeSlotEligibilityV1,
   isResolvedSlotEligibilityV1,
@@ -68,3 +69,9 @@ export type {
   V10UuidV7,
   V10WireObject,
 } from "./types";
+export type {
+  AccountsRecoveryFrontierPort,
+  AccountsRecoveryFrontierV1,
+  SQLiteAccountsSlotEligibilityPort,
+  SQLiteAccountsSlotEligibilityPortOptions,
+} from "./sqlite-slot-source";

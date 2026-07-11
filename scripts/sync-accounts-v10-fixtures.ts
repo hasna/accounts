@@ -7,6 +7,8 @@ const sourceRoot = resolve(
 );
 const repositoryRoot = resolve(import.meta.dir, "..");
 const sourceCommit = "80054c36b10111765a18b89743214679c58ad7c6";
+const infinityIntegrationCommit = "6c2ba3d490cd58c7192d6e274514a9d849575ab8";
+const sandboxesIntegrationCommit = "d8a4d37c35e8d98ea468a8d95dcf98b0a890fa48";
 const sourcePaths = {
   contract: "workstreams/accounts-v1-contract-662842e91a4b58475b92f28eec8caeead4cd7955a485f3d20b16032ab4fa9167.md",
   redteam: "workstreams/accounts-v1-redteam-24b05c49676a9d0d8bed430619942997de2a8d6eaf6f481536d5cc5fdc33b3b4.md",
@@ -80,6 +82,8 @@ await Bun.write(
     redteam_sha256: expected.redteam,
     transition_trace_sha256: expected.trace,
     review_pin_sha256: expected.pin,
+    infinity_integration_commit: infinityIntegrationCommit,
+    sandboxes_integration_commit: sandboxesIntegrationCommit,
     implementation_status: "IN_PROGRESS",
     integration_authorized: false,
     publish_authorized: false,
