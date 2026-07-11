@@ -150,7 +150,6 @@ export interface AccountsCapabilityUseConsumeInput {
   readonly authenticatedChannelBindingDigest: Sha256Digest;
   readonly expectedSlotEligibility: SlotEligibilityPositiveV1;
   readonly onlineReceiptBytes: Uint8Array;
-  readonly onlineTrust: AccountsCapabilityUseOnlineTrust;
 }
 
 export interface AccountsCapabilityUseConsumeResult {
@@ -167,6 +166,8 @@ export interface AccountsCapabilityUseConsumerOptions {
   readonly infinity: InfinityAccountsOperationPort;
   readonly receiptSigner: AccountsEvidenceSigner;
   readonly receiptSignerHistory: AccountsEvidenceSignerHistoryV2;
+  readonly onlineTrust: AccountsCapabilityUseOnlineTrust;
+  readonly expectedSerializationKeyDigest: Sha256Digest;
   readonly clock?: () => Date;
   readonly ledger: AccountsCapabilityUseLedgerOptions;
 }
@@ -353,6 +354,11 @@ export function createAccountsCapabilityUseConsumer(
     signerHistory,
     initialNow,
   );
+  const onlineTrustConfiguration = snapshotOnlineTrust(options.onlineTrust);
+  const expectedSerializationKeyDigest = sha256Digest(
+    options.expectedSerializationKeyDigest,
+    "capability-use expected serialization key digest",
+  ) as Sha256Digest;
   const ledgerOptions = Object.freeze({
     ledgerPath: options.ledger.ledgerPath,
     mirrorPath: options.ledger.mirrorPath,
@@ -370,6 +376,11 @@ export function createAccountsCapabilityUseConsumer(
       const inputRecord = exactInput(input);
       const requestBytes = copyBytes(inputRecord.consumeRequestBytes, "consume request");
       const request = parseCapabilityUseConsumeRequestV1(requestBytes);
+      invariant(
+        request.effect_namespace_id === onlineTrustConfiguration.expectedEffectNamespaceId &&
+          request.serialization_key_digest === expectedSerializationKeyDigest,
+        "Capability-use request differs from factory-pinned namespace or serialization identity",
+      );
       const authenticatedChannelBindingDigest = sha256Digest(
         inputRecord.authenticatedChannelBindingDigest,
         "authenticated channel binding",
@@ -384,7 +395,6 @@ export function createAccountsCapabilityUseConsumer(
 
       const now = trustedNow(clock);
       validateReceiptSigner(receiptSigner, signerHistory, now);
-      const onlineTrustConfiguration = snapshotOnlineTrust(inputRecord.onlineTrust);
       const onlineTrust = onlineTrustAt(onlineTrustConfiguration, now);
       const slotBytes = encodeSlotEligibilityV1(inputRecord.expectedSlotEligibility);
       const verifiedSlot = parseSlotEligibilityV1(
@@ -470,6 +480,36 @@ export function createAccountsCapabilityUseConsumer(
           }),
         },
       );
+      const currentPrepared = await assertPreparedCurrent(infinity, prepared);
+      const finalNow = trustedNow(clock);
+      invariant(
+        finalNow.getTime() >= commitNow.getTime(),
+        "Trusted capability-use clock moved backwards before durable append",
+      );
+      validateReceiptSigner(receiptSigner, signerHistory, finalNow);
+      const finalOnlineTrust = onlineTrustAt(onlineTrustConfiguration, finalNow);
+      const finalSlot = parseSlotEligibilityV1(slotBytes, finalOnlineTrust);
+      invariant(finalSlot.eligible, "capability use requires positive SlotEligibility at append");
+      const finalOnline = requireAllowedOnlineGenerationCheckReceiptV1(
+        parseOnlineGenerationCheckReceiptV1(onlineReceiptBytes, {
+          ...finalOnlineTrust,
+          expectedSlotEligibility: finalSlot,
+        }),
+      );
+      assertRequestBindings(
+        request,
+        finalOnline,
+        onlineReceiptBytes,
+        authenticatedChannelBindingDigest,
+      );
+      parseCapabilityUseConsumeReceiptV1(receiptBytes, {
+        request,
+        online: finalOnline,
+        signerHistory,
+        now: finalNow,
+        allowedClockSkewMs: finalOnlineTrust.allowedClockSkewMs ?? 5_000,
+        catalogIncarnation: ledgerOptions.catalogIncarnation,
+      });
 
       let appended: CapabilityUseLedgerRecord;
       let replayed = false;
@@ -494,7 +534,7 @@ export function createAccountsCapabilityUseConsumer(
         }
       }
 
-      const consumeBound = await bindAndAssertCurrent(infinity, prepared, appended);
+      const consumeBound = await bindAndAssertCurrent(infinity, currentPrepared, appended);
       return consumeResult(appended, replayed, consumeBound);
     },
     close: () => {
@@ -511,7 +551,6 @@ function exactInput(input: AccountsCapabilityUseConsumeInput): AccountsCapabilit
     "authenticatedChannelBindingDigest",
     "expectedSlotEligibility",
     "onlineReceiptBytes",
-    "onlineTrust",
   ] as const;
   invariant(
     input !== null && typeof input === "object" && !Array.isArray(input),
@@ -705,6 +744,24 @@ async function readPrepared(
     return dependencyFailure(error, "Infinity PREPARED/OPEN reader unavailable");
   }
   return validatePrepared(raw, binding);
+}
+
+async function assertPreparedCurrent(
+  infinity: InfinityAccountsOperationPort,
+  prepared: VerifiedPreparedOpenOperation,
+): Promise<VerifiedPreparedOpenOperation> {
+  let raw: VerifiedPreparedOpenOperation;
+  try {
+    raw = await infinity.assertPreparedOpenCurrent({ prepared });
+  } catch (error) {
+    return dependencyFailure(error, "Infinity PREPARED/OPEN currentness unavailable");
+  }
+  const current = validatePrepared(raw, prepared.binding);
+  invariant(
+    canonicalJson(current) === canonicalJson(prepared),
+    "Infinity current PREPARED/OPEN evidence differs from original proof",
+  );
+  return current;
 }
 
 function validatePrepared(
@@ -1166,6 +1223,7 @@ function validateInfinityPort(value: InfinityAccountsOperationPort): InfinityAcc
   invariant(
     value !== null && typeof value === "object" &&
       typeof value.readPreparedOpenOperation === "function" &&
+      typeof value.assertPreparedOpenCurrent === "function" &&
       typeof value.bindCapabilityUse === "function" &&
       typeof value.assertConsumeBoundCurrent === "function",
     "Infinity Accounts operation port is invalid",

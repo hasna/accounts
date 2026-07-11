@@ -606,6 +606,11 @@ describe("v10 non-rewindable capability-use ledger", () => {
         expect(lookup).toEqual(binding);
         return prepared;
       },
+      assertPreparedOpenCurrent: async ({ prepared: candidate }) => {
+        calls.push("assert-prepared-current");
+        expect(candidate).toBe(prepared);
+        return prepared;
+      },
       bindCapabilityUse: async (request) => {
         calls.push("bind");
         expect(request.prepared).toBe(prepared);
@@ -620,14 +625,15 @@ describe("v10 non-rewindable capability-use ledger", () => {
     };
 
     const read = await port.readPreparedOpenOperation(binding);
+    const currentPrepared = await port.assertPreparedOpenCurrent({ prepared: read });
     const bound = await port.bindCapabilityUse({
-      prepared: read,
+      prepared: currentPrepared,
       consumeReceiptDigest: digest("7"),
       useId: digest("6"),
     });
     const current = await port.assertConsumeBoundCurrent({ consumeBound: bound });
     expect(current.recordKind).toBe("CONSUME_BOUND");
-    expect(calls).toEqual(["read", "bind", "assert-current"]);
+    expect(calls).toEqual(["read", "assert-prepared-current", "bind", "assert-current"]);
   });
 
   test("fails closed when the structured opaque-byte verifier rejects", async () => {

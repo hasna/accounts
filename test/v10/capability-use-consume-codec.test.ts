@@ -297,8 +297,8 @@ function infinityFor(requestBytes: Uint8Array) {
     deliveryFrontierHash: `sha256:${"3".repeat(64)}`,
     holdModelFrontierDigest: `sha256:${"4".repeat(64)}`,
   };
-  const calls = { read: 0, bind: 0, assert: 0 };
-  let unavailableAt: "read" | "bind" | "assert" | undefined;
+  const calls = { read: 0, preparedCurrent: 0, bind: 0, assert: 0 };
+  let unavailableAt: "read" | "preparedCurrent" | "bind" | "assert" | undefined;
   let preparedOverride: VerifiedPreparedOpenOperation | undefined;
   let bound: VerifiedConsumeBoundOperation | undefined;
   let transformBound = (value: VerifiedConsumeBoundOperation) => value;
@@ -307,6 +307,11 @@ function infinityFor(requestBytes: Uint8Array) {
       calls.read += 1;
       if (unavailableAt === "read") throw new Error("unavailable");
       return preparedOverride ?? prepared;
+    },
+    assertPreparedOpenCurrent: async ({ prepared: candidate }) => {
+      calls.preparedCurrent += 1;
+      if (unavailableAt === "preparedCurrent") throw new Error("unavailable");
+      return candidate;
     },
     bindCapabilityUse: async (input) => {
       calls.bind += 1;
@@ -354,10 +359,19 @@ function consumerOptions(
   evidence: ReturnType<typeof signedEvidence>,
   infinity: InfinityAccountsOperationPort,
 ) {
+  const online = parseClosedJsonBytes(evidence.onlineBytes) as Record<string, unknown>;
   return {
     infinity,
     receiptSigner: evidence.signer,
     receiptSignerHistory: evidence.signerHistory,
+    onlineTrust: {
+      signerHistory: evidence.signerHistory,
+      expectedEffectNamespaceId: "effect-namespace-1",
+    },
+    expectedSerializationKeyDigest: stringField(
+      online,
+      "serialization_key_digest",
+    ) as `sha256:${string}`,
     clock: () => new Date(NOW),
     ledger: {
       ledgerPath: join(root, "capability-use.log"),
@@ -377,10 +391,6 @@ async function consumeInput(
     authenticatedChannelBindingDigest: CHANNEL_DIGEST,
     expectedSlotEligibility: await positiveSlot(evidence),
     onlineReceiptBytes: evidence.onlineBytes,
-    onlineTrust: {
-      signerHistory: evidence.signerHistory,
-      expectedEffectNamespaceId: "effect-namespace-1",
-    },
   } as const;
 }
 
@@ -422,7 +432,7 @@ describe("v11 capability-use consume production composition", () => {
       useId: first.useId,
     });
     expect(first.consumeReceiptDigest).toBe(digest(first.receiptBytes));
-    expect(infinity.calls).toEqual({ read: 1, bind: 1, assert: 1 });
+    expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 1, assert: 1 });
 
     const conflictingBytes = requestFor(evidence.onlineBytes, {
       consume_request_id: generateUuidV7(NOW.getTime() + 1),
@@ -443,7 +453,7 @@ describe("v11 capability-use consume production composition", () => {
     expect(replay.bindingCurrent).toBe(false);
     expect(replay.consumeBound).toBeUndefined();
     expect(replay.receiptBytes).toEqual(first.receiptBytes);
-    expect(unavailable.calls).toEqual({ read: 0, bind: 0, assert: 0 });
+    expect(unavailable.calls).toEqual({ read: 0, preparedCurrent: 0, bind: 0, assert: 0 });
     reopened.close();
   });
 
@@ -535,10 +545,6 @@ describe("v11 capability-use consume production composition", () => {
           holdAuthorityEpoch: "0",
         });
       }],
-      ["missing effect namespace trust", ({ input }) => {
-        delete (input.onlineTrust as { expectedEffectNamespaceId?: string })
-          .expectedEffectNamespaceId;
-      }],
       ["bad signature", ({ evidence, input }) => {
         const wire = parseClosedJsonBytes(evidence.onlineBytes) as Record<string, unknown>;
         wire.signature = Buffer.alloc(64, 0x42).toString("base64url");
@@ -548,6 +554,8 @@ describe("v11 capability-use consume production composition", () => {
         (input as { onlineReceiptBytes: Uint8Array }).onlineReceiptBytes = evidence.denyBytes;
       }],
       ["Infinity unavailable", ({ infinity }) => infinity.setUnavailableAt("read")],
+      ["Infinity PREPARED currentness unavailable", ({ infinity }) =>
+        infinity.setUnavailableAt("preparedCurrent")],
     ];
     for (const [name, mutate] of scenarios) {
       const root = mkdtempSync(join(tmpdir(), "accounts-v11-consume-reject-"));
@@ -579,7 +587,7 @@ describe("v11 capability-use consume production composition", () => {
     await expect(expiredConsumer.consume(
       await consumeInput(expiredEvidence, expiredRequest),
     )).rejects.toBeInstanceOf(AccountsError);
-    expect(expiredInfinity.calls).toEqual({ read: 0, bind: 0, assert: 0 });
+    expect(expiredInfinity.calls).toEqual({ read: 0, preparedCurrent: 0, bind: 0, assert: 0 });
     expiredConsumer.close();
   });
 
@@ -612,6 +620,40 @@ describe("v11 capability-use consume production composition", () => {
     }
   });
 
+  test("requires factory-pinned online trust and serialization identity", async () => {
+    const root = mkdtempSync(join(tmpdir(), "accounts-v11-consume-online-trust-"));
+    chmodSync(root, 0o700);
+    roots.push(root);
+    const evidence = signedEvidence();
+    const requestBytes = requestFor(evidence.onlineBytes);
+    const infinity = infinityFor(requestBytes);
+    const options = consumerOptions(root, evidence, infinity.port);
+    expect(() => publicApi.createAccountsCapabilityUseConsumer({
+      ...options,
+      onlineTrust: { signerHistory: evidence.signerHistory },
+    } as never)).toThrow(AccountsError);
+    const wrongSerialization = publicApi.createAccountsCapabilityUseConsumer({
+      ...options,
+      expectedSerializationKeyDigest: `sha256:${"f".repeat(64)}`,
+    });
+    await expect(wrongSerialization.consume(
+      await consumeInput(evidence, requestBytes),
+    )).rejects.toBeInstanceOf(AccountsError);
+    wrongSerialization.close();
+
+    const consumer = publicApi.createAccountsCapabilityUseConsumer(options);
+    const injected = {
+      ...await consumeInput(evidence, requestBytes),
+      onlineTrust: {
+        signerHistory: signedEvidence().signerHistory,
+        expectedEffectNamespaceId: "effect-namespace-1",
+      },
+    };
+    await expect(consumer.consume(injected as never)).rejects.toBeInstanceOf(AccountsError);
+    expect(infinity.calls).toEqual({ read: 0, preparedCurrent: 0, bind: 0, assert: 0 });
+    consumer.close();
+  });
+
   test("a post-append Infinity bind failure leaves the use durably consumed and replayable", async () => {
     const root = mkdtempSync(join(tmpdir(), "accounts-v11-consume-bind-fail-"));
     chmodSync(root, 0o700);
@@ -627,12 +669,12 @@ describe("v11 capability-use consume production composition", () => {
     await expect(consumer.consume(input)).rejects.toEqual(
       expect.objectContaining({ code: "DEPENDENCY_UNAVAILABLE" }),
     );
-    expect(infinity.calls).toEqual({ read: 1, bind: 1, assert: 0 });
+    expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 1, assert: 0 });
     const replay = await consumer.consume(input);
     expect(replay.replayed).toBe(true);
     expect(replay.bindingCurrent).toBe(false);
     expect(replay.consumeBound).toBeUndefined();
-    expect(infinity.calls).toEqual({ read: 1, bind: 1, assert: 0 });
+    expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 1, assert: 0 });
     consumer.close();
   });
 
@@ -652,7 +694,7 @@ describe("v11 capability-use consume production composition", () => {
     );
     const input = await consumeInput(evidence, requestBytes);
     await expect(consumer.consume(input)).rejects.toBeInstanceOf(AccountsError);
-    expect(infinity.calls).toEqual({ read: 1, bind: 1, assert: 0 });
+    expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 1, assert: 0 });
     const replay = await consumer.consume(input);
     expect(replay.replayed).toBe(true);
     expect(replay.bindingCurrent).toBe(false);
@@ -666,18 +708,18 @@ describe("v11 capability-use consume production composition", () => {
     const evidence = signedEvidence();
     const requestBytes = requestFor(evidence.onlineBytes);
     const infinity = infinityFor(requestBytes);
-    let clockCall = 0;
-    const advancingClock = () => {
-      clockCall += 1;
-      return new Date(clockCall < 3 ? NOW : "2026-07-11T11:00:00.000Z");
-    };
+    const advancingClock = () => new Date(
+      infinity.calls.preparedCurrent === 0
+        ? NOW
+        : "2026-07-11T11:00:00.000Z",
+    );
     const consumer = publicApi.createAccountsCapabilityUseConsumer({
       ...consumerOptions(root, evidence, infinity.port),
       clock: advancingClock,
     });
     const input = await consumeInput(evidence, requestBytes);
     await expect(consumer.consume(input)).rejects.toBeInstanceOf(AccountsError);
-    expect(infinity.calls).toEqual({ read: 1, bind: 0, assert: 0 });
+    expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 0, assert: 0 });
     consumer.close();
 
     const retryInfinity = infinityFor(requestBytes);

@@ -295,7 +295,7 @@ function consumeRequest(
 }
 
 function infinityOperationPort() {
-  const calls = { read: 0, bind: 0, assert: 0 };
+  const calls = { read: 0, preparedCurrent: 0, bind: 0, assert: 0 };
   let unavailable = false;
   const port: InfinityAccountsOperationPort = {
     readPreparedOpenOperation: async (binding) => {
@@ -323,6 +323,11 @@ function infinityOperationPort() {
         deliveryFrontierHash: `sha256:${"4".repeat(64)}`,
         holdModelFrontierDigest: `sha256:${"5".repeat(64)}`,
       };
+    },
+    assertPreparedOpenCurrent: async ({ prepared }) => {
+      calls.preparedCurrent += 1;
+      if (unavailable) throw new Error("Infinity unavailable");
+      return prepared;
     },
     bindCapabilityUse: async (input) => {
       calls.bind += 1;
@@ -603,6 +608,12 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
       infinity: infinity.port,
       receiptSigner: signedEvidence.signer,
       receiptSignerHistory: signedEvidence.signerHistory,
+      onlineTrust: {
+        signerHistory: signedEvidence.signerHistory,
+        expectedEffectNamespaceId: "effect-namespace-1",
+      },
+      expectedSerializationKeyDigest:
+        slot.serialization_key_digest as unknown as `sha256:${string}`,
       clock,
       ledger: ledgerOptions,
     });
@@ -614,10 +625,6 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
       ) as `sha256:${string}`,
       expectedSlotEligibility: slot,
       onlineReceiptBytes: signedEvidence.onlineAllow,
-      onlineTrust: {
-        signerHistory: signedEvidence.signerHistory,
-        expectedEffectNamespaceId: "effect-namespace-1",
-      },
     });
     const firstRequest = consumeRequest(signedEvidence.onlineAllow, "first");
     const consumer = createConsumer();
@@ -625,7 +632,7 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
     expect(first.replayed).toBe(false);
     expect(first.bindingCurrent).toBe(true);
     expect(first.consumeBound?.recordKind).toBe("CONSUME_BOUND");
-    expect(infinity.calls).toEqual({ read: 1, bind: 1, assert: 1 });
+    expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 1, assert: 1 });
 
     const secondRequest = consumeRequest(signedEvidence.onlineAllow, "second");
     await expect(consumer.consume(consumeInput(secondRequest))).rejects.toEqual(
@@ -640,7 +647,7 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
     expect(replay.bindingCurrent).toBe(false);
     expect(replay.consumeBound).toBeUndefined();
     expect(replay.receiptBytes).toEqual(first.receiptBytes);
-    expect(infinity.calls).toEqual({ read: 1, bind: 1, assert: 1 });
+    expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 1, assert: 1 });
 
     const writer = new Database(path);
     writer.query(

@@ -72,6 +72,10 @@ export interface BindCapabilityUseRequest {
   readonly useId: InfinitySha256Digest;
 }
 
+export interface AssertPreparedOpenCurrentRequest {
+  readonly prepared: VerifiedPreparedOpenOperation;
+}
+
 /**
  * Exact signed CONSUME_BOUND evidence. A future narrow broker resolver must
  * require this value together with the durable Accounts tombstone; PREPARED is
@@ -99,6 +103,11 @@ export interface InfinityAccountsOperationPort {
   /** Resolve and verify the exact signed PREPARED anchor and current OPEN hold. */
   readPreparedOpenOperation(
     binding: CapabilityUseOperationBinding,
+  ): Promise<VerifiedPreparedOpenOperation>;
+
+  /** Re-resolve immediately before the Accounts one-use CAS. */
+  assertPreparedOpenCurrent(
+    request: AssertPreparedOpenCurrentRequest,
   ): Promise<VerifiedPreparedOpenOperation>;
 
   /** Ask the Infinity effect owner to append the exact CONSUME_BOUND record. */
