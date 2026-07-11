@@ -632,6 +632,17 @@ describe("v11 capability-use consume production composition", () => {
       ...options,
       onlineTrust: { signerHistory: evidence.signerHistory },
     } as never)).toThrow(AccountsError);
+    const key = evidence.signerHistory.keys[0]!;
+    expect(() => publicApi.createAccountsCapabilityUseConsumer({
+      ...options,
+      onlineTrust: {
+        ...options.onlineTrust,
+        signerHistory: {
+          ...evidence.signerHistory,
+          keys: [{ ...key, revoked_at: NOW.toISOString() }],
+        },
+      },
+    })).toThrow(AccountsError);
     const wrongSerialization = publicApi.createAccountsCapabilityUseConsumer({
       ...options,
       expectedSerializationKeyDigest: `sha256:${"f".repeat(64)}`,

@@ -36,6 +36,7 @@ import {
   counter,
   invariant,
   nonemptyString,
+  normalizeTrust,
   parseCanonicalWireBytes,
   positiveCounter,
   requiredKeys,
@@ -355,6 +356,8 @@ export function createAccountsCapabilityUseConsumer(
     initialNow,
   );
   const onlineTrustConfiguration = snapshotOnlineTrust(options.onlineTrust);
+  normalizeTrust(onlineTrustAt(onlineTrustConfiguration, initialNow));
+  validateSignerHistory(onlineTrustConfiguration.signerHistory, initialNow.getTime());
   const expectedSerializationKeyDigest = sha256Digest(
     options.expectedSerializationKeyDigest,
     "capability-use expected serialization key digest",
