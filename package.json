@@ -30,6 +30,7 @@
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:storage": "bun test test/storage",
+    "sync:v10-contract": "bun scripts/sync-accounts-v10-fixtures.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
