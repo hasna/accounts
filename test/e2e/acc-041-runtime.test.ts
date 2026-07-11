@@ -1,160 +1,176 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { generateKeyPairSync } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { AccountsError } from "../../src/errors";
+import { canonicalJson } from "../../src/serialization/json";
 import {
-  createSQLiteAccountsV10Runtime,
-  signOnlineGenerationCheckReceiptV1,
-  signSlotEligibilityV1,
+  createAccountsSlotEligibilityAdapter,
+  createDeterministicAccountsSlotEligibilitySource,
   type AccountsEvidenceSignerHistoryV2,
-  type InfinityAccountsOperationPort,
 } from "../../src/v10";
+import {
+  SQLiteAccountsSlotEligibilitySource,
+  type AccountsRecoveryFrontierPort,
+  type AccountsRecoveryFrontierV1,
+} from "../../src/v10/sqlite-slot-source";
+
+interface Fixture {
+  readonly wire: Record<string, unknown>;
+}
 
 const fixtureDocument = await Bun.file(
   new URL("../../contracts/accounts-v10/acc-041-fixtures.json", import.meta.url),
 ).json() as {
-  wire_fixtures: Record<string, { wire: Record<string, unknown> }>;
+  readonly signer_history: AccountsEvidenceSignerHistoryV2;
+  readonly wire_fixtures: Readonly<Record<string, Fixture>>;
 };
 const NOW = new Date("2026-07-11T10:00:15.000Z");
+const LANE_ID = "0198a0a0-0000-7000-8000-000000000002";
+const FRONTIER: AccountsRecoveryFrontierV1 = {
+  catalog_incarnation: "catalog-incarnation-1",
+  sequence: "42",
+  hash: `sha256:${"1".repeat(64)}`,
+};
 const roots: string[] = [];
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function makeSignedFixture(name: string, signer: ReturnType<typeof signerFixture>): Uint8Array {
-  const draft = {
-    ...fixtureDocument.wire_fixtures[name]!.wire,
-    issuer: signer.signer.issuer,
-    issuer_incarnation: signer.signer.issuerIncarnation,
-    audience: signer.signer.audience,
-    key_id: signer.signer.keyId,
-  };
-  delete draft.signature;
-  return name.startsWith("slot_")
-    ? signSlotEligibilityV1(draft, signer.signer)
-    : signOnlineGenerationCheckReceiptV1(draft, signer.signer);
+class MutableRecoveryFrontier implements AccountsRecoveryFrontierPort {
+  state: "current" | "stale" | "forked" | "unavailable" = "current";
+
+  async readFreshFrontier(): Promise<AccountsRecoveryFrontierV1> {
+    if (this.state === "unavailable") {
+      throw new AccountsError("DEPENDENCY_UNAVAILABLE", "Recovery frontier unavailable");
+    }
+    if (this.state === "stale") return { ...FRONTIER, sequence: "41" };
+    if (this.state === "forked") return { ...FRONTIER, hash: `sha256:${"2".repeat(64)}` };
+    return FRONTIER;
+  }
 }
 
-function signerFixture() {
-  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-  const signer = {
-    issuer: "accounts:self-hosted",
-    issuerIncarnation: "accounts-incarnation-runtime",
-    audience: "infinity:self-hosted",
-    keyId: "accounts-runtime-current",
-    privateKey,
-  } as const;
-  const signerHistory: AccountsEvidenceSignerHistoryV2 = {
-    schema_version: "accounts.evidence-signer-history/v2",
-    issuer: signer.issuer,
-    issuer_incarnation: signer.issuerIncarnation,
-    audience: signer.audience,
-    current_key_id: signer.keyId,
-    keys: [{
-      key_id: signer.keyId,
-      public_key_spki_base64url: publicKey
-        .export({ format: "der", type: "spki" })
-        .toString("base64url"),
-      activated_at: "2026-07-11T09:00:00.000Z",
-      expires_at: "2026-07-12T00:00:00.000Z",
-      retired_at: null,
-      revoked_at: null,
-    }],
-  };
-  return { signer, signerHistory };
+function bytes(name: string): Uint8Array {
+  return new TextEncoder().encode(canonicalJson(fixtureDocument.wire_fixtures[name]!.wire));
 }
 
-describe("ACC-041 executable SQLite brokered lane", () => {
-  test("runs one exact use through a live Infinity operation and permanent tombstone", async () => {
-    const root = mkdtempSync(join(tmpdir(), "accounts-v10-"));
+function installSignedEvidence(path: string): void {
+  const database = new Database(path);
+  try {
+    const insert = database.query(`
+      INSERT INTO accounts_v10_signed_evidence(
+        account_lane_id, phase, decision, wire_jcs,
+        catalog_incarnation, recovery_frontier_sequence, recovery_frontier_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [phase, decision, name] of [
+      ["SLOT", "ALLOW", "slot_eligibility_brokered_positive"],
+      ["SLOT", "DENY", "slot_eligibility_brokered_resolved_negative"],
+      ["ONLINE", "ALLOW", "online_generation_check_positive"],
+      ["ONLINE", "DENY", "online_generation_check_resolved_negative"],
+    ] as const) {
+      insert.run(
+        LANE_ID,
+        phase,
+        decision,
+        bytes(name),
+        FRONTIER.catalog_incarnation,
+        FRONTIER.sequence,
+        FRONTIER.hash,
+      );
+    }
+    database.query(
+      "INSERT INTO accounts_v10_runtime_state(account_lane_id, current_deny) VALUES (?, 0)",
+    ).run(LANE_ID);
+  } finally {
+    database.close();
+  }
+}
+
+describe("ACC-041 SQLite Slot/online adapter", () => {
+  test("uses the same exact codecs for deterministic and production SQLite sources", async () => {
+    const root = mkdtempSync(join(tmpdir(), "accounts-v10-slot-"));
+    chmodSync(root, 0o700);
     roots.push(root);
-    const signing = signerFixture();
-    let live = true;
-    let providerContacts = 0;
-    const infinity: InfinityAccountsOperationPort = {
-      assertPreparedOpenOperation: async (binding) => {
-        if (!live) throw new AccountsError("CURRENT_DENY", "Infinity operation is not live");
-        expect(binding.operation_id).toBe("operation-1");
-        expect(binding.model_call_anchor_digest).toBe(`sha256:${"3".repeat(64)}`);
-      },
+    const path = join(root, "accounts.sqlite");
+    const frontier = new MutableRecoveryFrontier();
+    const source = new SQLiteAccountsSlotEligibilitySource({ path, recoveryFrontier: frontier });
+    installSignedEvidence(path);
+    const trust = {
+      signerHistory: fixtureDocument.signer_history,
+      clock: () => new Date(NOW),
     };
-    const runtime = createSQLiteAccountsV10Runtime({
-      catalogPath: join(root, "accounts.sqlite"),
-      useLedgerPath: join(root, "accounts-use-ledger.sqlite"),
-      signer: signing.signer,
-      signerHistory: signing.signerHistory,
-      infinity,
+    const production = createAccountsSlotEligibilityAdapter(source, trust);
+    const deterministic = createAccountsSlotEligibilityAdapter(
+      createDeterministicAccountsSlotEligibilitySource({
+        slot: bytes("slot_eligibility_brokered_positive"),
+        online: bytes("online_generation_check_positive"),
+      }),
+      trust,
+    );
+
+    const query = { account_lane_id: LANE_ID };
+    expect(await production.getSlotEligibility(query)).toEqual(
+      await deterministic.getSlotEligibility(query),
+    );
+    expect(await production.checkOnlineGeneration(query)).toEqual(
+      await deterministic.checkOnlineGeneration(query),
+    );
+    source.close();
+  });
+
+  test("current deny changes signed generation/revision consequences and no allow survives", async () => {
+    const root = mkdtempSync(join(tmpdir(), "accounts-v10-deny-"));
+    chmodSync(root, 0o700);
+    roots.push(root);
+    const path = join(root, "accounts.sqlite");
+    const source = new SQLiteAccountsSlotEligibilitySource({
+      path,
+      recoveryFrontier: new MutableRecoveryFrontier(),
+    });
+    installSignedEvidence(path);
+    const port = createAccountsSlotEligibilityAdapter(source, {
+      signerHistory: fixtureDocument.signer_history,
       clock: () => new Date(NOW),
     });
-    const slotAllow = makeSignedFixture("slot_eligibility_brokered_positive", signing);
-    const slotDeny = makeSignedFixture("slot_eligibility_brokered_resolved_negative", signing);
-    const onlineAllow = makeSignedFixture("online_generation_check_positive", signing);
-    const onlineDeny = makeSignedFixture("online_generation_check_resolved_negative", signing);
-    runtime.seedBrokeredLane({
-      accountLaneId: "0198a0a0-0000-7000-8000-000000000002",
-      credentialBindingId: "0198a0a0-0000-7000-8000-000000000006",
-      slotAllow,
-      slotDeny,
-      onlineAllow,
-      onlineDeny,
-      opaqueCredentialHandle: "fixture-opaque-handle-never-returned-to-the-caller",
-    });
+    const query = { account_lane_id: LANE_ID };
+    const allowed = await port.checkOnlineGeneration(query);
+    expect(allowed.allowed).toBe(true);
 
-    const slot = await runtime.port.getSlotEligibility({});
-    const online = await runtime.port.checkOnlineGeneration({});
-    expect(slot.eligible).toBe(true);
-    expect(online.allowed).toBe(true);
-
-    const result = await runtime.consumeAndExecute({
-      onlineReceipt: online,
-      consumeRequestId: "0198a0a0-0000-7000-8000-000000000901",
-      idempotencyKeyDigest: `sha256:${"4".repeat(64)}`,
-      modelCallAnchorDigest: `sha256:${"3".repeat(64)}`,
-      authenticatedChannelBindingDigest: online.sender_constraint_confirmation,
-      execute: async (credential) => {
-        providerContacts += 1;
-        expect(credential.opaqueHandle).toBe("fixture-opaque-handle-never-returned-to-the-caller");
-        return { providerReceiptDigest: `sha256:${"5".repeat(64)}` };
-      },
-    });
-    expect(result.value).toEqual({ providerReceiptDigest: `sha256:${"5".repeat(64)}` });
-    expect(result.consumeReceipt.use_ordinal).toBe("1");
-    expect(providerContacts).toBe(1);
-
-    await expect(runtime.consumeAndExecute({
-      onlineReceipt: online,
-      consumeRequestId: "0198a0a0-0000-7000-8000-000000000902",
-      idempotencyKeyDigest: `sha256:${"6".repeat(64)}`,
-      modelCallAnchorDigest: `sha256:${"3".repeat(64)}`,
-      authenticatedChannelBindingDigest: online.sender_constraint_confirmation,
-      execute: async () => {
-        providerContacts += 1;
-        return {};
-      },
-    })).rejects.toBeInstanceOf(AccountsError);
-    expect(providerContacts).toBe(1);
-
-    runtime.setCurrentDeny(true);
-    const denied = await runtime.port.checkOnlineGeneration({});
+    const database = new Database(path);
+    database.query(
+      "UPDATE accounts_v10_runtime_state SET current_deny=1 WHERE account_lane_id=?",
+    ).run(LANE_ID);
+    database.close();
+    const deniedSlot = await port.getSlotEligibility(query);
+    const denied = await port.checkOnlineGeneration(query);
+    expect(deniedSlot.eligible).toBe(false);
     expect(denied.allowed).toBe(false);
-    await expect(runtime.consumeAndExecute({
-      onlineReceipt: denied,
-      consumeRequestId: "0198a0a0-0000-7000-8000-000000000903",
-      idempotencyKeyDigest: `sha256:${"7".repeat(64)}`,
-      modelCallAnchorDigest: `sha256:${"3".repeat(64)}`,
-      authenticatedChannelBindingDigest: denied.sender_constraint_confirmation,
-      execute: async () => {
-        providerContacts += 1;
-        return {};
-      },
-    })).rejects.toBeInstanceOf(AccountsError);
-    expect(providerContacts).toBe(1);
+    expect(denied.current_deny).toBe(true);
+    expect(BigInt(denied.deny_generation)).toBeGreaterThan(BigInt(allowed.deny_generation));
+    expect(denied.accounts_revision_set_digest).not.toBe(allowed.accounts_revision_set_digest);
+    source.close();
+  });
 
-    runtime.close();
-    live = false;
+  test("stale, forked, or unavailable external frontier fails before returning signed evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "accounts-v10-frontier-"));
+    chmodSync(root, 0o700);
+    roots.push(root);
+    const path = join(root, "accounts.sqlite");
+    const frontier = new MutableRecoveryFrontier();
+    const source = new SQLiteAccountsSlotEligibilitySource({ path, recoveryFrontier: frontier });
+    installSignedEvidence(path);
+
+    for (const state of ["stale", "forked", "unavailable"] as const) {
+      frontier.state = state;
+      await expect(source.getSlotEligibility({ account_lane_id: LANE_ID }))
+        .rejects.toBeInstanceOf(AccountsError);
+      await expect(source.checkOnlineGeneration({ account_lane_id: LANE_ID }))
+        .rejects.toBeInstanceOf(AccountsError);
+    }
+    source.close();
   });
 });
