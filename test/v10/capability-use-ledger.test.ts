@@ -117,11 +117,18 @@ describe("v10 non-rewindable capability-use ledger", () => {
       encoder.encode(canonicalJson({ fixture: "receipt-1" })),
     );
 
-    const replayed = ledger.append(
-      await verifiedEvidence(claims(), "request-1", "a-different-receipt-that-must-not-win"),
-    );
+    const replayed = ledger.append(await verifiedEvidence(claims(), "request-1", "receipt-1"));
     expect(replayed.kind).toBe("REPLAYED");
     expect(replayed.record.consumeReceiptBytes).toEqual(appended.record.consumeReceiptBytes);
+
+    const changedReceipt = await verifiedEvidence(
+      claims(),
+      "request-1",
+      "a-different-receipt-must-conflict",
+    );
+    expect(() => ledger.append(changedReceipt)).toThrow(
+      expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }),
+    );
 
     expect(ledger.lookup({ consumeRequestId: claims().consumeRequestId })).toEqual(appended.record);
     expect(ledger.lookup({ idempotencyKeyDigest: claims().idempotencyKeyDigest })).toEqual(
@@ -195,6 +202,49 @@ describe("v10 non-rewindable capability-use ledger", () => {
       )
     ).toThrow(expect.objectContaining({ code: "CONFLICT" }));
 
+    ledger.close();
+  });
+
+  test("rejects same-request replay when any verified claim or receipt byte changes", async () => {
+    const ledger = ledgerAt(root());
+    ledger.append(await verifiedEvidence(claims()));
+    const mutants: ReadonlyArray<readonly [string, Partial<CapabilityUseVerifiedClaims>]> = [
+      ["consume request id", { consumeRequestId: "0198a0a0-0000-7000-8000-000000000902" }],
+      ["idempotency digest", { idempotencyKeyDigest: digest("7") }],
+      ["effect namespace", { effectNamespaceId: "effect-namespace-2" }],
+      ["serialization digest", { serializationKeyDigest: digest("7") }],
+      ["capability id", { capabilityId: "capability-2" }],
+      ["capability digest", { capabilityDigest: digest("7") }],
+      ["nonce", { nonce: "nonce-2" }],
+      ["online receipt", { onlineReceiptDigest: digest("7") }],
+      ["model-call anchor", { modelCallAnchorDigest: digest("7") }],
+      ["use id", { useId: digest("7") }],
+      ["commit time", { committedAt: "2026-07-11T10:00:16.000Z" }],
+      ["receipt expiry", { consumeReceiptExpiresAt: "2026-07-11T10:01:14.000Z" }],
+      ["catalog incarnation", { catalogIncarnation: "another-catalog-incarnation" }],
+      [
+        "recovery sequence",
+        {
+          recoveryFrontierSequence:
+            "2" as CapabilityUseVerifiedClaims["recoveryFrontierSequence"],
+        },
+      ],
+      ["recovery hash", { recoveryFrontierHash: digest("7") }],
+    ];
+    for (const [name, override] of mutants) {
+      const mutation = await verifiedEvidence(claims(override));
+      expect(() => ledger.append(mutation), name).toThrow(
+        expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }),
+      );
+    }
+    const changedReceipt = await verifiedEvidence(
+      claims(),
+      "request-1",
+      "changed-receipt",
+    );
+    expect(() => ledger.append(changedReceipt)).toThrow(
+      expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }),
+    );
     ledger.close();
   });
 
@@ -414,5 +464,23 @@ describe("v10 non-rewindable capability-use ledger", () => {
       ),
     ).rejects.toEqual(expect.objectContaining({ code: "VALIDATION_FAILED" }));
     ledger.close();
+  });
+
+  test("fails path verification closed when the process owner cannot be resolved", () => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    expect(descriptor).toBeDefined();
+    try {
+      Object.defineProperty(process, "getuid", {
+        configurable: true,
+        enumerable: true,
+        value: undefined,
+        writable: true,
+      });
+      expect(() => ledgerAt(root())).toThrow(
+        expect.objectContaining({ code: "DATABASE_PATH_UNSAFE" }),
+      );
+    } finally {
+      Object.defineProperty(process, "getuid", descriptor!);
+    }
   });
 });

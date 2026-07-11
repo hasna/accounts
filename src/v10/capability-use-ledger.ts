@@ -263,6 +263,7 @@ export class NonRewindableCapabilityUseLedger {
   private closed = false;
 
   constructor(options: NonRewindableCapabilityUseLedgerOptions) {
+    currentUid();
     this.catalogIncarnation = safeIdentifier(
       options.catalogIncarnation,
       "catalogIncarnation",
@@ -299,9 +300,6 @@ export class NonRewindableCapabilityUseLedger {
     if (!verifiedEvidenceInstances.has(evidence)) {
       throw new AccountsError("FORBIDDEN", "Capability-use evidence was not verified");
     }
-    if (evidence.catalogIncarnation !== this.catalogIncarnation) {
-      throw new AccountsError("CONFLICT", "Capability-use catalog incarnation conflicts");
-    }
     const payload = payloadFromEvidence(evidence);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const snapshot = this.log.readSnapshot();
@@ -310,6 +308,9 @@ export class NonRewindableCapabilityUseLedger {
       if (existing !== undefined) {
         this.reconcile();
         return Object.freeze({ kind: "REPLAYED", record: toPublicRecord(existing) });
+      }
+      if (payload.catalog_incarnation !== this.catalogIncarnation) {
+        throw new AccountsError("CONFLICT", "Capability-use catalog incarnation conflicts");
       }
       let appended: SignedLogRecord<CapabilityUseLedgerPayload>;
       try {
@@ -730,13 +731,7 @@ function isExactRequestReplay(
   existing: CapabilityUseLedgerPayload,
   candidate: CapabilityUseLedgerPayload,
 ): boolean {
-  return (
-    existing.consume_request_id === candidate.consume_request_id &&
-    existing.idempotency_key_digest === candidate.idempotency_key_digest &&
-    existing.consume_request_jcs_sha256 === candidate.consume_request_jcs_sha256 &&
-    existing.consume_request_jcs_base64url === candidate.consume_request_jcs_base64url &&
-    existing.capability_digest === candidate.capability_digest
-  );
+  return canonicalJson(existing) === canonicalJson(candidate);
 }
 
 function toPublicRecord(
@@ -908,6 +903,7 @@ function canonicalBase64url(value: unknown, field: string): string {
 }
 
 function prepareMirrorPath(path: string): string {
+  const uid = currentUid();
   if (!isAbsolute(path)) {
     throw new AccountsError("VALIDATION_FAILED", "Capability-use mirror path must be absolute");
   }
@@ -924,7 +920,7 @@ function prepareMirrorPath(path: string): string {
     realParent !== parent ||
     !parentMetadata.isDirectory() ||
     parentMetadata.isSymbolicLink() ||
-    (typeof process.getuid === "function" && parentMetadata.uid !== process.getuid()) ||
+    parentMetadata.uid !== uid ||
     (parentMetadata.mode & 0o077) !== 0
   ) {
     throw new AccountsError("DATABASE_PATH_UNSAFE", "Capability-use mirror parent is unsafe");
@@ -935,7 +931,7 @@ function prepareMirrorPath(path: string): string {
       !metadata.isFile() ||
       metadata.isSymbolicLink() ||
       metadata.nlink !== 1 ||
-      (typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
+      metadata.uid !== uid ||
       (metadata.mode & 0o077) !== 0
     ) {
       throw new AccountsError("DATABASE_PATH_UNSAFE", "Capability-use mirror path is unsafe");
@@ -945,6 +941,7 @@ function prepareMirrorPath(path: string): string {
 }
 
 function secureSQLiteSidecars(path: string): void {
+  const uid = currentUid();
   for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
     if (!existsSync(candidate)) continue;
     const metadata = lstatSync(candidate);
@@ -952,11 +949,19 @@ function secureSQLiteSidecars(path: string): void {
       !metadata.isFile() ||
       metadata.isSymbolicLink() ||
       metadata.nlink !== 1 ||
-      (typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
+      metadata.uid !== uid ||
       (metadata.mode & 0o077) !== 0
     ) {
       throw new AccountsError("DATABASE_PATH_UNSAFE", "Capability-use SQLite sidecar is unsafe");
     }
     chmodSync(candidate, 0o600);
   }
+}
+
+function currentUid(): number {
+  const getuid = process.getuid;
+  if (typeof getuid !== "function") {
+    throw new AccountsError("DATABASE_PATH_UNSAFE", "Owner verification is unavailable");
+  }
+  return getuid.call(process);
 }
