@@ -20,10 +20,99 @@ import { canonicalJson, canonicalSha256 } from "../serialization/json";
 export const CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION =
   "accounts.capability-use-ledger-entry/v1" as const;
 
+/** Sole reviewed planning commit that corrected the two consume identities. */
+export const CAPABILITY_USE_CONSUME_PIN_COMMIT =
+  "80054c36b10111765a18b89743214679c58ad7c6" as const;
+
+export const CAPABILITY_USE_CONSUME_REQUEST_DESCRIPTOR = Object.freeze({
+  fields: Object.freeze([
+    "schema_version",
+    "schema_digest",
+    "consume_request_id",
+    "capability_id",
+    "capability_digest",
+    "nonce",
+    "subject",
+    "actor_principal",
+    "effect_namespace_id",
+    "account_lane_id",
+    "capacity_pool_id",
+    "capacity_domain_ref",
+    "serialization_key_digest",
+    "credential_family_id",
+    "resource_lease_id",
+    "resource_id",
+    "resource_lifecycle_generation",
+    "operation_id",
+    "operation_digest",
+    "operation_execution_epoch",
+    "sender_key_thumbprint",
+    "channel_binding_digest",
+    "canonical_request_digest",
+    "provider_destination_policy_digest",
+    "online_receipt_id",
+    "online_receipt_digest",
+    "model_call_anchor_digest",
+    "expected_use_count",
+    "max_uses",
+    "not_after",
+    "idempotency_key_digest",
+  ]),
+  schema_version: "accounts.capability-use-consume-request.v1",
+});
+
+export const CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST =
+  "sha256:c248ce62b2acb9bb75f9bc88dfc272b05a9cd627f7e6ac19829bad9ea36de249" as const;
+
+export const CAPABILITY_USE_CONSUME_RECEIPT_DESCRIPTOR = Object.freeze({
+  fields: Object.freeze([
+    "schema_version",
+    "schema_digest",
+    "consume_request_id",
+    "consume_receipt_id",
+    "issuer",
+    "issuer_incarnation",
+    "key_id",
+    "audience",
+    "capability_id",
+    "capability_digest",
+    "nonce",
+    "subject",
+    "actor_principal",
+    "effect_namespace_id",
+    "account_lane_id",
+    "capacity_pool_id",
+    "serialization_key_digest",
+    "resource_lease_id",
+    "operation_id",
+    "operation_execution_epoch",
+    "sender_key_thumbprint",
+    "channel_binding_digest",
+    "canonical_request_digest",
+    "online_receipt_digest",
+    "model_call_anchor_digest",
+    "max_uses",
+    "prior_use_count",
+    "next_use_count",
+    "use_ordinal",
+    "use_id",
+    "committed_at",
+    "expires_at",
+    "catalog_incarnation",
+    "recovery_frontier_sequence",
+    "recovery_frontier_hash",
+    "signature",
+  ]),
+  schema_version: "accounts.capability-use-consume-receipt.v1",
+});
+
+export const CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST =
+  "sha256:4e969fab6b3ae55c479357ebffed40b5de1ce207ca955b478462b36c9a345bfc" as const;
+
 /**
- * This is the collision-free external tombstone descriptor from the frozen
- * v10 contract. The ledger payload below is an internal record and does not
- * claim to be the externally signed tombstone.
+ * This is the external tombstone descriptor preserved by the current v11
+ * successor contract. The ledger payload below is an internal record and does
+ * not claim to be the externally signed tombstone.
  */
 export const CAPABILITY_USE_TOMBSTONE_DESCRIPTOR = Object.freeze({
   fields: Object.freeze([
@@ -66,26 +155,19 @@ if (canonicalSha256(CAPABILITY_USE_TOMBSTONE_DESCRIPTOR) !== CAPABILITY_USE_TOMB
   throw new AccountsError("SCHEMA_CHECKSUM_MISMATCH", "Capability-use tombstone descriptor mismatch");
 }
 
-/**
- * No v10 request/receipt codec is provided while the frozen descriptor text
- * names the old digests. The computed values are evidence of the collision,
- * not replacement schema identities.
- */
-export const CAPABILITY_USE_WIRE_CODEC_STATUS = Object.freeze({
-  status: "BLOCKED_DESCRIPTOR_DIGEST_COLLISION" as const,
-  request: Object.freeze({
-    declaredDigest:
-      "sha256:a7cdc1dfbebeaea3bad6a5014cfb5189be40fb010f57161b46437458492cd1bc",
-    computedDescriptorDigest:
-      "sha256:c248ce62b2acb9bb75f9bc88dfc272b05a9cd627f7e6ac19829bad9ea36de249",
-  }),
-  receipt: Object.freeze({
-    declaredDigest:
-      "sha256:a0999ffabc197f46f6fdeb8a6b78521364b0f2153d52a0e6e63ee360bb408bce",
-    computedDescriptorDigest:
-      "sha256:4e969fab6b3ae55c479357ebffed40b5de1ce207ca955b478462b36c9a345bfc",
-  }),
-});
+if (
+  canonicalSha256(CAPABILITY_USE_CONSUME_REQUEST_DESCRIPTOR) !==
+  CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST
+) {
+  throw new AccountsError("SCHEMA_CHECKSUM_MISMATCH", "Capability-use request descriptor mismatch");
+}
+
+if (
+  canonicalSha256(CAPABILITY_USE_CONSUME_RECEIPT_DESCRIPTOR) !==
+  CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST
+) {
+  throw new AccountsError("SCHEMA_CHECKSUM_MISMATCH", "Capability-use receipt descriptor mismatch");
+}
 
 type Sha256Digest = `sha256:${string}`;
 
@@ -352,6 +434,7 @@ export class NonRewindableCapabilityUseLedger {
     const snapshot = this.log.readSnapshot();
     buildIndexes(snapshot);
     if (this.mirrorMatches(snapshot)) return reconciliation("CURRENT", snapshot);
+    this.assertMirrorNotAhead(snapshot);
 
     const rebuild = this.database.transaction(() => {
       this.database.exec("DELETE FROM capability_use_mirror");
@@ -461,6 +544,37 @@ export class NonRewindableCapabilityUseLedger {
       });
     } catch {
       return false;
+    }
+  }
+
+  private assertMirrorNotAhead(snapshot: SignedLogSnapshot<CapabilityUseLedgerPayload>): void {
+    try {
+      const meta = this.database.query(`
+        SELECT frontier_sequence, frontier_hash, frontier_signature_digest
+        FROM capability_use_mirror_meta WHERE singleton = 1
+      `).get() as MirrorMetaRow | null;
+      const row = this.database.query(`
+        SELECT MAX(sequence) AS maximum_sequence
+        FROM capability_use_mirror
+      `).get() as { readonly maximum_sequence: bigint | null };
+      const signedSequence = BigInt(snapshot.frontier.sequence);
+      if (
+        (meta !== null && meta.frontier_sequence > signedSequence) ||
+        (row.maximum_sequence !== null && row.maximum_sequence > signedSequence) ||
+        (meta !== null &&
+          meta.frontier_sequence === signedSequence &&
+          (meta.frontier_hash !== snapshot.frontier.hash ||
+            meta.frontier_signature_digest !== snapshot.frontier.signatureDigest))
+      ) {
+        throw new AccountsError(
+          "RECOVERY_HOLD",
+          "Capability-use mirror is ahead of the signed append log",
+        );
+      }
+    } catch (error) {
+      if (error instanceof AccountsError && error.code === "RECOVERY_HOLD") throw error;
+      // An unreadable/corrupt mirror is not positive higher-frontier evidence;
+      // the existing rebuild path will either replace it or fail closed.
     }
   }
 

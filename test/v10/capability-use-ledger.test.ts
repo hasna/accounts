@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -14,9 +15,13 @@ import { join } from "node:path";
 import { AccountsError } from "../../src/errors";
 import { canonicalJson } from "../../src/serialization/json";
 import {
+  CAPABILITY_USE_CONSUME_PIN_COMMIT,
+  CAPABILITY_USE_CONSUME_RECEIPT_DESCRIPTOR,
+  CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+  CAPABILITY_USE_CONSUME_REQUEST_DESCRIPTOR,
+  CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
   CAPABILITY_USE_TOMBSTONE_DESCRIPTOR,
   CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST,
-  CAPABILITY_USE_WIRE_CODEC_STATUS,
   NonRewindableCapabilityUseLedger,
   verifyCapabilityUseEvidence,
   type CapabilityUseVerifiedClaims,
@@ -278,6 +283,7 @@ describe("v10 non-rewindable capability-use ledger", () => {
     const logPath = join(directory, "capability-use.log");
     const ledger = ledgerAt(directory);
     const first = ledger.append(await verifiedEvidence(claims()));
+    const firstAnchor = readFileSync(`${logPath}.frontier`);
     ledger.append(
       await verifiedEvidence(
         claims({
@@ -296,6 +302,7 @@ describe("v10 non-rewindable capability-use ledger", () => {
     const lines = readFileSync(logPath, "utf8").trimEnd().split("\n");
     expect(lines).toHaveLength(3);
     writeFileSync(logPath, `${lines.slice(0, 2).join("\n")}\n`, { mode: 0o600 });
+    writeFileSync(`${logPath}.frontier`, firstAnchor, { mode: 0o600 });
 
     expect(() => ledgerAt(directory)).toThrow(
       expect.objectContaining({ code: "RECOVERY_HOLD" }),
@@ -303,27 +310,111 @@ describe("v10 non-rewindable capability-use ledger", () => {
     expect(String(first.record.ledgerSequence)).toBe("1");
   });
 
-  test("pins only the collision-free tombstone descriptor and exposes consume codecs as blocked", () => {
-    const actual = `sha256:${createHash("sha256")
+  test("never rewinds mirror metadata or rows that are ahead of the signed log", async () => {
+    for (const proof of ["metadata", "row"] as const) {
+      const directory = root();
+      const mirrorPath = join(directory, "capability-use.sqlite");
+      const ledger = ledgerAt(directory);
+      ledger.append(await verifiedEvidence(claims()));
+      ledger.close();
+
+      const mirror = new Database(mirrorPath, { strict: true, safeIntegers: true });
+      if (proof === "metadata") {
+        mirror.query(`
+          UPDATE capability_use_mirror_meta
+          SET frontier_sequence = 2
+          WHERE singleton = 1
+        `).run();
+      } else {
+        const first = mirror.query(`
+          SELECT payload_digest, payload_json
+          FROM capability_use_mirror WHERE sequence = 1
+        `).get() as { payload_digest: string; payload_json: string };
+        mirror.query(`
+          INSERT INTO capability_use_mirror (
+            sequence, payload_digest, payload_json, consume_request_id,
+            idempotency_key_digest, capability_id, nonce, use_id
+          ) VALUES (2, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          first.payload_digest,
+          first.payload_json,
+          "0198a0a0-0000-7000-8000-000000000902",
+          digest("7"),
+          "capability-2",
+          "nonce-2",
+          digest("8"),
+        );
+      }
+      mirror.close();
+
+      expect(() => ledgerAt(directory), proof).toThrow(
+        expect.objectContaining({ code: "RECOVERY_HOLD" }),
+      );
+    }
+  });
+
+  test("holds on a valid same-sequence log fork instead of rewriting the prior mirror", async () => {
+    const original = root();
+    const fork = root();
+    const originalLedger = ledgerAt(original);
+    originalLedger.append(await verifiedEvidence(claims(), "original-request", "original-receipt"));
+    originalLedger.close();
+
+    const forkLedger = ledgerAt(fork);
+    forkLedger.append(
+      await verifiedEvidence(
+        claims({
+          consumeRequestId: "0198a0a0-0000-7000-8000-000000000902",
+          idempotencyKeyDigest: digest("7"),
+          capabilityId: "capability-2",
+          nonce: "nonce-2",
+          useId: digest("8"),
+        }),
+        "fork-request",
+        "fork-receipt",
+      ),
+    );
+    forkLedger.close();
+
+    copyFileSync(
+      join(fork, "capability-use.log"),
+      join(original, "capability-use.log"),
+    );
+    copyFileSync(
+      join(fork, "capability-use.log.frontier"),
+      join(original, "capability-use.log.frontier"),
+    );
+
+    expect(() => ledgerAt(original)).toThrow(
+      expect.objectContaining({ code: "RECOVERY_HOLD" }),
+    );
+  });
+
+  test("pins v11 consume identities from sole planning commit and preserves tombstone identity", () => {
+    const requestDigest = `sha256:${createHash("sha256")
+      .update(canonicalJson(CAPABILITY_USE_CONSUME_REQUEST_DESCRIPTOR))
+      .digest("hex")}`;
+    const receiptDigest = `sha256:${createHash("sha256")
+      .update(canonicalJson(CAPABILITY_USE_CONSUME_RECEIPT_DESCRIPTOR))
+      .digest("hex")}`;
+    const tombstoneDigest = `sha256:${createHash("sha256")
       .update(canonicalJson(CAPABILITY_USE_TOMBSTONE_DESCRIPTOR))
       .digest("hex")}`;
-    expect(actual).toBe(CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST);
+    expect(CAPABILITY_USE_CONSUME_PIN_COMMIT).toBe(
+      "80054c36b10111765a18b89743214679c58ad7c6",
+    );
+    expect(requestDigest).toBe(CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST);
+    expect(CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST).toBe(
+      "sha256:c248ce62b2acb9bb75f9bc88dfc272b05a9cd627f7e6ac19829bad9ea36de249",
+    );
+    expect(receiptDigest).toBe(CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST);
+    expect(CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST).toBe(
+      "sha256:4e969fab6b3ae55c479357ebffed40b5de1ce207ca955b478462b36c9a345bfc",
+    );
+    expect(tombstoneDigest).toBe(CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST);
     expect(CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST).toBe(
       "sha256:c4d07c912e2d65350269a7425c461989fc747bbaa7c71ef5841135064fea5a12",
     );
-    expect(CAPABILITY_USE_WIRE_CODEC_STATUS).toEqual({
-      status: "BLOCKED_DESCRIPTOR_DIGEST_COLLISION",
-      request: {
-        declaredDigest: "sha256:a7cdc1dfbebeaea3bad6a5014cfb5189be40fb010f57161b46437458492cd1bc",
-        computedDescriptorDigest:
-          "sha256:c248ce62b2acb9bb75f9bc88dfc272b05a9cd627f7e6ac19829bad9ea36de249",
-      },
-      receipt: {
-        declaredDigest: "sha256:a0999ffabc197f46f6fdeb8a6b78521364b0f2153d52a0e6e63ee360bb408bce",
-        computedDescriptorDigest:
-          "sha256:4e969fab6b3ae55c479357ebffed40b5de1ce207ca955b478462b36c9a345bfc",
-      },
-    });
   });
 
   test("uses evidence-returning PREPARED/OPEN and CONSUME_BOUND port methods", async () => {

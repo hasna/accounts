@@ -40,6 +40,9 @@ const MAX_LEDGER_BYTES = 128 * 1024 * 1024;
 const MAX_RECORD_BYTES = 1024 * 1024;
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const CLOEXEC = (constants as unknown as Readonly<Record<string, number>>).O_CLOEXEC ?? 0;
+const LOCK_SCHEMA = "accounts.signed-log-lock.v2" as const;
+const BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const PROCESS_START_PATTERN = /^\d+$/;
 
 interface SignedLogHeader {
   readonly schema_version: typeof SIGNED_LOG_SCHEMA;
@@ -285,6 +288,77 @@ function readSecureBytes(path: string, maximumBytes: number): Uint8Array {
   }
 }
 
+type ProcessStartObservation =
+  | { readonly kind: "FOUND"; readonly value: string }
+  | { readonly kind: "MISSING" }
+  | { readonly kind: "UNAVAILABLE" };
+
+type ProcessIdentity =
+  | {
+      readonly identityMode: "linux-proc-v1";
+      readonly pid: number;
+      readonly processStart: string;
+      readonly bootId: string;
+    }
+  | {
+      readonly identityMode: "pid-liveness-v1";
+      readonly pid: number;
+    };
+
+function tryReadBootId(): string | undefined {
+  let value: string;
+  try {
+    value = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return undefined;
+  }
+  return BOOT_ID_PATTERN.test(value) ? value : undefined;
+}
+
+function observeProcessStart(pid: number): ProcessStartObservation {
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, "utf8").trim();
+  } catch (error) {
+    if (isNodeError(error, "ENOENT") || isNodeError(error, "ESRCH")) {
+      return Object.freeze({ kind: "MISSING" });
+    }
+    return Object.freeze({ kind: "UNAVAILABLE" });
+  }
+  const closingParenthesis = stat.lastIndexOf(")");
+  if (closingParenthesis < 0) return Object.freeze({ kind: "UNAVAILABLE" });
+  const fieldsFromState = stat.slice(closingParenthesis + 2).split(" ");
+  const processStart = fieldsFromState[19];
+  if (processStart === undefined || !PROCESS_START_PATTERN.test(processStart)) {
+    return Object.freeze({ kind: "UNAVAILABLE" });
+  }
+  return Object.freeze({ kind: "FOUND", value: processStart });
+}
+
+function currentProcessIdentity(): ProcessIdentity {
+  const bootId = tryReadBootId();
+  const processStart = observeProcessStart(process.pid);
+  if (bootId !== undefined && processStart.kind === "FOUND") {
+    return Object.freeze({
+      identityMode: "linux-proc-v1",
+      pid: process.pid,
+      processStart: processStart.value,
+      bootId,
+    });
+  }
+  return Object.freeze({ identityMode: "pid-liveness-v1", pid: process.pid });
+}
+
+function pidIsDefinitivelyDead(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    if (isNodeError(error, "ESRCH")) return true;
+    return failHold();
+  }
+}
+
 /**
  * A process-independent, owner-only, signed append log. The companion anchor is
  * deliberately stored outside the append stream so truncating a valid prefix is
@@ -344,7 +418,7 @@ export class OwnerOnlySignedAppendLog<T> {
   }
 
   readSnapshot(): SignedLogSnapshot<T> {
-    return this.scan();
+    return this.withLock(() => this.scan());
   }
 
   verifyFrontier(frontier: SignedLogFrontier): boolean {
@@ -609,15 +683,6 @@ export class OwnerOnlySignedAppendLog<T> {
       frontier = storedFrontier;
     }
 
-    const anchor = this.readAnchor();
-    if (
-      anchor.catalogIncarnation !== frontier.catalogIncarnation ||
-      anchor.sequence !== frontier.sequence ||
-      !digestEqual(anchor.hash, frontier.hash) ||
-      !digestEqual(anchor.signatureDigest, frontier.signatureDigest)
-    ) {
-      failHold();
-    }
     if (
       this.lastObserved !== undefined &&
       (BigInt(frontier.sequence) < BigInt(this.lastObserved.sequence) ||
@@ -626,6 +691,29 @@ export class OwnerOnlySignedAppendLog<T> {
             !digestEqual(frontier.signatureDigest, this.lastObserved.signatureDigest))))
     ) {
       failHold();
+    }
+
+    const anchor = this.readAnchor();
+    if (anchor.catalogIncarnation !== frontier.catalogIncarnation) failHold();
+    const anchorSequence = BigInt(anchor.sequence);
+    const frontierSequence = BigInt(frontier.sequence);
+    if (anchorSequence > frontierSequence) failHold();
+    const anchoredFrontier =
+      anchor.sequence === genesisFrontier.sequence
+        ? genesisFrontier
+        : records.find((record) => record.sequence === anchor.sequence);
+    if (
+      anchoredFrontier === undefined ||
+      !digestEqual(anchor.hash, anchoredFrontier.hash) ||
+      !digestEqual(anchor.signatureDigest, anchoredFrontier.signatureDigest)
+    ) {
+      failHold();
+    }
+    if (anchorSequence < frontierSequence) {
+      // append() fsyncs the authenticated line before replacing the anchor.
+      // A crash in that window is safe to heal only after the complete tail has
+      // passed every canonical, chain, HMAC, and payload validation above.
+      this.writeAnchor(frontier);
     }
     this.lastObserved = frontier;
     return Object.freeze({
@@ -731,28 +819,27 @@ export class OwnerOnlySignedAppendLog<T> {
 
   private withLock<R>(operation: () => R): R {
     assertOwnerOnlyDirectory(this.parentPath);
-    let descriptor: number;
-    try {
-      descriptor = openSync(
-        this.lockPath,
-        constants.O_CREAT |
-          constants.O_EXCL |
-          constants.O_WRONLY |
-          NOFOLLOW |
-          CLOEXEC,
-        0o600,
-      );
-    } catch {
-      failHold();
-    }
+    const descriptor = this.acquireLock();
     try {
       assertSecureRegularFile(descriptor);
+      const identity = currentProcessIdentity();
+      const lock =
+        identity.identityMode === "linux-proc-v1"
+          ? {
+              schema_version: LOCK_SCHEMA,
+              identity_mode: identity.identityMode,
+              pid: identity.pid,
+              process_start: identity.processStart,
+              boot_id: identity.bootId,
+            }
+          : {
+              schema_version: LOCK_SCHEMA,
+              identity_mode: identity.identityMode,
+              pid: identity.pid,
+            };
       writeAll(
         descriptor,
-        Buffer.from(
-          `${canonicalJson({ schema_version: "accounts.signed-log-lock.v1", pid: process.pid })}\n`,
-          "utf8",
-        ),
+        Buffer.from(`${canonicalJson(lock)}\n`, "utf8"),
       );
       fsyncSync(descriptor);
       return operation();
@@ -764,6 +851,107 @@ export class OwnerOnlySignedAppendLog<T> {
       } catch {
         failHold();
       }
+    }
+  }
+
+  private acquireLock(): number {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return openSync(
+          this.lockPath,
+          constants.O_CREAT |
+            constants.O_EXCL |
+            constants.O_WRONLY |
+            NOFOLLOW |
+            CLOEXEC,
+          0o600,
+        );
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST") || attempt !== 0) failHold();
+        this.removeStaleLock();
+      }
+    }
+    return failHold();
+  }
+
+  private removeStaleLock(): void {
+    const descriptor = openExistingSecure(this.lockPath, constants.O_RDONLY);
+    try {
+      const metadata = fstatSync(descriptor);
+      if (metadata.size <= 0 || metadata.size > MAX_RECORD_BYTES) failHold();
+      const bytes = readFileSync(descriptor);
+      if (bytes.at(-1) !== 0x0a) failHold();
+      let value: unknown;
+      try {
+        value = parseClosedJsonBytes(bytes.subarray(0, -1));
+      } catch {
+        return failHold();
+      }
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, -1));
+        if (canonicalJson(value) !== text) failHold();
+      } catch {
+        return failHold();
+      }
+      const record = exactRecord(value, [
+        "schema_version",
+        "identity_mode",
+        "pid",
+      ], ["process_start", "boot_id"]);
+      if (record.schema_version !== LOCK_SCHEMA) failHold();
+      const identityMode = record.identity_mode;
+      const pid = record.pid;
+      if (
+        (identityMode !== "linux-proc-v1" && identityMode !== "pid-liveness-v1") ||
+        typeof pid !== "number" ||
+        !Number.isSafeInteger(pid) ||
+        pid <= 0
+      ) {
+        failHold();
+      }
+
+      if (identityMode === "linux-proc-v1") {
+        const processStart = record.process_start;
+        const bootId = record.boot_id;
+        if (
+          typeof processStart !== "string" ||
+          !PROCESS_START_PATTERN.test(processStart) ||
+          typeof bootId !== "string" ||
+          !BOOT_ID_PATTERN.test(bootId)
+        ) {
+          failHold();
+        }
+        const currentBootId = tryReadBootId();
+        if (currentBootId === undefined) failHold();
+        if (bootId === currentBootId) {
+          const observedStart = observeProcessStart(pid);
+          if (observedStart.kind === "UNAVAILABLE") failHold();
+          if (observedStart.kind === "FOUND" && observedStart.value === processStart) {
+            failHold();
+          }
+        }
+      } else {
+        if (Object.hasOwn(record, "process_start") || Object.hasOwn(record, "boot_id")) {
+          failHold();
+        }
+        if (!pidIsDefinitivelyDead(pid)) failHold();
+      }
+
+      // Keep the verified inode open while checking that the directory entry
+      // still names it, then remove only that stale identity.
+      const linkMetadata = lstatSync(this.lockPath);
+      if (
+        linkMetadata.isSymbolicLink() ||
+        linkMetadata.dev !== metadata.dev ||
+        linkMetadata.ino !== metadata.ino
+      ) {
+        failHold();
+      }
+      unlinkSync(this.lockPath);
+      fsyncDirectory(this.parentPath);
+    } finally {
+      closeSync(descriptor);
     }
   }
 }
