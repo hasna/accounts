@@ -22,6 +22,7 @@ export {
   createDeterministicAccountsSlotEligibilitySource,
 } from "./adapter";
 export { createSQLiteAccountsSlotEligibilityPort } from "./sqlite-slot-source";
+export { createAccountsCapabilityUseConsumer } from "./capability-use-consume";
 export {
   encodeSlotEligibilityV1,
   isResolvedSlotEligibilityV1,
@@ -75,3 +76,11 @@ export type {
   SQLiteAccountsSlotEligibilityPort,
   SQLiteAccountsSlotEligibilityPortOptions,
 } from "./sqlite-slot-source";
+export type {
+  AccountsCapabilityUseConsumeInput,
+  AccountsCapabilityUseConsumeResult,
+  AccountsCapabilityUseConsumer,
+  AccountsCapabilityUseConsumerOptions,
+  AccountsCapabilityUseLedgerOptions,
+  AccountsCapabilityUseOnlineTrust,
+} from "./capability-use-consume";
