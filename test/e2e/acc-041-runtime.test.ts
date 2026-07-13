@@ -398,8 +398,10 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
       source_commit: "80054c36b10111765a18b89743214679c58ad7c6",
       infinity_integration_commit: "6c2ba3d490cd58c7192d6e274514a9d849575ab8",
       sandboxes_integration_commit: "d8a4d37c35e8d98ea468a8d95dcf98b0a890fa48",
+      implementation_status: "EXACT_BYTE_REVIEW_READY",
       integration_authorized: false,
       publish_authorized: false,
+      deploy_authorized: false,
     });
     expect(INFINITY_INTEGRATION_COMMIT).toBe(
       "6c2ba3d490cd58c7192d6e274514a9d849575ab8",

@@ -1,11 +1,11 @@
 # @hasna/accounts
 
-> **WIP CHECKPOINT — NO-GO.** This branch is preserved for local review only.
-> The Accounts V1 successor contract is not independently approved or pinned,
-> and the credential-effect journal still targets an obsolete candidate. Do not
-> deploy, merge to `main`, publish, or treat `ACCOUNTS_V1_CONTRACT_SHA256` as a
-> successor attestation until the exact contract, implementation, and final
-> adversarial gates all pass.
+> **EXACT-BYTE REVIEW READY — NO-GO.** This branch is preserved for local
+> review only. The Accounts V11 runtime pin is ready for fresh exact-byte
+> implementation review, but the successor contract is not independently
+> approved or release-pinned. Do not deploy, merge to `main`, publish, or treat
+> `ACCOUNTS_V11_CONTRACT_SHA256` / `ACCOUNTS_RUNTIME_CONTRACT_SHA256` as release
+> attestation until both exact-byte reviews and the final adversarial gates pass.
 >
 > The current immutable but unpinned review pair is preserved under
 > [`contracts/accounts-v1`](contracts/accounts-v1/README.md). Its presence on

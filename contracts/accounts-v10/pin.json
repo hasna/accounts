@@ -8,7 +8,7 @@
   "review_pin_sha256": "33e19b22cb6c1687f8f85e883e73bf1ecdec88b75eccd5203d16a7f9ff2d93dc",
   "infinity_integration_commit": "6c2ba3d490cd58c7192d6e274514a9d849575ab8",
   "sandboxes_integration_commit": "d8a4d37c35e8d98ea468a8d95dcf98b0a890fa48",
-  "implementation_status": "IN_PROGRESS",
+  "implementation_status": "EXACT_BYTE_REVIEW_READY",
   "integration_authorized": false,
   "publish_authorized": false,
   "deploy_authorized": false

@@ -84,7 +84,7 @@ await Bun.write(
     review_pin_sha256: expected.pin,
     infinity_integration_commit: infinityIntegrationCommit,
     sandboxes_integration_commit: sandboxesIntegrationCommit,
-    implementation_status: "IN_PROGRESS",
+    implementation_status: "EXACT_BYTE_REVIEW_READY",
     integration_authorized: false,
     publish_authorized: false,
     deploy_authorized: false,
