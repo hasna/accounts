@@ -25,6 +25,9 @@ import {
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
   CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST,
+  NonRewindableCapabilityUseLedger,
+  verifyCapabilityUseEvidenceWithTombstone,
+  type CapabilityUseVerifiedClaims,
 } from "../../src/v10/capability-use-ledger";
 import { parseCapabilityUseConsumeRequestV1 } from "../../src/v10/capability-use-consume";
 import type {
@@ -190,6 +193,43 @@ function signedEvidence() {
   delete denyDraft.signature;
   const denyBytes = signOnlineGenerationCheckReceiptV1(denyDraft, signer);
   return { signer, signerHistory, slotBytes, slotPort, onlineBytes, denyBytes };
+}
+
+function rotatedEvidence(
+  evidence: ReturnType<typeof signedEvidence>,
+  oldKeyState: { readonly retired_at?: string | null; readonly revoked_at?: string | null },
+) {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const signer = {
+    issuer: evidence.signer.issuer,
+    issuerIncarnation: evidence.signer.issuerIncarnation,
+    audience: evidence.signer.audience,
+    keyId: "accounts-rotated",
+    privateKey,
+  } satisfies AccountsEvidenceSigner;
+  const oldKey = evidence.signerHistory.keys[0]!;
+  const signerHistory: AccountsEvidenceSignerHistoryV2 = {
+    ...evidence.signerHistory,
+    current_key_id: signer.keyId,
+    keys: [
+      {
+        ...oldKey,
+        retired_at: oldKeyState.retired_at ?? null,
+        revoked_at: oldKeyState.revoked_at ?? null,
+      },
+      {
+        key_id: signer.keyId,
+        public_key_spki_base64url: publicKey
+          .export({ format: "der", type: "spki" })
+          .toString("base64url"),
+        activated_at: "2026-07-11T10:00:16.000Z",
+        expires_at: "2026-07-12T00:00:00.000Z",
+        retired_at: null,
+        revoked_at: null,
+      },
+    ],
+  };
+  return { signer, signerHistory };
 }
 
 async function positiveSlot(
@@ -383,6 +423,56 @@ function consumerOptions(
   } as const;
 }
 
+function verifiedClaimsFromStoredProof(
+  requestBytes: Uint8Array,
+  receiptBytes: Uint8Array,
+): CapabilityUseVerifiedClaims {
+  const request = parseClosedJsonBytes(requestBytes) as Record<string, unknown>;
+  const receipt = parseClosedJsonBytes(receiptBytes) as Record<string, unknown>;
+  return {
+    consumeRequestId: stringField(request, "consume_request_id"),
+    idempotencyKeyDigest: stringField(request, "idempotency_key_digest") as `sha256:${string}`,
+    effectNamespaceId: stringField(request, "effect_namespace_id"),
+    serializationKeyDigest: stringField(request, "serialization_key_digest") as `sha256:${string}`,
+    capabilityId: stringField(request, "capability_id"),
+    capabilityDigest: stringField(request, "capability_digest") as `sha256:${string}`,
+    nonce: stringField(request, "nonce"),
+    onlineReceiptDigest: stringField(request, "online_receipt_digest") as `sha256:${string}`,
+    modelCallAnchorDigest: stringField(request, "model_call_anchor_digest") as `sha256:${string}`,
+    useId: stringField(receipt, "use_id") as `sha256:${string}`,
+    committedAt: stringField(receipt, "committed_at"),
+    consumeReceiptExpiresAt: stringField(receipt, "expires_at"),
+    catalogIncarnation: stringField(receipt, "catalog_incarnation"),
+    recoveryFrontierSequence: parseCounter(stringField(receipt, "recovery_frontier_sequence")),
+    recoveryFrontierHash: stringField(receipt, "recovery_frontier_hash") as `sha256:${string}`,
+  };
+}
+
+async function appendStoredTombstoneProof(
+  root: string,
+  requestBytes: Uint8Array,
+  receiptBytes: Uint8Array,
+  tombstoneBytes: Uint8Array,
+) {
+  const ledger = new NonRewindableCapabilityUseLedger({
+    ledgerPath: join(root, "capability-use.log"),
+    mirrorPath: join(root, "capability-use.sqlite"),
+    catalogIncarnation: "catalog-incarnation-1",
+    signingKey: new Uint8Array(32).fill(0x61),
+  });
+  try {
+    const evidence = await verifyCapabilityUseEvidenceWithTombstone(
+      { consumeRequestBytes: requestBytes, consumeReceiptBytes: receiptBytes, tombstoneBytes },
+      {
+        verify: async () => verifiedClaimsFromStoredProof(requestBytes, receiptBytes),
+      },
+    );
+    ledger.append(evidence);
+  } finally {
+    ledger.close();
+  }
+}
+
 async function consumeInput(
   evidence: ReturnType<typeof signedEvidence>,
   requestBytes: Uint8Array,
@@ -466,6 +556,125 @@ describe("v11 capability-use consume production composition", () => {
     expect(replay.tombstoneDigest).toBe(digest(replay.tombstoneBytes));
     expect(unavailable.calls).toEqual({ read: 0, preparedCurrent: 0, bind: 0, assert: 0 });
     reopened.close();
+  });
+
+  test("fails closed when replayed stored tombstone bytes are malformed or binding-tampered", async () => {
+    for (const scenario of ["malformed", "binding-tampered"] as const) {
+      const sourceRoot = mkdtempSync(join(tmpdir(), "accounts-v11-consume-source-"));
+      const replayRoot = mkdtempSync(join(tmpdir(), "accounts-v11-consume-corrupt-replay-"));
+      chmodSync(sourceRoot, 0o700);
+      chmodSync(replayRoot, 0o700);
+      roots.push(sourceRoot, replayRoot);
+      const evidence = signedEvidence();
+      const requestBytes = requestFor(evidence.onlineBytes);
+      const sourceInfinity = infinityFor(requestBytes);
+      const sourceConsumer = publicApi.createAccountsCapabilityUseConsumer(
+        consumerOptions(sourceRoot, evidence, sourceInfinity.port),
+      );
+      const input = await consumeInput(evidence, requestBytes);
+      const first = await sourceConsumer.consume(input);
+      sourceConsumer.close();
+
+      const tombstoneBytes = scenario === "malformed"
+        ? bytes({ fixture: "not-a-capability-use-tombstone" })
+        : bytes({
+          ...(parseClosedJsonBytes(first.tombstoneBytes) as Record<string, unknown>),
+          nonce: "tampered-nonce",
+        });
+      await appendStoredTombstoneProof(
+        replayRoot,
+        requestBytes,
+        first.receiptBytes,
+        tombstoneBytes,
+      );
+
+      const unavailable = infinityFor(requestBytes);
+      unavailable.setUnavailableAt("read");
+      const replayConsumer = publicApi.createAccountsCapabilityUseConsumer(
+        consumerOptions(replayRoot, evidence, unavailable.port),
+      );
+      await expect(replayConsumer.consume(input)).rejects.toBeInstanceOf(AccountsError);
+      expect(unavailable.calls, scenario).toEqual({
+        read: 0,
+        preparedCurrent: 0,
+        bind: 0,
+        assert: 0,
+      });
+      replayConsumer.close();
+    }
+  });
+
+  test("replays stored tombstone proof after signer rotation and retirement after commit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "accounts-v11-consume-rotated-replay-"));
+    chmodSync(root, 0o700);
+    roots.push(root);
+    const evidence = signedEvidence();
+    const requestBytes = requestFor(evidence.onlineBytes);
+    const firstInfinity = infinityFor(requestBytes);
+    const firstConsumer = publicApi.createAccountsCapabilityUseConsumer(
+      consumerOptions(root, evidence, firstInfinity.port),
+    );
+    const input = await consumeInput(evidence, requestBytes);
+    const first = await firstConsumer.consume(input);
+    firstConsumer.close();
+
+    const rotated = rotatedEvidence(evidence, {
+      retired_at: "2026-07-11T10:00:16.000Z",
+    });
+    const unavailable = infinityFor(requestBytes);
+    unavailable.setUnavailableAt("read");
+    const replayConsumer = publicApi.createAccountsCapabilityUseConsumer({
+      ...consumerOptions(root, evidence, unavailable.port),
+      receiptSigner: rotated.signer,
+      receiptSignerHistory: rotated.signerHistory,
+      onlineTrust: {
+        signerHistory: rotated.signerHistory,
+        expectedEffectNamespaceId: "effect-namespace-1",
+      },
+      clock: () => new Date("2026-07-11T10:05:00.000Z"),
+    });
+    const replay = await replayConsumer.consume(input);
+    expect(replay.replayed).toBe(true);
+    expect(replay.receiptBytes).toEqual(first.receiptBytes);
+    expect(replay.tombstoneBytes).toEqual(first.tombstoneBytes);
+    expect(replay.tombstoneDigest).toBe(first.tombstoneDigest);
+    expect(unavailable.calls).toEqual({ read: 0, preparedCurrent: 0, bind: 0, assert: 0 });
+    replayConsumer.close();
+  });
+
+  test("rejects replayed stored tombstone proof when embedded signer key was revoked at commit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "accounts-v11-consume-revoked-replay-"));
+    chmodSync(root, 0o700);
+    roots.push(root);
+    const evidence = signedEvidence();
+    const requestBytes = requestFor(evidence.onlineBytes);
+    const firstInfinity = infinityFor(requestBytes);
+    const firstConsumer = publicApi.createAccountsCapabilityUseConsumer(
+      consumerOptions(root, evidence, firstInfinity.port),
+    );
+    const input = await consumeInput(evidence, requestBytes);
+    const first = await firstConsumer.consume(input);
+    firstConsumer.close();
+    const receipt = parseClosedJsonBytes(first.receiptBytes) as Record<string, unknown>;
+
+    const rotated = rotatedEvidence(evidence, {
+      revoked_at: stringField(receipt, "committed_at"),
+    });
+    const unavailable = infinityFor(requestBytes);
+    unavailable.setUnavailableAt("read");
+    const replayConsumer = publicApi.createAccountsCapabilityUseConsumer({
+      ...consumerOptions(root, evidence, unavailable.port),
+      receiptSigner: rotated.signer,
+      receiptSignerHistory: rotated.signerHistory,
+      onlineTrust: {
+        signerHistory: rotated.signerHistory,
+        expectedEffectNamespaceId: "effect-namespace-1",
+      },
+      clock: () => new Date("2026-07-11T10:05:00.000Z"),
+    });
+    await expect(replayConsumer.consume(input)).rejects.toBeInstanceOf(AccountsError);
+    expect(unavailable.calls).toEqual({ read: 0, preparedCurrent: 0, bind: 0, assert: 0 });
+    replayConsumer.close();
   });
 
   test("serializes concurrent identical first consumes onto one exact stored receipt", async () => {

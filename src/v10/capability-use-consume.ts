@@ -52,6 +52,7 @@ import {
 import { encodeSlotEligibilityV1, parseSlotEligibilityV1 } from "./slot";
 import type {
   AccountsEvidenceSigner,
+  AccountsEvidenceSignerKeyV2,
   AccountsEvidenceSignerHistoryV2,
   AccountsEvidenceTrustV1,
   AllowedOnlineGenerationCheckReceiptV1,
@@ -503,11 +504,13 @@ export function createAccountsCapabilityUseConsumer(
         throw new AccountsError("FORBIDDEN", "Authenticated channel binding differs");
       }
 
+      const now = trustedNow(clock);
       const replay = exactReplay(ledger, request, requestBytes);
-      if (replay !== undefined) return consumeResult(replay, true);
+      if (replay !== undefined) {
+        return consumeResult(replay, true, undefined, signerHistory, now);
+      }
       assertNoExistingConflict(ledger, request);
 
-      const now = trustedNow(clock);
       validateReceiptSigner(receiptSigner, signerHistory, now);
       const onlineTrust = onlineTrustAt(onlineTrustConfiguration, now);
       const slotBytes = encodeSlotEligibilityV1(inputRecord.expectedSlotEligibility);
@@ -667,7 +670,7 @@ export function createAccountsCapabilityUseConsumer(
       }
 
       const consumeBound = await bindAndAssertCurrent(infinity, currentPrepared, appended);
-      return consumeResult(appended, replayed, consumeBound);
+      return consumeResult(appended, replayed, consumeBound, signerHistory, finalNow);
     },
     close: () => {
       if (closed) return;
@@ -1291,15 +1294,16 @@ function assertEmbeddedConsumeReceipt(
     "embedded consume receipt freshness mismatch",
   );
 
-  const keys = validateSignerHistory(signerHistory, now.getTime());
-  invariant(
-    receipt.issuer === signerHistory.issuer &&
-      receipt.issuer_incarnation === signerHistory.issuer_incarnation &&
-      receipt.audience === signerHistory.audience &&
-      receipt.key_id === signerHistory.current_key_id,
-    "embedded consume receipt signer identity mismatch",
-  );
-  const current = keys.find((candidate) => candidate.key_id === signerHistory.current_key_id)!;
+  const key = historicalSignerKeyAtCommit({
+    label: "embedded consume receipt",
+    issuer: receipt.issuer,
+    issuerIncarnation: receipt.issuer_incarnation,
+    audience: receipt.audience,
+    keyId: receipt.key_id,
+    committedAt: receipt.committed_at,
+    signerHistory,
+    now,
+  });
   const signature = canonicalBase64urlBytes(
     receipt.signature,
     "embedded consume receipt signature",
@@ -1311,7 +1315,7 @@ function assertEmbeddedConsumeReceipt(
     ed25519Verify(
       null,
       canonicalBytes(unsigned),
-      signerPublicKey(current.public_key_spki_base64url),
+      signerPublicKey(key.public_key_spki_base64url),
       signature,
     ),
     "embedded consume receipt Ed25519 signature mismatch",
@@ -1324,22 +1328,16 @@ function verifyTombstoneSignature(
   now: Date,
 ): void {
   invariant(now instanceof Date && Number.isFinite(now.getTime()), "tombstone trust time is invalid");
-  const keys = validateSignerHistory(signerHistory, now.getTime());
-  invariant(
-    tombstone.signer_ref === signerHistory.issuer &&
-      tombstone.signer_incarnation === signerHistory.issuer_incarnation &&
-      tombstone.audience === signerHistory.audience &&
-      tombstone.key_id === signerHistory.current_key_id,
-    "capability-use tombstone signer identity mismatch",
-  );
-  const current = keys.find((candidate) => candidate.key_id === signerHistory.current_key_id)!;
-  const committedAt = timestampMs(tombstone.committed_at, "tombstone committed_at");
-  invariant(
-    timestampMs(current.activated_at, "tombstone signer activated_at") <= committedAt &&
-      committedAt < timestampMs(current.expires_at, "tombstone signer expires_at") &&
-      current.retired_at === null && current.revoked_at === null,
-    "capability-use tombstone signer was not current at commit",
-  );
+  const key = historicalSignerKeyAtCommit({
+    label: "capability-use tombstone",
+    issuer: tombstone.signer_ref,
+    issuerIncarnation: tombstone.signer_incarnation,
+    audience: tombstone.audience,
+    keyId: tombstone.key_id,
+    committedAt: tombstone.committed_at,
+    signerHistory,
+    now,
+  });
   const signature = canonicalBase64urlBytes(tombstone.signature, "tombstone signature", 64);
   const unsigned = { ...tombstone };
   delete unsigned.signature;
@@ -1347,11 +1345,53 @@ function verifyTombstoneSignature(
     ed25519Verify(
       null,
       canonicalBytes(unsigned),
-      signerPublicKey(current.public_key_spki_base64url),
+      signerPublicKey(key.public_key_spki_base64url),
       signature,
     ),
     "capability-use tombstone Ed25519 signature mismatch",
   );
+}
+
+function historicalSignerKeyAtCommit(input: {
+  readonly label: string;
+  readonly issuer: unknown;
+  readonly issuerIncarnation: unknown;
+  readonly audience: unknown;
+  readonly keyId: unknown;
+  readonly committedAt: unknown;
+  readonly signerHistory: AccountsEvidenceSignerHistoryV2;
+  readonly now: Date;
+}): AccountsEvidenceSignerKeyV2 {
+  invariant(
+    input.now instanceof Date && Number.isFinite(input.now.getTime()),
+    `${input.label} trust time is invalid`,
+  );
+  const keys = validateSignerHistory(input.signerHistory, input.now.getTime());
+  invariant(
+    input.issuer === input.signerHistory.issuer &&
+      input.issuerIncarnation === input.signerHistory.issuer_incarnation &&
+      input.audience === input.signerHistory.audience &&
+      typeof input.keyId === "string",
+    `${input.label} signer identity mismatch`,
+  );
+  const key = keys.find((candidate) => candidate.key_id === input.keyId);
+  invariant(key !== undefined, `${input.label} signer key_id is not trusted`);
+  const committedAt = timestampMs(input.committedAt, `${input.label} committed_at`);
+  const activatedAt = timestampMs(key.activated_at, `${input.label} signer activated_at`);
+  const expiresAt = timestampMs(key.expires_at, `${input.label} signer expires_at`);
+  invariant(
+    activatedAt <= committedAt && committedAt < expiresAt,
+    `${input.label} signer was not valid at commit`,
+  );
+  if (key.retired_at !== null) {
+    const retiredAt = timestampMs(key.retired_at, `${input.label} signer retired_at`);
+    invariant(committedAt <= retiredAt, `${input.label} signer was retired before commit`);
+  }
+  if (key.revoked_at !== null) {
+    const revokedAt = timestampMs(key.revoked_at, `${input.label} signer revoked_at`);
+    invariant(committedAt < revokedAt, `${input.label} signer was revoked at commit`);
+  }
+  return key;
 }
 
 function assertReceiptBindings(
@@ -1605,8 +1645,10 @@ function consumeResult(
   record: CapabilityUseLedgerRecord,
   replayed: boolean,
   consumeBound?: VerifiedConsumeBoundOperation,
+  signerHistory?: AccountsEvidenceSignerHistoryV2,
+  now?: Date,
 ): AccountsCapabilityUseConsumeResult {
-  assertExternalTombstonePresent(record);
+  verifyStoredTombstone(record, signerHistory, now);
   return Object.freeze({
     receiptBytes: Uint8Array.from(record.consumeReceiptBytes),
     consumeReceiptDigest: record.consumeReceiptDigest,
@@ -1617,6 +1659,31 @@ function consumeResult(
     bindingCurrent: consumeBound !== undefined,
     ...(consumeBound === undefined ? {} : { consumeBound }),
   });
+}
+
+function verifyStoredTombstone(
+  record: CapabilityUseLedgerRecord,
+  signerHistory: AccountsEvidenceSignerHistoryV2 | undefined,
+  now: Date | undefined,
+): asserts record is CapabilityUseLedgerRecord & {
+  readonly tombstoneBytes: Uint8Array;
+  readonly tombstoneDigest: Sha256Digest;
+} {
+  assertExternalTombstonePresent(record);
+  invariant(
+    signerHistory !== undefined && now instanceof Date && Number.isFinite(now.getTime()),
+    "Capability-use tombstone verification context is required",
+  );
+  parseCapabilityUseTombstoneV1(record.tombstoneBytes, {
+    consumeRequestBytes: record.consumeRequestBytes,
+    consumeReceiptBytes: record.consumeReceiptBytes,
+    signerHistory,
+    now,
+  });
+  invariant(
+    digestBytes(record.tombstoneBytes) === record.tombstoneDigest,
+    "Capability-use stored tombstone digest mismatch",
+  );
 }
 
 function assertExternalTombstonePresent(
