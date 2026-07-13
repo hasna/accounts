@@ -20,6 +20,8 @@ import { canonicalJson, canonicalSha256 } from "../serialization/json";
 
 export const CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION =
   "accounts.capability-use-ledger-entry/v1" as const;
+const CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION_V2 =
+  "accounts.capability-use-ledger-entry/v2" as const;
 
 /** Sole reviewed planning commit that corrected the two consume identities. */
 export const CAPABILITY_USE_CONSUME_PIN_COMMIT =
@@ -195,6 +197,10 @@ export interface CapabilityUseOpaqueBytes {
   readonly consumeReceiptBytes: Uint8Array;
 }
 
+export interface CapabilityUseSignedTombstoneOpaqueBytes extends CapabilityUseOpaqueBytes {
+  readonly tombstoneBytes: Uint8Array;
+}
+
 /**
  * The missing production implementation is intentionally a structured
  * verifier, not an `assert(): boolean` shortcut. Once the descriptor collision
@@ -204,6 +210,10 @@ export interface CapabilityUseEvidenceVerifier {
   verify(input: CapabilityUseOpaqueBytes): Promise<CapabilityUseVerifiedClaims>;
 }
 
+export interface CapabilityUseTombstoneEvidenceVerifier {
+  verify(input: CapabilityUseSignedTombstoneOpaqueBytes): Promise<CapabilityUseVerifiedClaims>;
+}
+
 const verifiedEvidenceInstances = new WeakSet<object>();
 
 export interface VerifiedCapabilityUseEvidence extends CapabilityUseVerifiedClaims {
@@ -211,6 +221,8 @@ export interface VerifiedCapabilityUseEvidence extends CapabilityUseVerifiedClai
   readonly consumeRequestJcsBase64url: string;
   readonly consumeReceiptDigest: Sha256Digest;
   readonly consumeReceiptJcsBase64url: string;
+  readonly tombstoneDigest?: Sha256Digest;
+  readonly tombstoneJcsBase64url?: string;
 }
 
 export interface CapabilityUseLedgerRecord extends CapabilityUseVerifiedClaims {
@@ -218,6 +230,8 @@ export interface CapabilityUseLedgerRecord extends CapabilityUseVerifiedClaims {
   readonly consumeRequestBytes: Uint8Array;
   readonly consumeReceiptDigest: Sha256Digest;
   readonly consumeReceiptBytes: Uint8Array;
+  readonly tombstoneDigest?: Sha256Digest;
+  readonly tombstoneBytes?: Uint8Array;
   readonly ledgerSequence: Counter;
   readonly ledgerHash: Sha256Digest;
   readonly ledgerSignatureDigest: Sha256Digest;
@@ -225,7 +239,10 @@ export interface CapabilityUseLedgerRecord extends CapabilityUseVerifiedClaims {
   readonly ledgerReceiptDigest: Sha256Digest;
 }
 
-export type DurableCapabilityUseTombstone = CapabilityUseLedgerRecord;
+export type DurableCapabilityUseTombstone = CapabilityUseLedgerRecord & {
+  readonly tombstoneDigest: Sha256Digest;
+  readonly tombstoneBytes: Uint8Array;
+};
 
 export type CapabilityUseAppendResult =
   | { readonly kind: "APPENDED"; readonly record: CapabilityUseLedgerRecord }
@@ -251,7 +268,7 @@ export interface NonRewindableCapabilityUseLedgerOptions {
   readonly signingKey: Uint8Array;
 }
 
-interface CapabilityUseLedgerPayload {
+interface CapabilityUseLedgerPayloadV1 {
   readonly schema_version: typeof CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION;
   readonly record_kind: "CONSUMED";
   readonly consume_request_id: string;
@@ -274,6 +291,15 @@ interface CapabilityUseLedgerPayload {
   readonly recovery_frontier_sequence: Counter;
   readonly recovery_frontier_hash: Sha256Digest;
 }
+
+interface CapabilityUseLedgerPayloadV2
+  extends Omit<CapabilityUseLedgerPayloadV1, "schema_version"> {
+  readonly schema_version: typeof CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION_V2;
+  readonly tombstone_digest: Sha256Digest;
+  readonly tombstone_jcs_base64url: string;
+}
+
+type CapabilityUseLedgerPayload = CapabilityUseLedgerPayloadV1 | CapabilityUseLedgerPayloadV2;
 
 interface MirrorRow {
   readonly sequence: bigint;
@@ -332,6 +358,51 @@ export async function verifyCapabilityUseEvidence(
     consumeRequestJcsBase64url: Buffer.from(request).toString("base64url"),
     consumeReceiptDigest: sha256Bytes(receipt),
     consumeReceiptJcsBase64url: Buffer.from(receipt).toString("base64url"),
+  }) satisfies VerifiedCapabilityUseEvidence;
+  verifiedEvidenceInstances.add(evidence);
+  return evidence;
+}
+
+export async function verifyCapabilityUseEvidenceWithTombstone(
+  input: CapabilityUseSignedTombstoneOpaqueBytes,
+  verifier: CapabilityUseTombstoneEvidenceVerifier,
+): Promise<VerifiedCapabilityUseEvidence> {
+  const inputRecord = exactDataRecord(input, [
+    "consumeRequestBytes",
+    "consumeReceiptBytes",
+    "tombstoneBytes",
+  ]);
+  const request = copyBoundedBytes(inputRecord.consumeRequestBytes, "consumeRequestBytes");
+  const receipt = copyBoundedBytes(inputRecord.consumeReceiptBytes, "consumeReceiptBytes");
+  const tombstone = copyBoundedBytes(inputRecord.tombstoneBytes, "tombstoneBytes");
+  if (verifier === null || typeof verifier !== "object" || typeof verifier.verify !== "function") {
+    throw new AccountsError("VALIDATION_FAILED", "Capability-use tombstone verifier is required");
+  }
+  const verifierRequest = Uint8Array.from(request);
+  const verifierReceipt = Uint8Array.from(receipt);
+  const verifierTombstone = Uint8Array.from(tombstone);
+  const verifiedClaims = validateClaims(
+    await verifier.verify({
+      consumeRequestBytes: verifierRequest,
+      consumeReceiptBytes: verifierReceipt,
+      tombstoneBytes: verifierTombstone,
+    }),
+  );
+  if (
+    !bytesEqual(request, verifierRequest) ||
+    !bytesEqual(receipt, verifierReceipt) ||
+    !bytesEqual(tombstone, verifierTombstone)
+  ) {
+    throw new AccountsError("VALIDATION_FAILED", "Capability-use verifier mutated evidence bytes");
+  }
+  const evidence = Object.freeze({
+    ...verifiedClaims,
+    consumeRequestJcsSha256: sha256Bytes(request),
+    consumeRequestJcsBase64url: Buffer.from(request).toString("base64url"),
+    consumeReceiptDigest: sha256Bytes(receipt),
+    consumeReceiptJcsBase64url: Buffer.from(receipt).toString("base64url"),
+    tombstoneDigest: sha256Bytes(tombstone),
+    tombstoneJcsBase64url: Buffer.from(tombstone).toString("base64url"),
   }) satisfies VerifiedCapabilityUseEvidence;
   verifiedEvidenceInstances.add(evidence);
   return evidence;
@@ -761,8 +832,18 @@ function validateClaims(value: unknown): CapabilityUseVerifiedClaims {
 }
 
 function payloadFromEvidence(evidence: VerifiedCapabilityUseEvidence): CapabilityUseLedgerPayload {
+  const hasTombstone =
+    evidence.tombstoneDigest !== undefined || evidence.tombstoneJcsBase64url !== undefined;
+  if (
+    hasTombstone &&
+    (evidence.tombstoneDigest === undefined || evidence.tombstoneJcsBase64url === undefined)
+  ) {
+    throw new AccountsError("VALIDATION_FAILED", "Capability-use tombstone evidence is incomplete");
+  }
   return validatePayload({
-    schema_version: CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION,
+    schema_version: hasTombstone
+      ? CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION_V2
+      : CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION,
     record_kind: "CONSUMED",
     consume_request_id: evidence.consumeRequestId,
     idempotency_key_digest: evidence.idempotencyKeyDigest,
@@ -783,10 +864,18 @@ function payloadFromEvidence(evidence: VerifiedCapabilityUseEvidence): Capabilit
     catalog_incarnation: evidence.catalogIncarnation,
     recovery_frontier_sequence: evidence.recoveryFrontierSequence,
     recovery_frontier_hash: evidence.recoveryFrontierHash,
+    ...(hasTombstone
+      ? {
+          tombstone_digest: evidence.tombstoneDigest,
+          tombstone_jcs_base64url: evidence.tombstoneJcsBase64url,
+        }
+      : {}),
   });
 }
 
 function validatePayload(value: unknown): CapabilityUseLedgerPayload {
+  const schemaVersion = dataSchemaVersion(value);
+  const v2 = schemaVersion === CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION_V2;
   const record = exactDataRecord(value, [
     "schema_version",
     "record_kind",
@@ -809,9 +898,11 @@ function validatePayload(value: unknown): CapabilityUseLedgerPayload {
     "catalog_incarnation",
     "recovery_frontier_sequence",
     "recovery_frontier_hash",
+    ...(v2 ? ["tombstone_digest", "tombstone_jcs_base64url"] : []),
   ]);
   if (
-    record.schema_version !== CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION ||
+    (record.schema_version !== CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION &&
+      record.schema_version !== CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION_V2) ||
     record.record_kind !== "CONSUMED"
   ) {
     throw new AccountsError("VALIDATION_FAILED", "Capability-use ledger literal mismatch");
@@ -835,6 +926,18 @@ function validatePayload(value: unknown): CapabilityUseLedgerPayload {
   ) {
     throw new AccountsError("VALIDATION_FAILED", "Capability-use evidence digest mismatch");
   }
+  let tombstoneDigest: Sha256Digest | undefined;
+  let tombstoneBase64: string | undefined;
+  if (v2) {
+    tombstoneBase64 = canonicalBase64url(
+      record.tombstone_jcs_base64url,
+      "tombstone_jcs_base64url",
+    );
+    tombstoneDigest = sha256Digest(record.tombstone_digest, "tombstone_digest");
+    if (sha256Bytes(Buffer.from(tombstoneBase64, "base64url")) !== tombstoneDigest) {
+      throw new AccountsError("VALIDATION_FAILED", "Capability-use tombstone digest mismatch");
+    }
+  }
   const committedAt = canonicalTimestamp(record.committed_at, "committed_at");
   const consumeReceiptExpiresAt = canonicalTimestamp(
     record.consume_receipt_expires_at,
@@ -844,8 +947,7 @@ function validatePayload(value: unknown): CapabilityUseLedgerPayload {
   if (lifetime <= 0 || lifetime > 60_000) {
     throw new AccountsError("VALIDATION_FAILED", "Capability-use receipt expiry is invalid");
   }
-  return Object.freeze({
-    schema_version: CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION,
+  const common = {
     record_kind: "CONSUMED",
     consume_request_id: safeIdentifier(record.consume_request_id, "consume_request_id"),
     idempotency_key_digest: sha256Digest(record.idempotency_key_digest, "idempotency_key_digest"),
@@ -878,6 +980,18 @@ function validatePayload(value: unknown): CapabilityUseLedgerPayload {
       record.recovery_frontier_hash,
       "recovery_frontier_hash",
     ),
+  } as const;
+  if (v2) {
+    return Object.freeze({
+      schema_version: CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION_V2,
+      ...common,
+      tombstone_digest: tombstoneDigest!,
+      tombstone_jcs_base64url: tombstoneBase64!,
+    });
+  }
+  return Object.freeze({
+    schema_version: CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION,
+    ...common,
   });
 }
 
@@ -971,12 +1085,44 @@ function toPublicRecord(
     consumeReceiptBytes: Uint8Array.from(
       Buffer.from(payload.consume_receipt_jcs_base64url, "base64url"),
     ),
+    ...(payload.schema_version === CAPABILITY_USE_LEDGER_ENTRY_SCHEMA_VERSION_V2
+      ? {
+          tombstoneDigest: payload.tombstone_digest,
+          tombstoneBytes: Uint8Array.from(
+            Buffer.from(payload.tombstone_jcs_base64url, "base64url"),
+          ),
+        }
+      : {}),
     ledgerSequence: record.sequence,
     ledgerHash: record.hash as Sha256Digest,
     ledgerSignatureDigest: record.signatureDigest as Sha256Digest,
     ledgerPayloadDigest: record.payloadDigest as Sha256Digest,
     ledgerReceiptDigest: record.receiptDigest as Sha256Digest,
   });
+}
+
+function dataSchemaVersion(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new AccountsError("VALIDATION_FAILED", "Expected a closed data record");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new AccountsError("VALIDATION_FAILED", "Expected a plain data record");
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new AccountsError("VALIDATION_FAILED", "Symbol fields are forbidden");
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, "schema_version");
+  if (
+    descriptor === undefined ||
+    !descriptor.enumerable ||
+    !("value" in descriptor) ||
+    descriptor.get !== undefined ||
+    descriptor.set !== undefined
+  ) {
+    throw new AccountsError("VALIDATION_FAILED", "Closed data record fields do not match");
+  }
+  return descriptor.value;
 }
 
 function validateLookup(query: CapabilityUseLookup):

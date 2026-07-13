@@ -26,6 +26,7 @@ import {
   CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST,
   NonRewindableCapabilityUseLedger,
   verifyCapabilityUseEvidence,
+  verifyCapabilityUseEvidenceWithTombstone,
   type CapabilityUseVerifiedClaims,
 } from "../../src/v10/capability-use-ledger";
 import type {
@@ -92,6 +93,32 @@ async function verifiedEvidence(
         verifierCalls += 1;
         expect(input.consumeRequestBytes).toEqual(requestBytes);
         expect(input.consumeReceiptBytes).toEqual(receiptBytes);
+        return verifiedClaims;
+      },
+    },
+  );
+  expect(verifierCalls).toBe(1);
+  return evidence;
+}
+
+async function verifiedTombstoneEvidence(
+  verifiedClaims: CapabilityUseVerifiedClaims,
+  requestMarker = "request-1",
+  receiptMarker = "receipt-1",
+  tombstoneMarker = "tombstone-1",
+) {
+  const requestBytes = encoder.encode(canonicalJson({ fixture: requestMarker }));
+  const receiptBytes = encoder.encode(canonicalJson({ fixture: receiptMarker }));
+  const tombstoneBytes = encoder.encode(canonicalJson({ fixture: tombstoneMarker }));
+  let verifierCalls = 0;
+  const evidence = await verifyCapabilityUseEvidenceWithTombstone(
+    { consumeRequestBytes: requestBytes, consumeReceiptBytes: receiptBytes, tombstoneBytes },
+    {
+      verify: async (input) => {
+        verifierCalls += 1;
+        expect(input.consumeRequestBytes).toEqual(requestBytes);
+        expect(input.consumeReceiptBytes).toEqual(receiptBytes);
+        expect(input.tombstoneBytes).toEqual(tombstoneBytes);
         return verifiedClaims;
       },
     },
@@ -172,6 +199,47 @@ describe("v10 non-rewindable capability-use ledger", () => {
     const reopened = ledgerAt(directory);
     expect(reopened.lookup({ useId: claims().useId })).toEqual(appended.record);
     expect(reopened.initialReconciliation.status).toBe("CURRENT");
+    reopened.close();
+  });
+
+  test("records tombstone proof bytes and replays the exact stored proof", async () => {
+    const directory = root();
+    const ledger = ledgerAt(directory);
+    const evidence = await verifiedTombstoneEvidence(claims());
+
+    const appended = ledger.append(evidence);
+    expect(appended.kind).toBe("APPENDED");
+    expect(appended.record.tombstoneBytes).toEqual(
+      encoder.encode(canonicalJson({ fixture: "tombstone-1" })),
+    );
+    expect(appended.record.tombstoneDigest).toBe(
+      `sha256:${createHash("sha256")
+        .update(encoder.encode(canonicalJson({ fixture: "tombstone-1" })))
+        .digest("hex")}`,
+    );
+
+    const replayed = ledger.append(
+      await verifiedTombstoneEvidence(claims(), "request-1", "receipt-1", "tombstone-1"),
+    );
+    expect(replayed.kind).toBe("REPLAYED");
+    expect(replayed.record.tombstoneBytes).toEqual(appended.record.tombstoneBytes);
+    expect(replayed.record.tombstoneDigest).toBe(appended.record.tombstoneDigest);
+
+    const changedTombstone = await verifiedTombstoneEvidence(
+      claims(),
+      "request-1",
+      "receipt-1",
+      "changed-tombstone-must-conflict",
+    );
+    expect(() => ledger.append(changedTombstone)).toThrow(
+      expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }),
+    );
+
+    ledger.close();
+    const reopened = ledgerAt(directory);
+    expect(reopened.lookup({ useId: claims().useId })?.tombstoneBytes).toEqual(
+      appended.record.tombstoneBytes,
+    );
     reopened.close();
   });
 

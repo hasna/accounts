@@ -24,6 +24,7 @@ import {
 import {
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
+  CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST,
 } from "../../src/v10/capability-use-ledger";
 import { parseCapabilityUseConsumeRequestV1 } from "../../src/v10/capability-use-consume";
 import type {
@@ -432,6 +433,12 @@ describe("v11 capability-use consume production composition", () => {
       useId: first.useId,
     });
     expect(first.consumeReceiptDigest).toBe(digest(first.receiptBytes));
+    expect(first.tombstoneDigest).toBe(digest(first.tombstoneBytes));
+    expect(Object.isFrozen(first)).toBe(true);
+    const storedReceiptBytes = Uint8Array.from(first.receiptBytes);
+    const storedTombstoneBytes = Uint8Array.from(first.tombstoneBytes);
+    first.receiptBytes[0] = first.receiptBytes[0]! ^ 0xff;
+    first.tombstoneBytes[0] = first.tombstoneBytes[0]! ^ 0xff;
     expect(infinity.calls).toEqual({ read: 1, preparedCurrent: 1, bind: 1, assert: 1 });
 
     const conflictingBytes = requestFor(evidence.onlineBytes, {
@@ -452,7 +459,11 @@ describe("v11 capability-use consume production composition", () => {
     expect(replay.replayed).toBe(true);
     expect(replay.bindingCurrent).toBe(false);
     expect(replay.consumeBound).toBeUndefined();
-    expect(replay.receiptBytes).toEqual(first.receiptBytes);
+    expect(replay.receiptBytes).toEqual(storedReceiptBytes);
+    expect(replay.consumeReceiptDigest).toBe(first.consumeReceiptDigest);
+    expect(replay.tombstoneBytes).toEqual(storedTombstoneBytes);
+    expect(replay.tombstoneDigest).toBe(first.tombstoneDigest);
+    expect(replay.tombstoneDigest).toBe(digest(replay.tombstoneBytes));
     expect(unavailable.calls).toEqual({ read: 0, preparedCurrent: 0, bind: 0, assert: 0 });
     reopened.close();
   });
@@ -472,6 +483,8 @@ describe("v11 capability-use consume production composition", () => {
     expect([left.replayed, right.replayed].sort()).toEqual([false, true]);
     expect(left.receiptBytes).toEqual(right.receiptBytes);
     expect(left.consumeReceiptDigest).toBe(right.consumeReceiptDigest);
+    expect(left.tombstoneBytes).toEqual(right.tombstoneBytes);
+    expect(left.tombstoneDigest).toBe(right.tombstoneDigest);
     consumer.close();
   });
 
@@ -754,6 +767,7 @@ describe("v11 capability-use consume production composition", () => {
     );
     const result = await consumer.consume(await consumeInput(evidence, requestBytes));
     const receipt = parseClosedJsonBytes(result.receiptBytes) as Record<string, unknown>;
+    const tombstone = parseClosedJsonBytes(result.tombstoneBytes) as Record<string, unknown>;
     const request = parseClosedJsonBytes(requestBytes) as Record<string, unknown>;
     expect(receipt).toMatchObject({
       schema_version: "accounts.capability-use-consume-receipt.v1",
@@ -787,6 +801,35 @@ describe("v11 capability-use consume production composition", () => {
         "recovery_frontier_sequence",
       )),
     );
+    expect(tombstone).toMatchObject({
+      schema_version: "accounts.capability-use-tombstone.v1",
+      schema_digest: CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST,
+      record_kind: "CONSUMED",
+      consume_request_id: request.consume_request_id,
+      idempotency_key_digest: request.idempotency_key_digest,
+      effect_namespace_id: request.effect_namespace_id,
+      serialization_key_digest: request.serialization_key_digest,
+      capability_id: request.capability_id,
+      capability_digest: request.capability_digest,
+      nonce: request.nonce,
+      online_receipt_digest: request.online_receipt_digest,
+      model_call_anchor_digest: request.model_call_anchor_digest,
+      use_id: receipt.use_id,
+      consume_request_jcs_sha256: digest(requestBytes),
+      consume_request_jcs_base64url: Buffer.from(requestBytes).toString("base64url"),
+      consume_receipt_digest: result.consumeReceiptDigest,
+      consume_receipt_jcs_base64url: Buffer.from(result.receiptBytes).toString("base64url"),
+      committed_at: receipt.committed_at,
+      consume_receipt_expires_at: receipt.expires_at,
+      catalog_incarnation: receipt.catalog_incarnation,
+      recovery_frontier_sequence: receipt.recovery_frontier_sequence,
+      recovery_frontier_hash: receipt.recovery_frontier_hash,
+      signer_ref: evidence.signerHistory.issuer,
+      signer_incarnation: evidence.signerHistory.issuer_incarnation,
+      key_id: evidence.signerHistory.current_key_id,
+      audience: evidence.signerHistory.audience,
+    });
+    expect(result.tombstoneDigest).toBe(digest(result.tombstoneBytes));
     consumer.close();
   });
 });

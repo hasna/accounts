@@ -8,13 +8,16 @@ import { parseCounter } from "../domain/counter";
 import { generateUuidV7 } from "../domain/ids";
 import { AccountsError } from "../errors";
 import { canonicalJson } from "../serialization/json";
+import { ACCOUNTS_V10_MAX_CLOCK_SKEW_MS } from "./constants";
 import {
   CAPABILITY_USE_CONSUME_RECEIPT_DESCRIPTOR,
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_REQUEST_DESCRIPTOR,
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
+  CAPABILITY_USE_TOMBSTONE_DESCRIPTOR,
+  CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST,
   NonRewindableCapabilityUseLedger,
-  verifyCapabilityUseEvidence,
+  verifyCapabilityUseEvidenceWithTombstone,
   type CapabilityUseLedgerRecord,
 } from "./capability-use-ledger";
 import {
@@ -134,6 +137,36 @@ export interface CapabilityUseConsumeReceiptV1 {
   readonly signature: string;
 }
 
+export interface CapabilityUseTombstoneV1 {
+  readonly schema_version: "accounts.capability-use-tombstone.v1";
+  readonly schema_digest: typeof CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST;
+  readonly record_kind: "CONSUMED";
+  readonly consume_request_id: string;
+  readonly idempotency_key_digest: Sha256Digest;
+  readonly effect_namespace_id: string;
+  readonly serialization_key_digest: Sha256Digest;
+  readonly capability_id: string;
+  readonly capability_digest: Sha256Digest;
+  readonly nonce: string;
+  readonly online_receipt_digest: Sha256Digest;
+  readonly model_call_anchor_digest: Sha256Digest;
+  readonly use_id: Sha256Digest;
+  readonly consume_request_jcs_sha256: Sha256Digest;
+  readonly consume_request_jcs_base64url: string;
+  readonly consume_receipt_digest: Sha256Digest;
+  readonly consume_receipt_jcs_base64url: string;
+  readonly committed_at: string;
+  readonly consume_receipt_expires_at: string;
+  readonly catalog_incarnation: string;
+  readonly recovery_frontier_sequence: string;
+  readonly recovery_frontier_hash: Sha256Digest;
+  readonly signer_ref: string;
+  readonly signer_incarnation: string;
+  readonly key_id: string;
+  readonly audience: string;
+  readonly signature: string;
+}
+
 export type AccountsCapabilityUseOnlineTrust = Omit<
   AccountsEvidenceTrustV1,
   | "now"
@@ -156,6 +189,8 @@ export interface AccountsCapabilityUseConsumeInput {
 export interface AccountsCapabilityUseConsumeResult {
   readonly receiptBytes: Uint8Array;
   readonly consumeReceiptDigest: Sha256Digest;
+  readonly tombstoneBytes: Uint8Array;
+  readonly tombstoneDigest: Sha256Digest;
   readonly useId: Sha256Digest;
   readonly replayed: boolean;
   /** True only when this call re-verified the live Infinity binding. */
@@ -192,6 +227,13 @@ interface ReceiptVerificationContext {
   readonly now: Date;
   readonly allowedClockSkewMs: number;
   readonly catalogIncarnation: string;
+}
+
+export interface CapabilityUseTombstoneVerificationContext {
+  readonly consumeRequestBytes: Uint8Array;
+  readonly consumeReceiptBytes: Uint8Array;
+  readonly signerHistory: AccountsEvidenceSignerHistoryV2;
+  readonly now: Date;
 }
 
 export function parseCapabilityUseConsumeRequestV1(
@@ -267,6 +309,14 @@ export function parseCapabilityUseConsumeReceiptV1(
   source: Uint8Array,
   context: ReceiptVerificationContext,
 ): CapabilityUseConsumeReceiptV1 {
+  const wire = parseCapabilityUseConsumeReceiptWire(source);
+  assertReceiptBindings(wire, context);
+  assertReceiptFreshness(wire, context);
+  verifyReceiptSignature(wire, context);
+  return Object.freeze(wire) as unknown as CapabilityUseConsumeReceiptV1;
+}
+
+function parseCapabilityUseConsumeReceiptWire(source: Uint8Array): Record<string, unknown> {
   const wire = parseCanonicalWireBytes(
     copyBytes(source, "consume receipt"),
     "capability-use consume receipt",
@@ -334,10 +384,71 @@ export function parseCapabilityUseConsumeReceiptV1(
     "capability-use consume receipt use literals mismatch",
   );
   assertSignatureShape(wire.signature);
-  assertReceiptBindings(wire, context);
-  assertReceiptFreshness(wire, context);
-  verifyReceiptSignature(wire, context);
-  return Object.freeze(wire) as unknown as CapabilityUseConsumeReceiptV1;
+  timestampMs(wire.committed_at, "capability-use consume receipt committed_at");
+  timestampMs(wire.expires_at, "capability-use consume receipt expires_at");
+  return wire;
+}
+
+export function parseCapabilityUseTombstoneV1(
+  source: Uint8Array,
+  context: CapabilityUseTombstoneVerificationContext,
+): CapabilityUseTombstoneV1 {
+  const contextRecord = exactTombstoneContext(context);
+  const requestBytes = copyBytes(contextRecord.consumeRequestBytes, "tombstone consume request");
+  const receiptBytes = copyBytes(contextRecord.consumeReceiptBytes, "tombstone consume receipt");
+  const request = parseCapabilityUseConsumeRequestV1(requestBytes);
+  const receipt = parseCapabilityUseConsumeReceiptWire(receiptBytes);
+  const wire = parseCanonicalWireBytes(
+    copyBytes(source, "capability-use tombstone"),
+    "capability-use tombstone",
+  );
+  requiredKeys(wire, CAPABILITY_USE_TOMBSTONE_DESCRIPTOR.fields, "capability-use tombstone");
+  invariant(
+    wire.schema_version === CAPABILITY_USE_TOMBSTONE_DESCRIPTOR.schema_version &&
+      wire.schema_digest === CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST &&
+      wire.record_kind === CAPABILITY_USE_TOMBSTONE_DESCRIPTOR.record_kind,
+    "capability-use tombstone descriptor mismatch",
+  );
+  for (const field of [
+    "consume_request_id",
+    "effect_namespace_id",
+    "capability_id",
+    "nonce",
+    "catalog_incarnation",
+    "signer_ref",
+    "signer_incarnation",
+    "key_id",
+    "audience",
+  ]) {
+    nonemptyString(wire[field], `capability-use tombstone ${field}`);
+  }
+  for (const field of [
+    "idempotency_key_digest",
+    "serialization_key_digest",
+    "capability_digest",
+    "online_receipt_digest",
+    "model_call_anchor_digest",
+    "use_id",
+    "consume_request_jcs_sha256",
+    "consume_receipt_digest",
+    "recovery_frontier_hash",
+  ]) {
+    sha256Digest(wire[field], `capability-use tombstone ${field}`);
+  }
+  counter(
+    wire.recovery_frontier_sequence,
+    "capability-use tombstone recovery_frontier_sequence",
+  );
+  timestampMs(wire.committed_at, "capability-use tombstone committed_at");
+  timestampMs(
+    wire.consume_receipt_expires_at,
+    "capability-use tombstone consume_receipt_expires_at",
+  );
+  assertSignatureShape(wire.signature);
+  assertEmbeddedConsumeReceipt(request, receipt, contextRecord.signerHistory, contextRecord.now);
+  assertTombstoneBindings(wire, request, requestBytes, receipt, receiptBytes);
+  verifyTombstoneSignature(wire, contextRecord.signerHistory, contextRecord.now);
+  return Object.freeze(wire) as unknown as CapabilityUseTombstoneV1;
 }
 
 export function createAccountsCapabilityUseConsumer(
@@ -441,9 +552,6 @@ export function createAccountsCapabilityUseConsumer(
         onlineReceiptBytes,
         authenticatedChannelBindingDigest,
       );
-      // The reviewed non-rewindable signed ledger is the durable tombstone in
-      // this runtime slice. This factory deliberately does not claim or expose
-      // an encoder for the separate external capability-use-tombstone wire.
       const receiptBytes = signConsumeReceipt(
         request,
         commitOnline,
@@ -461,8 +569,23 @@ export function createAccountsCapabilityUseConsumer(
         allowedClockSkewMs: commitOnlineTrust.allowedClockSkewMs ?? 5_000,
         catalogIncarnation: ledgerOptions.catalogIncarnation,
       });
-      const verified = await verifyCapabilityUseEvidence(
-        { consumeRequestBytes: requestBytes, consumeReceiptBytes: receiptBytes },
+      const tombstoneBytes = signCapabilityUseTombstone(
+        request,
+        requestBytes,
+        receipt,
+        receiptBytes,
+        receiptSigner,
+        signerHistory,
+        commitNow,
+      );
+      parseCapabilityUseTombstoneV1(tombstoneBytes, {
+        consumeRequestBytes: requestBytes,
+        consumeReceiptBytes: receiptBytes,
+        signerHistory,
+        now: commitNow,
+      });
+      const verified = await verifyCapabilityUseEvidenceWithTombstone(
+        { consumeRequestBytes: requestBytes, consumeReceiptBytes: receiptBytes, tombstoneBytes },
         {
           verify: async () => ({
             consumeRequestId: request.consume_request_id,
@@ -512,6 +635,12 @@ export function createAccountsCapabilityUseConsumer(
         now: finalNow,
         allowedClockSkewMs: finalOnlineTrust.allowedClockSkewMs ?? 5_000,
         catalogIncarnation: ledgerOptions.catalogIncarnation,
+      });
+      parseCapabilityUseTombstoneV1(tombstoneBytes, {
+        consumeRequestBytes: requestBytes,
+        consumeReceiptBytes: receiptBytes,
+        signerHistory,
+        now: finalNow,
       });
 
       let appended: CapabilityUseLedgerRecord;
@@ -585,6 +714,60 @@ function exactInput(input: AccountsCapabilityUseConsumeInput): AccountsCapabilit
     result[key] = descriptor.value;
   }
   return result as unknown as AccountsCapabilityUseConsumeInput;
+}
+
+function exactTombstoneContext(
+  context: CapabilityUseTombstoneVerificationContext,
+): CapabilityUseTombstoneVerificationContext {
+  const expected = ["consumeRequestBytes", "consumeReceiptBytes", "signerHistory", "now"] as const;
+  invariant(
+    context !== null && typeof context === "object" && !Array.isArray(context),
+    "capability-use tombstone context must be an object",
+  );
+  invariant(
+    Object.getPrototypeOf(context) === Object.prototype || Object.getPrototypeOf(context) === null,
+    "capability-use tombstone context must be a plain object",
+  );
+  invariant(
+    Object.getOwnPropertySymbols(context).length === 0,
+    "capability-use tombstone context cannot contain symbol fields",
+  );
+  const descriptors = Object.getOwnPropertyDescriptors(context);
+  const actual = Object.keys(descriptors).sort();
+  invariant(
+    actual.length === expected.length &&
+      actual.every((key, index) => key === [...expected].sort()[index]),
+    "capability-use tombstone context fields differ",
+  );
+  const result = Object.create(null) as Record<string, unknown>;
+  for (const key of expected) {
+    const descriptor = descriptors[key];
+    invariant(
+      descriptor !== undefined && descriptor.enumerable && "value" in descriptor &&
+        descriptor.get === undefined && descriptor.set === undefined,
+      `capability-use tombstone context ${key} must be a data field`,
+    );
+    result[key] = descriptor.value;
+  }
+  invariant(
+    result.now instanceof Date && Number.isFinite(result.now.getTime()),
+    "capability-use tombstone context now is invalid",
+  );
+  return Object.freeze({
+    consumeRequestBytes: copyBytes(
+      result.consumeRequestBytes,
+      "tombstone context consume request",
+    ),
+    consumeReceiptBytes: copyBytes(
+      result.consumeReceiptBytes,
+      "tombstone context consume receipt",
+    ),
+    signerHistory: cloneWire(
+      result.signerHistory,
+      "capability-use tombstone signer history",
+    ) as unknown as AccountsEvidenceSignerHistoryV2,
+    now: new Date(result.now.getTime()),
+  });
 }
 
 function snapshotOnlineTrust(
@@ -962,6 +1145,215 @@ function signConsumeReceipt(
   return signed;
 }
 
+function signCapabilityUseTombstone(
+  request: CapabilityUseConsumeRequestV1,
+  requestBytes: Uint8Array,
+  receipt: CapabilityUseConsumeReceiptV1,
+  receiptBytes: Uint8Array,
+  signer: AccountsEvidenceSigner,
+  signerHistory: AccountsEvidenceSignerHistoryV2,
+  now: Date,
+): Uint8Array {
+  validateReceiptSigner(signer, signerHistory, now);
+  const unsigned = {
+    schema_version: CAPABILITY_USE_TOMBSTONE_DESCRIPTOR.schema_version,
+    schema_digest: CAPABILITY_USE_TOMBSTONE_SCHEMA_DIGEST,
+    record_kind: CAPABILITY_USE_TOMBSTONE_DESCRIPTOR.record_kind,
+    consume_request_id: request.consume_request_id,
+    idempotency_key_digest: request.idempotency_key_digest,
+    effect_namespace_id: request.effect_namespace_id,
+    serialization_key_digest: request.serialization_key_digest,
+    capability_id: request.capability_id,
+    capability_digest: request.capability_digest,
+    nonce: request.nonce,
+    online_receipt_digest: request.online_receipt_digest,
+    model_call_anchor_digest: request.model_call_anchor_digest,
+    use_id: receipt.use_id,
+    consume_request_jcs_sha256: digestBytes(requestBytes),
+    consume_request_jcs_base64url: Buffer.from(requestBytes).toString("base64url"),
+    consume_receipt_digest: digestBytes(receiptBytes),
+    consume_receipt_jcs_base64url: Buffer.from(receiptBytes).toString("base64url"),
+    committed_at: receipt.committed_at,
+    consume_receipt_expires_at: receipt.expires_at,
+    catalog_incarnation: receipt.catalog_incarnation,
+    recovery_frontier_sequence: receipt.recovery_frontier_sequence,
+    recovery_frontier_hash: receipt.recovery_frontier_hash,
+    signer_ref: signerHistory.issuer,
+    signer_incarnation: signerHistory.issuer_incarnation,
+    key_id: signerHistory.current_key_id,
+    audience: signerHistory.audience,
+  } as const;
+  const signature = signEvidenceBytes(unsigned, signer.privateKey);
+  return canonicalBytes({
+    ...unsigned,
+    signature: Buffer.from(signature).toString("base64url"),
+  });
+}
+
+function assertTombstoneBindings(
+  tombstone: Record<string, unknown>,
+  request: CapabilityUseConsumeRequestV1,
+  requestBytes: Uint8Array,
+  receipt: Record<string, unknown>,
+  receiptBytes: Uint8Array,
+): void {
+  for (const field of [
+    "consume_request_id",
+    "idempotency_key_digest",
+    "effect_namespace_id",
+    "serialization_key_digest",
+    "capability_id",
+    "capability_digest",
+    "nonce",
+    "online_receipt_digest",
+    "model_call_anchor_digest",
+  ] as const) {
+    invariant(
+      tombstone[field] === request[field],
+      `capability-use tombstone ${field} differs from request`,
+    );
+  }
+  invariant(
+    tombstone.consume_request_jcs_sha256 === digestBytes(requestBytes) &&
+      tombstone.consume_request_jcs_base64url === Buffer.from(requestBytes).toString("base64url"),
+    "capability-use tombstone request bytes mismatch",
+  );
+  invariant(
+    tombstone.consume_receipt_digest === digestBytes(receiptBytes) &&
+      tombstone.consume_receipt_jcs_base64url === Buffer.from(receiptBytes).toString("base64url"),
+    "capability-use tombstone receipt bytes mismatch",
+  );
+  const receiptBindings = {
+    use_id: "use_id",
+    committed_at: "committed_at",
+    consume_receipt_expires_at: "expires_at",
+    catalog_incarnation: "catalog_incarnation",
+    recovery_frontier_sequence: "recovery_frontier_sequence",
+    recovery_frontier_hash: "recovery_frontier_hash",
+  } as const;
+  for (const [tombstoneField, receiptField] of Object.entries(receiptBindings)) {
+    invariant(
+      tombstone[tombstoneField] === receipt[receiptField],
+      `capability-use tombstone ${tombstoneField} differs from receipt`,
+    );
+  }
+}
+
+function assertEmbeddedConsumeReceipt(
+  request: CapabilityUseConsumeRequestV1,
+  receipt: Record<string, unknown>,
+  signerHistory: AccountsEvidenceSignerHistoryV2,
+  now: Date,
+): void {
+  for (const field of [
+    "consume_request_id",
+    "capability_id",
+    "capability_digest",
+    "nonce",
+    "subject",
+    "actor_principal",
+    "effect_namespace_id",
+    "account_lane_id",
+    "capacity_pool_id",
+    "serialization_key_digest",
+    "resource_lease_id",
+    "operation_id",
+    "operation_execution_epoch",
+    "sender_key_thumbprint",
+    "channel_binding_digest",
+    "canonical_request_digest",
+    "online_receipt_digest",
+    "model_call_anchor_digest",
+    "max_uses",
+  ] as const) {
+    invariant(
+      receipt[field] === request[field],
+      `embedded consume receipt ${field} differs from request`,
+    );
+  }
+  invariant(
+    receipt.use_id === capabilityUseId(request),
+    "embedded consume receipt use_id consequence mismatch",
+  );
+  const committedAt = timestampMs(
+    receipt.committed_at,
+    "embedded consume receipt committed_at",
+  );
+  const expiresAt = timestampMs(
+    receipt.expires_at,
+    "embedded consume receipt expires_at",
+  );
+  invariant(
+    committedAt <= now.getTime() + ACCOUNTS_V10_MAX_CLOCK_SKEW_MS &&
+      committedAt < expiresAt &&
+      expiresAt <= timestampMs(request.not_after, "consume request not_after") &&
+      expiresAt - committedAt <= MAX_CONSUME_RECEIPT_LIFETIME_MS,
+    "embedded consume receipt freshness mismatch",
+  );
+
+  const keys = validateSignerHistory(signerHistory, now.getTime());
+  invariant(
+    receipt.issuer === signerHistory.issuer &&
+      receipt.issuer_incarnation === signerHistory.issuer_incarnation &&
+      receipt.audience === signerHistory.audience &&
+      receipt.key_id === signerHistory.current_key_id,
+    "embedded consume receipt signer identity mismatch",
+  );
+  const current = keys.find((candidate) => candidate.key_id === signerHistory.current_key_id)!;
+  const signature = canonicalBase64urlBytes(
+    receipt.signature,
+    "embedded consume receipt signature",
+    64,
+  );
+  const unsigned = { ...receipt };
+  delete unsigned.signature;
+  invariant(
+    ed25519Verify(
+      null,
+      canonicalBytes(unsigned),
+      signerPublicKey(current.public_key_spki_base64url),
+      signature,
+    ),
+    "embedded consume receipt Ed25519 signature mismatch",
+  );
+}
+
+function verifyTombstoneSignature(
+  tombstone: Record<string, unknown>,
+  signerHistory: AccountsEvidenceSignerHistoryV2,
+  now: Date,
+): void {
+  invariant(now instanceof Date && Number.isFinite(now.getTime()), "tombstone trust time is invalid");
+  const keys = validateSignerHistory(signerHistory, now.getTime());
+  invariant(
+    tombstone.signer_ref === signerHistory.issuer &&
+      tombstone.signer_incarnation === signerHistory.issuer_incarnation &&
+      tombstone.audience === signerHistory.audience &&
+      tombstone.key_id === signerHistory.current_key_id,
+    "capability-use tombstone signer identity mismatch",
+  );
+  const current = keys.find((candidate) => candidate.key_id === signerHistory.current_key_id)!;
+  const committedAt = timestampMs(tombstone.committed_at, "tombstone committed_at");
+  invariant(
+    timestampMs(current.activated_at, "tombstone signer activated_at") <= committedAt &&
+      committedAt < timestampMs(current.expires_at, "tombstone signer expires_at") &&
+      current.retired_at === null && current.revoked_at === null,
+    "capability-use tombstone signer was not current at commit",
+  );
+  const signature = canonicalBase64urlBytes(tombstone.signature, "tombstone signature", 64);
+  const unsigned = { ...tombstone };
+  delete unsigned.signature;
+  invariant(
+    ed25519Verify(
+      null,
+      canonicalBytes(unsigned),
+      signerPublicKey(current.public_key_spki_base64url),
+      signature,
+    ),
+    "capability-use tombstone Ed25519 signature mismatch",
+  );
+}
+
 function assertReceiptBindings(
   receipt: Record<string, unknown>,
   context: ReceiptVerificationContext,
@@ -1183,6 +1575,7 @@ function exactReplay(
     if (!equalBytes(byRequest.consumeRequestBytes, requestBytes)) {
       throw new AccountsError("IDEMPOTENCY_CONFLICT", "Consume request replay changed bytes");
     }
+    assertExternalTombstonePresent(byRequest);
     return byRequest;
   }
   const byIdempotency = ledger.lookup({ idempotencyKeyDigest: request.idempotency_key_digest });
@@ -1190,6 +1583,7 @@ function exactReplay(
     if (!equalBytes(byIdempotency.consumeRequestBytes, requestBytes)) {
       throw new AccountsError("IDEMPOTENCY_CONFLICT", "Consume idempotency changed bytes");
     }
+    assertExternalTombstonePresent(byIdempotency);
     return byIdempotency;
   }
   return undefined;
@@ -1212,14 +1606,31 @@ function consumeResult(
   replayed: boolean,
   consumeBound?: VerifiedConsumeBoundOperation,
 ): AccountsCapabilityUseConsumeResult {
+  assertExternalTombstonePresent(record);
   return Object.freeze({
     receiptBytes: Uint8Array.from(record.consumeReceiptBytes),
     consumeReceiptDigest: record.consumeReceiptDigest,
+    tombstoneBytes: Uint8Array.from(record.tombstoneBytes),
+    tombstoneDigest: record.tombstoneDigest,
     useId: record.useId,
     replayed,
     bindingCurrent: consumeBound !== undefined,
     ...(consumeBound === undefined ? {} : { consumeBound }),
   });
+}
+
+function assertExternalTombstonePresent(
+  record: CapabilityUseLedgerRecord,
+): asserts record is CapabilityUseLedgerRecord & {
+  readonly tombstoneBytes: Uint8Array;
+  readonly tombstoneDigest: Sha256Digest;
+} {
+  if (record.tombstoneBytes === undefined || record.tombstoneDigest === undefined) {
+    throw new AccountsError(
+      "RECOVERY_HOLD",
+      "Capability-use ledger record lacks the required external tombstone",
+    );
+  }
 }
 
 function validateInfinityPort(value: InfinityAccountsOperationPort): InfinityAccountsOperationPort {
