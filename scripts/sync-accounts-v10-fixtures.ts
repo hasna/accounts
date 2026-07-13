@@ -7,6 +7,8 @@ const sourceRoot = resolve(
 );
 const repositoryRoot = resolve(import.meta.dir, "..");
 const sourceCommit = "80054c36b10111765a18b89743214679c58ad7c6";
+const accountsContractProvenanceCommit = "7873b8b6bae5d4a388a34add2feaea612bbaa4ee";
+const accountsReviewedImplementationCommit = "4486cd019ee1dcc133677b6fec3c0988bdec34b7";
 const infinityIntegrationCommit = "6c2ba3d490cd58c7192d6e274514a9d849575ab8";
 const sandboxesIntegrationCommit = "d8a4d37c35e8d98ea468a8d95dcf98b0a890fa48";
 const sourcePaths = {
@@ -77,7 +79,8 @@ await Bun.write(
   `${JSON.stringify({
     schema_version: "accounts.runtime-contract-pin/v1",
     source_commit: sourceCommit,
-    accounts_source_commit: "7873b8b6bae5d4a388a34add2feaea612bbaa4ee",
+    accounts_contract_provenance_commit: accountsContractProvenanceCommit,
+    accounts_reviewed_implementation_commit: accountsReviewedImplementationCommit,
     contract_sha256: expected.contract,
     redteam_sha256: expected.redteam,
     transition_trace_sha256: expected.trace,

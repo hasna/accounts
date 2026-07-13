@@ -6,6 +6,9 @@
 > approved or release-pinned. Do not deploy, merge to `main`, publish, or treat
 > `ACCOUNTS_V11_CONTRACT_SHA256` / `ACCOUNTS_RUNTIME_CONTRACT_SHA256` as release
 > attestation until both exact-byte reviews and the final adversarial gates pass.
+> The runtime pin separates planning source, legacy contract provenance, and the
+> reviewed Accounts implementation commit; do not infer implementation review
+> from the contract-provenance commit.
 >
 > The current immutable but unpinned review pair is preserved under
 > [`contracts/accounts-v1`](contracts/accounts-v1/README.md). Its presence on

@@ -53,10 +53,14 @@ const runtimePin = await Bun.file(
   new URL("../../contracts/accounts-v10/pin.json", import.meta.url),
 ).json() as {
   readonly source_commit: string;
+  readonly accounts_contract_provenance_commit: string;
+  readonly accounts_reviewed_implementation_commit: string;
   readonly infinity_integration_commit: string;
   readonly sandboxes_integration_commit: string;
+  readonly implementation_status: string;
   readonly integration_authorized: boolean;
   readonly publish_authorized: boolean;
+  readonly deploy_authorized: boolean;
 };
 const NOW = new Date("2026-07-11T10:00:15.000Z");
 const LANE_ID = "0198a0a0-0000-7000-8000-000000000002";
@@ -396,6 +400,8 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
   test("pins the reviewed planning, Infinity, and Sandboxes integration refs without lifting gates", () => {
     expect(runtimePin).toMatchObject({
       source_commit: "80054c36b10111765a18b89743214679c58ad7c6",
+      accounts_contract_provenance_commit: "7873b8b6bae5d4a388a34add2feaea612bbaa4ee",
+      accounts_reviewed_implementation_commit: "4486cd019ee1dcc133677b6fec3c0988bdec34b7",
       infinity_integration_commit: "6c2ba3d490cd58c7192d6e274514a9d849575ab8",
       sandboxes_integration_commit: "d8a4d37c35e8d98ea468a8d95dcf98b0a890fa48",
       implementation_status: "EXACT_BYTE_REVIEW_READY",
@@ -403,6 +409,7 @@ describe("ACC-041 SQLite Slot/online adapter", () => {
       publish_authorized: false,
       deploy_authorized: false,
     });
+    expect(runtimePin).not.toHaveProperty("accounts_source_commit");
     expect(INFINITY_INTEGRATION_COMMIT).toBe(
       "6c2ba3d490cd58c7192d6e274514a9d849575ab8",
     );
