@@ -27,31 +27,10 @@ let keychainState: string;
 let keychainLock: string;
 let securityBin: string;
 
-beforeAll(async () => {
+beforeAll(() => {
   binDir = mkdtempSync(join(tmpdir(), "accounts-claude-bin-"));
   securityBin = writeExecutable("security", fakeSecuritySource());
   writeExecutable("claude", fakeClaudeSource());
-  if (process.platform === "win32") {
-    const probeLog = join(binDir, "probe.jsonl");
-    let lastError = "";
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      const probe = spawnSync("claude", [], {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
-          FAKE_CLAUDE_LOG: probeLog,
-          FAKE_KEYCHAIN_STATE: join(binDir, "probe-keychain.json"),
-          FAKE_STDOUT: "0",
-          FAKE_STDERR: "0",
-        },
-      });
-      if (probe.status === 0) return;
-      lastError = probe.error?.message ?? probe.stderr;
-      await Bun.sleep(100);
-    }
-    throw new Error(`compiled fake Claude never became executable: ${lastError}`);
-  }
 });
 
 beforeEach(() => {

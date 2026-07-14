@@ -1,8 +1,8 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, extname, isAbsolute, join } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { claudeKeychainCredentialFromProfile } from "./claude-auth.js";
@@ -294,9 +294,27 @@ function signalExitCode(signal: NodeJS.Signals | null): number {
   return signal ? 1 : 0;
 }
 
+function resolveExecutable(bin: string, env: NodeJS.ProcessEnv): string {
+  if (process.platform !== "win32" || isAbsolute(bin) || /[\\/]/.test(bin)) return bin;
+  const extensions = extname(bin)
+    ? [""]
+    : (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  for (const entry of (env.PATH ?? "").split(delimiter)) {
+    const directory = entry.replace(/^"(.*)"$/, "$1");
+    if (!directory) continue;
+    for (const extension of extensions) {
+      const candidate = join(directory, `${bin}${extension.toLowerCase()}`);
+      if (existsSync(candidate)) return candidate;
+      const upperCandidate = join(directory, `${bin}${extension.toUpperCase()}`);
+      if (existsSync(upperCandidate)) return upperCandidate;
+    }
+  }
+  return bin;
+}
+
 async function relayProcess(tool: ToolDef, args: string[], env: NodeJS.ProcessEnv, cwd: string): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
-    const child = spawn(tool.bin, args, { cwd, env, stdio: "inherit" });
+    const child = spawn(resolveExecutable(tool.bin, env), args, { cwd, env, stdio: "inherit" });
     let forwardedSignal: NodeJS.Signals | undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
 
