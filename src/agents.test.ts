@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addProfile } from "./lib/profiles.js";
+import { addProfile, listProfiles } from "./lib/profiles.js";
 import {
   extractJsonArray,
   isToolSessionCommand,
@@ -55,6 +55,7 @@ test("listAgentsAcrossProfiles aggregates agents per claude profile", () => {
   };
 
   const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(),
     runner,
     processScanner: () => [],
     defaultDir: join(home, "no-default-dir"),
@@ -74,7 +75,8 @@ test("listAgentsAcrossProfiles records per-profile errors without failing the ru
       ? { ok: false, raw: "", error: "claude binary not found" }
       : { ok: true, raw: '[{"kind":"interactive","sessionId":"s2"}]' };
 
-  const results = listAgentsAcrossProfiles({ runner, processScanner: () => [] });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(), runner, processScanner: () => [] });
   const bad = results.find((r) => r.profile === "bad");
   const good = results.find((r) => r.profile === "good");
   expect(bad?.error).toContain("not found");
@@ -91,7 +93,8 @@ test("listAgentsAcrossProfiles filters to a single profile and background kind",
     raw: '[{"kind":"background","sessionId":"b1"},{"kind":"interactive","sessionId":"i1"}]',
   });
 
-  const results = listAgentsAcrossProfiles({ runner, profile: "acct1", backgroundOnly: true });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(), runner, profile: "acct1", backgroundOnly: true });
   expect(results).toHaveLength(1);
   expect(results[0]?.profile).toBe("acct1");
   expect(results[0]?.agents).toEqual([{ kind: "background", sessionId: "b1" }]);
@@ -101,7 +104,8 @@ test("listAgentsAcrossProfiles treats unparseable output as an error", () => {
   addProfile({ name: "acct1", tool: "claude", email: "one@example.com" });
   const runner: AgentsRunner = () => ({ ok: true, raw: "garbage with no json" });
 
-  const results = listAgentsAcrossProfiles({ runner, processScanner: () => [] });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(), runner, processScanner: () => [] });
   expect(results[0]?.error).toBeDefined();
   expect(results[0]?.agents).toEqual([]);
 });
@@ -132,7 +136,8 @@ test("listAgentsAcrossProfiles queries the tool default dir as a synthetic (defa
       : { ok: true, raw: "[]" };
   };
 
-  const results = listAgentsAcrossProfiles({ runner, defaultDir, processScanner: () => [] });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(), runner, defaultDir, processScanner: () => [] });
   expect(seen).toContain("(default)");
   const def = results.find((r) => r.profile === "(default)");
   expect(def?.dir).toBe(defaultDir);
@@ -145,14 +150,16 @@ test("default dir is not duplicated when a registered profile already uses it", 
   addProfile({ name: "main", tool: "claude", dir: defaultDir });
 
   const runner: AgentsRunner = () => ({ ok: true, raw: "[]" });
-  const results = listAgentsAcrossProfiles({ runner, defaultDir, processScanner: () => [] });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(), runner, defaultDir, processScanner: () => [] });
   expect(results.map((r) => r.profile)).toEqual(["main"]);
 });
 
 test("default dir is skipped when it does not exist", () => {
   addProfile({ name: "acct1", tool: "claude" });
   const runner: AgentsRunner = () => ({ ok: true, raw: "[]" });
-  const results = listAgentsAcrossProfiles({ runner, defaultDir: join(home, "missing-dir"), processScanner: () => [] });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(), runner, defaultDir: join(home, "missing-dir"), processScanner: () => [] });
   expect(results.map((r) => r.profile)).toEqual(["acct1"]);
 });
 
@@ -169,7 +176,8 @@ test("processes no daemon reports appear as (untracked)", () => {
     { pid: 12, ppid: 1, command: "claude --resume deadbeef --allow-dangerously-skip-permissions", configDir: "/home/u/.claude" },
   ];
 
-  const results = listAgentsAcrossProfiles({ runner, processScanner });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(), runner, processScanner });
   const untracked = results.find((r) => r.profile === "(untracked)");
   expect(untracked).toBeDefined();
   expect(untracked?.agents).toEqual([
@@ -186,12 +194,14 @@ test("(untracked) section is omitted when everything is accounted for or a profi
   addProfile({ name: "acct1", tool: "claude" });
   const runner: AgentsRunner = () => ({ ok: true, raw: '[{"kind":"background","pid":10}]' });
   const allTracked = listAgentsAcrossProfiles({
+    profiles: listProfiles(),
     runner,
     processScanner: () => [{ pid: 10, ppid: 1, command: "claude" }],
   });
   expect(allTracked.some((r) => r.profile === "(untracked)")).toBe(false);
 
   const filtered = listAgentsAcrossProfiles({
+    profiles: listProfiles(),
     runner,
     profile: "acct1",
     processScanner: () => [{ pid: 99, ppid: 1, command: "claude orphan" }],
@@ -225,6 +235,7 @@ test("backgroundOnly does not leak interactive sessions into (untracked)", () =>
     raw: '[{"kind":"interactive","pid":20},{"kind":"background","pid":21}]',
   });
   const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(),
     runner,
     backgroundOnly: true,
     processScanner: () => [

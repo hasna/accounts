@@ -3,9 +3,57 @@
   "name": "accounts",
   "class": "service",
   "contractVersion": "v1",
-  "kitVersion": "0.4.1",
-  "description": "Manage and switch between multiple AI coding tool profiles/accounts. Local mode keeps the registry at ~/.hasna/accounts/accounts.json; the accounts-serve HTTP API is PURE REMOTE per Amendment A1 (HASNA_ACCOUNTS_STORAGE_MODE=cloud) with all reads/writes hitting the shared cloud Postgres, API-key auth via @hasna/contracts.",
-  "bins": ["accounts", "accounts-mcp", "accounts-serve", "accounts-migrate"],
+  "kitVersion": "0.5.2",
+  "description": "Manage and switch between multiple AI coding tool profiles/accounts. Local mode keeps the registry at ~/.hasna/accounts/accounts.json; self-hosted/cloud modes use the authenticated accounts-serve HTTP API and PostgreSQL.",
+  "bins": [
+    "accounts",
+    "accounts-mcp",
+    "accounts-serve",
+    "accounts-migrate"
+  ],
+  "deploymentModes": [
+    "local",
+    "self-hosted",
+    "cloud"
+  ],
+  "serviceSurfaces": [
+    {
+      "name": "accounts-api",
+      "status": "supported",
+      "bin": "accounts-serve",
+      "mcpBin": "accounts-mcp",
+      "authMode": "api-key",
+      "deploymentModes": [
+        "self-hosted",
+        "cloud"
+      ],
+      "health": {
+        "method": "GET",
+        "path": "/health",
+        "public": true
+      },
+      "readiness": {
+        "method": "GET",
+        "path": "/ready",
+        "public": true
+      },
+      "version": {
+        "method": "GET",
+        "path": "/version",
+        "public": true
+      },
+      "apiBasePath": "/v1",
+      "readinessGates": [
+        {
+          "id": "accounts-migrations",
+          "kind": "migration",
+          "required": true,
+          "command": "accounts-migrate",
+          "status": "pending"
+        }
+      ]
+    }
+  ],
   "storage": {
     "mode": "local",
     "envPrefix": "HASNA_ACCOUNTS_",

@@ -7,8 +7,67 @@ on:
     branches: [main]
 
 jobs:
+  secret-scan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          install_dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$install_dir"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$install_dir" gitleaks
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Scan full pull request range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          printf '%s\n' '[extend]' 'useDefault = true' > "$RUNNER_TEMP/gitleaks.toml"
+          : > "$RUNNER_TEMP/gitleaksignore"
+          gitleaks git --redact=100 --no-banner --ignore-gitleaks-allow \
+            --config="$RUNNER_TEMP/gitleaks.toml" \
+            --gitleaks-ignore-path="$RUNNER_TEMP/gitleaksignore" \
+            --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: accounts_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d accounts_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -17,13 +76,37 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install
+        run: bun install --frozen-lockfile --minimum-release-age 259200
 
       - name: Type check
         run: bun run typecheck
+
+      - name: Legacy TypeScript compatibility
+        run: bun run test:compat
 
       - name: Run tests
         run: bun test
 
       - name: Build
         run: bun run build
+
+      - name: Build output no-cloud boundary
+        run: bun run contracts:no-cloud-scan
+
+      - name: Generated SDK contract sync
+        run: bun test src/sdk.test.ts src/contracts.test.ts
+
+      - name: Contract examples
+        run: bun run contracts:conformance
+
+      - name: Vendored storage kit
+        run: bun run vendor-kit:check
+
+      - name: Repository conformance
+        run: bun run conformance
+
+      - name: PostgreSQL migration and concurrency integration
+        env:
+          ACCOUNTS_REQUIRE_POSTGRES: "1"
+          HASNA_ACCOUNTS_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/accounts_test
+        run: bun test src/server/postgres.integration.test.ts

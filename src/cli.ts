@@ -11,39 +11,25 @@ import { AccountsError, type Profile } from "./types.js";
 import {
   DEFAULT_TOOL,
   getTool,
-  listTools,
   isBuiltinTool,
-  addCustomTool,
-  removeCustomTool,
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./lib/tools.js";
 import {
-  addProfile,
-  currentProfile,
   expandPath,
-  getProfile,
-  listProfiles,
-  redetectEmail,
-  removeProfile,
-  renameProfile,
-  updateProfile,
-  useProfile,
   type ProfileMetadata,
 } from "./lib/profiles.js";
-import { resolveAccountsCloud } from "./lib/cloud-accounts.js";
+import { resolveStore } from "./lib/store.js";
 import {
   accountsHome,
   getAccountsStorageStatus,
-  loadStore,
+  loadAppliedMap,
   storagePull,
   storagePush,
   storageSync,
   storePath,
-  type AccountsStorageStatus,
-  type AccountsStorageSyncResult,
 } from "./storage.js";
-import { applyProfile, appliedProfile } from "./lib/apply.js";
+import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
@@ -79,18 +65,49 @@ function die(message: string): never {
   process.exit(1);
 }
 
-/** Wrap an action so AccountsError surfaces cleanly without a stack trace. */
+/** True for a cloud-transport HTTP error (`HasnaHttpError`: status/method/path/body). */
+function isHttpError(err: unknown): err is { status: number; method?: string; path?: string; body?: unknown; message?: string } {
+  return Boolean(
+    err &&
+      typeof err === "object" &&
+      typeof (err as { status?: unknown }).status === "number" &&
+      "path" in (err as object) &&
+      "method" in (err as object),
+  );
+}
+
+/** Render a cloud HTTP error as one clean line (no stack trace, no secrets). */
+function formatHttpError(err: { status: number; body?: unknown; message?: string }): string {
+  const body = err.body;
+  const serverMsg =
+    body && typeof body === "object"
+      ? ((body as { error?: unknown }).error ?? (body as { message?: unknown }).message)
+      : undefined;
+  const detail =
+    typeof serverMsg === "string" && serverMsg.length > 0 ? serverMsg : (err.message || "request failed");
+  if (err.status === 404) {
+    return `${detail} — the self-hosted accounts API returned 404 for this endpoint. The server is likely running an older build; redeploy accounts-serve to enable it.`;
+  }
+  return `${detail} (HTTP ${err.status})`;
+}
+
+/**
+ * Wrap an action so known errors surface cleanly without a stack trace:
+ * `AccountsError` (validation / not-found) and cloud `HasnaHttpError` (API
+ * failures) both become a single `error: ...` line + exit 1. Genuinely
+ * unexpected errors still propagate with their stack to aid debugging.
+ */
 function action<A extends unknown[]>(fn: (...args: A) => void | Promise<void>) {
   return (...args: A) => {
-    try {
-      Promise.resolve(fn(...args)).catch((err) => {
+    void (async () => {
+      try {
+        await fn(...args);
+      } catch (err) {
         if (err instanceof AccountsError) die(err.message);
+        if (isHttpError(err)) die(formatHttpError(err));
         throw err;
-      });
-    } catch (err) {
-      if (err instanceof AccountsError) die(err.message);
-      throw err;
-    }
+      }
+    })();
   };
 }
 
@@ -131,16 +148,45 @@ function fmtProfile(p: Profile, active: boolean, applied = false, prelaunch?: Co
   return `${marker} ${name}${displayName}  ${tool}  ${email}${desc}${formatPrelaunchLabel(prelaunch)}`;
 }
 
+/** A profile whose tool is unknown on this machine can't have configs prelaunch;
+ * report it as unsupported rather than throwing (which would abort a whole
+ * listing when the cloud registry holds a tool not resolvable locally). */
+function unsupportedPrelaunchSummary(reason: string): ConfigsPrelaunchSummary {
+  return {
+    supported: false,
+    required: false,
+    status: "unsupported",
+    reasons: [reason],
+    manifest: {
+      path: "",
+      exists: false,
+      sourceIds: [],
+      sourceCount: 0,
+      sourceIdsTruncated: false,
+      drift: "unsupported",
+      reasons: [reason],
+    },
+  };
+}
+
 function prelaunchSummaryFor(p: Profile): ConfigsPrelaunchSummary {
-  const tool = getTool(p.tool);
+  let tool;
+  try {
+    tool = getTool(p.tool);
+  } catch (err) {
+    return unsupportedPrelaunchSummary(err instanceof AccountsError ? err.message : `unknown tool "${p.tool}"`);
+  }
   return getConfigsPrelaunchSummary(p, tool, configsSessionToolFor(tool));
 }
 
-function profileDetails(p: Profile): Profile & { active: boolean; applied: boolean; prelaunch: ConfigsPrelaunchSummary } {
+function profileDetails(
+  p: Profile,
+  active: boolean,
+): Profile & { active: boolean; applied: boolean; prelaunch: ConfigsPrelaunchSummary } {
   return {
     ...p,
-    active: currentProfile(p.tool)?.name === p.name,
-    applied: appliedProfile(p.tool)?.name === p.name,
+    active,
+    applied: appliedProfileName(p.tool) === p.name,
     prelaunch: prelaunchSummaryFor(p),
   };
 }
@@ -199,36 +245,6 @@ function parseMetadataPairs(pairs: string[] | undefined): ProfileMetadata | unde
     metadata[key] = parseMetadataValue(value);
   }
   return metadata;
-}
-
-function printStorageStatus(status: AccountsStorageStatus, json?: boolean): void {
-  if (json) {
-    console.log(JSON.stringify(status, null, 2));
-    return;
-  }
-  console.log(`${chalk.cyan("mode")}       ${status.mode}`);
-  console.log(`${chalk.cyan("local")}      ${status.local.storePath}`);
-  console.log(
-    `${chalk.cyan("remote")}     ${
-      status.remote.configured
-        ? `${status.remote.bucket}/${status.remote.prefix}`
-        : chalk.dim(`not configured (${status.remote.bucketEnv})`)
-    }`,
-  );
-}
-
-function printStorageSyncResult(result: AccountsStorageSyncResult, json?: boolean): void {
-  if (json) {
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
-  if (result.skipped) {
-    console.log(chalk.yellow(`skipped: ${result.reason ?? "storage sync is not configured"}`));
-    console.log(chalk.dim(`key: ${result.key}`));
-    return;
-  }
-  console.log(chalk.green(`pushed ${result.pushed}, pulled ${result.pulled}`));
-  console.log(chalk.dim(`key: ${result.key}`));
 }
 
 function readinessColor(status: AccountsReadinessStatus): (value: string) => string {
@@ -334,8 +350,8 @@ codexApp
   .description("print Codex.app menu-bar state")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
-      const state = codexAppMenuState();
+    action(async (opts: { json?: boolean }) => {
+      const state = await codexAppMenuState();
       if (opts.json) {
         console.log(JSON.stringify(state, null, 2));
         return;
@@ -399,20 +415,7 @@ program
           description?: string;
         },
       ) => {
-        const cloud = resolveAccountsCloud();
-        const p = cloud.transport === "cloud-http"
-          ? await cloud.api.create({
-              name,
-              tool: opts.tool,
-              email: opts.email,
-              displayName: opts.displayName,
-              identity: opts.identity,
-              cardLast4: opts.cardLast4,
-              metadata: parseMetadataPairs(opts.metadata),
-              dir: opts.dir,
-              description: opts.description,
-            })
-          : addProfile({
+        const p = await resolveStore().addProfile({
           name,
           tool: opts.tool,
           email: opts.email,
@@ -443,31 +446,19 @@ program
   .option("--json", "output JSON")
   .action(
     action(async (opts: { tool?: string; json?: boolean }) => {
-      const cloud = resolveAccountsCloud();
-      if (cloud.transport === "cloud-http") {
-        const profiles = await cloud.api.list(opts.tool);
-        const current = await cloud.api.listCurrent();
-        const activeFor = (tool: string) => current.find((c) => c.tool === tool)?.name;
-        if (opts.json) {
-          console.log(JSON.stringify(profiles.map((p) => ({
-            ...profileDetails(p),
-            active: activeFor(p.tool) === p.name,
-            applied: false,
-          })), null, 2));
-          return;
-        }
-        if (profiles.length === 0) {
-          console.log(chalk.dim("no profiles yet — create one with `accounts add <name> --email you@example.com`"));
-          return;
-        }
-        for (const p of profiles) {
-          console.log(fmtProfile(p, activeFor(p.tool) === p.name, false, undefined));
-        }
-        return;
-      }
-      const profiles = listProfiles(opts.tool);
+      const store = resolveStore();
+      // Hydrate the machine-local tool cache from the active registry so custom
+      // tools registered in the cloud resolve for per-profile rendering. This is
+      // best-effort: rendering already tolerates an unknown tool, so a failure
+      // here must not abort the listing.
+      await store.listTools().catch(() => {});
+      const profiles = await store.listProfiles(opts.tool);
+      const current = await store.listCurrent();
+      const activeFor = (tool: string) => current.find((c) => c.tool === tool)?.name;
       if (opts.json) {
-        console.log(JSON.stringify(profiles.map(profileDetails), null, 2));
+        console.log(
+          JSON.stringify(profiles.map((p) => profileDetails(p, activeFor(p.tool) === p.name)), null, 2),
+        );
         return;
       }
       if (profiles.length === 0) {
@@ -475,8 +466,8 @@ program
         return;
       }
       for (const p of profiles) {
-        const active = currentProfile(p.tool)?.name === p.name;
-        const isApplied = appliedProfile(p.tool)?.name === p.name;
+        const active = activeFor(p.tool) === p.name;
+        const isApplied = appliedProfileName(p.tool) === p.name;
         console.log(fmtProfile(p, active, isApplied, prelaunchSummaryFor(p)));
       }
     }),
@@ -490,34 +481,14 @@ program
   .option("--json", "output JSON")
   .action(
     action(async (name: string, opts: { tool?: string; json?: boolean }) => {
-      const cloud = resolveAccountsCloud();
-      if (cloud.transport === "cloud-http") {
-        const p = await cloud.api.get(name, opts.tool);
-        if (!p) die(`no profile named "${name}"${opts.tool ? ` for tool "${opts.tool}"` : ""}. Run \`accounts list\` to see profiles.`);
-        const active = (await cloud.api.getCurrent(p!.tool))?.name === p!.name;
-        if (opts.json) {
-          console.log(JSON.stringify({ ...profileDetails(p!), active, applied: false }, null, 2));
-          return;
-        }
-        console.log(fmtProfile(p!, active, false, undefined));
-        console.log(`  tool:       ${p!.tool} (${getTool(p!.tool).label})`);
-        console.log(`  active:     ${active ? chalk.green("yes") : chalk.dim("no")}`);
-        console.log(`  email:      ${p!.email ?? chalk.dim("(none)")}`);
-        if (p!.displayName) console.log(`  name:       ${p!.displayName}`);
-        if (p!.identity) console.log(`  identity:   ${p!.identity}`);
-        if (p!.cardLast4) console.log(`  card:       ****${p!.cardLast4}`);
-        if (p!.metadata && Object.keys(p!.metadata).length > 0) console.log(`  metadata:   ${JSON.stringify(p!.metadata)}`);
-        console.log(`  created:    ${p!.createdAt}`);
-        if (p!.lastUsedAt) console.log(`  last used:  ${p!.lastUsedAt}`);
-        return;
-      }
-      const p = getProfile(name, opts.tool);
-      const details = profileDetails(p);
+      const store = resolveStore();
+      const p = await store.getProfile(name, opts.tool);
+      const active = (await store.currentProfile(p.tool))?.name === p.name;
+      const details = profileDetails(p, active);
       if (opts.json) {
         console.log(JSON.stringify(details, null, 2));
         return;
       }
-      const active = details.active;
       const isApplied = details.applied;
       console.log(fmtProfile(p, active, isApplied, details.prelaunch));
       console.log(`  tool:       ${p.tool} (${getTool(p.tool).label})`);
@@ -544,20 +515,7 @@ program
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
     action(async (name: string, opts: { tool?: string }) => {
-      const cloud = resolveAccountsCloud();
-      let profile: { name: string; tool: string };
-      let toolId: string;
-      if (cloud.transport === "cloud-http") {
-        const p = await cloud.api.get(name, opts.tool);
-        if (!p) die(`no profile named "${name}"${opts.tool ? ` for tool "${opts.tool}"` : ""}. Run \`accounts list\` to see profiles.`);
-        await cloud.api.setCurrent(p!.tool, p!.name);
-        profile = { name: p!.name, tool: p!.tool };
-        toolId = p!.tool;
-      } else {
-        const r = useProfile(name, opts.tool);
-        profile = r.profile;
-        toolId = r.toolId;
-      }
+      const { profile, toolId } = await resolveStore().useProfile(name, opts.tool);
       const tool = getTool(toolId);
       console.log(chalk.green(`✓ ${chalk.bold(profile.name)} is now the active ${tool.label} profile`));
       console.log(chalk.dim("  this CLI can't change your current shell's env, so either:"));
@@ -573,8 +531,8 @@ program
   .description("apply profile auth to live ~/.claude paths (requires login/snapshot; Claude-only)")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string, opts: { tool?: string }) => {
-      const { profile, previous } = applyProfile(name, opts.tool);
+    action(async (name: string, opts: { tool?: string }) => {
+      const { profile, previous } = await applyProfile(name, opts.tool);
       console.log(chalk.green(`✓ applied ${chalk.bold(profile.name)} to live ${getTool(profile.tool).label} paths`));
       if (previous) console.log(chalk.dim(`  previous applied profile "${previous}" was snapshotted`));
       if (profile.email) console.log(chalk.dim(`  email: ${profile.email}`));
@@ -591,15 +549,15 @@ program
   .option("--description <text>", "description")
   .option("--copy", "copy into a managed profile dir instead of referencing the source")
   .action(
-    action((name: string | undefined, opts: { tool: string; dir?: string; email?: string; description?: string; copy?: boolean }) => {
-      const p = importProfile({
+    action(async (name: string | undefined, opts: { tool: string; dir?: string; email?: string; description?: string; copy?: boolean }) => {
+      const p = await importProfile({
         name: name ?? "main",
         tool: opts.tool,
         dir: opts.dir,
         email: opts.email,
         description: opts.description,
         copy: opts.copy,
-      });
+      }, resolveStore());
       console.log(chalk.green(`✓ imported profile ${chalk.bold(p.name)}`));
       console.log(`  config dir: ${p.dir}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none)")}`);
@@ -614,7 +572,8 @@ program
   .option("-t, --tool <tool>", "tool to use for this profile; locks bare commands to that tool")
   .action(
     action(async (name: string, opts: { tool?: string }) => {
-      const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env });
+      const store = resolveStore();
+      const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env, store });
       if (prepared.status === "stopped") {
         console.error(chalk.yellow(prepared.message));
         console.error(chalk.dim(`Selected tool kept: ${prepared.tool.id}`));
@@ -622,7 +581,7 @@ program
       }
       const { profile, tool, args: loginArgs } = prepared;
       const env = profileEnv(profile, tool);
-      useProfile(name, tool.id);
+      await store.useProfile(name, tool.id);
       console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
       console.log(chalk.dim(`  config dir: ${profile.dir}`));
       console.log(chalk.dim(`  env: ${formatEnvAssignments(env)}`));
@@ -637,7 +596,7 @@ program
       });
       if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
       if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
-      const finalized = finalizeLogin(name, tool.id);
+      const finalized = await finalizeLogin(name, tool.id, store);
       if (finalized.applied) {
         console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
       } else {
@@ -654,12 +613,13 @@ program
   .option("--no-act", "only mark active (store current); do not apply or print env")
   .action(
     action(async (opts: { tool: string; env?: boolean; act?: boolean }) => {
-      const result = await pickProfile({ tool: opts.tool, mode: resolvePickMode(opts) });
+      const store = resolveStore();
+      const result = await pickProfile({ tool: opts.tool, mode: resolvePickMode(opts) }, store);
       if (!result) return;
-      useProfile(result.profile.name, result.profile.tool);
+      await store.useProfile(result.profile.name, result.profile.tool);
       console.log(chalk.green(`✓ selected ${chalk.bold(result.profile.name)}`));
       if (result.mode === "apply") {
-        applyProfile(result.profile.name, result.profile.tool);
+        await applyProfile(result.profile.name, result.profile.tool, store);
         console.log(chalk.dim("  applied to live Claude paths"));
       } else if (result.mode === "env") {
         const tool = getTool(result.profile.tool);
@@ -676,14 +636,7 @@ program
   .action(
     action(async (toolId: string | undefined) => {
       const tool = toolId ?? DEFAULT_TOOL;
-      const cloud = resolveAccountsCloud();
-      if (cloud.transport === "cloud-http") {
-        const c = await cloud.api.getCurrent(tool);
-        if (!c) die(`no active profile for "${tool}". Run \`accounts use <name>\` first.`);
-        console.log(c!.name);
-        return;
-      }
-      const p = currentProfile(tool);
+      const p = await resolveStore().currentProfile(tool);
       if (!p) die(`no active profile for "${tool}". Run \`accounts use <name>\` first.`);
       console.log(p.name);
     }),
@@ -696,9 +649,9 @@ program
   .action(
     action((toolId: string | undefined) => {
       const tool = toolId ?? DEFAULT_TOOL;
-      const p = appliedProfile(tool);
-      if (!p) die(`no applied profile for "${tool}". Run \`accounts apply <name>\` first.`);
-      console.log(p.name);
+      const name = appliedProfileName(tool);
+      if (!name) die(`no applied profile for "${tool}". Run \`accounts apply <name>\` first.`);
+      console.log(name);
     }),
   );
 
@@ -730,8 +683,9 @@ addConfigsOptions(program
         } & ConfigsCliOptions,
       ) => {
         if (opts.supervisor && opts.launch) die("--supervisor and --launch cannot be used together");
+        const store = resolveStore();
         if (opts.supervisor) {
-          const profile = getProfile(name, opts.tool);
+          const profile = await store.getProfile(name, opts.tool);
           const response = await sendSupervisorRequest(
             profile.tool,
             {
@@ -761,13 +715,13 @@ addConfigsOptions(program
           return;
         }
 
-        const result = switchProfile(name, {
+        const result = await switchProfile(name, {
           tool: opts.tool,
           mode: opts.mode,
           resume: opts.resume,
           args,
           permissions: opts.permissions,
-        });
+        }, store);
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
         } else {
@@ -830,9 +784,10 @@ program
   .description("print the `export VAR=dir` line to activate a profile in your shell")
   .option("-t, --tool <tool>", "tool (required when a named profile is ambiguous; defaults to claude when no name is given)")
   .action(
-    action((name: string | undefined, opts: { tool?: string }) => {
+    action(async (name: string | undefined, opts: { tool?: string }) => {
       const toolId = opts.tool ?? DEFAULT_TOOL;
-      const profile = name ? getProfile(name, opts.tool) : currentProfile(toolId);
+      const store = resolveStore();
+      const profile = name ? await store.getProfile(name, opts.tool) : await store.currentProfile(toolId);
       if (!profile) die(`no active profile for "${toolId}". Use \`accounts use <name>\` first.`);
       const tool = getTool(profile.tool);
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
@@ -848,13 +803,14 @@ addConfigsOptions(program
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .action(
-    action((name: string, args: string[], opts: { tool?: string; permissions?: string } & ConfigsCliOptions) => {
-      const profile = getProfile(name, opts.tool);
+    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string } & ConfigsCliOptions) => {
+      const store = resolveStore();
+      const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
       const env = profileEnv(profile, tool);
       const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions, profile });
-      useProfile(name, tool.id); // mark active + bump lastUsedAt
+      await store.useProfile(name, tool.id); // mark active + bump lastUsedAt
       console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${launchArgs.join(" ")}`));
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(tool.bin, launchArgs, {
@@ -877,7 +833,7 @@ addConfigsOptions(program
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .action(
     action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ConfigsCliOptions) => {
-      const plan = resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
+      const plan = await resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
       const runArgs = mergeToolArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
         permissions: opts.permissions,
         profile: plan.profile,
@@ -945,7 +901,7 @@ addConfigsOptions(supervisor
         args: string[],
         opts: { tool?: string; mode: SwitchMode; resume?: boolean; permissions?: string; json?: boolean } & ConfigsCliOptions,
       ) => {
-      const profile = getProfile(name, opts.tool);
+      const profile = await resolveStore().getProfile(name, opts.tool);
       const response = await sendSupervisorRequest(
         profile.tool,
         {
@@ -993,11 +949,12 @@ program
   .description("open a subshell with the profile's config dir active")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string, opts: { tool?: string }) => {
-      const profile = getProfile(name, opts.tool);
+    action(async (name: string, opts: { tool?: string }) => {
+      const store = resolveStore();
+      const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
       const env = profileEnv(profile, tool);
-      useProfile(name, tool.id);
+      await store.useProfile(name, tool.id);
       const shell = process.env.SHELL || "/bin/sh";
       console.log(chalk.dim(`→ subshell with ${formatEnvAssignments(env)} (exit to leave)`));
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
@@ -1014,17 +971,50 @@ program
   .description("show the active profile for each tool")
   .option("-t, --tool <tool>", "show only this tool")
   .action(
-    action((opts: { tool?: string }) => {
-      const tools = opts.tool ? [getTool(opts.tool)] : listTools();
+    action(async (opts: { tool?: string }) => {
+      const store = resolveStore();
+      const tools = opts.tool ? [await store.resolveTool(opts.tool)] : await store.listTools();
       for (const tool of tools) {
-        const p = currentProfile(tool.id);
-        const a = appliedProfile(tool.id);
+        const p = await store.currentProfile(tool.id);
+        const appliedName = appliedProfileName(tool.id);
         const val = p ? `${chalk.green.bold(p.name)}${p.email ? chalk.dim(" (" + p.email + ")") : ""}` : chalk.dim("(none)");
-        const appliedVal = a && a.name !== p?.name ? chalk.magenta(` → applied: ${a.name}`) : a ? chalk.magenta(" (applied)") : "";
+        const appliedVal = appliedName && appliedName !== p?.name ? chalk.magenta(` → applied: ${appliedName}`) : appliedName ? chalk.magenta(" (applied)") : "";
         console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}${appliedVal}`);
       }
     }),
   );
+
+const storage = program.command("storage").description("deprecated storage compatibility commands");
+
+storage
+  .command("status", { isDefault: true })
+  .description("show local/API storage compatibility status")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { json?: boolean }) => {
+      const status = getAccountsStorageStatus();
+      if (opts.json) console.log(JSON.stringify(status, null, 2));
+      else {
+        console.log(`mode: ${status.mode}`);
+        console.log(`local store: ${status.local.storePath}`);
+        console.log(chalk.yellow("legacy provider-backed sync is retired; use the Accounts API"));
+      }
+    }),
+  );
+
+for (const [name, operation] of [
+  ["push", storagePush],
+  ["pull", storagePull],
+  ["sync", storageSync],
+] as const) {
+  storage
+    .command(name)
+    .description(`deprecated: ${name} is retained only as an explicit migration error`)
+    .option("--json", "retained for compatibility; the retirement diagnostic is unchanged")
+    .action(action(async (_opts: { json?: boolean }) => {
+      await operation();
+    }));
+}
 
 program
   .command("agents")
@@ -1034,8 +1024,11 @@ program
   .option("-b, --background", "only show background agents")
   .option("--json", "output JSON")
   .action(
-    action((opts: { tool: string; profile?: string; background?: boolean; json?: boolean }) => {
+    action(async (opts: { tool: string; profile?: string; background?: boolean; json?: boolean }) => {
+      const store = resolveStore();
+      await store.resolveTool(opts.tool);
       const results = listAgentsAcrossProfiles({
+        profiles: await store.listProfiles(opts.tool),
         tool: opts.tool,
         profile: opts.profile,
         backgroundOnly: opts.background,
@@ -1078,56 +1071,14 @@ program
     }),
   );
 
-const storage = program.command("storage").description("inspect and sync the accounts storage snapshot");
-
-storage
-  .command("status", { isDefault: true })
-  .description("show local and optional S3 snapshot storage status")
-  .option("--json", "output JSON")
-  .action(
-    action((opts: { json?: boolean }) => {
-      printStorageStatus(getAccountsStorageStatus(), opts.json);
-    }),
-  );
-
-storage
-  .command("push")
-  .description("push the local accounts snapshot to S3 when configured")
-  .option("--json", "output JSON")
-  .action(
-    action(async (opts: { json?: boolean }) => {
-      printStorageSyncResult(await storagePush(), opts.json);
-    }),
-  );
-
-storage
-  .command("pull")
-  .description("pull the accounts snapshot from S3 when configured")
-  .option("--json", "output JSON")
-  .action(
-    action(async (opts: { json?: boolean }) => {
-      printStorageSyncResult(await storagePull(), opts.json);
-    }),
-  );
-
-storage
-  .command("sync")
-  .description("pull then push the accounts snapshot when S3 is configured")
-  .option("--json", "output JSON")
-  .action(
-    action(async (opts: { json?: boolean }) => {
-      printStorageSyncResult(await storageSync(), opts.json);
-    }),
-  );
-
 program
   .command("health")
   .alias("readiness")
   .description("show sanitized account, provider, supervisor, and storage readiness")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
-      const readiness = getAccountsReadiness();
+    action(async (opts: { json?: boolean }) => {
+      const readiness = await getAccountsReadiness();
       if (opts.json) {
         console.log(JSON.stringify(readiness, null, 2));
       } else {
@@ -1151,7 +1102,7 @@ program
   .option("-d, --dir <path>", "set the config dir")
   .action(
     action(
-      (
+      async (
         name: string,
         opts: {
           tool?: string;
@@ -1175,7 +1126,7 @@ program
         ) {
           die("nothing to set — pass --email, --display-name, --identity, --card-last4, --metadata, --description, or --dir");
         }
-        const p = updateProfile(name, {
+        const p = await resolveStore().updateProfile(name, {
           tool: opts.tool,
           email: opts.email,
           displayName: opts.displayName,
@@ -1196,8 +1147,8 @@ program
   .description("re-detect the account email from the profile's config dir")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string, opts: { tool?: string }) => {
-      const p = redetectEmail(name, opts.tool);
+    action(async (name: string, opts: { tool?: string }) => {
+      const p = await resolveStore().redetectEmail(name, opts.tool);
       console.log(p.email ? chalk.green(`✓ ${p.name}: ${p.email}`) : chalk.yellow(`no email found in ${p.dir}`));
     }),
   );
@@ -1209,8 +1160,8 @@ program
   .description("rename a profile")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((oldName: string, newName: string, opts: { tool?: string }) => {
-      const p = renameProfile(oldName, newName, opts.tool);
+    action(async (oldName: string, newName: string, opts: { tool?: string }) => {
+      const p = await resolveStore().renameProfile(oldName, newName, opts.tool);
       console.log(chalk.green(`✓ renamed to ${chalk.bold(p.name)}`));
     }),
   );
@@ -1224,14 +1175,10 @@ program
   .option("--purge", "also delete the managed config dir on disk")
   .action(
     action(async (name: string, opts: { tool?: string; purge?: boolean }) => {
-      const cloud = resolveAccountsCloud();
-      if (cloud.transport === "cloud-http") {
-        const profile = await cloud.api.remove(name, opts.tool);
-        console.log(chalk.green(`✓ removed ${chalk.bold(profile.name)}`));
-        if (opts.purge) console.log(chalk.yellow("  --purge is a local-only operation; the config dir (if any) was not touched in self_hosted mode"));
-        return;
-      }
-      const { profile, purged, purgeNote } = removeProfile(name, { tool: opts.tool, purge: opts.purge });
+      const { profile, purged, purgeNote } = await resolveStore().removeProfile(name, {
+        tool: opts.tool,
+        purge: opts.purge,
+      });
       console.log(chalk.green(`✓ removed ${chalk.bold(profile.name)}`));
       if (purged) console.log(chalk.dim(`  deleted ${profile.dir}`));
       if (purgeNote) console.log(chalk.yellow(`  ${purgeNote}`));
@@ -1244,8 +1191,8 @@ program
   .description("print just the config dir path (useful for scripting)")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string, opts: { tool?: string }) => {
-      console.log(getProfile(name, opts.tool).dir);
+    action(async (name: string, opts: { tool?: string }) => {
+      console.log((await resolveStore().getProfile(name, opts.tool)).dir);
     }),
   );
 
@@ -1256,8 +1203,8 @@ tools
   .description("list supported tools (built-in + custom)")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
-      const all = listTools();
+    action(async (opts: { json?: boolean }) => {
+      const all = await resolveStore().listTools();
       if (opts.json) {
         console.log(JSON.stringify(all, null, 2));
         return;
@@ -1291,7 +1238,7 @@ tools
   .option("--email-path <path>", "dot-path to the email inside that file (e.g. account.email)")
   .action(
     action(
-      (
+      async (
         id: string,
         opts: {
           label: string;
@@ -1328,7 +1275,7 @@ tools
           ...(opts.accountFile ? { accountFile: opts.accountFile } : {}),
           ...(opts.emailPath ? { emailPath: opts.emailPath.split(".") } : {}),
         };
-        const t = addCustomTool(def);
+        const t = await resolveStore().addTool(def);
         console.log(chalk.green(`✓ registered tool ${chalk.bold(t.id)} (${t.label})`));
         console.log(chalk.dim(`  add a profile: accounts add <name> --tool ${t.id} --email you@example.com`));
       },
@@ -1341,8 +1288,8 @@ tools
   .argument("<id>", "custom tool id")
   .description("remove a custom tool")
   .action(
-    action((id: string) => {
-      removeCustomTool(id);
+    action(async (id: string) => {
+      await resolveStore().removeTool(id);
       console.log(chalk.green(`✓ removed custom tool ${chalk.bold(id)}`));
     }),
   );
@@ -1351,10 +1298,16 @@ program
   .command("doctor")
   .description("check the store and profile dirs for problems (exits 1 if any)")
   .action(
-    action(() => {
+    action(async () => {
       console.log(chalk.bold(`store: ${storePath()}`));
-      const store = loadStore();
-      const profiles = listProfiles();
+      const store = resolveStore();
+      const profiles = await store.listProfiles();
+      // `current` is the shared, cloud-owned selection in api mode — read it
+      // through the Store, never the local file. `applied` is machine-local.
+      const current: Record<string, string> = Object.fromEntries(
+        (await store.listCurrent()).map((entry) => [entry.tool, entry.name]),
+      );
+      const applied = loadAppliedMap();
       let problems = 0;
       for (const p of profiles) {
         const missing = !existsSync(p.dir);
@@ -1370,13 +1323,13 @@ program
           console.log(chalk.yellow(`  ! ${p.name}: no email recorded`));
         }
       }
-      for (const [toolId, appliedName] of Object.entries(store.applied)) {
+      for (const [toolId, appliedName] of Object.entries(applied)) {
         if (!profiles.some((p) => p.name === appliedName && p.tool === toolId)) {
           console.log(chalk.red(`  ✗ stale applied.${toolId}: "${appliedName}" (profile missing)`));
           problems++;
         }
       }
-      for (const [toolId, currentName] of Object.entries(store.current)) {
+      for (const [toolId, currentName] of Object.entries(current)) {
         if (!profiles.some((p) => p.name === currentName && p.tool === toolId)) {
           console.log(chalk.red(`  ✗ stale current.${toolId}: "${currentName}" (profile missing)`));
           problems++;
@@ -1384,13 +1337,13 @@ program
       }
       const driftWarned = new Set<string>();
       for (const p of profiles) {
-        const active = store.current[p.tool];
-        const applied = store.applied[p.tool];
-        if (active && applied && active !== applied && !driftWarned.has(p.tool)) {
+        const active = current[p.tool];
+        const appliedName = applied[p.tool];
+        if (active && appliedName && active !== appliedName && !driftWarned.has(p.tool)) {
           driftWarned.add(p.tool);
           console.log(
             chalk.yellow(
-              `  ! ${p.tool}: active (${active}) ≠ applied (${applied}) — Cursor/IDE use applied; run \`accounts apply ${active}\``,
+              `  ! ${p.tool}: active (${active}) ≠ applied (${appliedName}) — Cursor/IDE use applied; run \`accounts apply ${active}\``,
             ),
           );
         }

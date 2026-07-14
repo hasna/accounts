@@ -235,6 +235,7 @@ export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOption
 }
 
 const BUILTIN_IDS = new Set(BUILTIN_TOOLS.map((t) => t.id));
+let customToolsCache: ToolDef[] | undefined;
 
 export function isBuiltinTool(id: string): boolean {
   return BUILTIN_IDS.has(id);
@@ -242,7 +243,7 @@ export function isBuiltinTool(id: string): boolean {
 
 /** All tools: built-ins plus any user-registered ones (custom wins on id clash). */
 export function listTools(): ToolDef[] {
-  const custom = loadStore().tools;
+  const custom = customToolsCache ?? loadStore().tools;
   const byId = new Map<string, ToolDef>();
   for (const t of BUILTIN_TOOLS) byId.set(t.id, t);
   for (const t of custom) byId.set(t.id, t);
@@ -274,6 +275,21 @@ export function addCustomTool(def: ToolDef): ToolDef {
   else store.tools[idx] = tool;
   saveStore(store);
   return tool;
+}
+
+/**
+ * Replace the process-local cache of custom tool definitions. Cloud reads must
+ * never create or rewrite accounts.json merely to make synchronous launch/apply
+ * helpers aware of a remote tool. ApiStore hydrates this cache before returning
+ * a custom-tool profile to machine-local orchestration.
+ */
+export function setCustomToolsCache(defs: ToolDef[]): void {
+  customToolsCache = defs.filter((d) => !isBuiltinTool(d.id)).map((d) => structuredClone(d));
+}
+
+/** Clear process-only cloud tool state (primarily for isolated tests). */
+export function clearCustomToolsCache(): void {
+  customToolsCache = undefined;
 }
 
 /** Remove a custom tool. Fails if profiles still reference it. */

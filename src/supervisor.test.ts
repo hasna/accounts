@@ -76,11 +76,11 @@ async function listen(server: Server, socketPath: string): Promise<void> {
   });
 }
 
-test("resolveSupervisorLaunch treats a known target as a tool and uses the active profile", () => {
+test("resolveSupervisorLaunch treats a known target as a tool and uses the active profile", async () => {
   addProfile({ name: "one", tool: "codex" });
   useProfile("one", "codex");
 
-  const plan = resolveSupervisorLaunch("codex");
+  const plan = await resolveSupervisorLaunch("codex");
 
   expect(plan.targetKind).toBe("tool");
   expect(plan.tool.id).toBe("codex");

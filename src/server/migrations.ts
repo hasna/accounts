@@ -18,7 +18,13 @@ import {
 import { API_KEYS_TABLE } from "./config.js";
 
 /** Ordered app-schema SQL files, applied before the auth table migrations. */
-export const APP_MIGRATION_FILES = ["0001_accounts.sql", "0002_current_selections.sql"] as const;
+export const APP_MIGRATION_FILES = [
+  "0001_accounts.sql",
+  "0002_current_selections.sql",
+  "0003_custom_tools.sql",
+  "0004_current_selection_account_fk.sql",
+  "0005_custom_tool_tombstones.sql",
+] as const;
 
 function moduleDir(): string {
   try {
@@ -77,6 +83,23 @@ export interface MigrationStatus {
   ledgerPresent: boolean;
   /** Defined migration ids not yet recorded as applied. */
   pending: string[];
+  /** Applied ids absent from this build's manifest (deterministic downgrade guard). */
+  unknown: string[];
+  /** Applied ids whose recorded checksum differs from this build. */
+  checksumMismatches: string[];
+}
+
+export function assertMigrationStatusCompatible(status: MigrationStatus): void {
+  if (status.unknown.length > 0) {
+    throw new Error(
+      `Applied migration(s) ${status.unknown.join(", ")} are not recognized by this build (downgrade?).`,
+    );
+  }
+  if (status.checksumMismatches.length > 0) {
+    throw new Error(
+      `Migration checksum mismatch for: ${status.checksumMismatches.join(", ")}.`,
+    );
+  }
 }
 
 /**
@@ -94,10 +117,23 @@ export async function readMigrationStatus(
     [DEFAULT_MIGRATION_LEDGER_TABLE],
   );
   if (!exists?.present) {
-    return { ledgerPresent: false, pending: migrations.map((m) => m.id) };
+    return {
+      ledgerPresent: false,
+      pending: migrations.map((m) => m.id),
+      unknown: [],
+      checksumMismatches: [],
+    };
   }
-  const rows = await client.many<{ id: string }>(`SELECT id FROM ${DEFAULT_MIGRATION_LEDGER_TABLE}`);
-  const applied = new Set(rows.map((r) => r.id));
+  const rows = await client.many<{ id: string; checksum: string }>(
+    `SELECT id, checksum FROM ${DEFAULT_MIGRATION_LEDGER_TABLE}`,
+  );
+  const expected = new Map(migrations.map((migration) => [migration.id, migration.checksum]));
+  const applied = new Set(rows.map((row) => row.id));
   const pending = migrations.filter((m) => !applied.has(m.id)).map((m) => m.id);
-  return { ledgerPresent: true, pending };
+  const unknown = rows.filter((row) => !expected.has(row.id)).map((row) => row.id).sort();
+  const checksumMismatches = rows
+    .filter((row) => expected.has(row.id) && expected.get(row.id) !== row.checksum)
+    .map((row) => row.id)
+    .sort();
+  return { ledgerPresent: true, pending, unknown, checksumMismatches };
 }

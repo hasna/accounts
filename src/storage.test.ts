@@ -1,16 +1,20 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile } from "./lib/profiles.js";
 import {
-  ACCOUNTS_STORAGE_ENV,
-  accountsStorageSnapshotKey,
-  createAccountsStorageSnapshot,
-  getAccountsStorageStatus,
-  restoreAccountsStorageSnapshot,
-  storageSync,
+  accountsHome,
+  loadAppliedMap,
+  loadCurrentMap,
+  loadMachineStore,
+  loadStore,
+  profilesDir,
+  reconcileMachineProfileRemove,
+  reconcileMachineProfileRename,
+  saveStore,
+  storePath,
 } from "./storage.js";
 
 let home: string;
@@ -26,75 +30,117 @@ afterEach(() => {
   delete process.env.ACCOUNTS_HOME;
 });
 
-function runStorageCli(...args: string[]) {
-  return spawnSync(process.execPath, ["run", "src/cli.ts", "storage", ...args], {
+test("local path helpers resolve under ACCOUNTS_HOME", () => {
+  expect(accountsHome()).toBe(home);
+  expect(storePath()).toBe(join(home, "accounts.json"));
+  expect(profilesDir()).toBe(join(home, "profiles"));
+});
+
+test("loadStore returns an empty store before anything is written", () => {
+  const store = loadStore();
+  expect(store.profiles).toEqual([]);
+  expect(existsSync(storePath())).toBe(false);
+});
+
+test("saveStore/loadStore round-trips the registry", () => {
+  addProfile({ name: "work", tool: "claude", email: "work@example.test" });
+  const store = loadStore();
+  expect(store.profiles[0]?.name).toBe("work");
+  expect(store.profiles[0]?.email).toBe("work@example.test");
+
+  store.profiles.push({ name: "home", tool: "claude", dir: join(home, "profiles/claude/home"), createdAt: new Date().toISOString() });
+  saveStore(store);
+  expect(loadStore().profiles.map((p) => p.name).sort()).toEqual(["home", "work"]);
+});
+
+test("raw machine pointers survive cloud-only profiles and reconcile rename/remove", () => {
+  saveStore({
+    version: 1,
+    current: { acme: "old" },
+    applied: { acme: "old" },
+    toolLocks: { old: "acme" },
+    profiles: [],
+    tools: [],
+  });
+  expect(loadCurrentMap()).toEqual({ acme: "old" });
+  expect(loadAppliedMap()).toEqual({ acme: "old" });
+  expect(loadStore().current).toEqual({});
+
+  reconcileMachineProfileRename("acme", "old", "new");
+  expect(loadMachineStore().current).toEqual({ acme: "new" });
+  expect(loadMachineStore().applied).toEqual({ acme: "new" });
+  expect(loadMachineStore().toolLocks).toEqual({ new: "acme" });
+
+  reconcileMachineProfileRemove("acme", "new");
+  expect(loadMachineStore().current).toEqual({});
+  expect(loadMachineStore().applied).toEqual({});
+  expect(loadMachineStore().toolLocks).toEqual({});
+});
+
+test("saveStore atomically replaces the registry without leaving temp files", () => {
+  saveStore({ version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] });
+  saveStore({ version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] });
+  expect(JSON.parse(readFileSync(storePath(), "utf8")).version).toBe(1);
+  expect(readdirSync(accountsHome()).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+});
+
+function runCli(env: Record<string, string>, ...args: string[]) {
+  return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
     cwd: process.cwd(),
     encoding: "utf8",
-    env: {
-      ...process.env,
-      ACCOUNTS_HOME: home,
-      ACCOUNTS_STORE_PATH: "",
-      ACCOUNTS_STORAGE_MODE: "",
-      ACCOUNTS_S3_BUCKET: "",
-      HASNA_ACCOUNTS_STORAGE_MODE: "",
-      HASNA_ACCOUNTS_S3_BUCKET: "",
-    },
+    env: { ...process.env, ACCOUNTS_HOME: home, ...env },
   });
 }
 
-test("storage status exposes local paths and canonical S3 env names", () => {
-  const status = getAccountsStorageStatus({});
-
-  expect(status.mode).toBe("local");
-  expect(status.local.home).toBe(home);
-  expect(status.remote.configured).toBe(false);
-  expect(status.env.s3Bucket).toBe(ACCOUNTS_STORAGE_ENV.s3Bucket);
-  expect(status.tables).toEqual([]);
-});
-
-test("creates and restores local accounts storage snapshots", () => {
-  addProfile({ name: "work", tool: "claude", email: "work@example.test" });
-  const snapshot = createAccountsStorageSnapshot({ HASNA_ACCOUNTS_MACHINE_ID: "test-machine" });
-
-  expect(snapshot.source).toBe("accounts");
-  expect(snapshot.machineId).toBe("test-machine");
-  expect(snapshot.store.profiles[0]?.email).toBe("work@example.test");
-
-  rmSync(home, { recursive: true, force: true });
-  restoreAccountsStorageSnapshot(snapshot);
-  const restored = createAccountsStorageSnapshot();
-  expect(restored.store.profiles[0]?.name).toBe("work");
-});
-
-test("sync is a no-op until S3 is configured", async () => {
-  const result = await storageSync({});
-
-  expect(result.skipped).toBe(true);
-  expect(result.reason).toContain("S3 bucket is not configured");
-  expect(result.key).toBe("accounts/accounts.json");
-});
-
-test("storage CLI status emits local JSON without remote config", () => {
-  const result = runStorageCli("status", "--json");
-
+test("the legacy storage command group is a fail-explicit compatibility shim", () => {
+  const result = runCli({}, "storage", "status");
   expect(result.status).toBe(0);
-  const payload = JSON.parse(result.stdout) as ReturnType<typeof getAccountsStorageStatus>;
-  expect(payload.mode).toBe("local");
-  expect(payload.local.home).toBe(home);
-  expect(payload.remote.configured).toBe(false);
-  expect(payload.env.s3Bucket).toBe(ACCOUNTS_STORAGE_ENV.s3Bucket);
+  expect(result.stdout).toContain("legacy provider-backed sync is retired");
+  for (const operation of ["push", "pull", "sync"]) {
+    for (const args of [[operation], [operation, "--json"]]) {
+      const retired = runCli({}, "storage", ...args);
+      expect(retired.status).not.toBe(0);
+      expect(retired.stderr).toContain("legacy storage sync was retired");
+      expect(retired.stderr).not.toContain("unknown option");
+    }
+  }
 });
 
-test("storage CLI sync skips cleanly without remote config", () => {
-  const result = runStorageCli("sync", "--json");
+// Regression: a machine still carrying a stale S3-era storage-mode word must not
+// crash — the legacy value is ignored and the client stays local.
+for (const legacy of ["remote", "hybrid", "s3"]) {
+  test(`stale HASNA_ACCOUNTS_STORAGE_MODE=${legacy} does not crash registry commands`, () => {
+    const result = runCli(
+      { HASNA_ACCOUNTS_STORAGE_MODE: legacy, ACCOUNTS_STORAGE_MODE: legacy },
+      "list",
+      "--json",
+    );
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("Unknown storage mode");
+    expect(result.stderr).not.toContain("misconfigured");
+  });
+}
 
-  expect(result.status).toBe(0);
-  const payload = JSON.parse(result.stdout) as Awaited<ReturnType<typeof storageSync>>;
-  expect(payload.skipped).toBe(true);
-  expect(payload.reason).toContain("S3 bucket is not configured");
-  expect(payload.key).toBe("accounts/accounts.json");
-});
+for (const mode of ["cloud", "self_hosted"]) {
+  test(`explicit ${mode} CLI mode fails closed without API configuration`, () => {
+    const result = runCli(
+      {
+        HASNA_ACCOUNTS_STORAGE_MODE: mode,
+        HASNA_ACCOUNTS_API_URL: "",
+        HASNA_ACCOUNTS_API_KEY: "",
+      },
+      "list",
+      "--json",
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`${mode} storage mode requires HASNA_ACCOUNTS_API_URL and HASNA_ACCOUNTS_API_KEY`);
+    expect(existsSync(storePath())).toBe(false);
+  });
+}
 
-test("snapshot key respects configured S3 prefix", () => {
-  expect(accountsStorageSnapshotKey({ HASNA_ACCOUNTS_S3_PREFIX: "internal/accounts" })).toBe("internal/accounts/accounts.json");
+test("unknown CLI storage modes fail validation instead of falling back", () => {
+  const result = runCli({ HASNA_ACCOUNTS_STORAGE_MODE: "typo" }, "list", "--json");
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain("invalid accounts storage mode");
+  expect(existsSync(storePath())).toBe(false);
 });

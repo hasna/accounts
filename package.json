@@ -1,7 +1,7 @@
 {
   "name": "@hasna/accounts",
   "version": "0.1.33",
-  "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally \u2014 isolated config dirs, per-account email, one-command switching.",
+  "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally — isolated config dirs, per-account email, one-command switching.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -37,16 +37,18 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node --external @hasna/contracts && bun build src/mcp.ts --outdir dist --target node && bun build src/index.ts --outdir dist --target node --external @hasna/contracts && bun build src/storage.ts --outdir dist --target node --external @aws-sdk/client-s3 && bun build src/sdk/index.ts --outdir dist/sdk --target node && bun build src/server/index.ts src/server/migrate.ts --outdir dist/server --target bun --packages external && tsc --emitDeclarationOnly --outDir dist",
+    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node --external @hasna/contracts && bun build src/mcp.ts --outdir dist --target node --external @hasna/contracts && bun build src/index.ts --outdir dist --target node --external @hasna/contracts && bun build src/storage.ts --outdir dist --target node && bun build src/sdk/index.ts --outdir dist/sdk --target node && bun build src/server/index.ts src/server/migrate.ts --outdir dist/server --target bun --packages external && tsc --emitDeclarationOnly --outDir dist",
     "contracts:conformance": "contracts conformance examples",
     "contracts:no-cloud-scan": "contracts no-cloud-scan --json .",
     "dev": "bun run src/cli.ts",
     "sdk:generate": "bun run src/sdk/generate-sdk.ts",
+    "test:compat": "tsc --noEmit -p tsconfig.compat.json",
     "vendor-kit:check": "bunx @hasna/contracts vendor-kit --check .",
     "conformance": "bunx @hasna/contracts repo-conformance .",
     "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:postgres": "ACCOUNTS_REQUIRE_POSTGRES=1 bun test src/server/postgres.integration.test.ts"
   },
   "keywords": [
     "claude",
@@ -87,8 +89,7 @@
   "author": "Andrei Hasna <andrei@hasna.com>",
   "license": "Apache-2.0",
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.985.0",
-    "@hasna/contracts": "0.5.0",
+    "@hasna/contracts": "0.5.2",
     "@hasna/events": "^0.1.7",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "chalk": "^5.4.1",

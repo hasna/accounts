@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, useProfile } from "./lib/profiles.js";
 import { getAccountsReadiness } from "./lib/readiness.js";
+import type { AccountsStore, CurrentEntry } from "./lib/store.js";
+import { getTool } from "./lib/tools.js";
 import { loadStore, saveStore } from "./storage.js";
+import type { Profile, ToolDef } from "./types.js";
 
 let home: string;
 let binDir: string;
@@ -69,8 +72,8 @@ function markApplied(tool: string, name: string): void {
   saveStore(store);
 }
 
-test("empty store returns an unavailable readiness contract", () => {
-  const readiness = getAccountsReadiness({ env: readinessEnv() });
+test("empty store returns an unavailable readiness contract", async () => {
+  const readiness = await getAccountsReadiness({ env: readinessEnv() });
 
   expect(readiness.schema).toBe("hasna.accounts.readiness/v1");
   expect(readiness.ok).toBe(false);
@@ -79,14 +82,14 @@ test("empty store returns an unavailable readiness contract", () => {
   expect(readiness.nextActions.join("\n")).toContain("accounts add <name>");
 });
 
-test("fake Claude profile reports sanitized login, provider, storage, and supervisor readiness", () => {
+test("fake Claude profile reports sanitized login, provider, storage, and supervisor readiness", async () => {
   writeFakeBin("claude");
   const profile = addProfile({ name: "work", tool: "claude", email: "work@example.test" });
   writeClaudeAuth(profile.dir, "work@example.test", Date.now() + 60_000, "secret-readiness-token");
   useProfile("work", "claude");
   markApplied("claude", "work");
 
-  const readiness = getAccountsReadiness({ env: readinessEnv() });
+  const readiness = await getAccountsReadiness({ env: readinessEnv() });
   const profileReadiness = readiness.profiles.find((entry) => entry.name === "work");
   const provider = readiness.providers.find((entry) => entry.id === "claude");
   const json = JSON.stringify(readiness);
@@ -104,7 +107,7 @@ test("fake Claude profile reports sanitized login, provider, storage, and superv
   expect(json).not.toContain("accessToken");
 });
 
-test("valid Claude credential wins over an older expired snapshot", () => {
+test("valid Claude credential wins over an older expired snapshot", async () => {
   writeFakeBin("claude");
   const aKey = "access" + "Token";
   const rKey = "refresh" + "Token";
@@ -122,7 +125,7 @@ test("valid Claude credential wins over an older expired snapshot", () => {
     }) + "\n",
   );
 
-  const readiness = getAccountsReadiness({ env: readinessEnv() });
+  const readiness = await getAccountsReadiness({ env: readinessEnv() });
   const profileReadiness = readiness.profiles.find((entry) => entry.name === "mixed");
   const json = JSON.stringify(readiness);
 
@@ -134,12 +137,12 @@ test("valid Claude credential wins over an older expired snapshot", () => {
   expect(json).not.toContain("expired-fixture");
 });
 
-test("expired Claude credential is unavailable without leaking credential contents", () => {
+test("expired Claude credential is unavailable without leaking credential contents", async () => {
   writeFakeBin("claude");
   const profile = addProfile({ name: "expired", tool: "claude", email: "expired@example.test" });
   writeClaudeAuth(profile.dir, "expired@example.test", Date.now() - 60_000, "super-secret-refresh-token");
 
-  const readiness = getAccountsReadiness({ env: readinessEnv() });
+  const readiness = await getAccountsReadiness({ env: readinessEnv() });
   const profileReadiness = readiness.profiles.find((entry) => entry.name === "expired");
   const json = JSON.stringify(readiness);
 
@@ -152,7 +155,7 @@ test("expired Claude credential is unavailable without leaking credential conten
   expect(json).not.toContain("accessToken");
 });
 
-test("unknown-expiry Claude credential is degraded, not valid", () => {
+test("unknown-expiry Claude credential is degraded, not valid", async () => {
   writeFakeBin("claude");
   const aKey = "access" + "Token";
   const rKey = "refresh" + "Token";
@@ -168,7 +171,7 @@ test("unknown-expiry Claude credential is degraded, not valid", () => {
     }) + "\n",
   );
 
-  const readiness = getAccountsReadiness({ env: readinessEnv() });
+  const readiness = await getAccountsReadiness({ env: readinessEnv() });
   const profileReadiness = readiness.profiles.find((entry) => entry.name === "unknown");
   const json = JSON.stringify(readiness);
 
@@ -181,6 +184,58 @@ test("unknown-expiry Claude credential is degraded, not valid", () => {
   expect(json).not.toContain("accessToken");
 });
 
+test("api-mode readiness routes profiles + current through the Store, not the local file", async () => {
+  writeFakeBin("claude");
+  // Local file holds a DIFFERENT, stale registry: profile "localonly" selected
+  // and applied to claude. On a flipped machine this file is empty/stale and the
+  // cloud is the source of truth for profiles + current.
+  const localProfile = addProfile({ name: "localonly", tool: "claude", email: "local@example.test" });
+  writeClaudeAuth(localProfile.dir, "local@example.test", Date.now() + 60_000, "local-token");
+  useProfile("localonly", "claude");
+  markApplied("claude", "localonly");
+
+  const cloudDir = mkdtempSync(join(tmpdir(), "accounts-readiness-cloud-"));
+  writeClaudeAuth(cloudDir, "cloud@example.test", Date.now() + 60_000, "cloud-token");
+  const cloudProfile: Profile = {
+    name: "cloudwork",
+    tool: "claude",
+    email: "cloud@example.test",
+    dir: cloudDir,
+    createdAt: new Date().toISOString(),
+  };
+  const claudeTool: ToolDef = getTool("claude");
+  const apiStore: AccountsStore = {
+    transport: "api",
+    listProfiles: async () => [cloudProfile],
+    listTools: async () => [claudeTool],
+    listCurrent: async (): Promise<CurrentEntry[]> => [{ tool: "claude", name: "cloudwork" }],
+    getProfile: async () => cloudProfile,
+    findProfile: async () => cloudProfile,
+    addProfile: async () => cloudProfile,
+    updateProfile: async () => cloudProfile,
+    renameProfile: async () => cloudProfile,
+    removeProfile: async () => ({ profile: cloudProfile, purged: false }),
+    redetectEmail: async () => cloudProfile,
+    useProfile: async () => ({ profile: cloudProfile, toolId: "claude" }),
+    currentProfile: async () => cloudProfile,
+    addTool: async () => claudeTool,
+    removeTool: async () => {},
+  };
+
+  const readiness = await getAccountsReadiness({ env: readinessEnv(), store: apiStore });
+  const names = readiness.profiles.map((p) => p.name);
+  const cloud = readiness.profiles.find((p) => p.name === "cloudwork");
+
+  // The Store (cloud) is authoritative for profiles + active selection.
+  expect(names).toContain("cloudwork");
+  expect(names).not.toContain("localonly");
+  expect(cloud?.active).toBe(true);
+  // `applied` is machine-local: the local file applied "localonly" (a different
+  // profile), so the cloud profile is NOT reported as applied on this machine.
+  expect(cloud?.applied).toBe(false);
+  rmSync(cloudDir, { recursive: true, force: true });
+});
+
 test("health CLI emits JSON and text readiness without leaking fixture secrets", () => {
   writeFakeBin("claude");
   const profile = addProfile({ name: "expired", tool: "claude", email: "expired@example.test" });
@@ -188,7 +243,7 @@ test("health CLI emits JSON and text readiness without leaking fixture secrets",
 
   const jsonResult = runHealthCli(["--json"]);
   expect(jsonResult.status).toBe(1);
-  const payload = JSON.parse(jsonResult.stdout) as ReturnType<typeof getAccountsReadiness>;
+  const payload = JSON.parse(jsonResult.stdout) as Awaited<ReturnType<typeof getAccountsReadiness>>;
   expect(payload.status).toBe("unavailable");
   expect(payload.profiles[0]?.login.authStatus).toBe("expired");
   expect(jsonResult.stdout).not.toContain("cli-secret-token");

@@ -6,6 +6,43 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+
+### Changed
+
+- **Clear diagnostic when the self-hosted server predates an endpoint.** When a
+  mutating registry call (`accounts rename`, `accounts tools add`, `accounts
+  tools remove`) hits a route-missing `404` (`{ "error": "not found" }`) — the
+  signature of a deployed `accounts-serve` build older than the client — the CLI
+  now surfaces an actionable message instructing the operator to update
+  `accounts-serve`, instead of a raw HTTP failure. Entity-level `404`s (a real
+  "no profile"/"no custom tool") are unchanged and never masked. Local mode is
+  unaffected. No package version or deployment target is asserted by this
+  source change.
+
+- Explicit `cloud` and `self_hosted` modes now fail closed when API
+  configuration is incomplete. Cold custom-tool login/import/launch paths
+  hydrate before synchronous lookup.
+- Account rename/remove reconciles raw machine-local pointers. PostgreSQL
+  selection updates are protected by row locks and an additive cascading
+  foreign key migration. Migration `0004` archives orphan selections before
+  cleanup, and the migrator rejects unknown applied migrations before its
+  privilege-safe no-op path.
+- Custom-tool add/remove and account creation share a transaction-scoped
+  advisory lock, preventing tool deletion from racing a new dependent account.
+  Additive migration `0005` durably distinguishes unseen legacy custom tool
+  ids (accepted for old-client account creation) from explicitly removed ids
+  (rejected until explicit re-registration), including older direct SQL writers.
+- Migration `0005` trigger functions now remain owner-controlled
+  `SECURITY INVOKER` functions with a fixed schema-safe `search_path` and no
+  public execution. The owner-run migrator validates and applies an explicit
+  DML-only `accounts-serve` role contract; required PostgreSQL tests run normal
+  and raw old-server race operations through that separate role.
+- Pull requests run a checksum-pinned gitleaks binary over the complete
+  base-to-head commit range in a read-only, secret-free, fully redacted job.
+- Deprecated storage exports and CLI commands remain as compatibility shims;
+  retired provider-backed sync operations preserve optional environment
+  arguments and `--json` parsing, then fail explicitly.
+
 ## [0.1.32] - 2026-07-06
 
 ### Added

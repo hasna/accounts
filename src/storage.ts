@@ -1,82 +1,30 @@
-import { homedir } from "node:os";
-import { hostname } from "node:os";
+// Local, on-box primitives for the accounts registry file.
+//
+// This module owns ONLY the machine-local JSON registry at
+// `~/.hasna/accounts/accounts.json` (and the managed profiles dir). It is the
+// filesystem backend behind `LocalStore` in `./lib/store.ts`. There is no S3 /
+// "remote" / "hybrid" storage tier here: the single storage abstraction is the
+// `AccountsStore` in `./lib/store.ts`, whose only two transports are LocalStore
+// (these primitives) and ApiStore (the `<API_URL>/v1` HTTP client). Self-hosted
+// and cloud both route through ApiStore; nothing bypasses the Store.
+
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { type Store, storeSchema, AccountsError, profileNameSchema } from "./types.js";
 import { assertSafeWritePath } from "./lib/safe-path.js";
-
-export const ACCOUNTS_STORAGE_ENV = {
-  mode: "HASNA_ACCOUNTS_STORAGE_MODE",
-  s3Bucket: "HASNA_ACCOUNTS_S3_BUCKET",
-  s3Prefix: "HASNA_ACCOUNTS_S3_PREFIX",
-  awsRegion: "HASNA_ACCOUNTS_AWS_REGION",
-  s3Endpoint: "HASNA_ACCOUNTS_S3_ENDPOINT",
-  s3ForcePathStyle: "HASNA_ACCOUNTS_S3_FORCE_PATH_STYLE",
-  machineId: "HASNA_ACCOUNTS_MACHINE_ID",
-} as const;
-
-export const ACCOUNTS_STORAGE_FALLBACK_ENV = {
-  mode: "ACCOUNTS_STORAGE_MODE",
-  s3Bucket: "ACCOUNTS_S3_BUCKET",
-  s3Prefix: "ACCOUNTS_S3_PREFIX",
-  awsRegion: "ACCOUNTS_AWS_REGION",
-  s3Endpoint: "ACCOUNTS_S3_ENDPOINT",
-  s3ForcePathStyle: "ACCOUNTS_S3_FORCE_PATH_STYLE",
-  machineId: "ACCOUNTS_MACHINE_ID",
-} as const;
-
-export const STORAGE_MODE_ENV = ACCOUNTS_STORAGE_ENV.mode;
-export const STORAGE_TABLES = [] as const;
-
-export type AccountsStorageMode = "local" | "remote" | "hybrid";
-
-export interface AccountsStorageConfig {
-  mode: AccountsStorageMode;
-  s3Bucket?: string;
-  s3Prefix: string;
-  awsRegion?: string;
-  s3Endpoint?: string;
-  s3ForcePathStyle?: boolean;
-  machineId: string;
-}
-
-export interface AccountsStorageStatus {
-  configured: boolean;
-  mode: AccountsStorageMode;
-  local: {
-    home: string;
-    storePath: string;
-    profilesDir: string;
-  };
-  remote: {
-    configured: boolean;
-    bucketEnv: string;
-    bucket?: string;
-    prefix: string;
-    regionEnv: string;
-    endpointConfigured: boolean;
-  };
-  env: typeof ACCOUNTS_STORAGE_ENV;
-  fallbackEnv: typeof ACCOUNTS_STORAGE_FALLBACK_ENV;
-  tables: readonly [];
-}
-
-export interface AccountsStorageSnapshot {
-  schemaVersion: 1;
-  source: "accounts";
-  createdAt: string;
-  machineId: string;
-  store: Store;
-}
-
-export interface AccountsStorageSyncResult {
-  mode: AccountsStorageMode;
-  pushed: number;
-  pulled: number;
-  skipped: boolean;
-  key: string;
-  reason?: string;
-}
 
 function validateEnvPath(value: string, label: string): string {
   const trimmed = value.trim();
@@ -107,7 +55,16 @@ export function profilesDir(): string {
 
 const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
 
-export function loadStore(): Store {
+/**
+ * Parse and schema-validate the on-box registry file WITHOUT the profile
+ * cross-pruning that `loadStore()` applies. Returns the empty store when the
+ * file is absent. Used by both `loadStore()` (which then prunes against the
+ * local profile list) and the machine-local pointer readers, which must NOT
+ * prune: in api mode the profile records live in the cloud, so pruning a
+ * machine-local `applied`/`current` pointer against the (empty) local profile
+ * list would wrongly erase a valid pointer.
+ */
+function parseStoreFile(): Store {
   const path = storePath();
   if (!existsSync(path)) return structuredClone(EMPTY_STORE);
   let raw: unknown;
@@ -120,7 +77,77 @@ export function loadStore(): Store {
   if (!parsed.success) {
     throw new AccountsError(`invalid store at ${path}: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
   }
-  const store = parsed.data;
+  return parsed.data;
+}
+
+/** Raw validated machine state without pruning pointers against local profiles. */
+export function loadMachineStore(): Store {
+  return parseStoreFile();
+}
+
+/**
+ * The machine-local `applied` pointer map (toolId -> profile name): which
+ * profile's auth is currently restored to each tool's live default paths on
+ * THIS machine. This is genuinely machine-local state (never in the shared
+ * cloud registry), so readiness/doctor read it here regardless of storage mode.
+ * Entries are validated for name shape only — a pointer to a profile that no
+ * longer exists is preserved so `accounts doctor` can flag it as stale.
+ */
+export function loadAppliedMap(): Record<string, string> {
+  const applied: Record<string, string> = {};
+  for (const [toolId, name] of Object.entries(parseStoreFile().applied)) {
+    if (name && profileNameSchema.safeParse(name).success) applied[toolId] = name;
+  }
+  return applied;
+}
+
+export function loadCurrentMap(): Record<string, string> {
+  const current: Record<string, string> = {};
+  for (const [toolId, name] of Object.entries(parseStoreFile().current)) {
+    if (name && profileNameSchema.safeParse(name).success) current[toolId] = name;
+  }
+  return current;
+}
+
+export function reconcileMachineProfileRename(toolId: string, oldName: string, newName: string): void {
+  const store = parseStoreFile();
+  let changed = false;
+  if (store.current[toolId] === oldName) {
+    store.current[toolId] = newName;
+    changed = true;
+  }
+  if (store.applied[toolId] === oldName) {
+    store.applied[toolId] = newName;
+    changed = true;
+  }
+  if (store.toolLocks[oldName] === toolId) {
+    delete store.toolLocks[oldName];
+    store.toolLocks[newName] = toolId;
+    changed = true;
+  }
+  if (changed) saveStore(store);
+}
+
+export function reconcileMachineProfileRemove(toolId: string, name: string): void {
+  const store = parseStoreFile();
+  let changed = false;
+  if (store.current[toolId] === name) {
+    delete store.current[toolId];
+    changed = true;
+  }
+  if (store.applied[toolId] === name) {
+    delete store.applied[toolId];
+    changed = true;
+  }
+  if (store.toolLocks[name] === toolId) {
+    delete store.toolLocks[name];
+    changed = true;
+  }
+  if (changed) saveStore(store);
+}
+
+export function loadStore(): Store {
+  const store = parseStoreFile();
   for (const p of store.profiles) {
     const check = profileNameSchema.safeParse(p.name);
     if (!check.success) {
@@ -153,62 +180,127 @@ export function saveStore(store: Store): void {
   }
   assertSafeWritePath(path, { mustStayUnder: accountsHome() });
   mkdirSync(join(path, ".."), { recursive: true });
-  if (existsSync(path)) chmodSync(path, 0o600);
-  writeFileSync(path, JSON.stringify(parsed.data, null, 2) + "\n", { mode: 0o600 });
-  chmodSync(path, 0o600);
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  assertSafeWritePath(temp, { mustStayUnder: accountsHome() });
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(parsed.data, null, 2) + "\n", "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, path);
+    chmodSync(path, 0o600);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
 }
 
-function firstEnv(env: NodeJS.ProcessEnv, primary: string, fallback: string): string | undefined {
-  return env[primary] || env[fallback] || undefined;
+/**
+ * Deprecated source-compatibility shims for the pre-AccountsStore storage API.
+ * They intentionally contain no cloud-provider implementation.
+ */
+export const ACCOUNTS_STORAGE_ENV = {
+  mode: "HASNA_ACCOUNTS_STORAGE_MODE",
+  s3Bucket: "HASNA_ACCOUNTS_S3_BUCKET",
+  s3Prefix: "HASNA_ACCOUNTS_S3_PREFIX",
+  awsRegion: "HASNA_ACCOUNTS_AWS_REGION",
+  s3Endpoint: "HASNA_ACCOUNTS_S3_ENDPOINT",
+  s3ForcePathStyle: "HASNA_ACCOUNTS_S3_FORCE_PATH_STYLE",
+  machineId: "HASNA_ACCOUNTS_MACHINE_ID",
+} as const;
+
+export const ACCOUNTS_STORAGE_FALLBACK_ENV = {
+  mode: "ACCOUNTS_STORAGE_MODE",
+  s3Bucket: "ACCOUNTS_S3_BUCKET",
+  s3Prefix: "ACCOUNTS_S3_PREFIX",
+  awsRegion: "ACCOUNTS_AWS_REGION",
+  s3Endpoint: "ACCOUNTS_S3_ENDPOINT",
+  s3ForcePathStyle: "ACCOUNTS_S3_FORCE_PATH_STYLE",
+  machineId: "ACCOUNTS_MACHINE_ID",
+} as const;
+
+export const STORAGE_MODE_ENV = ACCOUNTS_STORAGE_ENV.mode;
+export const STORAGE_TABLES = [] as const;
+export type AccountsStorageMode = "local" | "self_hosted" | "cloud" | "remote" | "hybrid";
+
+export interface AccountsStorageConfig {
+  mode: AccountsStorageMode;
+  s3Bucket?: string;
+  s3Prefix: string;
+  awsRegion?: string;
+  s3Endpoint?: string;
+  s3ForcePathStyle?: boolean;
+  machineId: string;
 }
 
-function parseMode(value: string | undefined): AccountsStorageMode {
-  if (value === "remote" || value === "s3") return "remote";
-  if (value === "hybrid") return "hybrid";
+export interface AccountsStorageStatus {
+  configured: boolean;
+  mode: AccountsStorageMode;
+  local: { home: string; storePath: string; profilesDir: string };
+  remote: {
+    configured: boolean;
+    bucketEnv: string;
+    bucket?: string;
+    prefix: string;
+    regionEnv: string;
+    endpointConfigured: boolean;
+  };
+  env: typeof ACCOUNTS_STORAGE_ENV;
+  fallbackEnv: typeof ACCOUNTS_STORAGE_FALLBACK_ENV;
+  tables: readonly [];
+}
+
+export interface AccountsStorageSnapshot {
+  schemaVersion: 1;
+  source: "accounts";
+  createdAt: string;
+  machineId: string;
+  store: Store;
+}
+
+export interface AccountsStorageSyncResult {
+  mode: AccountsStorageMode;
+  pushed: number;
+  pulled: number;
+  skipped: boolean;
+  key: string;
+  reason?: string;
+}
+
+function compatibilityMode(env: NodeJS.ProcessEnv): AccountsStorageMode {
+  const value = (env.HASNA_ACCOUNTS_STORAGE_MODE || env.ACCOUNTS_STORAGE_MODE || "").trim().toLowerCase();
+  if (value === "cloud" || value === "self_hosted") return value;
   return "local";
 }
 
-function parseBoolean(value: string | undefined): boolean | undefined {
-  if (!value) return undefined;
-  if (["1", "true", "yes"].includes(value.toLowerCase())) return true;
-  if (["0", "false", "no"].includes(value.toLowerCase())) return false;
-  return undefined;
-}
-
-function normalizePrefix(prefix: string | undefined): string {
-  if (!prefix) return "accounts/";
-  return prefix.endsWith("/") ? prefix : `${prefix}/`;
-}
-
+/** @deprecated Use resolveStore() and AccountsStore.transport. */
 export function getAccountsStorageConfig(env: NodeJS.ProcessEnv = process.env): AccountsStorageConfig {
   return {
-    mode: parseMode(firstEnv(env, ACCOUNTS_STORAGE_ENV.mode, ACCOUNTS_STORAGE_FALLBACK_ENV.mode)),
-    s3Bucket: firstEnv(env, ACCOUNTS_STORAGE_ENV.s3Bucket, ACCOUNTS_STORAGE_FALLBACK_ENV.s3Bucket),
-    s3Prefix: normalizePrefix(firstEnv(env, ACCOUNTS_STORAGE_ENV.s3Prefix, ACCOUNTS_STORAGE_FALLBACK_ENV.s3Prefix)),
-    awsRegion: firstEnv(env, ACCOUNTS_STORAGE_ENV.awsRegion, ACCOUNTS_STORAGE_FALLBACK_ENV.awsRegion),
-    s3Endpoint: firstEnv(env, ACCOUNTS_STORAGE_ENV.s3Endpoint, ACCOUNTS_STORAGE_FALLBACK_ENV.s3Endpoint),
-    s3ForcePathStyle: parseBoolean(firstEnv(env, ACCOUNTS_STORAGE_ENV.s3ForcePathStyle, ACCOUNTS_STORAGE_FALLBACK_ENV.s3ForcePathStyle)),
-    machineId: firstEnv(env, ACCOUNTS_STORAGE_ENV.machineId, ACCOUNTS_STORAGE_FALLBACK_ENV.machineId) ?? hostname(),
+    mode: compatibilityMode(env),
+    s3Prefix: "accounts/",
+    machineId: env.HASNA_ACCOUNTS_MACHINE_ID || env.ACCOUNTS_MACHINE_ID || hostname(),
   };
 }
 
+/** @deprecated Use resolveStore(), health, or readiness. */
 export function getAccountsStorageStatus(env: NodeJS.ProcessEnv = process.env): AccountsStorageStatus {
   const config = getAccountsStorageConfig(env);
+  const apiConfigured = Boolean(
+    (env.HASNA_ACCOUNTS_API_URL || env.ACCOUNTS_API_URL) &&
+    (env.HASNA_ACCOUNTS_API_KEY || env.ACCOUNTS_API_KEY),
+  );
   return {
-    configured: config.mode === "local" || Boolean(config.s3Bucket),
+    configured: config.mode === "local" || apiConfigured,
     mode: config.mode,
-    local: {
-      home: accountsHome(),
-      storePath: storePath(),
-      profilesDir: profilesDir(),
-    },
+    local: { home: accountsHome(), storePath: storePath(), profilesDir: profilesDir() },
     remote: {
-      configured: Boolean(config.s3Bucket),
-      bucketEnv: env[ACCOUNTS_STORAGE_ENV.s3Bucket] ? ACCOUNTS_STORAGE_ENV.s3Bucket : ACCOUNTS_STORAGE_FALLBACK_ENV.s3Bucket,
-      bucket: config.s3Bucket,
+      configured: false,
+      bucketEnv: ACCOUNTS_STORAGE_ENV.s3Bucket,
       prefix: config.s3Prefix,
-      regionEnv: env[ACCOUNTS_STORAGE_ENV.awsRegion] ? ACCOUNTS_STORAGE_ENV.awsRegion : ACCOUNTS_STORAGE_FALLBACK_ENV.awsRegion,
-      endpointConfigured: Boolean(config.s3Endpoint),
+      regionEnv: ACCOUNTS_STORAGE_ENV.awsRegion,
+      endpointConfigured: false,
     },
     env: ACCOUNTS_STORAGE_ENV,
     fallbackEnv: ACCOUNTS_STORAGE_FALLBACK_ENV,
@@ -216,17 +308,18 @@ export function getAccountsStorageStatus(env: NodeJS.ProcessEnv = process.env): 
   };
 }
 
+/** @deprecated Local snapshot compatibility only. */
 export function createAccountsStorageSnapshot(env: NodeJS.ProcessEnv = process.env): AccountsStorageSnapshot {
-  const config = getAccountsStorageConfig(env);
   return {
     schemaVersion: 1,
     source: "accounts",
     createdAt: new Date().toISOString(),
-    machineId: config.machineId,
-    store: loadStore(),
+    machineId: getAccountsStorageConfig(env).machineId,
+    store: loadMachineStore(),
   };
 }
 
+/** @deprecated Local snapshot compatibility only. */
 export function restoreAccountsStorageSnapshot(snapshot: AccountsStorageSnapshot): void {
   if (snapshot.schemaVersion !== 1 || snapshot.source !== "accounts") {
     throw new AccountsError("invalid accounts storage snapshot");
@@ -234,72 +327,31 @@ export function restoreAccountsStorageSnapshot(snapshot: AccountsStorageSnapshot
   saveStore(snapshot.store);
 }
 
-export function accountsStorageSnapshotKey(env: NodeJS.ProcessEnv = process.env): string {
-  const config = getAccountsStorageConfig(env);
-  return `${config.s3Prefix}accounts.json`;
+/** @deprecated The provider-backed snapshot transport was retired. */
+export function accountsStorageSnapshotKey(_env: NodeJS.ProcessEnv = process.env): string {
+  return "accounts/accounts.json";
 }
 
-async function getS3Client(config: AccountsStorageConfig) {
-  const { S3Client } = await import("@aws-sdk/client-s3");
-  return new S3Client({
-    region: config.awsRegion,
-    endpoint: config.s3Endpoint,
-    forcePathStyle: config.s3ForcePathStyle,
-  });
+function retiredSyncError(): AccountsError {
+  return new AccountsError(
+    "legacy storage sync was retired; use local mode or configure the Accounts API for self_hosted/cloud mode",
+  );
 }
 
-async function bodyToString(body: unknown): Promise<string> {
-  if (typeof body === "string") return body;
-  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
-  if (body && typeof (body as { transformToString?: () => Promise<string> }).transformToString === "function") {
-    return (body as { transformToString: () => Promise<string> }).transformToString();
-  }
-  throw new AccountsError("unsupported S3 response body");
+/** @deprecated Always rejects; provider-backed sync was retired. */
+export async function storagePush(_env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
+  throw retiredSyncError();
 }
 
-export async function storagePush(env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
-  const config = getAccountsStorageConfig(env);
-  const key = accountsStorageSnapshotKey(env);
-  if (!config.s3Bucket) {
-    return { mode: config.mode, pushed: 0, pulled: 0, skipped: true, key, reason: "S3 bucket is not configured" };
-  }
-
-  const { PutObjectCommand } = await import("@aws-sdk/client-s3");
-  const client = await getS3Client(config);
-  const snapshot = createAccountsStorageSnapshot(env);
-  await client.send(new PutObjectCommand({
-    Bucket: config.s3Bucket,
-    Key: key,
-    Body: JSON.stringify(snapshot, null, 2) + "\n",
-    ContentType: "application/json",
-  }));
-  return { mode: config.mode, pushed: 1, pulled: 0, skipped: false, key };
+/** @deprecated Always rejects; provider-backed sync was retired. */
+export async function storagePull(_env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
+  throw retiredSyncError();
 }
 
-export async function storagePull(env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
-  const config = getAccountsStorageConfig(env);
-  const key = accountsStorageSnapshotKey(env);
-  if (!config.s3Bucket) {
-    return { mode: config.mode, pushed: 0, pulled: 0, skipped: true, key, reason: "S3 bucket is not configured" };
-  }
-
-  const { GetObjectCommand } = await import("@aws-sdk/client-s3");
-  const client = await getS3Client(config);
-  const result = await client.send(new GetObjectCommand({ Bucket: config.s3Bucket, Key: key }));
-  const snapshot = JSON.parse(await bodyToString(result.Body)) as AccountsStorageSnapshot;
-  restoreAccountsStorageSnapshot(snapshot);
-  return { mode: config.mode, pushed: 0, pulled: 1, skipped: false, key };
+/** @deprecated Always rejects; provider-backed sync was retired. */
+export async function storageSync(_env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
+  throw retiredSyncError();
 }
 
-export async function storageSync(env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
-  const config = getAccountsStorageConfig(env);
-  const key = accountsStorageSnapshotKey(env);
-  if (!config.s3Bucket) {
-    return { mode: config.mode, pushed: 0, pulled: 0, skipped: true, key, reason: "S3 bucket is not configured" };
-  }
-  const pull = await storagePull(env);
-  const push = await storagePush(env);
-  return { mode: config.mode, pushed: push.pushed, pulled: pull.pulled, skipped: false, key };
-}
-
+/** @deprecated Alias retained for source compatibility. */
 export const getStorageStatus = getAccountsStorageStatus;

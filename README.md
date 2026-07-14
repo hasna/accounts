@@ -289,24 +289,51 @@ then invokes the real `claude` binary. Full behavior and footguns: [docs/hook.md
 
 Overrides: `ACCOUNTS_HOME`, `ACCOUNTS_STORE_PATH`.
 
-The native storage API is available from `@hasna/accounts/storage`. It exposes
-the local registry paths, snapshot helpers, and optional S3 registry sync for
-internal cross-machine use:
+Registry access is selected through `AccountsStore`:
+
+- `local` uses the atomic on-machine JSON registry.
+- `self_hosted` and `cloud` use the authenticated Accounts HTTP API.
+- Explicit `self_hosted`/`cloud` modes fail closed unless both the API URL
+  and key are configured.
+- Retired `remote`, `hybrid`, and `s3` aliases are ignored for migration
+  safety; any other unknown mode is rejected.
 
 ```ts
-import { getAccountsStorageStatus, storagePush } from "@hasna/accounts/storage";
+import { resolveStore } from "@hasna/accounts";
 
-console.log(getAccountsStorageStatus().local.storePath);
-await storagePush();
+const store = resolveStore();
+console.log(store.transport);
+console.log(await store.listProfiles());
 ```
 
-Cloud sync targets repo-owned AWS S3 using the service-owned env names below and
-only syncs the accounts registry JSON by default; auth snapshots stay local.
+Configure API mode with:
 
-- `HASNA_ACCOUNTS_STORAGE_MODE=local|cloud` (`cloud` = repo-owned AWS S3)
-- `HASNA_ACCOUNTS_S3_BUCKET=hasna-xyz-opensource-accounts-prod`
-- `HASNA_ACCOUNTS_S3_PREFIX=accounts/`
-- `HASNA_ACCOUNTS_AWS_REGION=us-east-1`
+- `HASNA_ACCOUNTS_STORAGE_MODE=local|self_hosted|cloud`
+- `HASNA_ACCOUNTS_API_URL=https://accounts.example.com`
+- `HASNA_ACCOUNTS_API_KEY` from the service operator
+
+The `@hasna/accounts/storage` entry point and `accounts storage` command
+group retain deprecated source/CLI compatibility shims. Local status and
+snapshot helpers continue to work. `push`, `pull`, and `sync` fail
+explicitly because the retired provider-backed transport is not present. Their
+legacy optional environment arguments remain accepted, and the retired CLI
+commands still parse `--json` before returning the same deterministic
+retirement diagnostic.
+
+For server compatibility, an older client may create an account using a
+previously local custom tool id without first registering a Tool definition.
+The server distinguishes that unseen id from an explicitly removed id using a
+durable PostgreSQL tombstone; only an explicit tools registration reactivates a
+removed id.
+
+Production PostgreSQL uses separate identities: an object-owning migration role
+for `accounts-migrate`, and a DML-only `LOGIN NOINHERIT` role for
+`accounts-serve`. `accounts-migrate` requires
+`HASNA_ACCOUNTS_RUNTIME_ROLE` to name the server role so it validates and
+reapplies the least-privilege grants.
+The server role must never own the schema or run migrations. See
+[Accounts Storage Stabilization](docs/STORAGE_STABILIZATION.md#database-role-contract)
+for the exact grants and rollout order.
 
 ## Supported tools
 

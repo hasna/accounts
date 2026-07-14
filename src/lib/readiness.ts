@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs";
-import type { Profile, Store, ToolDef } from "../types.js";
-import { getAccountsStorageStatus, loadStore } from "../storage.js";
+import type { Profile, ToolDef } from "../types.js";
+import { accountsHome, loadAppliedMap, profilesDir, storePath } from "../storage.js";
+import { resolveStore, type AccountsStore } from "./store.js";
+import { resolveAccountsCloud } from "./cloud-accounts.js";
 import { claudeProfileAuthHealth, type ClaudeProfileAuthStatus } from "./claude-auth.js";
 import { configsSessionToolFor } from "./configs-prelaunch.js";
 import {
@@ -10,7 +12,6 @@ import {
 } from "./configs-prelaunch-status.js";
 import { detectToolAvailability } from "./login.js";
 import { listSupervisorStates, readSupervisorState, type SupervisorState } from "./supervisor.js";
-import { BUILTIN_TOOLS } from "./tools.js";
 
 export type AccountsReadinessStatus = "ok" | "degraded" | "unavailable";
 
@@ -91,7 +92,10 @@ export interface AccountsSupervisorReadiness {
 
 export interface AccountsStorageReadiness {
   status: AccountsReadinessStatus;
-  mode: string;
+  /** `local` (on-box JSON registry) or `self_hosted` (cloud HTTP `/v1` API). */
+  mode: "local" | "self_hosted";
+  /** Store transport in effect: `local` (fs) or `api` (contracts HTTP client). */
+  transport: "local" | "api";
   configured: boolean;
   local: {
     home: string;
@@ -99,12 +103,9 @@ export interface AccountsStorageReadiness {
     profilesDir: string;
     storeExists: boolean;
   };
-  sync: {
-    remoteConfigured: boolean;
-    bucketEnv: string;
-    prefix: string;
-    regionEnv: string;
-    endpointConfigured: boolean;
+  /** Present only in api mode: the `<url>/v1` base the client reads/writes. */
+  api?: {
+    baseUrl: string;
   };
   reasons: string[];
   nextActions: string[];
@@ -127,6 +128,8 @@ export interface AccountsReadiness {
 export interface AccountsReadinessOptions {
   env?: NodeJS.ProcessEnv;
   now?: Date;
+  /** Registry store to route reads through (defaults to `resolveStore(env)`). */
+  store?: AccountsStore;
 }
 
 function rank(status: AccountsReadinessStatus): number {
@@ -152,13 +155,6 @@ function check(
   nextActions: string[] = [],
 ): AccountsReadinessCheck {
   return { id, label, status, summary, reasons: unique(reasons), nextActions: unique(nextActions) };
-}
-
-function toolsFromStore(store: Store): ToolDef[] {
-  const byId = new Map<string, ToolDef>();
-  for (const tool of BUILTIN_TOOLS) byId.set(tool.id, tool);
-  for (const tool of store.tools) byId.set(tool.id, tool);
-  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function processAlive(pid: number): boolean {
@@ -230,7 +226,8 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
 function profileReadiness(
   profile: Profile,
   tool: ToolDef | undefined,
-  store: Store,
+  current: Record<string, string>,
+  applied: Record<string, string>,
   providerStatus: AccountsReadinessStatus,
 ): AccountsProfileReadiness {
   const dirExists = existsSync(profile.dir);
@@ -261,8 +258,8 @@ function profileReadiness(
     name: profile.name,
     tool: profile.tool,
     status: worst(statuses),
-    active: store.current[profile.tool] === profile.name,
-    applied: store.applied[profile.tool] === profile.name,
+    active: current[profile.tool] === profile.name,
+    applied: applied[profile.tool] === profile.name,
     emailRecorded: Boolean(profile.email),
     dir: { exists: dirExists },
     login,
@@ -284,12 +281,13 @@ function profileReadiness(
 function providerReadiness(
   tool: ToolDef,
   profiles: Profile[],
-  store: Store,
+  current: Record<string, string>,
+  appliedMap: Record<string, string>,
   env: NodeJS.ProcessEnv,
 ): AccountsProviderReadiness {
   const availability = detectToolAvailability(tool, env);
-  const activeProfile = store.current[tool.id];
-  const applied = store.applied[tool.id];
+  const activeProfile = current[tool.id];
+  const applied = appliedMap[tool.id];
   const required = profiles.length > 0 || Boolean(activeProfile) || Boolean(applied);
   const status: AccountsReadinessStatus = availability.available || !required ? "ok" : "unavailable";
   const reasons = availability.available
@@ -362,40 +360,54 @@ function supervisorReadiness(toolId: string, state: SupervisorState | undefined,
 }
 
 function storageReadiness(env: NodeJS.ProcessEnv): AccountsStorageReadiness {
-  const storage = getAccountsStorageStatus(env);
-  const reasons: string[] = [];
-  const nextActions: string[] = [];
-  let status: AccountsReadinessStatus = "ok";
+  const local = {
+    home: accountsHome(),
+    storePath: storePath(),
+    profilesDir: profilesDir(),
+    storeExists: existsSync(storePath()),
+  };
 
-  if (!storage.remote.configured && storage.mode !== "local") {
-    status = "unavailable";
-    reasons.push(`${storage.mode} storage mode requires an S3 bucket`);
-    nextActions.push(`Set ${storage.remote.bucketEnv} before using ${storage.mode} storage mode.`);
-  } else if (!storage.remote.configured) {
-    status = "degraded";
-    reasons.push("remote storage sync is not configured; state is local-only");
-    nextActions.push(`Set ${storage.remote.bucketEnv} if this machine should sync account state through S3.`);
+  let cloud: ReturnType<typeof resolveAccountsCloud> | undefined;
+  try {
+    cloud = resolveAccountsCloud(env);
+  } catch (err) {
+    // Cloud was requested but is misconfigured (e.g. URL without a key). Surface
+    // it without leaking the key or a raw stack trace.
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      status: "unavailable",
+      mode: "self_hosted",
+      transport: "api",
+      configured: false,
+      local,
+      reasons: [`self_hosted storage is misconfigured: ${message}`],
+      nextActions: [
+        "Set both HASNA_ACCOUNTS_API_URL and HASNA_ACCOUNTS_API_KEY, or unset them to use local storage.",
+      ],
+    };
+  }
+
+  if (cloud.transport === "cloud-http") {
+    return {
+      status: "ok",
+      mode: "self_hosted",
+      transport: "api",
+      configured: true,
+      local,
+      api: { baseUrl: cloud.api.baseUrl },
+      reasons: [],
+      nextActions: [],
+    };
   }
 
   return {
-    status,
-    mode: storage.mode,
-    configured: storage.configured,
-    local: {
-      home: storage.local.home,
-      storePath: storage.local.storePath,
-      profilesDir: storage.local.profilesDir,
-      storeExists: existsSync(storage.local.storePath),
-    },
-    sync: {
-      remoteConfigured: storage.remote.configured,
-      bucketEnv: storage.remote.bucketEnv,
-      prefix: storage.remote.prefix,
-      regionEnv: storage.remote.regionEnv,
-      endpointConfigured: storage.remote.endpointConfigured,
-    },
-    reasons,
-    nextActions,
+    status: "ok",
+    mode: "local",
+    transport: "local",
+    configured: true,
+    local,
+    reasons: [],
+    nextActions: [],
   };
 }
 
@@ -407,7 +419,7 @@ function degradedModesFrom(readiness: {
 }): string[] {
   const modes: string[] = [];
   if (readiness.storage.status !== "ok") {
-    modes.push(readiness.storage.status === "unavailable" ? "storage.remote_missing" : "storage.local_only");
+    modes.push("storage.misconfigured");
   }
   for (const provider of readiness.providers) {
     if (provider.status !== "ok") modes.push(`provider.${provider.id}.unavailable`);
@@ -431,7 +443,7 @@ function unavailableReadiness(generatedAt: string, env: NodeJS.ProcessEnv, err: 
   const storage = storageReadiness(env);
   const checks = [
     check("store", "Profile registry", "unavailable", "accounts store could not be loaded", [message], ["Fix the accounts store JSON before checking readiness again."]),
-    check("storage", "Storage sync", storage.status, storage.status === "ok" ? "storage is configured" : "storage has degraded sync", storage.reasons, storage.nextActions),
+    check("storage", "Registry storage", storage.status, storage.status === "ok" ? `registry storage is ${storage.mode}` : "registry storage is misconfigured", storage.reasons, storage.nextActions),
   ];
   const status = worst(checks.map((item) => item.status));
   return {
@@ -444,39 +456,55 @@ function unavailableReadiness(generatedAt: string, env: NodeJS.ProcessEnv, err: 
     providers: [],
     supervisors: [],
     storage,
-    degradedModes: unique(["store.unreadable", ...(storage.status !== "ok" ? ["storage.local_only"] : [])]),
+    degradedModes: unique(["store.unreadable", ...(storage.status !== "ok" ? ["storage.misconfigured"] : [])]),
     nextActions: unique(checks.flatMap((item) => item.nextActions)),
   };
 }
 
-export function getAccountsReadiness(opts: AccountsReadinessOptions = {}): AccountsReadiness {
+export async function getAccountsReadiness(opts: AccountsReadinessOptions = {}): Promise<AccountsReadiness> {
   const env = opts.env ?? process.env;
   const generatedAt = (opts.now ?? new Date()).toISOString();
 
-  let store: Store;
+  // Route the shared registry (profiles, custom tools, and the cloud-owned
+  // `current` selection) through the Store so api mode reads the cloud, not a
+  // stale local file. `applied` is genuinely machine-local (which profile's
+  // auth is restored to the tool's live paths on THIS box), so it is read from
+  // the on-box registry regardless of mode.
+  let allProfiles: Profile[];
+  let tools: ToolDef[];
+  let current: Record<string, string>;
+  let applied: Record<string, string>;
   try {
-    store = loadStore();
+    const store = opts.store ?? resolveStore(env);
+    const [listedProfiles, listedTools, currentEntries] = await Promise.all([
+      store.listProfiles(),
+      store.listTools(),
+      store.listCurrent(),
+    ]);
+    allProfiles = listedProfiles;
+    tools = listedTools;
+    current = Object.fromEntries(currentEntries.map((entry) => [entry.tool, entry.name]));
+    applied = loadAppliedMap();
   } catch (err) {
     return unavailableReadiness(generatedAt, env, err);
   }
 
-  const tools = toolsFromStore(store);
   const toolById = new Map(tools.map((tool) => [tool.id, tool]));
   const profilesByTool = new Map<string, Profile[]>();
-  for (const profile of store.profiles) {
+  for (const profile of allProfiles) {
     const profiles = profilesByTool.get(profile.tool) ?? [];
     profiles.push(profile);
     profilesByTool.set(profile.tool, profiles);
   }
 
-  const providers = tools.map((tool) => providerReadiness(tool, profilesByTool.get(tool.id) ?? [], store, env));
+  const providers = tools.map((tool) => providerReadiness(tool, profilesByTool.get(tool.id) ?? [], current, applied, env));
   const providerStatusById = new Map(providers.map((provider) => [provider.id, provider.status]));
-  const profiles = store.profiles
+  const profiles = allProfiles
     .slice()
     .sort((a, b) => a.tool.localeCompare(b.tool) || a.name.localeCompare(b.name))
-    .map((profile) => profileReadiness(profile, toolById.get(profile.tool), store, providerStatusById.get(profile.tool) ?? "unavailable"));
+    .map((profile) => profileReadiness(profile, toolById.get(profile.tool), current, applied, providerStatusById.get(profile.tool) ?? "unavailable"));
 
-  const activeOrAppliedTools = unique([...Object.keys(store.current), ...Object.keys(store.applied)]);
+  const activeOrAppliedTools = unique([...Object.keys(current), ...Object.keys(applied)]);
   const supervisorToolIds = unique([
     ...activeOrAppliedTools,
     ...listSupervisorStates().map((state) => state.tool),
@@ -513,9 +541,9 @@ export function getAccountsReadiness(opts: AccountsReadinessOptions = {}): Accou
     ),
     check(
       "storage",
-      "Storage sync",
+      "Registry storage",
       storage.status,
-      storage.status === "ok" ? "storage sync is configured" : "storage sync is degraded",
+      storage.status === "ok" ? `registry storage is ${storage.mode}` : "registry storage is misconfigured",
       storage.reasons,
       storage.nextActions,
     ),

@@ -2,7 +2,6 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:os";
 import type { Profile } from "../types.js";
-import { listProfiles } from "./profiles.js";
 import { getTool } from "./tools.js";
 
 export type AgentEntry = Record<string, unknown>;
@@ -169,6 +168,13 @@ function readProcessEnvVar(pid: number, envVar: string): string | undefined {
 }
 
 export interface ListAgentsOptions {
+  /**
+   * Registered profiles for the tool, resolved by the caller through the Store
+   * (`resolveStore().listProfiles(tool)`). This module never reads the local
+   * registry directly, so in self_hosted/cloud mode the cloud registry drives
+   * the listing. Defaults to none.
+   */
+  profiles?: ProfileLike[];
   tool?: string;
   profile?: string;
   backgroundOnly?: boolean;
@@ -192,7 +198,7 @@ export function listAgentsAcrossProfiles(opts: ListAgentsOptions = {}): ProfileA
   const runner = opts.runner ?? runClaudeAgentsJson;
   const tool = getTool(toolId);
 
-  const registered = listProfiles(toolId);
+  const registered = (opts.profiles ?? []).filter((p) => p.tool === toolId);
   const entries: ProfileLike[] = [...registered];
   const defaultDir = opts.defaultDir ?? tool.defaultDir;
   if (defaultDir && !registered.some((p) => p.dir === defaultDir) && existsSync(defaultDir)) {

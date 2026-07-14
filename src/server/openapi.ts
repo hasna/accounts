@@ -146,15 +146,54 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           required: ["name"],
           properties: { name: { type: "string" } },
         },
+        RenameAccountInput: {
+          type: "object",
+          required: ["name"],
+          properties: { name: { type: "string" } },
+        },
         Tool: {
+          // WIRE-ADDITIVE: the deployed (0.1.x) server returned Tool objects with
+          // only `id`/`label` guaranteed (required) plus `envVar`/`bin`/`builtin`.
+          // The refactored server returns the full ToolDef, but the response
+          // contract must remain a strict SUPERSET of the deployed one so old
+          // /v1 clients keep working — therefore the extra ToolDef fields are
+          // documented as OPTIONAL and `required` stays exactly ["id","label"].
           type: "object",
           required: ["id", "label"],
           properties: {
             id: { type: "string" },
             label: { type: "string" },
             envVar: { type: "string" },
+            extraEnv: { type: "object", additionalProperties: { type: "string" } },
+            defaultDir: { type: "string" },
             bin: { type: "string" },
+            loginArgs: { type: "array", items: { type: "string" } },
+            loginHint: { type: "string" },
+            resumeArgs: { type: "array", items: { type: "string" } },
+            permissionArgs: { type: "object", additionalProperties: { type: "array", items: { type: "string" } } },
+            launchArgs: { type: "array", items: { type: "string" } },
+            accountFile: { type: "string" },
+            emailPath: { type: "array", items: { type: "string" } },
             builtin: { type: "boolean" },
+          },
+        },
+        ToolDefInput: {
+          type: "object",
+          required: ["id", "label", "envVar", "defaultDir", "bin"],
+          properties: {
+            id: { type: "string" },
+            label: { type: "string" },
+            envVar: { type: "string" },
+            extraEnv: { type: "object", additionalProperties: { type: "string" } },
+            defaultDir: { type: "string" },
+            bin: { type: "string" },
+            loginArgs: { type: "array", items: { type: "string" } },
+            loginHint: { type: "string" },
+            resumeArgs: { type: "array", items: { type: "string" } },
+            permissionArgs: { type: "object", additionalProperties: { type: "array", items: { type: "string" } } },
+            launchArgs: { type: "array", items: { type: "string" } },
+            accountFile: { type: "string" },
+            emailPath: { type: "array", items: { type: "string" } },
           },
         },
         ToolList: {
@@ -257,6 +296,24 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           },
         },
       },
+      "/v1/accounts/{tool}/{name}/rename": {
+        post: {
+          operationId: "renameAccount",
+          summary: "Rename an account",
+          security: [{ apiKey: [] }],
+          parameters: [
+            { name: "tool", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: jsonBody(ref("RenameAccountInput")),
+          responses: {
+            "200": jsonResponse("Renamed", ref("Account")),
+            "404": jsonResponse("Not found", ref("ErrorResponse")),
+            "409": jsonResponse("Already exists", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
       "/v1/current": {
         get: {
           operationId: "listCurrent",
@@ -300,6 +357,31 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           security: [{ apiKey: [] }],
           responses: {
             "200": jsonResponse("Tools", ref("ToolList")),
+            ...errorResponses,
+          },
+        },
+        post: {
+          operationId: "addTool",
+          summary: "Register a custom tool",
+          security: [{ apiKey: [] }],
+          requestBody: jsonBody(ref("ToolDefInput")),
+          responses: {
+            "201": jsonResponse("Registered", ref("Tool")),
+            "409": jsonResponse("Built-in tool id", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
+      "/v1/tools/{id}": {
+        delete: {
+          operationId: "removeTool",
+          summary: "Remove a custom tool",
+          security: [{ apiKey: [] }],
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: {
+            "204": { description: "Removed" },
+            "404": jsonResponse("Not found", ref("ErrorResponse")),
+            "409": jsonResponse("Built-in tool id", ref("ErrorResponse")),
             ...errorResponses,
           },
         },

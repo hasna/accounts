@@ -30,7 +30,8 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 
 | Path | Role |
 |------|------|
-| `src/storage.ts` | `ACCOUNTS_HOME`, load/save store, sanitize stale pointers |
+| `src/storage.ts` | `ACCOUNTS_HOME`, atomic temp+rename saves, pruned local reads, raw machine-pointer reads |
+| `src/lib/store.ts` | Local/API registry routing, cloud custom-tool hydration, API path cleanup |
 | `src/lib/profiles.ts` | CRUD, profile metadata/identity/card-last4 validation, `useProfile` → `current`, rename/remove pointer hygiene |
 | `src/lib/tools.ts` | Built-in and custom tool registry |
 | `src/lib/env.ts` | Per-tool env rendering (`{profileDir}`, `{profileName}`, `{toolId}` templates), including Claude channel state |
@@ -79,6 +80,15 @@ private identity documents in `metadata`.
 bun test
 bun run typecheck
 bun run build
+bun run contracts:no-cloud-scan
+bun run conformance
+ACCOUNTS_REQUIRE_POSTGRES=1 HASNA_ACCOUNTS_TEST_DATABASE_URL=<isolated-test-db> bun run test:postgres
 ```
 
 Use isolated `ACCOUNTS_HOME` and `ACCOUNTS_TEST_LIVE_DIR` in every test (`accounts.test.ts`, `switcher.test.ts`).
+PostgreSQL tests create and drop random owner/runtime roles plus a random
+schema. Migrations run as the non-superuser schema owner; server and raw legacy
+SQL operations reconnect through the documented DML-only runtime grants. CI
+provides a disposable PostgreSQL service and treats role separation,
+migration/concurrency coverage, and the checksum-pinned full-PR-range gitleaks
+scan as required.
