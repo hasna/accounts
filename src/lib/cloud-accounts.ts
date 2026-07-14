@@ -22,7 +22,7 @@
 // inside the contracts transport.
 
 import type { Profile, ToolDef } from "../types.js";
-import { AccountsError } from "../types.js";
+import { AccountsError, toolDefSchema } from "../types.js";
 import { resolveStorageClient, type HasnaStorageClient } from "@hasna/contracts";
 
 const APP_SLUG = "accounts";
@@ -72,8 +72,11 @@ export interface CloudUpdateInput {
   lastUsedAt?: string;
 }
 
-/** A tool as returned by `GET /v1/tools` — a full ToolDef plus a builtin flag. */
-export type CloudTool = ToolDef & { builtin: boolean };
+/**
+ * Tool payload accepted from GET /v1/tools. Older servers only guaranteed
+ * id/label, so all enriched ToolDef fields and builtin remain optional on read.
+ */
+export type CloudTool = Pick<ToolDef, "id" | "label"> & Partial<ToolDef> & { builtin?: boolean };
 
 /** Registry surface backed by `<API_URL>/v1`. */
 export interface AccountsCloudApi {
@@ -290,7 +293,11 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       try {
         const created = await t.post<CloudTool>("/tools", def);
         const { builtin: _builtin, ...toolDef } = created;
-        return toolDef;
+        const parsed = toolDefSchema.safeParse(toolDef);
+        if (!parsed.success) {
+          throw new AccountsError("accounts-serve returned an invalid custom tool after creation");
+        }
+        return parsed.data;
       } catch (err) {
         if (isEndpointMissing(err)) throw endpointMissingError("accounts tools add");
         throw err;

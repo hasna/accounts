@@ -11,16 +11,21 @@ import {
 } from "./lib/codex-app-menu.js";
 
 let home: string;
+let previousStorageMode: string | undefined;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-menu-test-"));
+  previousStorageMode = process.env.HASNA_ACCOUNTS_STORAGE_MODE;
   process.env.ACCOUNTS_HOME = home;
+  process.env.HASNA_ACCOUNTS_STORAGE_MODE = "local";
   delete process.env.ACCOUNTS_STORE_PATH;
 });
 
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
+  if (previousStorageMode === undefined) delete process.env.HASNA_ACCOUNTS_STORAGE_MODE;
+  else process.env.HASNA_ACCOUNTS_STORAGE_MODE = previousStorageMode;
 });
 
 test("codex app menu state lists profiles with active marker", async () => {

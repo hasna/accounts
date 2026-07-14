@@ -34,8 +34,10 @@ import {
   addCustomTool as localAddCustomTool,
   removeCustomTool as localRemoveCustomTool,
   setCustomToolsCache,
+  clearCustomToolsCache,
   BUILTIN_TOOLS,
 } from "./tools.js";
+import { toolDefSchema } from "../types.js";
 import { detectEmail } from "./detect.js";
 import {
   addProfile as localAdd,
@@ -150,7 +152,9 @@ class ApiStore implements AccountsStore {
   constructor(private readonly api: AccountsCloudApi) {}
 
   async listProfiles(tool?: string): Promise<Profile[]> {
-    return this.api.list(tool);
+    const profiles = await this.api.list(tool);
+    await this.hydrateProfileTools(profiles);
+    return profiles;
   }
 
   async getProfile(name: string, tool?: string): Promise<Profile> {
@@ -159,15 +163,17 @@ class ApiStore implements AccountsStore {
   }
 
   async findProfile(name: string, tool?: string): Promise<Profile | undefined> {
-    return this.api.get(name, tool);
+    const profile = await this.api.get(name, tool);
+    if (profile) await this.hydrateProfileTools([profile]);
+    return profile;
   }
 
   async addProfile(opts: AddOptions): Promise<Profile> {
     const toolId = opts.tool ?? DEFAULT_TOOL;
-    getTool(toolId); // validate tool exists
+    const tool = await this.resolveTool(toolId);
     const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, opts.name);
     mkdirSync(dir, { recursive: true });
-    const email = opts.email ?? detectEmail(dir, getTool(toolId)) ?? undefined;
+    const email = opts.email ?? detectEmail(dir, tool) ?? undefined;
     return this.api.create({
       name: opts.name,
       tool: toolId,
@@ -226,7 +232,9 @@ class ApiStore implements AccountsStore {
   async currentProfile(tool: string): Promise<Profile | undefined> {
     const current = await this.api.getCurrent(tool);
     if (!current) return undefined;
-    return this.api.get(current.name, tool);
+    const profile = await this.api.get(current.name, tool);
+    if (profile) await this.hydrateProfileTools([profile]);
+    return profile;
   }
 
   async listCurrent(): Promise<CurrentEntry[]> {
@@ -236,9 +244,7 @@ class ApiStore implements AccountsStore {
 
   async listTools(): Promise<ToolDef[]> {
     const cloud = await this.api.listTools();
-    const custom = cloud.filter((t) => !t.builtin).map(({ builtin: _b, ...def }) => def as ToolDef);
-    // Refresh the machine-local cache so synchronous getTool/listTools (used by
-    // launch/apply/detect) can resolve cloud-registered tools on this machine.
+    const custom = this.customToolsFrom(cloud);
     setCustomToolsCache(custom);
     const byId = new Map<string, ToolDef>();
     for (const t of BUILTIN_TOOLS) byId.set(t.id, t);
@@ -249,7 +255,7 @@ class ApiStore implements AccountsStore {
   async addTool(def: ToolDef): Promise<ToolDef> {
     if (isBuiltinTool(def.id)) throw new AccountsError(`"${def.id}" is a built-in tool and cannot be redefined`);
     const created = await this.api.createTool(def);
-    // Write through to the machine-local cache so this machine can launch it now.
+    // Write through to the process cache so this process can launch it now.
     await this.refreshToolCache();
     return created;
   }
@@ -260,11 +266,35 @@ class ApiStore implements AccountsStore {
     await this.refreshToolCache();
   }
 
-  /** Pull the cloud custom-tool set into the machine-local resolution cache. */
+  /** Pull the cloud custom-tool set into the process-local resolution cache. */
   private async refreshToolCache(): Promise<void> {
     const cloud = await this.api.listTools();
-    const custom = cloud.filter((t) => !t.builtin).map(({ builtin: _b, ...def }) => def as ToolDef);
-    setCustomToolsCache(custom);
+    setCustomToolsCache(this.customToolsFrom(cloud));
+  }
+
+  private customToolsFrom(cloud: Awaited<ReturnType<AccountsCloudApi["listTools"]>>): ToolDef[] {
+    const custom: ToolDef[] = [];
+    for (const item of cloud) {
+      if (item.builtin !== false) continue;
+      const { builtin: _builtin, ...definition } = item;
+      const parsed = toolDefSchema.safeParse(definition);
+      if (!parsed.success) {
+        throw new AccountsError(
+          `invalid custom tool "${item.id}" returned by accounts-serve: ${parsed.error.issues.map((issue) => issue.message).join("; ")}`,
+        );
+      }
+      custom.push(parsed.data);
+    }
+    return custom;
+  }
+
+  private async resolveTool(toolId: string): Promise<ToolDef> {
+    if (!isBuiltinTool(toolId)) await this.refreshToolCache();
+    return getTool(toolId);
+  }
+
+  private async hydrateProfileTools(profiles: readonly Profile[]): Promise<void> {
+    if (profiles.some((profile) => !isBuiltinTool(profile.tool))) await this.refreshToolCache();
   }
 
   /** Resolve a profile by name (+optional tool), mirroring local error text. */
@@ -272,6 +302,7 @@ class ApiStore implements AccountsStore {
     if (tool) {
       const profile = await this.api.get(name, tool);
       if (!profile) throw new AccountsError(`no profile named "${name}" for tool "${tool}". Run \`accounts list\` to see profiles.`);
+      await this.hydrateProfileTools([profile]);
       return profile;
     }
     const matches = (await this.api.list()).filter((p) => p.name === name);
@@ -283,7 +314,9 @@ class ApiStore implements AccountsStore {
         `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
       );
     }
-    return matches[0]!;
+    const profile = matches[0]!;
+    await this.hydrateProfileTools([profile]);
+    return profile;
   }
 }
 
@@ -298,5 +331,6 @@ export function resolveStore(
 ): AccountsStore {
   const cloud = resolveAccountsCloud(env, overrides);
   if (cloud.transport === "cloud-http") return new ApiStore(cloud.api);
+  clearCustomToolsCache();
   return new LocalStore();
 }

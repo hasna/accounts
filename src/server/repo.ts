@@ -7,7 +7,7 @@
 // requires the account to exist and stamps last_used_at.
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
-import type { TypedQueryClient } from "../generated/storage-kit/index.js";
+import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
 import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
 
 export interface Account {
@@ -99,7 +99,7 @@ function rowToAccount(row: AccountRow): Account {
 }
 
 export class AccountsRepo implements AccountsStore {
-  constructor(private readonly client: TypedQueryClient) {}
+  constructor(private readonly client: PoolQueryClient) {}
 
   async list(tool?: string): Promise<Account[]> {
     const rows = tool
@@ -112,7 +112,11 @@ export class AccountsRepo implements AccountsStore {
   }
 
   async get(tool: string, name: string): Promise<Account | null> {
-    const row = await this.client.get<AccountRow>(
+    return this.getWith(this.client, tool, name);
+  }
+
+  private async getWith(client: TypedQueryClient, tool: string, name: string): Promise<Account | null> {
+    const row = await client.get<AccountRow>(
       "SELECT * FROM accounts WHERE tool = $1 AND name = $2",
       [tool, name],
     );
@@ -179,36 +183,38 @@ export class AccountsRepo implements AccountsStore {
   }
 
   async rename(tool: string, oldName: string, newName: string): Promise<Account> {
-    const existing = await this.get(tool, oldName);
-    if (!existing) throw new AccountsError(`no profile named "${oldName}" for tool "${tool}"`);
-    if (oldName !== newName) {
-      const dupe = await this.get(tool, newName);
-      if (dupe) throw new AccountsError(`a ${tool} profile named "${newName}" already exists`);
-    }
-    const row = await this.client.one<AccountRow>(
-      "UPDATE accounts SET name = $1 WHERE tool = $2 AND name = $3 RETURNING *",
-      [newName, tool, oldName],
-    );
-    // Keep the current selection pointing at the renamed account.
-    await this.client.execute(
-      "UPDATE current_selections SET name = $1 WHERE tool = $2 AND name = $3",
-      [newName, tool, oldName],
-    );
-    return rowToAccount(row);
+    return this.client.transaction(async (client) => {
+      const existing = await this.getWith(client, tool, oldName);
+      if (!existing) throw new AccountsError(`no profile named "${oldName}" for tool "${tool}"`);
+      if (oldName !== newName) {
+        const dupe = await this.getWith(client, tool, newName);
+        if (dupe) throw new AccountsError(`a ${tool} profile named "${newName}" already exists`);
+      }
+      const row = await client.one<AccountRow>(
+        "UPDATE accounts SET name = $1 WHERE tool = $2 AND name = $3 RETURNING *",
+        [newName, tool, oldName],
+      );
+      await client.execute(
+        "UPDATE current_selections SET name = $1 WHERE tool = $2 AND name = $3",
+        [newName, tool, oldName],
+      );
+      return rowToAccount(row);
+    });
   }
 
   async remove(tool: string, name: string): Promise<boolean> {
-    const result = await this.client.query<AccountRow>(
-      "DELETE FROM accounts WHERE tool = $1 AND name = $2 RETURNING tool",
-      [tool, name],
-    );
-    if (result.rowCount === 0) return false;
-    // Clear the current selection if it pointed at the removed account.
-    await this.client.execute(
-      "DELETE FROM current_selections WHERE tool = $1 AND name = $2",
-      [tool, name],
-    );
-    return true;
+    return this.client.transaction(async (client) => {
+      const result = await client.query<AccountRow>(
+        "DELETE FROM accounts WHERE tool = $1 AND name = $2 RETURNING tool",
+        [tool, name],
+      );
+      if (result.rowCount === 0) return false;
+      await client.execute(
+        "DELETE FROM current_selections WHERE tool = $1 AND name = $2",
+        [tool, name],
+      );
+      return true;
+    });
   }
 
   async listCurrent(): Promise<CurrentSelection[]> {
@@ -227,20 +233,22 @@ export class AccountsRepo implements AccountsStore {
   }
 
   async setCurrent(tool: string, name: string): Promise<CurrentSelection> {
-    const account = await this.get(tool, name);
-    if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
-    await this.client.execute("UPDATE accounts SET last_used_at = now() WHERE tool = $1 AND name = $2", [
-      tool,
-      name,
-    ]);
-    const row = await this.client.one<{ tool: string; name: string; updated_at: string | Date }>(
-      `INSERT INTO current_selections (tool, name, updated_at)
-       VALUES ($1, $2, now())
-       ON CONFLICT (tool) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
-       RETURNING tool, name, updated_at`,
-      [tool, name],
-    );
-    return { tool: row.tool, name: row.name, updatedAt: iso(row.updated_at)! };
+    return this.client.transaction(async (client) => {
+      const account = await this.getWith(client, tool, name);
+      if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+      await client.execute("UPDATE accounts SET last_used_at = now() WHERE tool = $1 AND name = $2", [
+        tool,
+        name,
+      ]);
+      const row = await client.one<{ tool: string; name: string; updated_at: string | Date }>(
+        `INSERT INTO current_selections (tool, name, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (tool) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
+         RETURNING tool, name, updated_at`,
+        [tool, name],
+      );
+      return { tool: row.tool, name: row.name, updatedAt: iso(row.updated_at)! };
+    });
   }
 
   async listCustomTools(): Promise<ToolDef[]> {

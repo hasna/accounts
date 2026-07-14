@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveStore } from "./lib/store.js";
+import { resolveSupervisorLaunch } from "./lib/supervisor.js";
+import { clearCustomToolsCache, getTool } from "./lib/tools.js";
 
 const BASE = "https://accounts.hasna.xyz";
 const KEY = "hasna_accounts_testkey_0000";
@@ -79,6 +81,7 @@ describe("ApiStore routes registry ops to /v1", () => {
       delete process.env.ACCOUNTS_STORE_PATH;
     });
     afterEach(() => {
+      clearCustomToolsCache();
       rmSync(home, { recursive: true, force: true });
       delete process.env.ACCOUNTS_HOME;
     });
@@ -120,6 +123,90 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(calls.some((c) => c.method === "GET" && c.url === `${BASE}/v1/tools`)).toBe(true);
       expect(tools.some((t) => t.id === "acme")).toBe(true);
       expect(tools.some((t) => t.id === "claude")).toBe(true);
+    });
+
+    test("new client accepts an old server's minimal builtin Tool response", async () => {
+      const { fetchImpl } = mockFetch(() => ({
+        status: 200,
+        body: { tools: [{ id: "claude", label: "Claude Code", builtin: true }] },
+      }));
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const claude = (await store.listTools()).find((tool) => tool.id === "claude");
+      expect(claude?.envVar).toBe("CLAUDE_CONFIG_DIR");
+      expect(claude?.defaultDir).toBeDefined();
+      expect(existsSync(join(home, "accounts.json"))).toBe(false);
+    });
+
+    test("listTools hydrates custom tools without creating accounts.json", async () => {
+      const { fetchImpl } = mockFetch(() => ({
+        status: 200,
+        body: { tools: [{ ...acme, builtin: false }] },
+      }));
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      expect(existsSync(join(home, "accounts.json"))).toBe(false);
+      expect((await store.listTools()).some((tool) => tool.id === "acme")).toBe(true);
+      expect(getTool("acme").bin).toBe("acme");
+      expect(existsSync(join(home, "accounts.json"))).toBe(false);
+    });
+
+    test("cold add hydrates a cloud custom tool before validation", async () => {
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.method === "GET" && c.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        }
+        if (c.method === "POST" && c.url.endsWith("/accounts")) {
+          return {
+            status: 201,
+            body: { tool: "acme", name: "work", dir: join(home, "profiles", "acme", "work"), createdAt: "2020-01-01T00:00:00Z" },
+          };
+        }
+        return { status: 404, body: { error: "not found" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const profile = await store.addProfile({ name: "work", tool: "acme" });
+      expect(profile.tool).toBe("acme");
+      expect(calls.map((c) => c.method + " " + new URL(c.url).pathname)).toEqual([
+        "GET /v1/tools",
+        "POST /v1/accounts",
+      ]);
+    });
+
+    test("cold custom-profile lookup hydrates launch resolution", async () => {
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/accounts/acme/work")) {
+          return {
+            status: 200,
+            body: { tool: "acme", name: "work", dir: join(home, "profiles", "acme", "work"), createdAt: "2020-01-01T00:00:00Z" },
+          };
+        }
+        if (c.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        }
+        return { status: 404, body: { error: "not found" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const plan = await resolveSupervisorLaunch("work", { tool: "acme" }, store);
+      expect(plan.tool.id).toBe("acme");
+      expect(plan.tool.bin).toBe("acme");
+      expect(calls.map((c) => new URL(c.url).pathname)).toEqual([
+        "/v1/accounts/acme/work",
+        "/v1/tools",
+      ]);
+    });
+
+    test("switching from cloud to explicit local mode clears remote tool state", async () => {
+      const { fetchImpl } = mockFetch(() => ({
+        status: 200,
+        body: { tools: [{ ...acme, builtin: false }] },
+      }));
+      const cloudStore = resolveStore(cloudEnv, { fetchImpl });
+      expect((await cloudStore.listTools()).some((tool) => tool.id === "acme")).toBe(true);
+
+      const localStore = resolveStore({
+        ACCOUNTS_HOME: home,
+        HASNA_ACCOUNTS_STORAGE_MODE: "local",
+      } as NodeJS.ProcessEnv);
+      expect((await localStore.listTools()).some((tool) => tool.id === "acme")).toBe(false);
     });
   });
 });

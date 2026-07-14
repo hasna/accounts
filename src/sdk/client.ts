@@ -28,7 +28,7 @@ export interface SetCurrentInput { "name": string }
 
 export interface RenameAccountInput { "name": string }
 
-export interface Tool { "id": string; "label": string; "envVar": string; "extraEnv"?: Record<string, string>; "defaultDir": string; "bin": string; "loginArgs"?: Array<string>; "loginHint"?: string; "resumeArgs"?: Array<string>; "permissionArgs"?: Record<string, Array<string>>; "launchArgs"?: Array<string>; "accountFile"?: string; "emailPath"?: Array<string>; "builtin"?: boolean }
+export interface Tool { "id": string; "label": string; "envVar"?: string; "extraEnv"?: Record<string, string>; "defaultDir"?: string; "bin"?: string; "loginArgs"?: Array<string>; "loginHint"?: string; "resumeArgs"?: Array<string>; "permissionArgs"?: Record<string, Array<string>>; "launchArgs"?: Array<string>; "accountFile"?: string; "emailPath"?: Array<string>; "builtin"?: boolean }
 
 export interface ToolDefInput { "id": string; "label": string; "envVar": string; "extraEnv"?: Record<string, string>; "defaultDir": string; "bin": string; "loginArgs"?: Array<string>; "loginHint"?: string; "resumeArgs"?: Array<string>; "permissionArgs"?: Record<string, Array<string>>; "launchArgs"?: Array<string>; "accountFile"?: string; "emailPath"?: Array<string> }
 
