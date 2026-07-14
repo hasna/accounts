@@ -1,6 +1,6 @@
 {
   "name": "@hasna/accounts",
-  "version": "0.1.33",
+  "version": "0.2.8",
   "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally — isolated config dirs, per-account email, one-command switching.",
   "type": "module",
   "main": "dist/index.js",
@@ -76,11 +76,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hasna/accounts.git"
+    "url": "git+https://github.com/hasna/accounts-legacy.git"
   },
-  "homepage": "https://github.com/hasna/accounts",
+  "homepage": "https://github.com/hasna/accounts-legacy",
   "bugs": {
-    "url": "https://github.com/hasna/accounts/issues"
+    "url": "https://github.com/hasna/accounts-legacy/issues"
   },
   "engines": {
     "node": ">=18",

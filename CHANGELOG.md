@@ -6,6 +6,29 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-14
+
+### Added
+
+- `accounts launch` and `accounts run` now support Claude-only worker modes:
+  `--headless` for a foreground `claude -p` invocation, and
+  `--background`/`--bg` with an optional `--name` for a detached, supervisor
+  backed session. Background state records the generated or explicit session
+  id, name, working directory, terminal status, and exit code.
+
+### Fixed
+
+- Reject conflicting convenience and raw Claude mode flags before prelaunch,
+  profile selection, or process launch. Noninteractive invocations do not
+  update the active-profile selection or inherit `ACCOUNTS_ACTIVE`.
+- `accounts supervisor stop claude` clears a completed background state after
+  its terminal status has been inspected.
+
+### Changed
+
+- Release provenance now identifies the source repository as
+  `hasna/accounts-legacy`. This source release is prepared as
+  `@hasna/accounts@0.2.8`; it has not been published or tagged.
 
 ### Changed
 

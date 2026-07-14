@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, join } from "node:path";
+import type { Writable } from "node:stream";
 import { accountsHome, loadAppliedMap } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -13,6 +14,7 @@ import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
 import { getTool } from "./tools.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchOptions, type ConfigsPrelaunchResult } from "./configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./configs-prelaunch-status.js";
+import { redactArgv, redactText } from "./claude-launch.js";
 
 export interface SupervisorState {
   version: 1;
@@ -25,6 +27,14 @@ export interface SupervisorState {
   startedAt: string;
   updatedAt: string;
   prelaunch?: ConfigsPrelaunchSummary;
+  mode?: "foreground" | "background";
+  name?: string;
+  sessionId?: string;
+  cwd?: string;
+  status?: "starting" | "running" | "stopping" | "exited" | "failed";
+  exitCode?: number;
+  signal?: NodeJS.Signals;
+  error?: string;
 }
 
 export type SupervisorRequest =
@@ -58,11 +68,31 @@ export interface RunSupervisorOptions {
   restartDelayMs?: number;
   log?: (message: string) => void;
   configsPrelaunch?: ConfigsPrelaunchOptions;
+  cwd?: string;
+  markActive?: boolean;
+  preserveFinalState?: boolean;
+  background?: { name?: string; sessionId: string };
 }
 
 export interface SupervisorClientOptions {
   timeoutMs?: number;
   allowMissing?: boolean;
+}
+
+export interface BackgroundSupervisorOptions {
+  cwd?: string;
+  name?: string;
+  sessionId: string;
+  timeoutMs?: number;
+}
+
+export interface BackgroundSupervisorPayload {
+  profile: string;
+  tool: string;
+  args: string[];
+  cwd: string;
+  name?: string;
+  sessionId: string;
 }
 
 const STATE_SUFFIX = ".json";
@@ -130,6 +160,10 @@ function writeSupervisorState(state: SupervisorState): void {
 function removeSupervisorFiles(toolId: string): void {
   rmSync(supervisorStatePath(toolId), { force: true });
   if (process.platform !== "win32") rmSync(supervisorSocketPath(toolId), { force: true });
+}
+
+export function clearSupervisorState(toolId: string): void {
+  removeSupervisorFiles(toolId);
 }
 
 function processAlive(pid: number): boolean {
@@ -289,6 +323,101 @@ export async function sendSupervisorRequest(
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function readBackgroundSupervisorPayload(
+  value?: string,
+): BackgroundSupervisorPayload {
+  if (value === undefined) {
+    try {
+      value = readFileSync(3, "utf8");
+    } catch {
+      throw new AccountsError("missing internal background supervisor payload");
+    }
+  }
+  if (!value) throw new AccountsError("missing internal background supervisor payload");
+  let parsed: Partial<BackgroundSupervisorPayload>;
+  try {
+    parsed = JSON.parse(value) as Partial<BackgroundSupervisorPayload>;
+  } catch {
+    throw new AccountsError("invalid internal background supervisor payload");
+  }
+  if (
+    typeof parsed.profile !== "string" ||
+    typeof parsed.tool !== "string" ||
+    !Array.isArray(parsed.args) ||
+    !parsed.args.every((arg) => typeof arg === "string") ||
+    typeof parsed.cwd !== "string" ||
+    typeof parsed.sessionId !== "string"
+  ) {
+    throw new AccountsError("invalid internal background supervisor payload");
+  }
+  return parsed as BackgroundSupervisorPayload;
+}
+
+export async function startBackgroundSupervisor(
+  profile: Profile,
+  tool: ToolDef,
+  args: string[],
+  opts: BackgroundSupervisorOptions,
+): Promise<SupervisorState> {
+  const existing = readSupervisorState(tool.id);
+  if (existing && processAlive(existing.pid)) {
+    throw new AccountsError(`an accounts supervisor for ${tool.label} is already running (pid ${existing.pid})`);
+  }
+  removeSupervisorFiles(tool.id);
+
+  const entrypoint = process.argv[1];
+  if (!entrypoint) throw new AccountsError("could not resolve the accounts CLI entrypoint");
+  const payload: BackgroundSupervisorPayload = {
+    profile: profile.name,
+    tool: tool.id,
+    args,
+    cwd: opts.cwd ?? process.cwd(),
+    ...(opts.name ? { name: opts.name } : {}),
+    sessionId: opts.sessionId,
+  };
+  const { ACCOUNTS_BACKGROUND_PAYLOAD: _legacyPayload, ...parentEnv } = process.env;
+  const child = spawn(process.execPath, [entrypoint, "__background-supervisor"], {
+    cwd: payload.cwd,
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore", "pipe"],
+    env: parentEnv,
+  });
+  const payloadChannel = child.stdio[3] as (Writable & { unref?: () => void }) | null;
+  if (!payloadChannel) {
+    child.kill();
+    throw new AccountsError("could not open the internal background supervisor payload channel");
+  }
+  payloadChannel.end(JSON.stringify(payload));
+  payloadChannel.unref?.();
+  child.unref();
+
+  let launchError: string | undefined;
+  child.once("error", (error) => {
+    launchError = redactText(error.message);
+  });
+  const timeoutMs = opts.timeoutMs ?? 4_000;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (launchError) throw new AccountsError(`failed to start background supervisor: ${launchError}`);
+    const state = readSupervisorState(tool.id);
+    if (state && state.pid === child.pid) {
+      if (state.status === "failed") {
+        throw new AccountsError(`failed to start background Claude: ${state.error ?? "unknown error"}`);
+      }
+      return state;
+    }
+    if (child.exitCode !== null) {
+      throw new AccountsError(`background supervisor exited before startup (exit ${child.exitCode})`);
+    }
+    await sleep(25);
+  }
+  throw new AccountsError(`timed out waiting for the background ${tool.label} supervisor`);
+}
+
 export async function runSupervisedTool(
   initialProfile: Profile,
   tool: ToolDef,
@@ -314,6 +443,11 @@ export async function runSupervisedTool(
   let stopping = false;
   let restarting = false;
   let settled = false;
+  let childStatus: SupervisorState["status"] = "starting";
+  let childExitCode: number | undefined;
+  let childSignal: NodeJS.Signals | undefined;
+  let childError: string | undefined;
+  const cwd = opts.cwd ?? process.cwd();
 
   const state = (): SupervisorState => ({
     version: 1,
@@ -322,10 +456,18 @@ export async function runSupervisedTool(
     pid: process.pid,
     ...(child?.pid ? { childPid: child.pid } : {}),
     socketPath,
-    command: [tool.bin, ...childArgs],
+    command: redactArgv([tool.bin, ...childArgs]),
     startedAt,
     updatedAt: nowIso(),
     prelaunch: getConfigsPrelaunchSummary(profile, tool, configsSessionToolFor(tool)),
+    mode: opts.background ? "background" : "foreground",
+    ...(opts.background?.name ? { name: opts.background.name } : {}),
+    ...(opts.background?.sessionId ? { sessionId: opts.background.sessionId } : {}),
+    cwd,
+    status: childStatus,
+    ...(childExitCode !== undefined ? { exitCode: childExitCode } : {}),
+    ...(childSignal ? { signal: childSignal } : {}),
+    ...(childError ? { error: childError } : {}),
   });
 
   const persist = () => writeSupervisorState(state());
@@ -359,7 +501,11 @@ export async function runSupervisedTool(
 
   const cleanup = () => {
     server.close();
-    removeSupervisorFiles(tool.id);
+    if (opts.preserveFinalState) {
+      if (process.platform !== "win32") rmSync(supervisorSocketPath(tool.id), { force: true });
+    } else {
+      removeSupervisorFiles(tool.id);
+    }
     process.off("SIGINT", onSigint);
     process.off("SIGTERM", onSigterm);
   };
@@ -369,9 +515,13 @@ export async function runSupervisedTool(
     resolveRun = resolve;
   });
 
-  const finishRun = (code: number) => {
+  const finishRun = (code: number, error?: string) => {
     if (settled) return;
     settled = true;
+    childExitCode = code;
+    childError = error ? redactText(error) : childError;
+    childStatus = error ? "failed" : "exited";
+    if (opts.preserveFinalState) persist();
     cleanup();
     resolveRun(code);
   };
@@ -405,27 +555,37 @@ export async function runSupervisedTool(
     // Mark this profile as the tool's active selection through the Store so the
     // shared registry (cloud in api mode) is the single source of truth — never
     // a local-only write that would diverge from the cloud "current".
-    await store.useProfile(profile.name, tool.id);
+    if (opts.markActive !== false) await store.useProfile(profile.name, tool.id);
     const env = profileEnv(profile, tool);
+    const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
     log(`accounts supervisor: starting ${tool.bin} for ${profile.name}`);
     prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
     const proc = spawn(tool.bin, childArgs, {
       stdio: opts.stdio ?? "inherit",
-      env: { ...process.env, ...env, ACCOUNTS_SUPERVISOR: "1", ACCOUNTS_ACTIVE: profile.name },
+      env: {
+        ...(opts.markActive === false ? parentEnv : process.env),
+        ...env,
+        ACCOUNTS_SUPERVISOR: "1",
+        ...(opts.markActive === false ? {} : { ACCOUNTS_ACTIVE: profile.name }),
+      },
       detached: process.platform !== "win32",
+      cwd,
     });
     child = proc;
+    childStatus = "running";
     persist();
 
     proc.once("error", (err) => {
-      log(`accounts supervisor: failed to start ${tool.bin}: ${err.message}`);
-      if (!restarting && !stopping) finishRun(1);
+      const message = redactText(err.message);
+      log(`accounts supervisor: failed to start ${tool.bin}: ${message}`);
+      if (!restarting && !stopping) finishRun(1, message);
     });
 
     proc.once("exit", (code, signal) => {
       if (child === proc) child = undefined;
       persist();
       if (restarting || stopping) return;
+      childSignal = signal ?? undefined;
       finishRun(exitCode(code, signal));
     });
   };
@@ -444,6 +604,8 @@ export async function runSupervisedTool(
   const shutdown = async (code: number): Promise<void> => {
     if (stopping) return;
     stopping = true;
+    childStatus = "stopping";
+    persist();
     await stopChild();
     finishRun(code);
   };
