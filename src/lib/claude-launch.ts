@@ -363,13 +363,19 @@ export async function runClaudeLaunch(
   if (!credential) return relayProcess(tool, args, env, cwd);
 
   const release = await acquireKeychainLock();
+  let pendingSignal: NodeJS.Signals | undefined;
+  const rememberSigint = () => { pendingSignal ??= "SIGINT"; };
+  const rememberSigterm = () => { pendingSignal ??= "SIGTERM"; };
+  process.once("SIGINT", rememberSigint);
+  process.once("SIGTERM", rememberSigterm);
   let prior: ReturnType<typeof captureClaudeKeychain>;
   let keychainTouched = false;
   try {
     prior = captureClaudeKeychain();
     keychainTouched = true;
     writeClaudeKeychain(credential);
-    return await relayProcess(tool, args, env, cwd);
+    const code = await relayProcess(tool, args, env, cwd);
+    return pendingSignal ? signalExitCode(pendingSignal) : code;
   } finally {
     try {
       if (keychainTouched) {
@@ -377,6 +383,8 @@ export async function runClaudeLaunch(
         else clearClaudeKeychain();
       }
     } finally {
+      process.removeListener("SIGINT", rememberSigint);
+      process.removeListener("SIGTERM", rememberSigterm);
       release();
     }
   }

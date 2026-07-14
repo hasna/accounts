@@ -140,6 +140,8 @@ if (command === "add-generic-password") {
   const secret = valueAfter("-w");
   if (!account || !secret) process.exit(64);
   appendFileSync(logPath, JSON.stringify({ operation: "add", account }) + "\\n");
+  const delay = Number(process.env.FAKE_SECURITY_ADD_SLEEP_MS ?? 0);
+  if (delay > 0) await Bun.sleep(delay);
   writeFileSync(statePath, JSON.stringify({ account, secret }), { mode: 0o600 });
   process.exit(0);
 }
@@ -547,6 +549,30 @@ test("SIGTERM is forwarded, returns nonzero, and restores the prior keychain", a
   );
   const result = collect(child);
   await waitFor(() => claudeEntries().length === 1);
+  child.kill("SIGTERM");
+  const completed = await result;
+  expect(completed.code).toBe(143);
+  expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });
+  expect(existsSync(keychainLock)).toBe(false);
+});
+
+test("SIGTERM during keychain mutation still restores the prior credential", async () => {
+  if (process.platform === "win32") return;
+  addProfile("acct", "profile-credential-value");
+  setKeychain("prior", "prior-credential-value");
+  const child = spawnCli(
+    ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "Prompt"],
+    {
+      ACCOUNTS_TEST_KEYCHAIN: "1",
+      ACCOUNTS_TEST_SECURITY_BIN: securityBin,
+      ACCOUNTS_TEST_CHILD_KILL_TIMEOUT_MS: "100",
+      FAKE_SECURITY_ADD_SLEEP_MS: "250",
+      FAKE_IGNORE_TERM: "1",
+      FAKE_SLEEP_MS: "10000",
+    },
+  );
+  const result = collect(child);
+  await waitFor(() => entries(securityLog).some((entry) => entry.operation === "add" && entry.account === "acct"));
   child.kill("SIGTERM");
   const completed = await result;
   expect(completed.code).toBe(143);
