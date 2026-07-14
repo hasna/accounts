@@ -172,6 +172,17 @@ function runCli(args: string[], options: { cwd?: string; env?: Record<string, st
   });
 }
 
+function expectStatus(
+  result: ReturnType<typeof runCli>,
+  expected: number,
+): void {
+  if (result.status !== expected) {
+    throw new Error(
+      `expected status ${expected}, received ${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    );
+  }
+}
+
 function spawnCli(args: string[], env: Record<string, string> = {}): ChildProcess {
   return spawn(process.execPath, ["run", cli, ...args], {
     cwd: launchCwd,
@@ -318,7 +329,7 @@ test("headless launch keeps Claude stdout clean and returns its exit code", () =
     ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--permissions", "dangerous", "--", "Prompt with spaces"],
     { cwd: launchCwd, env: { FAKE_EXIT: "23", ACCOUNTS_ACTIVE: "inherited" } },
   );
-  expect(result.status).toBe(23);
+  expectStatus(result, 23);
   expect(result.stdout).toBe("fake-claude-stdout\n");
   expect(result.stderr).toContain("fake-claude-stderr");
   expect(result.stderr).toContain("claude --dangerously-skip-permissions -p Prompt with spaces");
@@ -337,7 +348,7 @@ test("background convenience relays exact native bg and name argv", () => {
     ["launch", "acct", "--tool", "claude", "--skip-configs", "--background", "--name", "worker-one", "--", "Background prompt"],
     { cwd: launchCwd, env: { FAKE_REQUIRE_BG: "1", FAKE_REQUIRE_NAME: "1" } },
   );
-  expect(result.status).toBe(0);
+  expectStatus(result, 0);
   expect(result.stdout).toBe("fake-claude-stdout\n");
   expect(claudeEntries()[0]).toMatchObject({
     args: ["--bg", "--name", "worker-one", "Background prompt"],
@@ -352,8 +363,8 @@ test("run headless and background bypass the Accounts supervisor", () => {
   const background = runCli([
     "run", "claude", "--profile", "acct", "--skip-configs", "--bg", "--name", "run-worker", "--", "Run background",
   ], { env: { FAKE_REQUIRE_BG: "1", FAKE_REQUIRE_NAME: "1" } });
-  expect(headless.status).toBe(0);
-  expect(background.status).toBe(0);
+  expectStatus(headless, 0);
+  expectStatus(background, 0);
   expect(claudeEntries().map((entry) => entry.args)).toEqual([
     ["-p", "Run prompt"],
     ["--bg", "--name", "run-worker", "Run background"],
@@ -387,7 +398,7 @@ test("only print mode accepts raw output-format json; Accounts has no json mode"
   const supported = runCli([
     "launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "--output-format", "json", "Prompt",
   ]);
-  expect(supported.status).toBe(0);
+  expectStatus(supported, 0);
   expect(claudeEntries()[0]?.args).toEqual(["-p", "--output-format", "json", "Prompt"]);
   const unsupported = runCli(["launch", "acct", "--tool", "claude", "--skip-configs", "--json"]);
   expect(unsupported.status).toBe(1);
@@ -400,7 +411,7 @@ test("diagnostic redaction stays on stderr", () => {
   const result = runCli([
     "launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "--api-key", secret, "Prompt",
   ]);
-  expect(result.status).toBe(0);
+  expectStatus(result, 0);
   expect(result.stdout).toBe("fake-claude-stdout\n");
   expect(result.stderr).toContain("--api-key [REDACTED]");
   expect(result.stderr).not.toContain(secret);
