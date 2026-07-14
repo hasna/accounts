@@ -13,11 +13,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   mutating registry call (`accounts rename`, `accounts tools add`, `accounts
   tools remove`) hits a route-missing `404` (`{ "error": "not found" }`) — the
   signature of a deployed `accounts-serve` build older than the client — the CLI
-  now surfaces an actionable message instructing the operator to redeploy
+  now surfaces an actionable message instructing the operator to update
   `accounts-serve`, instead of a raw HTTP failure. Entity-level `404`s (a real
   "no profile"/"no custom tool") are unchanged and never masked. Local mode is
-  unaffected. (The rename + tools endpoints already exist in `src/server`; the
-  live fix for cloud mode is an ECS redeploy of `accounts-serve` to >= 0.2.4.)
+  unaffected. No package version or deployment target is asserted by this
+  source change.
+
+- Explicit `cloud` and `self_hosted` modes now fail closed when API
+  configuration is incomplete. Cold custom-tool login/import/launch paths
+  hydrate before synchronous lookup.
+- Account rename/remove reconciles raw machine-local pointers. PostgreSQL
+  selection updates are protected by row locks and an additive cascading
+  foreign key migration.
+- Deprecated storage exports and CLI commands remain as compatibility shims;
+  retired provider-backed sync operations fail explicitly.
 
 ## [0.1.32] - 2026-07-06
 

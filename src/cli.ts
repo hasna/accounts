@@ -20,8 +20,16 @@ import {
   type ProfileMetadata,
 } from "./lib/profiles.js";
 import { resolveStore } from "./lib/store.js";
-import { accountsHome, loadAppliedMap, storePath } from "./storage.js";
-import { applyProfile, appliedProfile } from "./lib/apply.js";
+import {
+  accountsHome,
+  getAccountsStorageStatus,
+  loadAppliedMap,
+  storagePull,
+  storagePush,
+  storageSync,
+  storePath,
+} from "./storage.js";
+import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
@@ -178,7 +186,7 @@ function profileDetails(
   return {
     ...p,
     active,
-    applied: appliedProfile(p.tool)?.name === p.name,
+    applied: appliedProfileName(p.tool) === p.name,
     prelaunch: prelaunchSummaryFor(p),
   };
 }
@@ -459,7 +467,7 @@ program
       }
       for (const p of profiles) {
         const active = activeFor(p.tool) === p.name;
-        const isApplied = appliedProfile(p.tool)?.name === p.name;
+        const isApplied = appliedProfileName(p.tool) === p.name;
         console.log(fmtProfile(p, active, isApplied, prelaunchSummaryFor(p)));
       }
     }),
@@ -641,9 +649,9 @@ program
   .action(
     action((toolId: string | undefined) => {
       const tool = toolId ?? DEFAULT_TOOL;
-      const p = appliedProfile(tool);
-      if (!p) die(`no applied profile for "${tool}". Run \`accounts apply <name>\` first.`);
-      console.log(p.name);
+      const name = appliedProfileName(tool);
+      if (!name) die(`no applied profile for "${tool}". Run \`accounts apply <name>\` first.`);
+      console.log(name);
     }),
   );
 
@@ -965,16 +973,47 @@ program
   .action(
     action(async (opts: { tool?: string }) => {
       const store = resolveStore();
-      const tools = opts.tool ? [getTool(opts.tool)] : await store.listTools();
+      const tools = opts.tool ? [await store.resolveTool(opts.tool)] : await store.listTools();
       for (const tool of tools) {
         const p = await store.currentProfile(tool.id);
-        const a = appliedProfile(tool.id);
+        const appliedName = appliedProfileName(tool.id);
         const val = p ? `${chalk.green.bold(p.name)}${p.email ? chalk.dim(" (" + p.email + ")") : ""}` : chalk.dim("(none)");
-        const appliedVal = a && a.name !== p?.name ? chalk.magenta(` → applied: ${a.name}`) : a ? chalk.magenta(" (applied)") : "";
+        const appliedVal = appliedName && appliedName !== p?.name ? chalk.magenta(` → applied: ${appliedName}`) : appliedName ? chalk.magenta(" (applied)") : "";
         console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}${appliedVal}`);
       }
     }),
   );
+
+const storage = program.command("storage").description("deprecated storage compatibility commands");
+
+storage
+  .command("status", { isDefault: true })
+  .description("show local/API storage compatibility status")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { json?: boolean }) => {
+      const status = getAccountsStorageStatus();
+      if (opts.json) console.log(JSON.stringify(status, null, 2));
+      else {
+        console.log(`mode: ${status.mode}`);
+        console.log(`local store: ${status.local.storePath}`);
+        console.log(chalk.yellow("legacy provider-backed sync is retired; use the Accounts API"));
+      }
+    }),
+  );
+
+for (const [name, operation] of [
+  ["push", storagePush],
+  ["pull", storagePull],
+  ["sync", storageSync],
+] as const) {
+  storage
+    .command(name)
+    .description(`deprecated: ${name} is retained only as an explicit migration error`)
+    .action(action(async () => {
+      await operation();
+    }));
+}
 
 program
   .command("agents")
@@ -985,8 +1024,10 @@ program
   .option("--json", "output JSON")
   .action(
     action(async (opts: { tool: string; profile?: string; background?: boolean; json?: boolean }) => {
+      const store = resolveStore();
+      await store.resolveTool(opts.tool);
       const results = listAgentsAcrossProfiles({
-        profiles: await resolveStore().listProfiles(opts.tool),
+        profiles: await store.listProfiles(opts.tool),
         tool: opts.tool,
         profile: opts.profile,
         backgroundOnly: opts.background,

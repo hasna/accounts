@@ -1,6 +1,6 @@
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
-import { loadStore, saveStore } from "../storage.js";
+import { loadAppliedMap, loadMachineStore, loadStore, saveStore } from "../storage.js";
 import { getTool } from "./tools.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import {
@@ -30,6 +30,10 @@ export function appliedProfile(toolId: string): Profile | undefined {
   const name = store.applied[toolId];
   if (!name) return undefined;
   return store.profiles.find((p) => p.name === name && p.tool === toolId);
+}
+
+export function appliedProfileName(toolId: string): string | undefined {
+  return loadAppliedMap()[toolId];
 }
 
 /**
@@ -72,7 +76,7 @@ function applyProfileAuth(
 ): { profile: Profile; previous?: string } {
   assertRestorableProfileAuth(profile.dir, tool, profile.name);
 
-  const local = loadStore();
+  const local = loadMachineStore();
   const previous = local.applied[tool.id];
 
   // Preserve whatever auth is currently live by snapshotting it into the

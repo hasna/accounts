@@ -39,6 +39,10 @@ export const metadataSchema = z
 
 const optionalNonBlank = (label: string) =>
   z.string().refine((v) => v.trim().length > 0, `${label} must not be empty`);
+const profileDirSchema = z
+  .string()
+  .min(1)
+  .refine((value) => !value.includes("\0") && !/[\r\n]/.test(value), "dir contains invalid characters");
 
 export const createAccountSchema = z.object({
   name: profileNameSchema,
@@ -48,7 +52,7 @@ export const createAccountSchema = z.object({
   identity: optionalNonBlank("identity").optional(),
   cardLast4: z.string().regex(/^\d{4}$/, "cardLast4 must be exactly 4 digits").optional(),
   metadata: metadataSchema.optional(),
-  dir: z.string().min(1).optional(),
+  dir: profileDirSchema.optional(),
   description: z.string().optional(),
 });
 export type CreateAccountInput = z.infer<typeof createAccountSchema>;
@@ -60,7 +64,7 @@ export const updateAccountSchema = z
     identity: optionalNonBlank("identity").nullable().optional(),
     cardLast4: z.string().regex(/^\d{4}$/, "cardLast4 must be exactly 4 digits").nullable().optional(),
     metadata: metadataSchema.optional(),
-    dir: z.string().min(1).nullable().optional(),
+    dir: profileDirSchema.nullable().optional(),
     description: z.string().nullable().optional(),
     lastUsedAt: z.string().datetime().optional(),
   })

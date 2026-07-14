@@ -14,7 +14,8 @@ The source change covers four related surfaces:
 
 1. AccountsStore routing for CLI, MCP, login, launch, supervisor, readiness, and
    profile registry operations.
-2. Removal of the legacy S3 remote/hybrid storage subsystem and its sync API.
+2. Retirement of the legacy provider-backed remote/hybrid subsystem, with
+   source-compatible shims but no provider runtime.
 3. PostgreSQL migration `0003_custom_tools.sql` plus additive custom-tool and
    rename endpoints.
 4. Readiness and server compatibility, including additive Tool responses and
@@ -23,36 +24,29 @@ The source change covers four related surfaces:
 Local-only mode remains supported. No publish or deployment is part of this
 source change.
 
-## Removed Public Surfaces
+## Compatibility Shims
 
-The `@hasna/accounts/storage` entry point remains, but these legacy S3 exports
-are removed:
+No breaking removal is approved for this restack. The
+`@hasna/accounts/storage` entry point retains its prior constants, types,
+status/config functions, local snapshot functions, and sync function
+signatures. The implementation has no provider runtime: `storagePush`,
+`storagePull`, and `storageSync` reject with migration guidance.
 
-- `ACCOUNTS_STORAGE_ENV`, `ACCOUNTS_STORAGE_FALLBACK_ENV`,
-  `STORAGE_MODE_ENV`, and `STORAGE_TABLES`
-- `AccountsStorageMode`, `AccountsStorageConfig`,
-  `AccountsStorageStatus`, `AccountsStorageSnapshot`, and
-  `AccountsStorageSyncResult`
-- `getAccountsStorageConfig`, `getAccountsStorageStatus`,
-  `getStorageStatus`, `createAccountsStorageSnapshot`,
-  `restoreAccountsStorageSnapshot`, and `accountsStorageSnapshotKey`
-- `storagePush`, `storagePull`, and `storageSync`
+The root `ensureProfileForLogin` export remains as a deprecated, synchronous,
+local-only shim. New callers use async `prepareLogin` so custom tools can be
+hydrated from the active Store.
 
-The root export `ensureProfileForLogin` is removed. Callers should use
-`prepareLogin` or `importProfile` and route profile reads/writes through
-`resolveStore()`.
-
-The CLI group `accounts storage status|push|pull|sync` is removed. Use local
-mode for an on-machine registry or configure the Accounts API URL and key for
-self-hosted/cloud mode. The retired `remote`, `hybrid`, and `s3` mode words
-are ignored.
+The `accounts storage status|push|pull|sync` command group remains
+discoverable. Status reports local/API compatibility state; provider-backed
+mutations fail explicitly. The retired `remote`, `hybrid`, and `s3` mode
+words are ignored. Other unknown modes fail validation.
 
 ## Deployment Order
 
 1. Back up the Accounts database using the normal database procedure.
 2. Run `accounts-migrate` with the new source against PostgreSQL. Migration
-   `0003` is additive and creates `custom_tools`; it does not rewrite account
-   or current-selection rows.
+   `0003` is additive and creates `custom_tools`. Migration `0004` removes
+   orphan current selections once, then adds a cascading account foreign key.
 3. Deploy `accounts-serve` and verify `/health`, `/ready`, `/version`,
    `GET /v1/tools`, and the OpenAPI document.
 4. Roll out new clients only after the server is ready.
@@ -69,13 +63,14 @@ account reads and writes continue to use their original endpoints.
 | Old | Old | Existing account and selection operations are unchanged. |
 | Old | New | Compatible. Routes are additive and Tool only requires `id` and `label`; enriched fields are optional. |
 | New | Old | Existing operations work. Minimal legacy built-in Tool responses are accepted. Rename and custom-tool mutations require a server upgrade and fail with an actionable error. |
-| New | New before migration 0003 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migration 0003 | Full AccountsStore routing, custom tools, rename, and transactional selection updates are available. |
+| New | New before migrations 0003/0004 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
+| New | New after migrations 0003/0004 | Full AccountsStore routing, custom tools, row-locked rename/remove/current updates, and pointer reconciliation are available. |
 
 ## Rollback And Forward Fix
 
-- Before client rollout, the server may be rolled back. Leave migration `0003`
-  in place because it is additive and older servers ignore `custom_tools`.
+- Before client rollout, the server may be rolled back. Leave migrations
+  `0003` and `0004` in place; older servers ignore `custom_tools`, and the
+  foreign key preserves existing account/current semantics.
 - After new clients use rename or custom-tool endpoints, prefer a server
   forward-fix. Rolling the server below those endpoints makes the new mutations
   unavailable until it is restored.
@@ -90,6 +85,7 @@ account reads and writes continue to use their original endpoints.
   cold custom-tool lookup/launch, endpoint compatibility, and transaction use.
 - `bun run test:postgres` requires
   `HASNA_ACCOUNTS_TEST_DATABASE_URL`. It uses an isolated schema to verify the
-  `0003` upgrade, restart idempotency, and real rollback semantics.
+  `0003` upgrade, restart idempotency, rollback/forward-fix behavior,
+  `0004` constraints, transaction rollback, and concurrent row locking.
 - Contract, no-cloud, generated SDK, and vendored storage-kit checks remain
   required before release.

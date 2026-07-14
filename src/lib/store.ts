@@ -6,7 +6,8 @@
 //
 // `resolveStore()` is the mode resolver: when `HASNA_ACCOUNTS_API_URL` +
 // `HASNA_ACCOUNTS_API_KEY` are set (and mode is not explicitly `local`), every
-// registry read/write routes to the cloud ApiStore; otherwise LocalStore. Both
+// registry read/write routes to the cloud ApiStore. Explicit API modes fail
+// closed when either value is missing; an unset mode defaults to local. Both
 // `self_hosted` and `cloud` deployments use the SAME ApiStore code — only the
 // URL/key differ (server-side tenancy, not client logic).
 //
@@ -21,11 +22,15 @@
 // the only two backends are LocalStore (fs) and ApiStore (@hasna/contracts HTTP
 // transport). The bearer key never appears in output or logs.
 
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
-import { profilesDir } from "../storage.js";
+import {
+  profilesDir,
+  reconcileMachineProfileRemove,
+  reconcileMachineProfileRename,
+} from "../storage.js";
 import {
   DEFAULT_TOOL,
   getTool,
@@ -37,7 +42,7 @@ import {
   clearCustomToolsCache,
   BUILTIN_TOOLS,
 } from "./tools.js";
-import { toolDefSchema } from "../types.js";
+import { profileNameSchema, toolDefSchema } from "../types.js";
 import { detectEmail } from "./detect.js";
 import {
   addProfile as localAdd,
@@ -57,6 +62,7 @@ import {
 } from "./profiles.js";
 import { loadStore } from "../storage.js";
 import { resolveAccountsCloud, type AccountsCloudApi } from "./cloud-accounts.js";
+import { assertSafeWritePath } from "./safe-path.js";
 
 export interface CurrentEntry {
   tool: string;
@@ -85,6 +91,8 @@ export interface AccountsStore {
   listCurrent(): Promise<CurrentEntry[]>;
   /** All tools (built-in + custom) known to the active registry. */
   listTools(): Promise<ToolDef[]>;
+  /** Resolve a tool after hydrating the active registry's custom definitions. */
+  resolveTool(toolId: string): Promise<ToolDef>;
   /** Register (or update) a custom tool in the active registry. */
   addTool(def: ToolDef): Promise<ToolDef>;
   /** Remove a custom tool from the active registry. */
@@ -132,6 +140,9 @@ class LocalStore implements AccountsStore {
   async listTools(): Promise<ToolDef[]> {
     return localListTools();
   }
+  async resolveTool(toolId: string): Promise<ToolDef> {
+    return getTool(toolId);
+  }
   async addTool(def: ToolDef): Promise<ToolDef> {
     return localAddCustomTool(def);
   }
@@ -169,46 +180,62 @@ class ApiStore implements AccountsStore {
   }
 
   async addProfile(opts: AddOptions): Promise<Profile> {
+    assertProfileName(opts.name);
     const toolId = opts.tool ?? DEFAULT_TOOL;
     const tool = await this.resolveTool(toolId);
-    const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, opts.name);
-    mkdirSync(dir, { recursive: true });
+    const managed = opts.dir === undefined;
+    const dir = managed ? join(profilesDir(), toolId, opts.name) : validatedDirectoryPath(opts.dir!);
+    const created = prepareProfileDirectory(dir, managed);
     const email = opts.email ?? detectEmail(dir, tool) ?? undefined;
-    return this.api.create({
-      name: opts.name,
-      tool: toolId,
-      email,
-      displayName: opts.displayName,
-      identity: opts.identity,
-      cardLast4: opts.cardLast4,
-      metadata: opts.metadata,
-      dir,
-      description: opts.description,
-    });
+    try {
+      return await this.api.create({
+        name: opts.name,
+        tool: toolId,
+        email,
+        displayName: opts.displayName,
+        identity: opts.identity,
+        cardLast4: opts.cardLast4,
+        metadata: opts.metadata,
+        dir,
+        description: opts.description,
+      });
+    } catch (error) {
+      if (created) rmSync(dir, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   async updateProfile(name: string, opts: UpdateOptions): Promise<Profile> {
     const existing = await this.resolve(name, opts.tool);
-    const dir = opts.dir !== undefined ? expandPath(opts.dir) : undefined;
-    if (dir !== undefined) mkdirSync(dir, { recursive: true });
-    return this.api.update(name, existing.tool, {
-      email: opts.email,
-      displayName: opts.displayName,
-      identity: opts.identity,
-      cardLast4: opts.cardLast4,
-      metadata: opts.metadata,
-      dir,
-      description: opts.description,
-    });
+    const dir = opts.dir !== undefined ? validatedDirectoryPath(opts.dir) : undefined;
+    const created = dir !== undefined ? prepareProfileDirectory(dir, false) : false;
+    try {
+      return await this.api.update(name, existing.tool, {
+        email: opts.email,
+        displayName: opts.displayName,
+        identity: opts.identity,
+        cardLast4: opts.cardLast4,
+        metadata: opts.metadata,
+        dir,
+        description: opts.description,
+      });
+    } catch (error) {
+      if (dir && created) rmSync(dir, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   async renameProfile(oldName: string, newName: string, tool?: string): Promise<Profile> {
+    assertProfileName(newName);
     const existing = await this.resolve(oldName, tool);
-    return this.api.rename(oldName, newName, existing.tool);
+    const renamed = await this.api.rename(oldName, newName, existing.tool);
+    reconcileMachineProfileRename(existing.tool, oldName, newName);
+    return renamed;
   }
 
   async removeProfile(name: string, opts: RemoveOptions = {}): Promise<RemoveResult> {
     const profile = await this.api.remove(name, opts.tool);
+    reconcileMachineProfileRemove(profile.tool, profile.name);
     const purgeNote = opts.purge
       ? "--purge is a local-only operation; the config dir (if any) was not touched in self_hosted mode"
       : undefined;
@@ -252,6 +279,11 @@ class ApiStore implements AccountsStore {
     return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
   }
 
+  async resolveTool(toolId: string): Promise<ToolDef> {
+    if (!isBuiltinTool(toolId)) await this.refreshToolCache();
+    return getTool(toolId);
+  }
+
   async addTool(def: ToolDef): Promise<ToolDef> {
     if (isBuiltinTool(def.id)) throw new AccountsError(`"${def.id}" is a built-in tool and cannot be redefined`);
     const created = await this.api.createTool(def);
@@ -288,11 +320,6 @@ class ApiStore implements AccountsStore {
     return custom;
   }
 
-  private async resolveTool(toolId: string): Promise<ToolDef> {
-    if (!isBuiltinTool(toolId)) await this.refreshToolCache();
-    return getTool(toolId);
-  }
-
   private async hydrateProfileTools(profiles: readonly Profile[]): Promise<void> {
     if (profiles.some((profile) => !isBuiltinTool(profile.tool))) await this.refreshToolCache();
   }
@@ -318,6 +345,37 @@ class ApiStore implements AccountsStore {
     await this.hydrateProfileTools([profile]);
     return profile;
   }
+}
+
+function assertProfileName(name: string): void {
+  const parsed = profileNameSchema.safeParse(name);
+  if (!parsed.success) throw new AccountsError(parsed.error.issues[0]?.message ?? "invalid profile name");
+}
+
+function validatedDirectoryPath(input: string): string {
+  if (!input.trim() || input.includes("\0") || /[\r\n]/.test(input)) {
+    throw new AccountsError("invalid profile directory");
+  }
+  return expandPath(input);
+}
+
+function assertManagedDirectory(dir: string): void {
+  const base = resolve(profilesDir());
+  const rel = relative(base, resolve(dir));
+  if (!rel || rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
+    throw new AccountsError(`refusing to create managed profile outside ${base}`);
+  }
+}
+
+function prepareProfileDirectory(dir: string, managed: boolean): boolean {
+  if (managed) assertManagedDirectory(dir);
+  const existed = existsSync(dir);
+  assertSafeWritePath(
+    join(dir, ".accounts-directory-check"),
+    managed ? { mustStayUnder: profilesDir() } : { mustStayUnder: dir },
+  );
+  mkdirSync(dir, { recursive: true });
+  return !existed;
 }
 
 /**

@@ -9,6 +9,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: accounts_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d accounts_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -17,7 +31,7 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install
+        run: bun install --frozen-lockfile --minimum-release-age 259200
 
       - name: Type check
         run: bun run typecheck
@@ -27,3 +41,24 @@ jobs:
 
       - name: Build
         run: bun run build
+
+      - name: Build output no-cloud boundary
+        run: bun run contracts:no-cloud-scan
+
+      - name: Generated SDK contract sync
+        run: bun test src/sdk.test.ts src/contracts.test.ts
+
+      - name: Contract examples
+        run: bun run contracts:conformance
+
+      - name: Vendored storage kit
+        run: bun run vendor-kit:check
+
+      - name: Repository conformance
+        run: bun run conformance
+
+      - name: PostgreSQL migration and concurrency integration
+        env:
+          ACCOUNTS_REQUIRE_POSTGRES: "1"
+          HASNA_ACCOUNTS_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/accounts_test
+        run: bun test src/server/postgres.integration.test.ts

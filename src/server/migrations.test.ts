@@ -15,6 +15,8 @@ describe("accounts migrations", () => {
     const ids = migrations.map((m) => m.id);
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids).toContain("accounts_0001_accounts");
+    expect(ids).toContain("accounts_0003_custom_tools");
+    expect(ids).toContain("accounts_0004_current_selection_account_fk");
     expect(ids.some((id) => id.startsWith("hasna_auth_"))).toBe(true);
     for (const m of migrations) {
       expect(m.checksum.startsWith("sha256:")).toBe(true);

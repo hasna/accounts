@@ -3,7 +3,7 @@ import { stdin as input, stdout as output } from "node:process";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { resolveStore, type AccountsStore } from "./store.js";
-import { appliedProfile } from "./apply.js";
+import { appliedProfileName } from "./apply.js";
 
 export interface PickOptions {
   tool?: string;
@@ -43,7 +43,7 @@ export async function pickProfile(
     const p = profiles[i]!;
     const markers: string[] = [];
     if (activeByTool.get(p.tool) === p.name) markers.push("active");
-    if (appliedProfile(p.tool)?.name === p.name) markers.push("applied");
+    if (appliedProfileName(p.tool) === p.name) markers.push("applied");
     const tag = markers.length ? ` (${markers.join(", ")})` : "";
     const email = p.email ? ` ${p.email}` : "";
     console.log(`  ${i + 1}. ${p.name}${email}${tag}`);

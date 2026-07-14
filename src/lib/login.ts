@@ -8,7 +8,7 @@ import { applyProfile } from "./apply.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
 import { getProfileToolLock, lockProfileTool } from "./profiles.js";
 import { resolveStore, type AccountsStore } from "./store.js";
-import { getTool, listTools, mergeToolArgs } from "./tools.js";
+import { getTool, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
 import { profilesDir } from "../storage.js";
 
@@ -143,7 +143,7 @@ export async function loginToolChoices(
   const existing = new Set(
     (await store.listProfiles()).filter((profile) => profile.name === name).map((profile) => profile.tool),
   );
-  return listTools()
+  return (await store.listTools())
     .map((tool) => ({
       tool,
       availability: detectToolAvailability(tool, env),
@@ -313,16 +313,16 @@ async function selectLoginTool(
   session: PromptSession,
   store: AccountsStore,
 ): Promise<ToolDef> {
-  if (opts.toolId) return getTool(opts.toolId);
+  if (opts.toolId) return store.resolveTool(opts.toolId);
 
   if (store.transport === "local") {
     const lockedTool = getProfileToolLock(name);
-    if (lockedTool) return getTool(lockedTool);
+    if (lockedTool) return store.resolveTool(lockedTool);
   }
 
   const matches = (await store.listProfiles()).filter((profile) => profile.name === name);
   if (matches.length === 1) {
-    return getTool(matches[0]!.tool);
+    return store.resolveTool(matches[0]!.tool);
   }
 
   const reason =

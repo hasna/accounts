@@ -289,24 +289,33 @@ then invokes the real `claude` binary. Full behavior and footguns: [docs/hook.md
 
 Overrides: `ACCOUNTS_HOME`, `ACCOUNTS_STORE_PATH`.
 
-The native storage API is available from `@hasna/accounts/storage`. It exposes
-the local registry paths, snapshot helpers, and optional S3 registry sync for
-internal cross-machine use:
+Registry access is selected through `AccountsStore`:
+
+- `local` uses the atomic on-machine JSON registry.
+- `self_hosted` and `cloud` use the authenticated Accounts HTTP API.
+- Explicit `self_hosted`/`cloud` modes fail closed unless both the API URL
+  and key are configured.
+- Retired `remote`, `hybrid`, and `s3` aliases are ignored for migration
+  safety; any other unknown mode is rejected.
 
 ```ts
-import { getAccountsStorageStatus, storagePush } from "@hasna/accounts/storage";
+import { resolveStore } from "@hasna/accounts";
 
-console.log(getAccountsStorageStatus().local.storePath);
-await storagePush();
+const store = resolveStore();
+console.log(store.transport);
+console.log(await store.listProfiles());
 ```
 
-Cloud sync targets repo-owned AWS S3 using the service-owned env names below and
-only syncs the accounts registry JSON by default; auth snapshots stay local.
+Configure API mode with:
 
-- `HASNA_ACCOUNTS_STORAGE_MODE=local|cloud` (`cloud` = repo-owned AWS S3)
-- `HASNA_ACCOUNTS_S3_BUCKET=hasna-xyz-opensource-accounts-prod`
-- `HASNA_ACCOUNTS_S3_PREFIX=accounts/`
-- `HASNA_ACCOUNTS_AWS_REGION=us-east-1`
+- `HASNA_ACCOUNTS_STORAGE_MODE=local|self_hosted|cloud`
+- `HASNA_ACCOUNTS_API_URL=https://accounts.example.com`
+- `HASNA_ACCOUNTS_API_KEY` from the service operator
+
+The `@hasna/accounts/storage` entry point and `accounts storage` command
+group retain deprecated source/CLI compatibility shims. Local status and
+snapshot helpers continue to work. `push`, `pull`, and `sync` fail
+explicitly because the retired provider-backed transport is not present.
 
 ## Supported tools
 

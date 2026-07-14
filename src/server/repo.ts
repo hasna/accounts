@@ -115,9 +115,14 @@ export class AccountsRepo implements AccountsStore {
     return this.getWith(this.client, tool, name);
   }
 
-  private async getWith(client: TypedQueryClient, tool: string, name: string): Promise<Account | null> {
+  private async getWith(
+    client: TypedQueryClient,
+    tool: string,
+    name: string,
+    opts: { forUpdate?: boolean } = {},
+  ): Promise<Account | null> {
     const row = await client.get<AccountRow>(
-      "SELECT * FROM accounts WHERE tool = $1 AND name = $2",
+      `SELECT * FROM accounts WHERE tool = $1 AND name = $2${opts.forUpdate ? " FOR UPDATE" : ""}`,
       [tool, name],
     );
     return row ? rowToAccount(row) : null;
@@ -184,7 +189,7 @@ export class AccountsRepo implements AccountsStore {
 
   async rename(tool: string, oldName: string, newName: string): Promise<Account> {
     return this.client.transaction(async (client) => {
-      const existing = await this.getWith(client, tool, oldName);
+      const existing = await this.getWith(client, tool, oldName, { forUpdate: true });
       if (!existing) throw new AccountsError(`no profile named "${oldName}" for tool "${tool}"`);
       if (oldName !== newName) {
         const dupe = await this.getWith(client, tool, newName);
@@ -194,25 +199,19 @@ export class AccountsRepo implements AccountsStore {
         "UPDATE accounts SET name = $1 WHERE tool = $2 AND name = $3 RETURNING *",
         [newName, tool, oldName],
       );
-      await client.execute(
-        "UPDATE current_selections SET name = $1 WHERE tool = $2 AND name = $3",
-        [newName, tool, oldName],
-      );
       return rowToAccount(row);
     });
   }
 
   async remove(tool: string, name: string): Promise<boolean> {
     return this.client.transaction(async (client) => {
+      const existing = await this.getWith(client, tool, name, { forUpdate: true });
+      if (!existing) return false;
       const result = await client.query<AccountRow>(
         "DELETE FROM accounts WHERE tool = $1 AND name = $2 RETURNING tool",
         [tool, name],
       );
       if (result.rowCount === 0) return false;
-      await client.execute(
-        "DELETE FROM current_selections WHERE tool = $1 AND name = $2",
-        [tool, name],
-      );
       return true;
     });
   }
@@ -234,7 +233,7 @@ export class AccountsRepo implements AccountsStore {
 
   async setCurrent(tool: string, name: string): Promise<CurrentSelection> {
     return this.client.transaction(async (client) => {
-      const account = await this.getWith(client, tool, name);
+      const account = await this.getWith(client, tool, name, { forUpdate: true });
       if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
       await client.execute("UPDATE accounts SET last_used_at = now() WHERE tool = $1 AND name = $2", [
         tool,

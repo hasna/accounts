@@ -7,10 +7,10 @@
 // HTTP storage client, so it inherits retries, timeout, idempotency and JSON
 // error mapping.
 //
-// The toggle is the presence of the two env vars (what the fleet flip writes):
-// both set -> cloud; either unset -> local. An explicit
-// `HASNA_ACCOUNTS_STORAGE_MODE=local` forces local even when the vars are set.
-// Any non-canonical mode word (the retired `remote`/`hybrid`/`s3`) is ignored.
+// Without an explicit mode, both API env vars select cloud and an incomplete
+// pair stays local. Explicit `self_hosted`/`cloud` fails closed unless both
+// vars exist; explicit `local` forces local. Only the retired
+// `remote`/`hybrid`/`s3` aliases are ignored.
 //
 // Registry vs local: the cloud is the source of truth for account metadata
 // (name, tool, email, displayName, identity, cardLast4, metadata, description,
@@ -115,9 +115,10 @@ function toProfile(account: CloudAccount): Profile {
   };
 }
 
-/** The only storage-mode words this client understands. Everything else (incl.
- * the retired `remote`/`hybrid`/`s3` S3-era words) is treated as unset. */
+/** Canonical storage modes. Unknown words are rejected; retired aliases are
+ * stripped and treated as unset. */
 const CANONICAL_MODES = new Set(["local", "self_hosted", "cloud"]);
+const RETIRED_MODES = new Set(["remote", "hybrid", "s3"]);
 
 /** Env keys the contracts resolver reads for the storage mode. We compute the
  * mode ourselves and clear these so no stale/legacy value can reach it. */
@@ -129,19 +130,26 @@ const MODE_ENV_KEYS = ["HASNA_ACCOUNTS_STORAGE_MODE", "ACCOUNTS_STORAGE_MODE", "
  * `HASNA_ACCOUNTS_API_KEY`: when both are set (and mode is not explicitly
  * `local`) the client uses the cloud HTTP transport; otherwise local.
  *
- * The storage-mode env var is only honored for the canonical `local |
- * self_hosted | cloud` words, and its sole authority is to force `local`. Any
- * other value — including a stale `HASNA_ACCOUNTS_STORAGE_MODE=remote|hybrid|s3`
- * left over from the retired S3 subsystem — is ignored and stripped, so it can
- * never reach the contracts resolver (where `remote`/`hybrid` normalize to
- * `cloud` and then throw for a missing key, crashing every registry command on
- * a machine that has no API key).
+ * Canonical modes are enforced here. Explicit `self_hosted`/`cloud` requires
+ * both API variables and fails before the contracts resolver if either is
+ * absent. Only stale `remote|hybrid|s3` aliases are ignored and stripped.
  */
 function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const url = env.HASNA_ACCOUNTS_API_URL || env.ACCOUNTS_API_URL;
   const key = env.HASNA_ACCOUNTS_API_KEY || env.ACCOUNTS_API_KEY;
-  const rawMode = (env.HASNA_ACCOUNTS_STORAGE_MODE || env.HASNA_ACCOUNTS_MODE || "").toLowerCase();
+  const rawMode = (
+    env.HASNA_ACCOUNTS_STORAGE_MODE ||
+    env.ACCOUNTS_STORAGE_MODE ||
+    env.HASNA_ACCOUNTS_MODE ||
+    ""
+  ).trim().toLowerCase();
   const explicitMode = CANONICAL_MODES.has(rawMode) ? rawMode : "";
+
+  if (rawMode && !explicitMode && !RETIRED_MODES.has(rawMode)) {
+    throw new AccountsError(
+      `invalid accounts storage mode "${rawMode}"; expected local, self_hosted, or cloud`,
+    );
+  }
 
   const next: NodeJS.ProcessEnv = { ...env };
   for (const k of MODE_ENV_KEYS) delete next[k];
@@ -149,13 +157,21 @@ function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   if (explicitMode === "local") {
     // Force local even when URL+KEY are present.
     next.HASNA_ACCOUNTS_STORAGE_MODE = "local";
+  } else if (explicitMode === "self_hosted" || explicitMode === "cloud") {
+    if (!url || !key) {
+      const missing = [!url ? "HASNA_ACCOUNTS_API_URL" : "", !key ? "HASNA_ACCOUNTS_API_KEY" : ""]
+        .filter(Boolean)
+        .join(" and ");
+      throw new AccountsError(`${explicitMode} storage mode requires ${missing}`);
+    }
+    next.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
   } else if (url && key) {
     // Both self_hosted and cloud use the identical cloud-http transport; the
     // canonical runtime word contracts expects is `cloud`.
     next.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
   }
-  // Otherwise leave the mode unset so contracts defaults to local — a stale
-  // legacy word can never force (and crash) a cloud resolution without a key.
+  // Otherwise leave the mode unset so contracts defaults to local. Only the
+  // explicitly retired aliases are silently ignored.
   return next;
 }
 

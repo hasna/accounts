@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, join } from "node:path";
-import { accountsHome, loadStore } from "../storage.js";
+import { accountsHome, loadAppliedMap } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
@@ -141,11 +141,12 @@ function processAlive(pid: number): boolean {
   }
 }
 
-function knownTool(id: string): ToolDef | undefined {
+async function knownTool(id: string, store: AccountsStore): Promise<ToolDef | undefined> {
   try {
-    return getTool(id);
-  } catch {
-    return undefined;
+    return await store.resolveTool(id);
+  } catch (error) {
+    if (error instanceof AccountsError && /unknown tool/.test(error.message)) return undefined;
+    throw error;
   }
 }
 
@@ -156,7 +157,7 @@ function knownTool(id: string): ToolDef | undefined {
  * cloud registry instead of local profile metadata.
  */
 async function resolveAppliedProfile(toolId: string, store: AccountsStore): Promise<Profile | undefined> {
-  const name = loadStore().applied[toolId];
+  const name = loadAppliedMap()[toolId];
   if (!name) return undefined;
   return store.findProfile(name, toolId);
 }
@@ -166,7 +167,7 @@ export async function resolveSupervisorLaunch(
   opts: { profile?: string; tool?: string } = {},
   store: AccountsStore = resolveStore(),
 ): Promise<SupervisorLaunchPlan> {
-  const targetTool = knownTool(target);
+  const targetTool = await knownTool(target, store);
 
   if (opts.profile) {
     const profile = await store.getProfile(opts.profile, opts.tool ?? targetTool?.id);

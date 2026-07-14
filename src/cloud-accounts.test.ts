@@ -36,6 +36,34 @@ describe("resolveAccountsCloud", () => {
     expect(resolveAccountsCloud({ HASNA_ACCOUNTS_API_URL: BASE } as NodeJS.ProcessEnv).transport).toBe("local");
   });
 
+  for (const mode of ["cloud", "self_hosted"]) {
+    test(`explicit ${mode} fails closed when URL and key are missing`, () => {
+      expect(() =>
+        resolveAccountsCloud({ HASNA_ACCOUNTS_STORAGE_MODE: mode } as NodeJS.ProcessEnv),
+      ).toThrow(/requires HASNA_ACCOUNTS_API_URL and HASNA_ACCOUNTS_API_KEY/);
+    });
+
+    test(`explicit ${mode} fails closed when only URL is configured`, () => {
+      expect(() =>
+        resolveAccountsCloud({
+          HASNA_ACCOUNTS_STORAGE_MODE: mode,
+          HASNA_ACCOUNTS_API_URL: BASE,
+        } as NodeJS.ProcessEnv),
+      ).toThrow(/requires HASNA_ACCOUNTS_API_KEY/);
+    });
+  }
+
+  test("only retired storage aliases are silently ignored", () => {
+    for (const mode of ["remote", "hybrid", "s3"]) {
+      expect(
+        resolveAccountsCloud({ HASNA_ACCOUNTS_STORAGE_MODE: mode } as NodeJS.ProcessEnv).transport,
+      ).toBe("local");
+    }
+    expect(() =>
+      resolveAccountsCloud({ HASNA_ACCOUNTS_STORAGE_MODE: "typo" } as NodeJS.ProcessEnv),
+    ).toThrow(/invalid accounts storage mode/);
+  });
+
   test("cloud-http when URL+KEY set; baseUrl is <url>/v1", () => {
     const r = resolveAccountsCloud(cloudEnv);
     expect(r.transport).toBe("cloud-http");

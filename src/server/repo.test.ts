@@ -16,7 +16,7 @@ const OLD_ROW = {
   last_used_at: null,
 };
 
-function transactionalClient(failOnCurrent: boolean) {
+function transactionalClient(failOnAccountWrite: boolean) {
   let transactions = 0;
   let rolledBack = false;
   const statements: string[] = [];
@@ -38,12 +38,14 @@ function transactionalClient(failOnCurrent: boolean) {
     },
     async one(sql) {
       statements.push(sql);
-      if (sql.startsWith("UPDATE accounts SET name")) return { ...OLD_ROW, name: "new" };
+      if (sql.startsWith("UPDATE accounts SET name")) {
+        if (failOnAccountWrite) throw new Error("account update failed");
+        return { ...OLD_ROW, name: "new" };
+      }
       throw new Error("unexpected one: " + sql);
     },
     async execute(sql) {
       statements.push(sql);
-      if (failOnCurrent && /current_selections/.test(sql)) throw new Error("selection update failed");
     },
   };
   const client = {
@@ -68,27 +70,29 @@ function transactionalClient(failOnCurrent: boolean) {
 }
 
 describe("AccountsRepo account/current atomicity", () => {
-  test("rename updates the account and current selection in one transaction", async () => {
+  test("rename locks and updates the account in one transaction; the FK cascades current", async () => {
     const fixture = transactionalClient(false);
     const renamed = await new AccountsRepo(fixture.client).rename("claude", "old", "new");
     expect(renamed.name).toBe("new");
     expect(fixture.evidence().transactions).toBe(1);
-    expect(fixture.evidence().statements.some((sql) => /UPDATE current_selections/.test(sql))).toBe(true);
+    expect(fixture.evidence().statements.some((sql) => /FOR UPDATE/.test(sql))).toBe(true);
+    expect(fixture.evidence().statements.some((sql) => /UPDATE current_selections/.test(sql))).toBe(false);
   });
 
-  test("rename rolls back when current-selection update fails", async () => {
+  test("rename rolls back when the account update fails", async () => {
     const fixture = transactionalClient(true);
     await expect(new AccountsRepo(fixture.client).rename("claude", "old", "new")).rejects.toThrow(
-      "selection update failed",
+      "account update failed",
     );
     expect(fixture.evidence().transactions).toBe(1);
     expect(fixture.evidence().rolledBack).toBe(true);
   });
 
-  test("remove deletes the account and current selection in one transaction", async () => {
+  test("remove locks and deletes the account; the FK cascades current", async () => {
     const fixture = transactionalClient(false);
     expect(await new AccountsRepo(fixture.client).remove("claude", "old")).toBe(true);
     expect(fixture.evidence().transactions).toBe(1);
-    expect(fixture.evidence().statements.some((sql) => /DELETE FROM current_selections/.test(sql))).toBe(true);
+    expect(fixture.evidence().statements.some((sql) => /FOR UPDATE/.test(sql))).toBe(true);
+    expect(fixture.evidence().statements.some((sql) => /DELETE FROM current_selections/.test(sql))).toBe(false);
   });
 });

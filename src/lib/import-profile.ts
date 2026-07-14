@@ -1,13 +1,20 @@
-import { cpSync, existsSync } from "node:fs";
+import { cpSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Profile } from "../types.js";
 import { profilesDir } from "../storage.js";
-import { AccountsError } from "../types.js";
-import { expandPath, type AddOptions } from "./profiles.js";
-import { getTool, DEFAULT_TOOL } from "./tools.js";
+import { AccountsError, profileNameSchema } from "../types.js";
+import {
+  addProfile,
+  expandPath,
+  findProfile,
+  lockProfileTool,
+  type AddOptions,
+} from "./profiles.js";
+import { DEFAULT_TOOL } from "./tools.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
 import { detectEmail } from "./detect.js";
 import { resolveStore, type AccountsStore } from "./store.js";
+import { assertSafeWritePath } from "./safe-path.js";
 
 export interface ImportOptions {
   name?: string;
@@ -29,8 +36,10 @@ export interface ImportOptions {
  */
 export async function importProfile(opts: ImportOptions, store: AccountsStore = resolveStore()): Promise<Profile> {
   const toolId = opts.tool ?? DEFAULT_TOOL;
-  const tool = getTool(toolId);
   const name = opts.name ?? "main";
+  const nameCheck = profileNameSchema.safeParse(name);
+  if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
+  const tool = await store.resolveTool(toolId);
   const sourceDir = opts.dir ? expandPath(opts.dir) : tool.defaultDir;
 
   if (!existsSync(sourceDir)) {
@@ -42,16 +51,22 @@ export async function importProfile(opts: ImportOptions, store: AccountsStore = 
     if (existsSync(targetDir)) {
       throw new AccountsError(`managed copy target already exists: ${targetDir}`);
     }
+    assertSafeWritePath(join(targetDir, ".accounts-import-check"), { mustStayUnder: profilesDir() });
     cpSync(sourceDir, targetDir, { recursive: true });
-    if (tool.id === "claude") ensureProfileAuthSnapshot(targetDir, tool);
-    const addOpts: AddOptions = {
-      name,
-      tool: toolId,
-      dir: targetDir,
-      email: opts.email ?? detectEmail(targetDir, tool),
-      description: opts.description ?? "imported copy",
-    };
-    return store.addProfile(addOpts);
+    try {
+      if (tool.id === "claude") ensureProfileAuthSnapshot(targetDir, tool);
+      const addOpts: AddOptions = {
+        name,
+        tool: toolId,
+        dir: targetDir,
+        email: opts.email ?? detectEmail(targetDir, tool),
+        description: opts.description ?? "imported copy",
+      };
+      return await store.addProfile(addOpts);
+    } catch (error) {
+      rmSync(targetDir, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   const addOpts: AddOptions = {
@@ -63,5 +78,34 @@ export async function importProfile(opts: ImportOptions, store: AccountsStore = 
   };
   const profile = await store.addProfile(addOpts);
   if (tool.id === "claude") ensureProfileAuthSnapshot(profile.dir, tool);
+  return profile;
+}
+
+/**
+ * @deprecated Local-only synchronous compatibility shim. New callers should
+ * use prepareLogin(), whose async Store path also supports cloud custom tools.
+ */
+export function ensureProfileForLogin(name: string, toolId = DEFAULT_TOOL): Profile {
+  const mode = (
+    process.env.HASNA_ACCOUNTS_STORAGE_MODE ||
+    process.env.ACCOUNTS_STORAGE_MODE ||
+    ""
+  ).trim().toLowerCase();
+  const apiConfigured = Boolean(
+    (process.env.HASNA_ACCOUNTS_API_URL || process.env.ACCOUNTS_API_URL) &&
+    (process.env.HASNA_ACCOUNTS_API_KEY || process.env.ACCOUNTS_API_KEY),
+  );
+  if (mode === "cloud" || mode === "self_hosted" || (mode !== "local" && apiConfigured)) {
+    throw new AccountsError(
+      "ensureProfileForLogin is a local-only compatibility shim; use async prepareLogin in API mode",
+    );
+  }
+  const existing = findProfile(name, toolId);
+  if (existing) {
+    lockProfileTool(existing.name, existing.tool);
+    return existing;
+  }
+  const profile = addProfile({ name, tool: toolId, description: "created for login" });
+  lockProfileTool(profile.name, profile.tool);
   return profile;
 }

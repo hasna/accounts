@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveStore } from "./lib/store.js";
 import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
+import { loginToolChoices, prepareLogin } from "./lib/login.js";
+import { importProfile } from "./lib/import-profile.js";
+import { loadMachineStore, saveStore } from "./storage.js";
 
 const BASE = "https://accounts.hasna.xyz";
 const KEY = "hasna_accounts_testkey_0000";
@@ -189,9 +192,136 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(plan.tool.id).toBe("acme");
       expect(plan.tool.bin).toBe("acme");
       expect(calls.map((c) => new URL(c.url).pathname)).toEqual([
+        "/v1/tools",
         "/v1/accounts/acme/work",
         "/v1/tools",
       ]);
+    });
+
+    test("cold login choices include cloud custom tools", async () => {
+      const { fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/accounts")) return { status: 200, body: { accounts: [] } };
+        if (c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        return { status: 404, body: { error: "not found" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const choices = await loginToolChoices("work", process.env, store);
+      expect(choices.some((choice) => choice.tool.id === "acme")).toBe(true);
+    });
+
+    test("cold explicit login resolves a cloud custom tool before profile creation", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (c.method === "GET" && c.url.endsWith("/accounts/acme/work")) {
+          return { status: 404, body: { error: "not found" } };
+        }
+        if (c.method === "POST" && c.url.endsWith("/accounts")) {
+          return {
+            status: 201,
+            body: {
+              tool: "acme",
+              name: "work",
+              dir: join(home, "profiles", "acme", "work"),
+              createdAt: "2020-01-01T00:00:00Z",
+            },
+          };
+        }
+        return { status: 404, body: { error: "not found" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const prepared = await prepareLogin("work", { toolId: "acme", env: process.env, store });
+      expect(prepared.status).toBe("ready");
+      expect(prepared.tool.id).toBe("acme");
+      expect(calls[0]!.url).toBe(`${BASE}/v1/tools`);
+    });
+
+    test("cold import resolves a cloud custom tool", async () => {
+      const source = join(home, "source");
+      mkdirSync(source, { recursive: true });
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, defaultDir: source, builtin: false }] } };
+        if (c.method === "POST" && c.url.endsWith("/accounts")) {
+          return {
+            status: 201,
+            body: { tool: "acme", name: "imported", dir: source, createdAt: "2020-01-01T00:00:00Z" },
+          };
+        }
+        return { status: 404, body: { error: "not found" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const profile = await importProfile({ name: "imported", tool: "acme", dir: source }, store);
+      expect(profile.tool).toBe("acme");
+      expect(calls[0]!.url).toBe(`${BASE}/v1/tools`);
+    });
+
+    test("invalid API profile names fail before network or filesystem mutation", async () => {
+      const { calls, fetchImpl } = mockFetch(() => ({ status: 500, body: { error: "unexpected" } }));
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await expect(store.addProfile({ name: "../escape", tool: "claude" })).rejects.toThrow(/lowercase/);
+      expect(calls).toEqual([]);
+      expect(existsSync(join(home, "profiles"))).toBe(false);
+    });
+
+    test("API add and update remove only directories created by failed writes", async () => {
+      const addDir = join(home, "profiles", "claude", "failed-add");
+      const updateDir = join(home, "failed-update");
+      const { fetchImpl } = mockFetch((c) => {
+        if (c.method === "GET") {
+          return {
+            status: 200,
+            body: { tool: "claude", name: "work", dir: join(home, "existing"), createdAt: "2020-01-01T00:00:00Z" },
+          };
+        }
+        return { status: 500, body: { error: "write failed" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await expect(store.addProfile({ name: "failed-add", tool: "claude" })).rejects.toThrow(/500/);
+      expect(existsSync(addDir)).toBe(false);
+      await expect(store.updateProfile("work", { tool: "claude", dir: updateDir })).rejects.toThrow(/500/);
+      expect(existsSync(updateDir)).toBe(false);
+    });
+
+    test("failed copied import cleans its newly copied managed directory", async () => {
+      const source = join(home, "source-copy");
+      mkdirSync(source, { recursive: true });
+      const target = join(home, "profiles", "acme", "copied");
+      const { fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        return { status: 500, body: { error: "write failed" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await expect(importProfile({ name: "copied", tool: "acme", dir: source, copy: true }, store)).rejects.toThrow(/500/);
+      expect(existsSync(target)).toBe(false);
+    });
+
+    test("API rename/remove reconcile unpruned machine-local pointers", async () => {
+      saveStore({
+        version: 1,
+        current: { acme: "old" },
+        applied: { acme: "old" },
+        toolLocks: { old: "acme" },
+        profiles: [],
+        tools: [],
+      });
+      const { fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        if (c.method === "POST" && c.url.endsWith("/rename")) {
+          return { status: 200, body: { tool: "acme", name: "new", createdAt: "2020-01-01T00:00:00Z" } };
+        }
+        if (c.method === "DELETE") return { status: 204, body: null };
+        const name = c.url.endsWith("/new") ? "new" : "old";
+        return { status: 200, body: { tool: "acme", name, createdAt: "2020-01-01T00:00:00Z" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await store.renameProfile("old", "new", "acme");
+      expect(loadMachineStore().current).toEqual({ acme: "new" });
+      expect(loadMachineStore().applied).toEqual({ acme: "new" });
+      await store.removeProfile("new", { tool: "acme" });
+      expect(loadMachineStore().current).toEqual({});
+      expect(loadMachineStore().applied).toEqual({});
     });
 
     test("switching from cloud to explicit local mode clears remote tool state", async () => {
@@ -213,16 +343,24 @@ describe("ApiStore routes registry ops to /v1", () => {
 
 describe("LocalStore reads/writes the on-box registry", () => {
   let home: string;
+  let previousUrl: string | undefined;
+  let previousKey: string | undefined;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "accounts-store-test-"));
     process.env.ACCOUNTS_HOME = home;
     delete process.env.ACCOUNTS_STORE_PATH;
+    previousUrl = process.env.HASNA_ACCOUNTS_API_URL;
+    previousKey = process.env.HASNA_ACCOUNTS_API_KEY;
     delete process.env.HASNA_ACCOUNTS_API_URL;
     delete process.env.HASNA_ACCOUNTS_API_KEY;
   });
   afterEach(() => {
     rmSync(home, { recursive: true, force: true });
     delete process.env.ACCOUNTS_HOME;
+    if (previousUrl === undefined) delete process.env.HASNA_ACCOUNTS_API_URL;
+    else process.env.HASNA_ACCOUNTS_API_URL = previousUrl;
+    if (previousKey === undefined) delete process.env.HASNA_ACCOUNTS_API_KEY;
+    else process.env.HASNA_ACCOUNTS_API_KEY = previousKey;
   });
 
   test("add, use, then currentProfile round-trips through the store", async () => {

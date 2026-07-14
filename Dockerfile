@@ -33,7 +33,7 @@ COPY hasna.contract.json ./hasna.contract.json
 COPY docker/rds-global-bundle.pem /app/rds-global-bundle.pem
 
 # Cloud service defaults. The DSN + signing secret are injected at runtime
-# (Secrets Manager via the hasna-app ECS task def). The RDS CA bundle lets TLS
+# (injected by the runtime environment). The database CA bundle lets TLS
 # verify the shared RDS certificate chain.
 ENV HASNA_ACCOUNTS_STORAGE_MODE=cloud \
     NODE_EXTRA_CA_CERTS=/app/rds-global-bundle.pem \
