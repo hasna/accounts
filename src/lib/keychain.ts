@@ -54,6 +54,51 @@ export function readClaudeKeychain(): KeychainCredential | undefined {
   }
 }
 
+function commandStatus(err: unknown): number | undefined {
+  return err && typeof err === "object" && typeof (err as { status?: unknown }).status === "number"
+    ? (err as { status: number }).status
+    : undefined;
+}
+
+/**
+ * Capture the current Claude credential without collapsing a read failure into
+ * "not found". Launch leases use this so they never overwrite state they could
+ * not first preserve in memory.
+ */
+export function captureClaudeKeychain(): KeychainCredential | undefined {
+  if (!keychainSupported()) return undefined;
+  let secret: string;
+  try {
+    secret = execFileSync(
+      securityExecutable(),
+      ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+  } catch (err) {
+    if (commandStatus(err) === 44) return undefined;
+    throw new AccountsError("keychain read failed before Claude launch");
+  }
+  if (!secret) return undefined;
+
+  let account: string;
+  try {
+    const metadata = execFileSync(
+      securityExecutable(),
+      ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const match = metadata.match(/"acct"<blob>="([^"]+)"/);
+    if (!match) throw new AccountsError("keychain account metadata is unavailable");
+    account = match[1]!;
+  } catch (err) {
+    if (err instanceof AccountsError) throw err;
+    throw new AccountsError("keychain account read failed before Claude launch");
+  }
+  const credential = { service: CLAUDE_KEYCHAIN_SERVICE, account, secret };
+  assertAllowedKeychainCredential(credential);
+  return credential;
+}
+
 function readKeychainAccount(): string | undefined {
   try {
     const out = execFileSync(

@@ -49,6 +49,12 @@ import {
   type SupervisorState,
 } from "./lib/supervisor.js";
 import {
+  planClaudeLaunch,
+  redactArgv,
+  runClaudeLaunch,
+  type ClaudeLaunchOptions,
+} from "./lib/claude-launch.js";
+import {
   codexAppBinaryExists,
   codexAppMenuState,
   runCodexAppMenuBar,
@@ -802,23 +808,30 @@ addConfigsOptions(program
   .description("launch the tool's binary with the profile's config dir active")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
+  .option("--headless", "run Claude in native print mode")
+  .option("--background", "run Claude with its native --bg flag")
+  .option("--bg", "alias for --background")
+  .option("--name <name>", "pass a validated native name to a background Claude session")
   .action(
-    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string } & ConfigsCliOptions) => {
+    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string } & ClaudeLaunchOptions & ConfigsCliOptions) => {
       const store = resolveStore();
       const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
+      const plan = planClaudeLaunch(tool, args, opts);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
       const env = profileEnv(profile, tool);
-      const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions, profile });
-      await store.useProfile(name, tool.id); // mark active + bump lastUsedAt
-      console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${launchArgs.join(" ")}`));
-      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
-      const res = spawnSync(tool.bin, launchArgs, {
-        stdio: "inherit",
-        env: { ...process.env, ...env },
-      });
-      if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
-      process.exit(res.status ?? 0);
+      const launchArgs = mergeToolArgs(tool, plan.args, { permissions: opts.permissions, profile });
+      if (!plan.nonInteractive) await store.useProfile(name, tool.id);
+      console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([tool.bin, ...launchArgs]).join(" ")}`));
+      const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
+      const code = await runClaudeLaunch(
+        profile,
+        tool,
+        launchArgs,
+        { ...(plan.nonInteractive ? parentEnv : process.env), ...env },
+        process.cwd(),
+      );
+      process.exit(code);
     }),
   );
 
@@ -831,13 +844,32 @@ addConfigsOptions(program
   .option("-t, --tool <tool>", "tool when target is a profile name")
   .option("--resume", "start with the tool's resume/continue args")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
+  .option("--headless", "run Claude in native print mode without the Accounts supervisor")
+  .option("--background", "run Claude with its native --bg flag without the Accounts supervisor")
+  .option("--bg", "alias for --background")
+  .option("--name <name>", "pass a validated native name to a background Claude session")
   .action(
-    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ConfigsCliOptions) => {
+    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ClaudeLaunchOptions & ConfigsCliOptions) => {
       const plan = await resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
-      const runArgs = mergeToolArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
+      const launch = planClaudeLaunch(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], opts);
+      const runArgs = mergeToolArgs(plan.tool, launch.args, {
         permissions: opts.permissions,
         profile: plan.profile,
       });
+      if (launch.nonInteractive) {
+        runConfigsPrelaunch(plan.profile, plan.tool, configsPrelaunchOptions(opts));
+        const env = profileEnv(plan.profile, plan.tool);
+        const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
+        console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([plan.tool.bin, ...runArgs]).join(" ")}`));
+        const code = await runClaudeLaunch(
+          plan.profile,
+          plan.tool,
+          runArgs,
+          { ...parentEnv, ...env },
+          process.cwd(),
+        );
+        process.exit(code);
+      }
       console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
       console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
