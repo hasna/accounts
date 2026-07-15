@@ -11,7 +11,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { planClaudeLaunch, redactArgv, redactText } from "./lib/claude-launch.js";
+import {
+  planClaudeLaunch,
+  prepareWindowsBatchCommand,
+  redactArgv,
+  redactText,
+} from "./lib/claude-launch.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
 
@@ -181,6 +186,23 @@ function runCli(args: string[], options: { cwd?: string; env?: Record<string, st
   });
 }
 
+function windowsNodeExecutable(): string {
+  const located = spawnSync("where.exe", ["node"], { encoding: "utf8" });
+  const executable = located.stdout.split(/\r?\n/).find(Boolean);
+  if (located.status !== 0 || !executable) {
+    throw new Error(`failed to locate node.exe: ${located.stderr}`);
+  }
+  return executable;
+}
+
+function runBuiltNodeCli(args: string[], options: { cwd?: string; env?: Record<string, string> } = {}) {
+  return spawnSync(windowsNodeExecutable(), [join(repo, "dist", "cli.js"), ...args], {
+    cwd: options.cwd ?? repo,
+    encoding: "utf8",
+    env: baseEnv(options.env),
+  });
+}
+
 function expectStatus(
   result: ReturnType<typeof runCli>,
   expected: number,
@@ -330,6 +352,104 @@ describe("Claude launch planning", () => {
     });
     expect(() => planClaudeLaunch(getTool("codex"), ["Prompt"], { headless: true })).toThrow(/only with --tool claude/);
   });
+});
+
+test("Windows batch commands escape shell metacharacters before serialization", () => {
+  const command = prepareWindowsBatchCommand(
+    "C:\\Tools & Stuff\\claude.cmd",
+    ["plain", "space value", "x&whoami", "%PATH%", "caret^value", "quote\"value"],
+    "C:\\Windows\\System32\\cmd.exe",
+  );
+
+  expect(command.command).toBe("C:\\Windows\\System32\\cmd.exe");
+  expect(command.args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
+  expect(command.args).toHaveLength(4);
+  expect(command.windowsVerbatimArguments).toBe(true);
+  expect(command.args[3]).not.toContain("x&whoami");
+  expect(command.args[3]).not.toContain("%PATH%");
+  expect(command.args[3]).not.toContain("C:\\Tools & Stuff\\claude.cmd");
+  expect(() => prepareWindowsBatchCommand("claude.cmd", ["line\nbreak"], "cmd.exe"))
+    .toThrow("Windows batch arguments cannot contain line breaks");
+});
+
+test("built Node CLI executes a real Windows cmd shim with exact argv", () => {
+  if (process.platform !== "win32") return;
+  addProfile("acct");
+  const batchBin = mkdtempSync(join(tmpdir(), "accounts claude & cmd-"));
+  const batchLog = join(home, "fake-cmd-claude.jsonl");
+  const injectionMarker = join(home, "cmd-injection-marker");
+  const script = join(batchBin, "fake-claude.mjs");
+  const shim = join(batchBin, "claude.cmd");
+  const hostileArgs = [
+    "",
+    "Prompt with spaces",
+    `literal&echo injected>${injectionMarker}`,
+    "%PATH%",
+    "caret^value",
+    "bang!value",
+    "quote\"value",
+    "trailing\\",
+  ];
+
+  try {
+    writeFileSync(script, `
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
+  args: process.argv.slice(2),
+  cwd: process.cwd(),
+  relayEnv: process.env.CMD_RELAY_ENV,
+}) + "\\n");
+process.stdout.write("fake-cmd-stdout\\n");
+process.stderr.write("fake-cmd-stderr\\n");
+process.exit(29);
+`);
+    writeFileSync(shim, `@echo off\r\n"${windowsNodeExecutable()}" "${script}" %*\r\n`);
+    const inheritedPath = Object.entries(process.env)
+      .find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
+    const result = runBuiltNodeCli(
+      [
+        "launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--",
+        ...hostileArgs,
+      ],
+      {
+        cwd: launchCwd,
+        env: {
+          PATH: `${batchBin}${delimiter}${inheritedPath}`,
+          PATHEXT: ".CMD;.EXE",
+          FAKE_CLAUDE_LOG: batchLog,
+          CMD_RELAY_ENV: "preserved",
+        },
+      },
+    );
+
+    expectStatus(result, 29);
+    expect(result.stdout).toBe("fake-cmd-stdout\n");
+    expect(result.stderr).toContain("fake-cmd-stderr");
+    expect(entries<{ args: string[]; cwd: string; relayEnv: string }>(batchLog)).toEqual([
+      { args: ["-p", ...hostileArgs], cwd: launchCwd, relayEnv: "preserved" },
+    ]);
+
+    const rejected = runBuiltNodeCli(
+      [
+        "launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--",
+        `line\r\necho injected>${injectionMarker}`,
+      ],
+      {
+        cwd: launchCwd,
+        env: {
+          PATH: `${batchBin}${delimiter}${inheritedPath}`,
+          PATHEXT: ".CMD;.EXE",
+          FAKE_CLAUDE_LOG: batchLog,
+        },
+      },
+    );
+    expectStatus(rejected, 1);
+    expect(rejected.stderr).toContain("Windows batch arguments cannot contain line breaks");
+    expect(entries(batchLog)).toHaveLength(1);
+    expect(existsSync(injectionMarker)).toBe(false);
+  } finally {
+    rmSync(batchBin, { recursive: true, force: true });
+  }
 });
 
 test("headless launch keeps Claude stdout clean and returns its exit code", () => {
