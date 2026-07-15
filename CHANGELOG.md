@@ -6,21 +6,29 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-15
+
 ### Changed
 
-- **Clear diagnostic when the self-hosted server predates an endpoint.** When a
-  mutating registry call (`accounts rename`, `accounts tools add`, `accounts
-  tools remove`) hits a route-missing `404` (`{ "error": "not found" }`) — the
-  signature of a deployed `accounts-serve` build older than the client — the CLI
-  now surfaces an actionable message instructing the operator to update
-  `accounts-serve`, instead of a raw HTTP failure. Entity-level `404`s (a real
-  "no profile"/"no custom tool") are unchanged and never masked. Local mode is
-  unaffected. No package version or deployment target is asserted by this
-  source change.
-
+- `accounts launch` and `accounts run` treat Claude-only convenience modes as
+  thin native relays:
+  `--headless` relays native print mode, while `--background`/`--bg` and an
+  optional validated `--name` relay exactly to Claude's native `--bg --name`
+  lifecycle. Claude remains the owner of session ids, status, logs, attach, and
+  stop behavior.
 - Explicit `cloud` and `self_hosted` modes now fail closed when API
   configuration is incomplete. Cold custom-tool login/import/launch paths
   hydrate before synchronous lookup.
+- Pull requests run a checksum-pinned gitleaks binary over the complete
+  base-to-head commit range in a read-only, secret-free, fully redacted job.
+- Deprecated storage exports and CLI commands remain as compatibility shims;
+  retired provider-backed sync operations preserve optional environment
+  arguments and `--json` parsing, then fail explicitly.
+- Release provenance identifies the source repository as
+  `hasna/accounts-legacy`.
+
+### Fixed
+
 - Account rename/remove reconciles raw machine-local pointers. PostgreSQL
   selection updates are protected by row locks and an additive cascading
   foreign key migration. Migration `0004` archives orphan selections before
@@ -29,31 +37,11 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 - Custom-tool add/remove and account creation share a transaction-scoped
   advisory lock, preventing tool deletion from racing a new dependent account.
   Additive migration `0005` durably distinguishes unseen legacy custom tool
-  ids (accepted for old-client account creation) from explicitly removed ids
-  (rejected until explicit re-registration), including older direct SQL writers.
-- Migration `0005` trigger functions now remain owner-controlled
+  ids from explicitly removed ids, including for older direct SQL writers.
+- Migration `0005` trigger functions remain owner-controlled
   `SECURITY INVOKER` functions with a fixed schema-safe `search_path` and no
   public execution. The owner-run migrator validates and applies an explicit
-  DML-only `accounts-serve` role contract; required PostgreSQL tests run normal
-  and raw old-server race operations through that separate role.
-- Pull requests run a checksum-pinned gitleaks binary over the complete
-  base-to-head commit range in a read-only, secret-free, fully redacted job.
-- Deprecated storage exports and CLI commands remain as compatibility shims;
-  retired provider-backed sync operations preserve optional environment
-  arguments and `--json` parsing, then fail explicitly.
-
-## [0.2.8] - 2026-07-14
-
-### Added
-
-- `accounts launch` and `accounts run` accept Claude-only convenience modes:
-  `--headless` relays native print mode, while `--background`/`--bg` and an
-  optional validated `--name` relay exactly to Claude's native `--bg --name`
-  lifecycle. Claude remains the owner of session ids, status, logs, attach, and
-  stop behavior.
-
-### Fixed
-
+  DML-only `accounts-serve` role contract.
 - Validate raw, convenience, alias, duplicate, name, and explicit session UUID
   conflicts before configs prelaunch, active-profile mutation, keychain access,
   or process launch. Noninteractive invocations neither select a profile nor
@@ -61,14 +49,61 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 - Serialize temporary macOS keychain use across processes and restore the prior
   credential after Claude confirms dispatch or exits, including launch errors
   and forwarded termination signals. Lock files contain no credential values.
+- Resolve Claude from Windows `PATH`/`PATHEXT`, invoke only resolved `.cmd` and
+  `.bat` shims through `cmd.exe` with control-character rejection and escaped
+  arguments, and keep native executables on the direct-spawn path.
 - Keep Claude stdout unmodified, send Accounts diagnostics to stderr, preserve
   Claude exit status, and map forwarded termination signals to nonzero exits.
 
+## [0.2.7] - 2026-07-14
+
+### Added
+
+- First-class Claude worker flags on `accounts launch` and `accounts run`:
+  `--headless` maps to Claude `-p`, `--background` / `--bg` maps to Claude
+  `--bg`, and `--name <name>` names a background Claude agent. These flags compose
+  with `--permissions dangerous`, leaving the existing `-- ...` passthrough path
+  intact for raw Claude options.
+- Regression coverage for Claude worker argument placement, passthrough
+  de-duplication, and invalid flag combinations so dangerous permissions continue
+  to appear before worker-mode args.
+
 ### Changed
 
-- Release provenance identifies the source repository as
-  `hasna/accounts-legacy`. This source prepares `@hasna/accounts@0.2.8`
-  without publishing, tagging, or installing it.
+- The package repository metadata now points at `hasna/accounts-legacy`, the
+  current source home for the launcher-era `@hasna/accounts` npm package. The
+  clean `hasna/accounts` repository is a separate capacity-service product line.
+
+## [0.2.6] - 2026-07-09
+
+### Fixed
+
+- **`accounts-serve` OpenAPI `Tool` response schema is wire-additive again.** The
+  refactor that enriched `GET /v1/tools` (returning the full `ToolDef` plus custom
+  tools from the cloud registry) had also grown the `Tool` schema's `required` set
+  to `["id","label","envVar","defaultDir","bin"]`. The deployed (0.1.x) server only
+  guaranteed `["id","label"]` and never emitted `defaultDir`, so the change was a
+  non-additive contract narrowing that the server-redeploy safety gate blocked. The
+  extra `ToolDef` fields are now documented as **optional** and `required` is back to
+  `["id","label"]`, making the HTTP response contract a strict SUPERSET of the
+  deployed version. Runtime behavior is unchanged (the handler still returns the full
+  `ToolDef` + custom tools); old `/v1` clients — which parse the response without
+  strict validation — keep working. No route was removed or renamed; the new
+  `rename` / custom-tool endpoints remain additive alongside the old surface.
+
+## [0.2.4] - 2026-07-08
+
+### Changed
+
+- **Clear diagnostic when the self-hosted server predates an endpoint.** When a
+  mutating registry call (`accounts rename`, `accounts tools add`, `accounts
+  tools remove`) hits a route-missing `404` (`{ "error": "not found" }`) — the
+  signature of a deployed `accounts-serve` build older than the client — the CLI
+  now surfaces an actionable message instructing the operator to redeploy
+  `accounts-serve`, instead of a raw HTTP failure. Entity-level `404`s (a real
+  "no profile"/"no custom tool") are unchanged and never masked. Local mode is
+  unaffected. (The rename + tools endpoints already exist in `src/server`; the
+  live fix for cloud mode is an ECS redeploy of `accounts-serve` to >= 0.2.4.)
 
 ## [0.1.32] - 2026-07-06
 
