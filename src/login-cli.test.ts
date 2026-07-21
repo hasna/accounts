@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,24 +25,57 @@ interface RunOptions {
   path?: string;
 }
 
+function cliEnv(opts: RunOptions = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    NODE_ENV: "test",
+    HOME: home,
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    HASNA_ACCOUNTS_API_URL: "",
+    HASNA_ACCOUNTS_API_KEY: "",
+    FAKE_LOGIN_LOG: logPath,
+    PATH: opts.path ?? `${binDir}:${process.env.PATH ?? ""}`,
+    ...opts.env,
+  };
+}
+
 function runCliWith(args: string[], opts: RunOptions = {}) {
   return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
     cwd: process.cwd(),
     encoding: "utf8",
     input: opts.input,
-    env: {
-      ...process.env,
-      NODE_ENV: "test",
-      HOME: home,
-      ACCOUNTS_HOME: home,
-      HASNA_ACCOUNTS_STORAGE_MODE: "local",
-      HASNA_ACCOUNTS_API_URL: "",
-      HASNA_ACCOUNTS_API_KEY: "",
-      FAKE_LOGIN_LOG: logPath,
-      PATH: opts.path ?? `${binDir}:${process.env.PATH ?? ""}`,
-      ...opts.env,
-    },
+    env: cliEnv(opts),
   });
+}
+
+function spawnCliWith(args: string[], opts: RunOptions = {}): ChildProcess {
+  return spawn(process.execPath, ["run", "src/cli.ts", ...args], {
+    cwd: process.cwd(),
+    env: cliEnv(opts),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+async function collect(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk) => { stdout += chunk; });
+  child.stderr?.on("data", (chunk) => { stderr += chunk; });
+  return await new Promise((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+}
+
+async function waitFor(read: () => boolean, timeoutMs = 4_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (read()) return;
+    await Bun.sleep(20);
+  }
+  throw new Error("timed out waiting for fake login process");
 }
 
 function runCli(...args: string[]) {
@@ -74,6 +107,32 @@ function writeSignalledFakeTool(binName: string, envVar: string, toolName = binN
       "kill -TERM $$",
     ].join("\n"),
   );
+  chmodSync(fakeBin, 0o755);
+}
+
+function writeBlockingFakeTool(binName: string, envVar: string, toolName = binName) {
+  const script = join(binDir, `${binName}-blocking.ts`);
+  const fakeBin = join(binDir, binName);
+  writeFileSync(
+    script,
+    `
+import { appendFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_LOGIN_LOG, JSON.stringify({
+  tool: ${JSON.stringify(toolName)},
+  args: args.join(" "),
+  home: process.env[${JSON.stringify(envVar)}] ?? "",
+}) + "\\n");
+if (args.length === 0) {
+  writeFileSync(process.env.FAKE_LOGIN_READY, "ready");
+  process.on("SIGINT", () => process.exit(130));
+  process.on("SIGTERM", () => process.exit(143));
+  await new Promise(() => {});
+}
+process.exit(0);
+`,
+  );
+  writeFileSync(fakeBin, `#!/bin/sh\nexec "${process.execPath}" run "${script}" "$@"\n`);
   chmodSync(fakeBin, 0o755);
 }
 
@@ -237,6 +296,7 @@ function setupClaudeLogin(exit: "success" | "nonzero" | "signal") {
   const fakeSecurity = writeStatefulFakeSecurity();
   const securityLog = join(home, "stateful-security.log");
   const keychainState = join(home, "stateful-keychain.json");
+  const keychainLock = join(home, "keychain.lock");
   expect(runCli("add", "prior", "--tool", "claude").status).toBe(0);
   expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
   expect(runCli("use", "prior", "--tool", "claude").status).toBe(0);
@@ -250,8 +310,10 @@ function setupClaudeLogin(exit: "success" | "nonzero" | "signal") {
       ACCOUNTS_TEST_SECURITY_BIN: fakeSecurity,
       FAKE_SECURITY_LOG: securityLog,
       FAKE_KEYCHAIN_STATE: keychainState,
+      ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH: keychainLock,
     },
     keychainState,
+    keychainLock,
     securityLog,
   };
 }
@@ -368,6 +430,74 @@ test("signalled Claude login returns nonzero and restores active profile and key
     account: "prior",
     secret: "prior-secret",
   });
+  expect(readLogEntries()).toHaveLength(1);
+});
+
+test("parent SIGINT rolls back while holding the shared Claude keychain lease", async () => {
+  const fixture = setupClaudeLogin("success");
+  const ready = join(home, "blocking-login.ready");
+  writeBlockingFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
+  const child = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: { ...fixture.env, FAKE_LOGIN_READY: ready },
+  });
+  const resultPromise = collect(child);
+
+  await waitFor(() => existsSync(ready));
+  expect(existsSync(fixture.keychainLock)).toBe(true);
+  const securityBeforeBlockedLaunch = readFileSync(fixture.securityLog, "utf8");
+  const blockedLaunch = runCliWith(
+    ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "Prompt"],
+    {
+      env: {
+        ...fixture.env,
+        ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS: "75",
+      },
+    },
+  );
+  expect(blockedLaunch.status).toBe(1);
+  expect(blockedLaunch.stderr).toContain("timed out waiting for the Claude keychain lock");
+  expect(readFileSync(fixture.securityLog, "utf8")).toBe(securityBeforeBlockedLaunch);
+  expect(readLogEntries()).toHaveLength(1);
+
+  child.kill("SIGINT");
+  const result = await resultPromise;
+  expect(result.code).toBe(130);
+  expect(result.signal).toBeNull();
+  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
+    account: "prior",
+    secret: "prior-secret",
+  });
+  expect(existsSync(fixture.keychainLock)).toBe(false);
+});
+
+test("zero exit without completed auth rolls back failed finalization", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  const fakeSecurity = writeStatefulFakeSecurity();
+  const securityLog = join(home, "finalize-security.log");
+  const keychainState = join(home, "finalize-keychain.json");
+  const keychainLock = join(home, "finalize-keychain.lock");
+  writeFileSync(keychainState, JSON.stringify({ account: "prior", secret: "prior-secret" }), { mode: 0o600 });
+
+  const result = runCliWith(["login", "unfinished", "--tool", "claude"], {
+    env: {
+      ACCOUNTS_TEST_KEYCHAIN: "1",
+      ACCOUNTS_TEST_SECURITY_BIN: fakeSecurity,
+      FAKE_SECURITY_LOG: securityLog,
+      FAKE_KEYCHAIN_STATE: keychainState,
+      ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH: keychainLock,
+    },
+  });
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('profile "unfinished" has no auth to apply');
+  expectNoProfileState("unfinished", "claude");
+  expect(JSON.parse(readFileSync(keychainState, "utf8"))).toEqual({
+    account: "prior",
+    secret: "prior-secret",
+  });
+  expect(existsSync(keychainLock)).toBe(false);
   expect(readLogEntries()).toHaveLength(1);
 });
 

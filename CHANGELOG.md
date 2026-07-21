@@ -25,9 +25,11 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 - Repeated `--permissions` options now fail during raw CLI validation before
   profile, tool-lock, keychain, or process mutation, including same-value and
   conflicting repetitions.
-- Failed and signalled login processes now return nonzero without finalizing the
-  profile, restore the prior active selection, tool lock, and Claude keychain,
-  and remove only profile state created by the failed attempt.
+- Failed, interrupted, signalled, and unfinalized login processes now return
+  nonzero without retaining partial state, restore the prior active selection,
+  tool lock, and Claude keychain, and remove only profile state created by the
+  failed attempt. Claude login holds the shared keychain lease throughout the
+  child process and finalization.
 - The default Bun test preload neutralizes inherited station Accounts cloud/API
   configuration while explicit cloud fixtures remain supported.
 - Compatible transitive overrides keep the MCP SDK graph on patched

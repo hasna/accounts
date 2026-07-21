@@ -51,9 +51,11 @@ import {
   type SupervisorState,
 } from "./lib/supervisor.js";
 import {
+  acquireClaudeKeychainLock,
   planClaudeLaunch,
   redactArgv,
   runClaudeLaunch,
+  runToolProcess,
   signalExitCode,
   type ClaudeLaunchOptions,
 } from "./lib/claude-launch.js";
@@ -666,6 +668,15 @@ program
       }
       let priorKeychain: ReturnType<typeof captureClaudeKeychain>;
       let keychainCaptured = false;
+      let releaseKeychainLock: (() => void) | undefined;
+      let pendingSignal: NodeJS.Signals | undefined;
+      const lockAbort = new AbortController();
+      const rememberSignal = (signal: NodeJS.Signals) => {
+        pendingSignal ??= signal;
+        lockAbort.abort();
+      };
+      const onSigint = () => rememberSignal("SIGINT");
+      const onSigterm = () => rememberSignal("SIGTERM");
       let rolledBack = false;
       const rollback = async () => {
         if (rolledBack) return;
@@ -676,32 +687,43 @@ program
           if (keychainCaptured) restoreClaudeKeychain(priorKeychain);
         }
       };
+      if (tool.id === "claude" && keychainSupported()) {
+        process.once("SIGINT", onSigint);
+        process.once("SIGTERM", onSigterm);
+      }
       try {
         if (tool.id === "claude" && keychainSupported()) {
+          releaseKeychainLock = await acquireClaudeKeychainLock(lockAbort.signal);
+          if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
           priorKeychain = captureClaudeKeychain();
           keychainCaptured = true;
+          if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
         }
         prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
-        const res = spawnSync(tool.bin, loginArgs, {
-          stdio: "inherit",
-          env: { ...process.env, ...env },
-        });
-        if (res.error) throw new AccountsError(`failed to launch ${tool.bin}: ${res.error.message}`);
-        const exitCode = res.status ?? signalExitCode(res.signal);
+        if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
+        const exitCode = await runToolProcess(tool, loginArgs, { ...process.env, ...env }, process.cwd());
         if (exitCode !== 0) {
           await rollback();
           process.exitCode = exitCode;
           return;
         }
+        const finalized = await finalizeLogin(name, tool.id, store);
+        if (finalized.applied) {
+          console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
+        } else {
+          console.log(chalk.green(`✓ ${chalk.bold(name)} login finished and profile is active`));
+        }
       } catch (error) {
         await rollback();
+        if (pendingSignal) {
+          process.exitCode = signalExitCode(pendingSignal);
+          return;
+        }
         throw error;
-      }
-      const finalized = await finalizeLogin(name, tool.id, store);
-      if (finalized.applied) {
-        console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
-      } else {
-        console.log(chalk.green(`✓ ${chalk.bold(name)} login finished and profile is active`));
+      } finally {
+        process.removeListener("SIGINT", onSigint);
+        process.removeListener("SIGTERM", onSigterm);
+        releaseKeychainLock?.();
       }
     }),
   );

@@ -233,12 +233,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function acquireKeychainLock(): Promise<() => void> {
+export async function acquireClaudeKeychainLock(signal?: AbortSignal): Promise<() => void> {
   const path = keychainLockPath();
   const token = `${process.pid}:${randomUUID()}`;
   const deadline = Date.now() + numericTestSetting("ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS", 600_000);
 
   while (true) {
+    if (signal?.aborted) throw new AccountsError("interrupted while waiting for the Claude keychain lock");
     try {
       const fd = openSync(path, "wx", 0o600);
       try {
@@ -338,7 +339,12 @@ export function prepareWindowsBatchCommand(
   };
 }
 
-async function relayProcess(tool: ToolDef, args: string[], env: NodeJS.ProcessEnv, cwd: string): Promise<number> {
+export async function runToolProcess(
+  tool: ToolDef,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
     const executable = resolveExecutable(tool.bin, env);
     const batchCommand = process.platform === "win32" && /\.(?:bat|cmd)$/i.test(executable)
@@ -389,11 +395,11 @@ export async function runClaudeLaunch(
   env: NodeJS.ProcessEnv,
   cwd: string,
 ): Promise<number> {
-  if (tool.id !== "claude" || !keychainSupported()) return relayProcess(tool, args, env, cwd);
+  if (tool.id !== "claude" || !keychainSupported()) return runToolProcess(tool, args, env, cwd);
   const credential = claudeKeychainCredentialFromProfile(profile.dir, profile.name);
-  if (!credential) return relayProcess(tool, args, env, cwd);
+  if (!credential) return runToolProcess(tool, args, env, cwd);
 
-  const release = await acquireKeychainLock();
+  const release = await acquireClaudeKeychainLock();
   let pendingSignal: NodeJS.Signals | undefined;
   const rememberSigint = () => { pendingSignal ??= "SIGINT"; };
   const rememberSigterm = () => { pendingSignal ??= "SIGTERM"; };
@@ -405,7 +411,7 @@ export async function runClaudeLaunch(
     prior = captureClaudeKeychain();
     keychainTouched = true;
     writeClaudeKeychain(credential);
-    const code = await relayProcess(tool, args, env, cwd);
+    const code = await runToolProcess(tool, args, env, cwd);
     return pendingSignal ? signalExitCode(pendingSignal) : code;
   } finally {
     try {
