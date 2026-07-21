@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -23,6 +23,17 @@ import {
 import { assertSafeWritePath } from "./safe-path.js";
 
 type JsonRecord = Record<string, unknown>;
+
+interface ClaudeLiveAuthFileSnapshot {
+  path: string;
+  contents?: Buffer;
+  mode?: number;
+}
+
+export interface ClaudeLiveAuthSnapshot {
+  base: string;
+  files: ClaudeLiveAuthFileSnapshot[];
+}
 
 export const CLAUDE_API_AUTH_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
@@ -231,6 +242,43 @@ export function sanitizeClaudeOAuthProfileSettings(profileDir: string, tool: Too
 
 export function sanitizeLiveClaudeOAuthSettings(): boolean {
   return sanitizeSettingsFile(liveClaudePaths().configDir, liveClaudeBase());
+}
+
+/** Capture every live Claude file that apply may replace or sanitize. */
+export function captureClaudeLiveAuthSnapshot(): ClaudeLiveAuthSnapshot {
+  const base = liveClaudeBase();
+  const live = liveClaudePaths();
+  const paths = [live.homeJson, live.credentialsFile, join(live.configDir, "settings.json")];
+  return {
+    base,
+    files: paths.map((path) => {
+      if (!existsSync(path)) return { path };
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new AccountsError(`refusing to snapshot unsafe live Claude auth path ${path}`);
+      }
+      return { path, contents: readFileSync(path), mode: stat.mode & 0o777 };
+    }),
+  };
+}
+
+/** Restore an exact live Claude auth snapshot after failed finalization. */
+export function restoreClaudeLiveAuthSnapshot(snapshot: ClaudeLiveAuthSnapshot): void {
+  for (const file of snapshot.files) {
+    assertSafeWritePath(file.path, { mustStayUnder: snapshot.base });
+    if (file.contents === undefined) {
+      if (!existsSync(file.path)) continue;
+      const stat = lstatSync(file.path);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new AccountsError(`refusing to remove unsafe live Claude auth path ${file.path}`);
+      }
+      unlinkSync(file.path);
+      continue;
+    }
+    mkdirSync(dirname(file.path), { recursive: true });
+    writeFileSync(file.path, file.contents, { mode: file.mode ?? 0o600 });
+    chmodSync(file.path, file.mode ?? 0o600);
+  }
 }
 
 /** Email address of the account currently authenticated on the live Claude paths. */

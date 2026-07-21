@@ -6,7 +6,11 @@ import { join } from "node:path";
 import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile } from "./lib/profiles.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile } from "./lib/import-profile.js";
-import { finalizeLogin } from "./lib/login.js";
+import {
+  captureLoginFinalizationState,
+  finalizeLogin,
+  rollbackLoginFinalization,
+} from "./lib/login.js";
 import {
   claudeKeychainCredentialFromProfile,
   ensureProfileAuthSnapshot,
@@ -20,6 +24,7 @@ import { switchProfile } from "./lib/switch.js";
 import { profileEnv } from "./lib/env.js";
 import { loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
+import { resolveStore, type AccountsStore } from "./lib/store.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -256,6 +261,46 @@ test("finalizeLogin refreshes a stale auth snapshot from the profile dir", async
   };
   expect(live.oauthAccount.emailAddress).toBe("new@example.com");
   rmSync(workDir, { recursive: true, force: true });
+});
+
+test("failed API current persistence restores prior live Claude auth and applied pointer", async () => {
+  const prior = addProfile({ name: "prior-finalize" });
+  const target = addProfile({ name: "target-finalize" });
+  writeOAuth(prior.dir, "prior-finalize@example.com");
+  writeOAuth(target.dir, "target-finalize@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const currentWrites: string[] = [];
+  const apiLikeStore = new Proxy(localStore, {
+    get(store, property, receiver) {
+      if (property === "transport") return "api";
+      if (property === "useProfile") {
+        return async (name: string, tool?: string) => {
+          currentWrites.push(name);
+          if (name === target.name) throw new AccountsError("simulated current persistence failure");
+          return await store.useProfile(name, tool);
+        };
+      }
+      const value = Reflect.get(store, property, receiver);
+      return typeof value === "function" ? value.bind(store) : value;
+    },
+  }) as AccountsStore;
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"), apiLikeStore);
+
+  await expect(finalizeLogin(target.name, target.tool, apiLikeStore)).rejects.toThrow(
+    "simulated current persistence failure",
+  );
+  expect(appliedProfile("claude")?.name).toBe(target.name);
+  await rollbackLoginFinalization(state, apiLikeStore);
+
+  expect(appliedProfile("claude")?.name).toBe(prior.name);
+  expect(currentProfile("claude")?.name).toBe(prior.name);
+  expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
+    .toBe("prior-finalize@example.com");
+  expect(currentWrites).toEqual([target.name, prior.name]);
 });
 
 test("rename and remove keep applied pointer coherent", async () => {

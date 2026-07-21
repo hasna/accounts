@@ -5,16 +5,29 @@ import { createInterface, type Interface } from "node:readline";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
-import { ensureProfileAuthSnapshot } from "./claude-auth.js";
+import {
+  captureClaudeLiveAuthSnapshot,
+  ensureProfileAuthSnapshot,
+  restoreClaudeLiveAuthSnapshot,
+  type ClaudeLiveAuthSnapshot,
+} from "./claude-auth.js";
 import { getProfileToolLock, lockProfileTool, restoreProfileToolLock } from "./profiles.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
-import { profilesDir } from "../storage.js";
+import { loadMachineStore, profilesDir, saveStore } from "../storage.js";
 
 export interface FinalizeLoginResult {
   profile: Profile;
   applied: boolean;
+}
+
+export interface LoginFinalizationState {
+  tool: ToolDef;
+  profile: Profile;
+  current?: Profile;
+  applied?: string;
+  liveClaude?: ClaudeLiveAuthSnapshot;
 }
 
 export interface ToolAvailability {
@@ -424,6 +437,62 @@ export async function rollbackLoginPreparation(
       restoreProfileToolLock(preparation.profile.name, preparation.previousToolLock);
     }
   }
+}
+
+/** Capture state that Claude finalization may mutate after the login child exits. */
+export async function captureLoginFinalizationState(
+  name: string,
+  tool: ToolDef,
+  store: AccountsStore = resolveStore(),
+): Promise<LoginFinalizationState> {
+  const [profile, current] = await Promise.all([
+    store.getProfile(name, tool.id),
+    store.currentProfile(tool.id),
+  ]);
+  const machine = loadMachineStore();
+  return {
+    tool,
+    profile,
+    ...(current ? { current } : {}),
+    ...(machine.applied[tool.id] ? { applied: machine.applied[tool.id] } : {}),
+    ...(tool.id === "claude" ? { liveClaude: captureClaudeLiveAuthSnapshot() } : {}),
+  };
+}
+
+/** Restore live auth and active/applied pointers after failed or interrupted finalization. */
+export async function rollbackLoginFinalization(
+  state: LoginFinalizationState,
+  store: AccountsStore = resolveStore(),
+): Promise<void> {
+  let firstError: unknown;
+  const attempt = async (operation: () => void | Promise<void>) => {
+    try {
+      await operation();
+    } catch (error) {
+      firstError ??= error;
+    }
+  };
+
+  if (state.liveClaude) await attempt(() => restoreClaudeLiveAuthSnapshot(state.liveClaude!));
+  await attempt(() => {
+    const machine = loadMachineStore();
+    if (state.applied) machine.applied[state.tool.id] = state.applied;
+    else delete machine.applied[state.tool.id];
+    if (store.transport === "local") {
+      if (state.current) machine.current[state.tool.id] = state.current.name;
+      else delete machine.current[state.tool.id];
+      const profileIndex = machine.profiles.findIndex(
+        (profile) => profile.name === state.profile.name && profile.tool === state.profile.tool,
+      );
+      if (profileIndex >= 0) machine.profiles[profileIndex] = structuredClone(state.profile);
+    }
+    saveStore(machine);
+  });
+  if (store.transport === "api" && state.current) {
+    await attempt(() => store.useProfile(state.current!.name, state.tool.id).then(() => undefined));
+  }
+
+  if (firstError) throw firstError;
 }
 
 /**

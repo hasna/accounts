@@ -38,7 +38,14 @@ import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.j
 import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.js";
 import { captureClaudeKeychain, keychainSupported, restoreClaudeKeychain } from "./lib/keychain.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
-import { finalizeLogin, prepareLogin, rollbackLoginPreparation } from "./lib/login.js";
+import {
+  captureLoginFinalizationState,
+  finalizeLogin,
+  prepareLogin,
+  rollbackLoginFinalization,
+  rollbackLoginPreparation,
+  type LoginFinalizationState,
+} from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
@@ -669,6 +676,7 @@ program
       let priorKeychain: ReturnType<typeof captureClaudeKeychain>;
       let keychainCaptured = false;
       let releaseKeychainLock: (() => void) | undefined;
+      let finalizationState: LoginFinalizationState | undefined;
       let pendingSignal: NodeJS.Signals | undefined;
       const lockAbort = new AbortController();
       const rememberSignal = (signal: NodeJS.Signals) => {
@@ -682,14 +690,18 @@ program
         if (rolledBack) return;
         rolledBack = true;
         try {
-          await rollbackLoginPreparation(prepared, store);
+          if (finalizationState) await rollbackLoginFinalization(finalizationState, store);
         } finally {
-          if (keychainCaptured) restoreClaudeKeychain(priorKeychain);
+          try {
+            await rollbackLoginPreparation(prepared, store);
+          } finally {
+            if (keychainCaptured) restoreClaudeKeychain(priorKeychain);
+          }
         }
       };
       if (tool.id === "claude" && keychainSupported()) {
-        process.once("SIGINT", onSigint);
-        process.once("SIGTERM", onSigterm);
+        process.on("SIGINT", onSigint);
+        process.on("SIGTERM", onSigterm);
       }
       try {
         if (tool.id === "claude" && keychainSupported()) {
@@ -707,7 +719,20 @@ program
           process.exitCode = exitCode;
           return;
         }
+        finalizationState = await captureLoginFinalizationState(name, tool, store);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (pendingSignal) {
+          await rollback();
+          process.exitCode = signalExitCode(pendingSignal);
+          return;
+        }
         const finalized = await finalizeLogin(name, tool.id, store);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (pendingSignal) {
+          await rollback();
+          process.exitCode = signalExitCode(pendingSignal);
+          return;
+        }
         if (finalized.applied) {
           console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
         } else {

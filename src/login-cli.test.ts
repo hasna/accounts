@@ -110,6 +110,21 @@ function writeSignalledFakeTool(binName: string, envVar: string, toolName = binN
   chmodSync(fakeBin, 0o755);
 }
 
+function writeFinalizationSignalTool(binName: string, envVar: string, toolName = binName) {
+  const fakeBin = join(binDir, binName);
+  writeFileSync(
+    fakeBin,
+    [
+      "#!/bin/sh",
+      `home="\${${envVar}:-}"`,
+      `printf '{"tool":"${toolName}","args":"%s","home":"%s"}\\n' "$*" "$home" >> "$FAKE_LOGIN_LOG"`,
+      'printf completed > "$FAKE_LOGIN_COMPLETED"',
+      "exit 0",
+    ].join("\n"),
+  );
+  chmodSync(fakeBin, 0o755);
+}
+
 function writeBlockingFakeTool(binName: string, envVar: string, toolName = binName) {
   const script = join(binDir, `${binName}-blocking.ts`);
   const fakeBin = join(binDir, binName);
@@ -125,8 +140,12 @@ appendFileSync(process.env.FAKE_LOGIN_LOG, JSON.stringify({
 }) + "\\n");
 if (args.length === 0) {
   writeFileSync(process.env.FAKE_LOGIN_READY, "ready");
-  process.on("SIGINT", () => process.exit(130));
-  process.on("SIGTERM", () => process.exit(143));
+  const handleSignal = (signal, code) => {
+    if (process.env.FAKE_LOGIN_SIGNAL_LOG) appendFileSync(process.env.FAKE_LOGIN_SIGNAL_LOG, signal + "\\n");
+    if (process.env.FAKE_LOGIN_IGNORE_SIGNALS !== "1") process.exit(code);
+  };
+  process.on("SIGINT", () => handleSignal("SIGINT", 130));
+  process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
   await new Promise(() => {});
 }
 process.exit(0);
@@ -206,6 +225,17 @@ const command = args[0];
 const statePath = process.env.FAKE_KEYCHAIN_STATE;
 const logPath = process.env.FAKE_SECURITY_LOG;
 const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : undefined;
+if (
+  process.env.FAKE_LOGIN_COMPLETED &&
+  existsSync(process.env.FAKE_LOGIN_COMPLETED) &&
+  process.env.FAKE_FINALIZE_SIGNAL_SENT &&
+  !existsSync(process.env.FAKE_FINALIZE_SIGNAL_SENT)
+) {
+  writeFileSync(process.env.FAKE_FINALIZE_SIGNAL_SENT, "sent");
+  process.kill(process.ppid, "SIGINT");
+}
+const delay = Number(process.env.FAKE_SECURITY_DELAY_MS ?? 0);
+if (delay > 0) await Bun.sleep(delay);
 const valueAfter = (flag) => {
   const index = args.indexOf(flag);
   return index < 0 ? undefined : args[index + 1];
@@ -433,13 +463,20 @@ test("signalled Claude login returns nonzero and restores active profile and key
   expect(readLogEntries()).toHaveLength(1);
 });
 
-test("parent SIGINT rolls back while holding the shared Claude keychain lease", async () => {
+test("repeated parent SIGINT rolls back while holding the shared Claude keychain lease", async () => {
   const fixture = setupClaudeLogin("success");
   const ready = join(home, "blocking-login.ready");
+  const signalLog = join(home, "blocking-login.signals");
   writeBlockingFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
   const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
   const child = spawnCliWith(["login", "acct", "--tool", "claude"], {
-    env: { ...fixture.env, FAKE_LOGIN_READY: ready },
+    env: {
+      ...fixture.env,
+      FAKE_LOGIN_READY: ready,
+      FAKE_LOGIN_SIGNAL_LOG: signalLog,
+      FAKE_LOGIN_IGNORE_SIGNALS: "1",
+      ACCOUNTS_TEST_CHILD_KILL_TIMEOUT_MS: "100",
+    },
   });
   const resultPromise = collect(child);
 
@@ -461,10 +498,56 @@ test("parent SIGINT rolls back while holding the shared Claude keychain lease", 
   expect(readLogEntries()).toHaveLength(1);
 
   child.kill("SIGINT");
+  await waitFor(() => existsSync(signalLog));
+  child.kill("SIGINT");
   const result = await resultPromise;
   expect(result.code).toBe(130);
   expect(result.signal).toBeNull();
   expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
+    account: "prior",
+    secret: "prior-secret",
+  });
+  expect(existsSync(fixture.keychainLock)).toBe(false);
+  expect(readFileSync(signalLog, "utf8")).toContain("SIGINT");
+});
+
+test("SIGINT during finalization restores live auth, applied state, profile metadata, and keychain", () => {
+  const fixture = setupClaudeLogin("success");
+  const liveBase = join(home, "live-claude");
+  const liveConfig = join(liveBase, ".claude");
+  const loginCompleted = join(home, "login-completed");
+  const signalSent = join(home, "finalization-signal.sent");
+  mkdirSync(liveConfig, { recursive: true });
+  const liveHomeJson = join(liveBase, ".claude.json");
+  const liveCredentials = join(liveConfig, ".credentials.json");
+  const liveSettings = join(liveConfig, "settings.json");
+  writeFileSync(liveHomeJson, '{"oauthAccount":{"emailAddress":"prior@example.com"}}\n', { mode: 0o600 });
+  writeFileSync(liveCredentials, '{"claudeAiOauth":{"refreshToken":"prior-live"}}\n', { mode: 0o600 });
+  writeFileSync(liveSettings, '{"apiKeyHelper":"keep-me","theme":"dark"}\n', { mode: 0o600 });
+  const store = readStore();
+  store.applied = { ...(store.applied ?? {}), claude: "prior" };
+  writeFileSync(join(home, "accounts.json"), JSON.stringify({ version: 1, tools: [], ...store }, null, 2) + "\n");
+  const storeBefore = readStore();
+  writeFinalizationSignalTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+
+  const result = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LIVE_DIR: liveBase,
+      FAKE_SECURITY_DELAY_MS: "40",
+      FAKE_LOGIN_COMPLETED: loginCompleted,
+      FAKE_FINALIZE_SIGNAL_SENT: signalSent,
+    },
+  });
+
+  expect(result.status).toBe(130);
+  expect(existsSync(signalSent)).toBe(true);
+  expect(result.stdout).not.toContain("live/default Claude Code account");
+  expect(readStore()).toEqual(storeBefore);
+  expect(readFileSync(liveHomeJson, "utf8")).toBe('{"oauthAccount":{"emailAddress":"prior@example.com"}}\n');
+  expect(readFileSync(liveCredentials, "utf8")).toBe('{"claudeAiOauth":{"refreshToken":"prior-live"}}\n');
+  expect(readFileSync(liveSettings, "utf8")).toBe('{"apiKeyHelper":"keep-me","theme":"dark"}\n');
   expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
     account: "prior",
     secret: "prior-secret",

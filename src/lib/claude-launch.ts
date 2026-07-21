@@ -368,8 +368,8 @@ export async function runToolProcess(
     };
     const onSigint = () => forward("SIGINT");
     const onSigterm = () => forward("SIGTERM");
-    process.once("SIGINT", onSigint);
-    process.once("SIGTERM", onSigterm);
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
 
     const cleanup = () => {
       process.removeListener("SIGINT", onSigint);
@@ -403,8 +403,8 @@ export async function runClaudeLaunch(
   let pendingSignal: NodeJS.Signals | undefined;
   const rememberSigint = () => { pendingSignal ??= "SIGINT"; };
   const rememberSigterm = () => { pendingSignal ??= "SIGTERM"; };
-  process.once("SIGINT", rememberSigint);
-  process.once("SIGTERM", rememberSigterm);
+  process.on("SIGINT", rememberSigint);
+  process.on("SIGTERM", rememberSigterm);
   let prior: ReturnType<typeof captureClaudeKeychain>;
   let keychainTouched = false;
   try {
