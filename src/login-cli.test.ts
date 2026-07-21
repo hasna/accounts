@@ -110,6 +110,25 @@ function writeSignalledFakeTool(binName: string, envVar: string, toolName = binN
   chmodSync(fakeBin, 0o755);
 }
 
+function writeRawAuthMutatingFailureTool(
+  binName: string,
+  envVar: string,
+  exit: "nonzero" | "signal",
+) {
+  const fakeBin = join(binDir, binName);
+  writeFileSync(
+    fakeBin,
+    [
+      "#!/bin/sh",
+      `profile_dir="\${${envVar}:-}"`,
+      'printf \'{"oauthAccount":{"emailAddress":"partial@example.com"},"concurrentPreference":"keep"}\\n\' > "$profile_dir/.claude.json"',
+      'printf \'{"claudeAiOauth":{"refreshToken":"partial-refresh"},"concurrentPreference":"keep"}\\n\' > "$profile_dir/.credentials.json"',
+      exit === "signal" ? "kill -TERM $$" : "exit 23",
+    ].join("\n"),
+  );
+  chmodSync(fakeBin, 0o755);
+}
+
 function writeFinalizationSignalTool(binName: string, envVar: string, toolName = binName) {
   const fakeBin = join(binDir, binName);
   writeFileSync(
@@ -264,6 +283,10 @@ if (command === "add-generic-password") {
   const secret = valueAfter("-w");
   if (!account || !secret) process.exit(64);
   appendFileSync(logPath, JSON.stringify({ operation: "add", account }) + "\\n");
+  if (
+    process.env.FAKE_SECURITY_FAIL_ADD_CONTAINS &&
+    secret.includes(process.env.FAKE_SECURITY_FAIL_ADD_CONTAINS)
+  ) process.exit(23);
   writeFileSync(statePath, JSON.stringify({ account, secret }), { mode: 0o600 });
   process.exit(0);
 }
@@ -469,6 +492,41 @@ test("signalled Claude login returns nonzero and restores active profile and key
   expect(readLogEntries()).toHaveLength(1);
 });
 
+for (const failure of [
+  { label: "failed", exit: "nonzero" as const, status: 23 },
+  { label: "signalled", exit: "signal" as const, status: 143 },
+]) {
+  test(`${failure.label} existing-profile login restores raw auth while preserving unrelated fields`, () => {
+    const fixture = setupClaudeLogin(failure.exit);
+    writeRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", failure.exit);
+    const target = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+    if (!target) throw new Error("missing existing Claude profile fixture");
+    writeFileSync(
+      join(target.dir, ".claude.json"),
+      '{"oauthAccount":{"emailAddress":"before@example.com"},"stablePreference":"before"}\n',
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      join(target.dir, ".credentials.json"),
+      '{"claudeAiOauth":{"refreshToken":"before-refresh"}}\n',
+      { mode: 0o600 },
+    );
+
+    const result = runCliWith(["login", "acct", "--tool", "claude"], { env: fixture.env });
+
+    expect(result.status).toBe(failure.status);
+    expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8"))).toEqual({
+      oauthAccount: { emailAddress: "before@example.com" },
+      stablePreference: "before",
+      concurrentPreference: "keep",
+    });
+    expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8"))).toEqual({
+      claudeAiOauth: { refreshToken: "before-refresh" },
+      concurrentPreference: "keep",
+    });
+  });
+}
+
 test("post-child SIGTERM rolls back finalization without Claude keychain support", async () => {
   const completed = join(home, "non-keychain-login-completed");
   writeFinalizationSignalTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
@@ -542,6 +600,54 @@ test("repeated parent SIGINT rolls back while holding the shared Claude keychain
   });
   expect(existsSync(fixture.keychainLock)).toBe(false);
   expect(readFileSync(signalLog, "utf8")).toContain("SIGINT");
+});
+
+test("ordinary apply waits for the shared Claude keychain lease before mutating", () => {
+  const fixture = setupClaudeLogin("success");
+  const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
+  const keychainBefore = readFileSync(fixture.keychainState, "utf8");
+  writeFileSync(fixture.keychainLock, `${process.pid}:held-by-test`, { mode: 0o600 });
+
+  const result = runCliWith(["apply", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS: "75",
+    },
+  });
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("timed out waiting for the Claude keychain lock");
+  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expect(readFileSync(fixture.keychainState, "utf8")).toBe(keychainBefore);
+});
+
+test("ordinary apply rolls back live, registry, and keychain state when the keychain write fails", () => {
+  const fixture = setupClaudeLogin("success");
+  const profiles = readStore().profiles ?? [];
+  const prior = profiles.find((profile) => profile.name === "prior" && profile.tool === "claude");
+  if (!prior) throw new Error("missing prior Claude profile fixture");
+  writeClaudeAuth(prior.dir, "prior@example.com");
+  expect(runCliWith(["apply", "prior", "--tool", "claude"], { env: fixture.env }).status).toBe(0);
+  const liveHomeJson = join(home, ".claude.json");
+  const liveCredentials = join(home, ".claude", ".credentials.json");
+  const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
+  const keychainBefore = readFileSync(fixture.keychainState, "utf8");
+  const liveHomeBefore = readFileSync(liveHomeJson, "utf8");
+  const liveCredentialsBefore = readFileSync(liveCredentials, "utf8");
+
+  const result = runCliWith(["apply", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      FAKE_SECURITY_FAIL_ADD_CONTAINS: "acct@example.com-access-token",
+    },
+  });
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("keychain write failed");
+  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expect(readFileSync(fixture.keychainState, "utf8")).toBe(keychainBefore);
+  expect(readFileSync(liveHomeJson, "utf8")).toBe(liveHomeBefore);
+  expect(readFileSync(liveCredentials, "utf8")).toBe(liveCredentialsBefore);
 });
 
 test("SIGINT during finalization restores live auth, applied state, profile metadata, and keychain", () => {

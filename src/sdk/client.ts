@@ -24,7 +24,7 @@ export interface RestoreFieldInput { "expected": string | null; "restore": strin
 
 export interface RestoreAccountInput { "email"?: RestoreFieldInput; "lastUsedAt"?: RestoreFieldInput }
 
-export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string; "revision"?: string; "operationId"?: string }
+export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string; "revision"?: string; "operationId"?: string; "previousName"?: string; "previousTargetLastUsedAt"?: string }
 
 export interface CurrentSelectionList { "current": Array<CurrentSelection>; "transactionalLoginRollback"?: true }
 

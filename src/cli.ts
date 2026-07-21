@@ -707,6 +707,7 @@ program
         }
         if (tool.id === "claude" && keychainSupported()) {
           releaseKeychainLock = await acquireClaudeKeychainLock(lockAbort.signal);
+          finalizationState.writes.keychainLeaseHeld = true;
           if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
           priorKeychain = captureClaudeKeychain();
           keychainCaptured = true;

@@ -33,6 +33,8 @@ export interface CurrentSelection {
 
 export interface LoginCurrentSelection extends CurrentSelection {
   operationId: string;
+  previousName?: string;
+  previousTargetLastUsedAt?: string;
 }
 
 /** The storage surface the HTTP handler depends on (implemented by AccountsRepo). */
@@ -375,8 +377,11 @@ export class AccountsRepo implements AccountsStore {
         state: "completed" | "cancelled";
         updated_at: string | Date | null;
         revision: string | number | null;
+        previous_name: string | null;
+        previous_target_last_used_at: string | Date | null;
       }>(
-        `SELECT operation_id, tool, name, state, updated_at, revision
+        `SELECT operation_id, tool, name, state, updated_at, revision,
+                previous_name, previous_target_last_used_at
            FROM current_login_operations
           WHERE operation_id = $1`,
         [operationId],
@@ -397,10 +402,18 @@ export class AccountsRepo implements AccountsStore {
           updatedAt: iso(completed.updated_at)!,
           revision: String(completed.revision),
           operationId: completed.operation_id,
+          ...(completed.previous_name ? { previousName: completed.previous_name } : {}),
+          ...(completed.previous_target_last_used_at
+            ? { previousTargetLastUsedAt: iso(completed.previous_target_last_used_at)! }
+            : {}),
         };
       }
       const account = await this.getWith(client, tool, name, { forUpdate: true });
       if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+      const displaced = await client.get<{ name: string }>(
+        "SELECT name FROM current_selections WHERE tool = $1 FOR UPDATE",
+        [tool],
+      );
       const row = await client.one<{
         tool: string;
         name: string;
@@ -426,9 +439,18 @@ export class AccountsRepo implements AccountsStore {
         [tool, name, operationId],
       );
       await client.execute(
-        `INSERT INTO current_login_operations (operation_id, tool, name, state, updated_at, revision)
-         VALUES ($1::uuid, $2, $3, 'completed', $4::timestamptz, $5::bigint)`,
-        [operationId, row.tool, row.name, iso(row.updated_at), String(row.revision)],
+        `INSERT INTO current_login_operations
+           (operation_id, tool, name, state, updated_at, revision, previous_name, previous_target_last_used_at)
+         VALUES ($1::uuid, $2, $3, 'completed', $4::timestamptz, $5::bigint, $6, $7::timestamptz)`,
+        [
+          operationId,
+          row.tool,
+          row.name,
+          iso(row.updated_at),
+          String(row.revision),
+          displaced?.name ?? null,
+          account.lastUsedAt ?? null,
+        ],
       );
       return {
         tool: row.tool,
@@ -436,6 +458,8 @@ export class AccountsRepo implements AccountsStore {
         updatedAt: iso(row.updated_at)!,
         revision: String(row.revision),
         operationId: row.login_operation_id,
+        ...(displaced?.name ? { previousName: displaced.name } : {}),
+        ...(account.lastUsedAt ? { previousTargetLastUsedAt: account.lastUsedAt } : {}),
       };
     });
   }
@@ -523,8 +547,8 @@ export class AccountsRepo implements AccountsStore {
     tool: string,
     expectedName: string,
     operationId: string,
-    name?: string,
-    restoreLastUsedAt?: string | null,
+    _name?: string,
+    _restoreLastUsedAt?: string | null,
   ): Promise<boolean> {
     return this.client.transaction(async (client) => {
       await this.lockLoginOperation(client, operationId);
@@ -533,8 +557,10 @@ export class AccountsRepo implements AccountsStore {
         name: string;
         state: "completed" | "cancelled";
         updated_at: string | Date | null;
+        previous_name: string | null;
+        previous_target_last_used_at: string | Date | null;
       }>(
-        `SELECT tool, name, state, updated_at
+        `SELECT tool, name, state, updated_at, previous_name, previous_target_last_used_at
            FROM current_login_operations
           WHERE operation_id = $1::uuid`,
         [operationId],
@@ -561,12 +587,11 @@ export class AccountsRepo implements AccountsStore {
       // Account rows are always locked in name order before the current row.
       // This matches activation's account-before-current order and prevents a
       // rollback-to-prior / concurrent-activation deadlock cycle.
-      const requiredNames = name ? [expectedName, name] : [expectedName];
+      const previousName = operation.previous_name ?? undefined;
+      const requiredNames = previousName ? [expectedName, previousName] : [expectedName];
       const lockedNames = await this.lockAccounts(client, tool, requiredNames);
       if (!lockedNames.has(expectedName)) return false;
-      if (name && !lockedNames.has(name)) {
-        throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
-      }
+      const restoreName = previousName && lockedNames.has(previousName) ? previousName : undefined;
       const owned = await client.get<{ updated_at: string | Date }>(
         `SELECT updated_at
            FROM current_selections
@@ -577,13 +602,13 @@ export class AccountsRepo implements AccountsStore {
         [tool, expectedName, operationId],
       );
       if (!owned) return false;
-      if (name) {
+      if (restoreName) {
         const result = await client.query(
           `UPDATE current_selections
               SET name = $4, updated_at = now(), revision = DEFAULT, login_operation_id = NULL
             WHERE tool = $1 AND name = $2 AND login_operation_id = $3
             RETURNING tool`,
-          [tool, expectedName, operationId, name],
+          [tool, expectedName, operationId, restoreName],
         );
         if (result.rowCount === 0) return false;
       } else {
@@ -593,13 +618,21 @@ export class AccountsRepo implements AccountsStore {
         );
         if (result.rowCount === 0) return false;
       }
-      if (restoreLastUsedAt !== undefined) {
+      if (operation.previous_target_last_used_at != null) {
         await client.execute(
           `UPDATE accounts
               SET last_used_at = $4::timestamptz
             WHERE tool = $1 AND name = $2
               AND last_used_at IS NOT DISTINCT FROM $3::timestamptz`,
-          [tool, expectedName, iso(operation.updated_at), restoreLastUsedAt],
+          [tool, expectedName, iso(operation.updated_at), iso(operation.previous_target_last_used_at)],
+        );
+      } else {
+        await client.execute(
+          `UPDATE accounts
+              SET last_used_at = NULL
+            WHERE tool = $1 AND name = $2
+              AND last_used_at IS NOT DISTINCT FROM $3::timestamptz`,
+          [tool, expectedName, iso(operation.updated_at)],
         );
       }
       return true;

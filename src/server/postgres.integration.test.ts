@@ -178,7 +178,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migrations 0003/0004/0005/0006 upgrade existing data and are restart-idempotent", async () => {
+  test("migrations 0003/0004/0005/0006/0007 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
@@ -203,9 +203,13 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       ["migration-probe", "valid", "migration-orphan", "missing"],
     );
 
-    const upgraded = await new MigrationLedger(client, appMigrations).migrate();
+    const rollbackStateIndex = appMigrations.findIndex(
+      (migration) => migration.id === "accounts_0007_login_operation_rollback_state",
+    );
+    const shippedMigrations = appMigrations.slice(0, rollbackStateIndex);
+    const shippedUpgrade = await new MigrationLedger(client, shippedMigrations).migrate();
     expect(
-      upgraded.plan.find((item) => item.migration.id === "accounts_0003_custom_tools")?.state,
+      shippedUpgrade.plan.find((item) => item.migration.id === "accounts_0003_custom_tools")?.state,
     ).toBe("pending");
     expect(
       await client.get<{ table_name: string | null }>(
@@ -252,6 +256,14 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         reason: "missing account during migration 0004",
       },
     ]);
+
+    const pendingRollbackState = await readMigrationStatus(client, appMigrations);
+    expect(pendingRollbackState.pending).toEqual(["accounts_0007_login_operation_rollback_state"]);
+    expect(pendingRollbackState.checksumMismatches).toEqual([]);
+    const upgraded = await new MigrationLedger(client, appMigrations).migrate();
+    expect(
+      upgraded.plan.find((item) => item.migration.id === "accounts_0007_login_operation_rollback_state")?.state,
+    ).toBe("pending");
 
     await client.close();
     client = openClient();
@@ -498,6 +510,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0004_current_selection_account_fk",
       "accounts_0005_custom_tool_tombstones",
       "accounts_0006_current_selection_revisions",
+      "accounts_0007_login_operation_rollback_state",
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,
@@ -600,6 +613,32 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     const second = await repo.getCurrent("claude");
     expect(second?.name).toBe("legacy-second");
     expect(second?.revision).not.toBe(first.revision);
+  });
+
+  test("login operation rollback restores the state displaced at activation instead of stale client state", async () => {
+    const repo = new AccountsRepo(appClient);
+    const tool = "claude";
+    const prior = "operation-stale-prior";
+    const concurrent = "operation-concurrent";
+    const target = "operation-target";
+    const operationId = "44444444-4444-4444-8444-444444444444";
+    await repo.create({ tool, name: prior });
+    await repo.create({ tool, name: concurrent });
+    await repo.create({ tool, name: target });
+    await repo.setCurrent(tool, prior);
+
+    // These writes commit after the client captured `prior`, while its login
+    // child is still running. Activation must remember what it actually
+    // displaces, not trust that stale client snapshot during rollback.
+    await repo.setCurrent(tool, target);
+    await repo.setCurrent(tool, concurrent);
+    const targetBeforeActivation = (await repo.get(tool, target))?.lastUsedAt;
+    expect(targetBeforeActivation).toBeDefined();
+    await repo.setCurrentForLogin(tool, target, operationId);
+
+    expect(await repo.restoreCurrentOperation(tool, target, operationId, prior, null)).toBe(true);
+    expect((await repo.getCurrent(tool))?.name).toBe(concurrent);
+    expect((await repo.get(tool, target))?.lastUsedAt).toBe(targetBeforeActivation);
   });
 
   test("current activation timestamps round-trip for conditional last-used rollback", async () => {

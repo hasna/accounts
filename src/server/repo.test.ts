@@ -26,6 +26,8 @@ function transactionalClient(failOnAccountWrite: boolean) {
     state: "completed" | "cancelled";
     updated_at: string | null;
     revision: string | null;
+    previous_name: string | null;
+    previous_target_last_used_at: string | null;
   } | null = null;
   const statements: string[] = [];
   const direct = () => {
@@ -56,6 +58,7 @@ function transactionalClient(failOnAccountWrite: boolean) {
       if (sql.includes("FROM current_selections") && sql.includes("login_operation_id")) {
         return { updated_at: "2026-07-21T00:00:00.000Z" };
       }
+      if (sql.includes("SELECT name FROM current_selections")) return { name: "old" };
       if (sql.includes("SELECT updated_at") && sql.includes("FROM current_selections")) {
         return { updated_at: "2026-07-21T00:00:00.000Z" };
       }
@@ -88,6 +91,8 @@ function transactionalClient(failOnAccountWrite: boolean) {
           state: sql.includes("'cancelled'") ? "cancelled" : "completed",
           updated_at: sql.includes("'cancelled'") ? null : String(params?.[3]),
           revision: sql.includes("'cancelled'") ? null : String(params?.[4]),
+          previous_name: sql.includes("'cancelled'") ? null : String(params?.[5]),
+          previous_target_last_used_at: sql.includes("'cancelled'") ? null : (params?.[6] as string | null),
         };
       }
     },
@@ -149,7 +154,7 @@ describe("AccountsRepo account/current atomicity", () => {
     expect(statements.some((sql) => /login_operation_id/.test(sql))).toBe(true);
     expect(statements.some((sql) => /INSERT INTO current_login_operations/.test(sql))).toBe(true);
     expect(statements.some((sql) => /WHERE tool = \$1 AND name = \$2 AND login_operation_id = \$3/.test(sql))).toBe(true);
-    expect(statements.some((sql) => /SET last_used_at = \$4::timestamptz/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /SET last_used_at = NULL/.test(sql))).toBe(true);
     const rollbackAccountLock = statements.findIndex((sql) => /name = ANY\(\$2::text\[\]\)/.test(sql));
     const rollbackCurrentLock = statements.findIndex((sql, index) =>
       index > rollbackAccountLock && /FROM current_selections[\s\S]*login_operation_id/.test(sql),

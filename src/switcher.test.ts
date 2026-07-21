@@ -23,7 +23,7 @@ import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook
 import { resolvePickMode } from "./lib/pick.js";
 import { switchProfile } from "./lib/switch.js";
 import { profileEnv } from "./lib/env.js";
-import { loadMachineStore, loadStore } from "./storage.js";
+import { loadMachineStore, loadStore, saveStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { resolveStore, type AccountsStore } from "./lib/store.js";
 import { AccountsError } from "./types.js";
@@ -327,7 +327,42 @@ test("lost API activation response restores prior current, live Claude auth, and
   expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
     .toBe("prior-finalize@example.com");
   expect(currentWrites).toEqual([target.name]);
-  expect(currentRestores).toEqual([{ expectedName: target.name, name: prior.name }]);
+  expect(currentRestores).toEqual([{ expectedName: target.name }]);
+});
+
+test("ordinary apply rolls back an operation-owned activation after a lost response", async () => {
+  const prior = addProfile({ name: "prior-apply-response-loss" });
+  const target = addProfile({ name: "target-apply-response-loss" });
+  writeOAuth(prior.dir, "prior-apply-response-loss@example.com");
+  writeOAuth(target.dir, "target-apply-response-loss@example.com");
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  await applyProfile(prior.name, prior.tool, localStore);
+  const responseLossStore = new Proxy(localStore, {
+    get(store, property, receiver) {
+      if (property === "useProfileForLogin") {
+        return async (name: string, tool: string | undefined, operationId: string) => {
+          const active = await store.useProfileForLogin!(name, tool, operationId);
+          if (name === target.name) throw new AccountsError("simulated lost ordinary apply response");
+          return active;
+        };
+      }
+      const value = Reflect.get(store, property, receiver);
+      return typeof value === "function" ? value.bind(store) : value;
+    },
+  }) as AccountsStore;
+
+  await expect(applyProfile(target.name, target.tool, responseLossStore)).rejects.toThrow(
+    "simulated lost ordinary apply response",
+  );
+
+  expect(appliedProfile("claude")?.name).toBe(prior.name);
+  expect(currentProfile("claude")?.name).toBe(prior.name);
+  expect(getProfile(target.name, target.tool).lastUsedAt).toBeUndefined();
+  expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
+    .toBe("prior-apply-response-loss@example.com");
 });
 
 test("interrupted API finalization clears a newly-created current selection", async () => {
@@ -364,15 +399,59 @@ test("rollback does not overwrite a newer concurrent Claude apply", async () => 
   await applyProfile(prior.name, prior.tool);
   const state = await captureLoginFinalizationState(target.name, getTool("claude"));
   await finalizeLogin(target.name, target.tool, undefined, state);
+  const failedActivationTimestamp = getProfile(target.name, target.tool).lastUsedAt;
+  expect(failedActivationTimestamp).toBeDefined();
+  const live = liveClaudePaths();
+  writeFileSync(
+    live.homeJson,
+    JSON.stringify({ oauthAccount: { emailAddress: "rotated-target-concurrent@example.com" } }),
+  );
+  writeFileSync(
+    live.credentialsFile,
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "rotated-target-concurrent-access-token",
+        refreshToken: "rotated-target-concurrent-refresh-token",
+        expiresAt: Date.now() + 60_000,
+      },
+    }),
+  );
   await applyProfile(newer.name, newer.tool);
+  expect(
+    JSON.parse(readFileSync(profileOAuthSnapshot(target.dir), "utf8")).oauthAccount.emailAddress,
+  ).toBe("rotated-target-concurrent@example.com");
 
   await rollbackLoginFinalization(state);
 
   expect(appliedProfile("claude")?.name).toBe(newer.name);
   expect(currentProfile("claude")?.name).toBe(newer.name);
-  expect(getProfile(target.name, target.tool).lastUsedAt).toBeUndefined();
+  expect(getProfile(target.name, target.tool).lastUsedAt).toBe(failedActivationTimestamp);
   expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
     .toBe("newer-concurrent@example.com");
+  expect(
+    JSON.parse(readFileSync(profileOAuthSnapshot(target.dir), "utf8")).oauthAccount.emailAddress,
+  ).toBe("rotated-target-concurrent@example.com");
+});
+
+test("failed login rollback restores the apply displaced at finalization, not the pre-child apply", async () => {
+  const prior = addProfile({ name: "prior-before-child" });
+  const target = addProfile({ name: "target-after-child" });
+  const concurrent = addProfile({ name: "concurrent-during-child" });
+  writeOAuth(prior.dir, "prior-before-child@example.com");
+  writeOAuth(target.dir, "target-after-child@example.com");
+  writeOAuth(concurrent.dir, "concurrent-during-child@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+
+  // This selection/apply commits while the isolated login child is running.
+  await applyProfile(concurrent.name, concurrent.tool);
+  await finalizeLogin(target.name, target.tool, undefined, state);
+  await rollbackLoginFinalization(state);
+
+  expect(appliedProfile("claude")?.name).toBe(concurrent.name);
+  expect(currentProfile("claude")?.name).toBe(concurrent.name);
+  expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
+    .toBe("concurrent-during-child@example.com");
 });
 
 test("lost email write response still rolls back the owned profile field", async () => {
@@ -413,11 +492,21 @@ test("rollback does not overwrite a newer same-target current selection", async 
   await applyProfile(prior.name, prior.tool);
   const state = await captureLoginFinalizationState(target.name, getTool("claude"));
   await finalizeLogin(target.name, target.tool, undefined, state);
+  const activationTimestamp = getProfile(target.name, target.tool).lastUsedAt;
+  expect(activationTimestamp).toBeDefined();
 
   useProfile(target.name, target.tool);
+  const machine = loadMachineStore();
+  const machineTarget = machine.profiles.find(
+    (profile) => profile.name === target.name && profile.tool === target.tool,
+  );
+  if (!machineTarget) throw new Error("missing same-target timestamp collision fixture");
+  machineTarget.lastUsedAt = activationTimestamp;
+  saveStore(machine);
   await rollbackLoginFinalization(state);
 
   expect(currentProfile("claude")?.name).toBe(target.name);
+  expect(getProfile(target.name, target.tool).lastUsedAt).toBe(activationTimestamp);
 });
 
 test("rollback does not overwrite a newer same-target Claude apply", async () => {

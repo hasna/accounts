@@ -19,6 +19,7 @@ describe("accounts migrations", () => {
     expect(ids).toContain("accounts_0004_current_selection_account_fk");
     expect(ids).toContain("accounts_0005_custom_tool_tombstones");
     expect(ids).toContain("accounts_0006_current_selection_revisions");
+    expect(ids).toContain("accounts_0007_login_operation_rollback_state");
     expect(ids.some((id) => id.startsWith("hasna_auth_"))).toBe(true);
     for (const m of migrations) {
       expect(m.checksum.startsWith("sha256:")).toBe(true);
@@ -43,5 +44,16 @@ describe("accounts migrations", () => {
     expect(migration?.sql).toMatch(/CREATE TABLE IF NOT EXISTS current_login_operations/);
     expect(migration?.sql).toMatch(/operation_id UUID PRIMARY KEY/);
     expect(migration?.sql).toMatch(/REVOKE ALL PRIVILEGES ON SEQUENCE current_selection_revision_seq FROM PUBLIC/);
+  });
+
+  test("shipped migration 0006 stays checksum-stable and rollback state is additive", () => {
+    const migrations = accountsMigrations();
+    const revisions = migrations.find((item) => item.id === "accounts_0006_current_selection_revisions");
+    const rollbackState = migrations.find((item) => item.id === "accounts_0007_login_operation_rollback_state");
+    expect(revisions?.checksum).toBe(
+      "sha256:fb55c634d8062524ffa86cf4ab45630d294f7750fd3c817e0c0a90c6b53d873c",
+    );
+    expect(rollbackState?.sql).toMatch(/ADD COLUMN IF NOT EXISTS previous_name TEXT/);
+    expect(rollbackState?.sql).toMatch(/ADD COLUMN IF NOT EXISTS previous_target_last_used_at TIMESTAMPTZ/);
   });
 });

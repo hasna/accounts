@@ -6,22 +6,43 @@ import { getTool } from "./tools.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import {
   assertRestorableProfileAuth,
+  captureClaudeLiveAuthSnapshot,
   captureClaudeProfileAuthSnapshot,
   ensureProfileAuthSnapshot,
   liveCredentialShouldUpdateProfile,
   liveOAuthEmail,
   restoreClaudeAuthFromProfile,
+  restoreClaudeLiveAuthSnapshot,
+  restoreClaudeProfileAuthSnapshot,
   snapshotLiveAuthToProfile,
+  type ClaudeLiveAuthSnapshot,
   type ClaudeProfileAuthSnapshot,
 } from "./claude-auth.js";
-import { withApplyLock } from "./apply-lock.js";
+import { withApplyLock, withApplyLockWait } from "./apply-lock.js";
+import { acquireClaudeKeychainLock } from "./claude-launch.js";
+import {
+  captureClaudeKeychain,
+  keychainSupported,
+  restoreClaudeKeychain,
+  type KeychainCredential,
+} from "./keychain.js";
+
+interface ApplyRollbackState {
+  liveClaude: ClaudeLiveAuthSnapshot;
+  applied?: { name: string; revision?: string };
+  profileAuthSnapshots: ClaudeProfileAuthSnapshot[];
+}
 
 export interface ApplyTransactionTracker {
   applyStarted?: boolean;
   appliedRevision?: string;
   currentRevision?: string;
   currentOperationId?: string;
+  currentPreviousName?: string;
+  currentPreviousProfileLastUsedAt?: string;
   profileAuthSnapshots?: ClaudeProfileAuthSnapshot[];
+  applyRollback?: ApplyRollbackState;
+  keychainLeaseHeld?: boolean;
 }
 
 function singleMatch(profiles: Profile[]): Profile | undefined {
@@ -62,10 +83,10 @@ export async function applyProfile(
   store: AccountsStore = resolveStore(),
   tracker?: ApplyTransactionTracker,
 ): Promise<{ profile: Profile; previous?: string; appliedRevision: string; currentRevision?: string }> {
-  if (tracker && !store.useProfileForLogin) {
+  if (!store.useProfileForLogin || !store.restoreCurrentOperation) {
     throw new AccountsError(
-      "the configured Accounts store does not support transactional login activation; " +
-      "upgrade the custom store before running accounts login",
+      "the configured Accounts store does not support transactional apply activation and rollback; " +
+      "upgrade the custom store before running accounts apply",
     );
   }
   const profile = await store.getProfile(name, toolId);
@@ -81,18 +102,104 @@ export async function applyProfile(
   // profiles; fetch it via the Store before taking the (synchronous) lock so no
   // async work happens while the lock file is held.
   const toolProfiles = await store.listProfiles(tool.id);
-  const result = withApplyLock(() => {
-    if (tracker) tracker.applyStarted = true;
-    return applyProfileAuth(profile, tool, toolProfiles, tracker);
-  });
-  if (tracker) tracker.appliedRevision = result.appliedRevision;
-  const operationId = tracker ? randomUUID() : undefined;
-  if (tracker) tracker.currentOperationId = operationId;
-  const active = tracker
-    ? await store.useProfileForLogin!(profile.name, tool.id, operationId!)
-    : await store.useProfile(profile.name, tool.id);
-  if (tracker) tracker.currentRevision = active.currentRevision;
-  return { ...result, profile: active.profile, currentRevision: active.currentRevision };
+  let releaseKeychainLease: (() => void) | undefined;
+  if (keychainSupported() && !tracker?.keychainLeaseHeld) {
+    releaseKeychainLease = await acquireClaudeKeychainLock();
+  }
+  let keychainBefore: KeychainCredential | undefined;
+  let result: ReturnType<typeof applyProfileAuth> | undefined;
+  try {
+    keychainBefore = keychainSupported() ? captureClaudeKeychain() : undefined;
+    try {
+      result = withApplyLock(() => {
+        if (tracker) tracker.applyStarted = true;
+        return applyProfileAuth(profile, tool, toolProfiles, tracker);
+      });
+    } catch (error) {
+      restoreKeychainAfterFailure(keychainBefore, error);
+    }
+    if (tracker) tracker.appliedRevision = result.appliedRevision;
+    const operationId = randomUUID();
+    if (tracker) tracker.currentOperationId = operationId;
+    let active;
+    try {
+      active = await store.useProfileForLogin(profile.name, tool.id, operationId);
+    } catch (error) {
+      if (tracker) throw error;
+      await rollbackAppliedState(
+        result.rollback,
+        profile.name,
+        result.appliedRevision,
+        keychainBefore,
+        () => store.restoreCurrentOperation!(tool.id, profile.name, operationId),
+        error,
+      );
+    }
+    if (!active) throw new AccountsError("apply activation ended without a committed result");
+    if (tracker) tracker.currentRevision = active.currentRevision;
+    if (tracker) tracker.currentPreviousName = active.previousCurrentName;
+    if (tracker) tracker.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
+    return { ...result, profile: active.profile, currentRevision: active.currentRevision };
+  } finally {
+    releaseKeychainLease?.();
+  }
+}
+
+function restoreKeychainAfterFailure(previous: KeychainCredential | undefined, original: unknown): never {
+  if (!keychainSupported()) throw original;
+  try {
+    restoreClaudeKeychain(previous);
+  } catch {
+    const message = original instanceof Error ? original.message : String(original);
+    throw new AccountsError(`${message}; failed to restore the prior Claude keychain state`);
+  }
+  throw original;
+}
+
+async function rollbackAppliedState(
+  rollback: ApplyRollbackState,
+  expectedName: string,
+  expectedRevision: string,
+  keychainBefore: KeychainCredential | undefined,
+  restoreCurrent: () => Promise<boolean>,
+  original: unknown,
+): Promise<never> {
+  let rollbackFailed = false;
+  try {
+    await restoreCurrent();
+  } catch {
+    rollbackFailed = true;
+  }
+  try {
+    await withApplyLockWait(() => withStoreLock(() => {
+      const local = loadMachineStore();
+      if (local.applied.claude !== expectedName || local.appliedRevisions.claude !== expectedRevision) return;
+      for (const snapshot of [...rollback.profileAuthSnapshots].reverse()) {
+        restoreClaudeProfileAuthSnapshot(snapshot);
+      }
+      restoreClaudeLiveAuthSnapshot(rollback.liveClaude);
+      if (rollback.applied) {
+        local.applied.claude = rollback.applied.name;
+        local.appliedRevisions.claude = randomUUID();
+      } else {
+        delete local.applied.claude;
+        delete local.appliedRevisions.claude;
+      }
+      saveStore(local);
+    }));
+  } catch {
+    rollbackFailed = true;
+  }
+  try {
+    if (keychainSupported()) restoreClaudeKeychain(keychainBefore);
+  } catch {
+    rollbackFailed = true;
+  }
+  if (rollbackFailed) {
+    const message = original instanceof Error ? original.message : String(original);
+    throw new AccountsError(`${message}; failed to roll back the interrupted apply transaction`);
+  }
+  throw original;
 }
 
 /** Synchronous, machine-local disk work for apply (runs under the apply lock). */
@@ -101,11 +208,19 @@ function applyProfileAuth(
   tool: ToolDef,
   toolProfiles: Profile[],
   tracker?: ApplyTransactionTracker,
-): { profile: Profile; previous?: string; appliedRevision: string } {
+): { profile: Profile; previous?: string; appliedRevision: string; rollback: ApplyRollbackState } {
   assertRestorableProfileAuth(profile.dir, tool, profile.name);
   return withStoreLock(() => {
     const local = loadMachineStore();
     const previous = local.applied[tool.id];
+    const rollback: ApplyRollbackState = {
+      liveClaude: captureClaudeLiveAuthSnapshot(),
+      ...(previous
+        ? { applied: { name: previous, ...(local.appliedRevisions[tool.id] ? { revision: local.appliedRevisions[tool.id] } : {}) } }
+        : {}),
+      profileAuthSnapshots: [captureClaudeProfileAuthSnapshot(profile.dir)],
+    };
+    if (tracker) tracker.applyRollback = rollback;
 
     // Preserve whatever auth is currently live by snapshotting it into the
     // profile that actually owns it. The live OAuth email is the source of
@@ -124,17 +239,31 @@ function applyProfileAuth(
       if (tracker && !tracker.profileAuthSnapshots?.some((snapshot) => snapshot.base === owner.dir)) {
         (tracker.profileAuthSnapshots ??= []).push(captureClaudeProfileAuthSnapshot(owner.dir));
       }
-      snapshotLiveAuthToProfile(owner.dir, tool);
+      if (!rollback.profileAuthSnapshots.some((snapshot) => snapshot.base === owner.dir)) {
+        rollback.profileAuthSnapshots.push(captureClaudeProfileAuthSnapshot(owner.dir));
+      }
+      try {
+        snapshotLiveAuthToProfile(owner.dir, tool);
+      } catch (error) {
+        for (const snapshot of [...rollback.profileAuthSnapshots].reverse()) restoreClaudeProfileAuthSnapshot(snapshot);
+        restoreClaudeLiveAuthSnapshot(rollback.liveClaude);
+        throw error;
+      }
     }
+    try {
+      ensureProfileAuthSnapshot(profile.dir, tool);
+      restoreClaudeAuthFromProfile(profile.dir, tool, profile.name);
 
-    ensureProfileAuthSnapshot(profile.dir, tool);
-    restoreClaudeAuthFromProfile(profile.dir, tool, profile.name);
+      local.applied[tool.id] = profile.name;
+      const appliedRevision = randomUUID();
+      local.appliedRevisions[tool.id] = appliedRevision;
+      saveStore(local);
 
-    local.applied[tool.id] = profile.name;
-    const appliedRevision = randomUUID();
-    local.appliedRevisions[tool.id] = appliedRevision;
-    saveStore(local);
-
-    return { profile, appliedRevision, ...(previous && previous !== profile.name ? { previous } : {}) };
+      return { profile, appliedRevision, rollback, ...(previous && previous !== profile.name ? { previous } : {}) };
+    } catch (error) {
+      for (const snapshot of [...rollback.profileAuthSnapshots].reverse()) restoreClaudeProfileAuthSnapshot(snapshot);
+      restoreClaudeLiveAuthSnapshot(rollback.liveClaude);
+      throw error;
+    }
   });
 }

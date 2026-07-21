@@ -53,7 +53,8 @@ export function withApplyLock<T>(fn: () => T): T {
   const lease = tryAcquireApplyLock();
   if (!lease) {
     throw new AccountsError(
-      `another accounts apply is in progress; wait and retry (or remove ${lockPath()} if stale)`,
+      `another accounts apply is in progress at ${lockPath()}; ` +
+      "automatic stale-lock reclaim is disabled because ownership cannot be proven",
     );
   }
   try {

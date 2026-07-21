@@ -149,6 +149,8 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             updatedAt: { type: "string" },
             revision: { type: "string" },
             operationId: { type: "string", format: "uuid" },
+            previousName: { type: "string" },
+            previousTargetLastUsedAt: { type: "string", format: "date-time" },
           },
         },
         CurrentSelectionList: {

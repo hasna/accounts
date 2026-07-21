@@ -296,7 +296,8 @@ test("withApplyLock rejects concurrent apply", () => {
   const lock = join(home, ".apply.lock");
   writeFileSync(lock, "99999\n");
   chmodSync(lock, 0o600);
-  expect(() => withApplyLock(() => undefined)).toThrow(AccountsError);
+  expect(() => withApplyLock(() => undefined)).toThrow(/automatic stale-lock reclaim is disabled/);
+  expect(existsSync(lock)).toBe(true);
 });
 
 test("withApplyLockWait serializes rollback behind an in-flight apply", async () => {

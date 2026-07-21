@@ -1,6 +1,17 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, extname, isAbsolute, join } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
@@ -240,30 +251,60 @@ export async function acquireClaudeKeychainLock(signal?: AbortSignal): Promise<(
 
   while (true) {
     if (signal?.aborted) throw new AccountsError("interrupted while waiting for the Claude keychain lock");
+    const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
+    let candidateFd: number | undefined;
+    let published = false;
     try {
-      const fd = openSync(path, "wx", 0o600);
+      candidateFd = openSync(candidate, "wx", 0o600);
+      writeFileSync(candidateFd, token, { encoding: "utf8" });
+      fsyncSync(candidateFd);
+      closeSync(candidateFd);
+      candidateFd = undefined;
       try {
-        writeFileSync(fd, token, { encoding: "utf8" });
-      } finally {
-        closeSync(fd);
+        // Publish only a fully initialized inode, so observers never mistake
+        // an in-progress creator for an abandoned empty lock.
+        linkSync(candidate, path);
+        published = true;
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+        if (code !== "EEXIST") throw error;
       }
-      return () => {
-        try {
-          if (readFileSync(path, "utf8") === token) unlinkSync(path);
-        } catch {
-          // A missing lock is already released; a replaced lock belongs to another process.
-        }
-      };
+      if (published) {
+        return () => {
+          try {
+            if (readFileSync(path, "utf8") === token) unlinkSync(path);
+          } catch {
+            // A missing lock is already released; a replaced lock belongs to another process.
+          }
+        };
+      }
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
       if (code !== "EEXIST") throw new AccountsError(`failed to acquire Claude keychain lock: ${redactText(String(error))}`);
+    } finally {
+      if (candidateFd !== undefined) closeSync(candidateFd);
+      rmSync(candidate, { force: true });
     }
 
     try {
-      const owner = Number(readFileSync(path, "utf8").split(":", 1)[0]);
-      if (Number.isInteger(owner) && owner > 0 && !processAlive(owner)) unlinkSync(path);
-    } catch {
-      // The owner may have released the lock between open attempts.
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new AccountsError(`invalid Claude keychain lock at ${path}; refusing unsafe reclaim`);
+      }
+      const ownerText = readFileSync(path, "utf8").trim();
+      const match = ownerText.match(/^([1-9]\d*):([^:\r\n]+)$/);
+      const owner = match ? Number(match[1]) : Number.NaN;
+      if (!Number.isSafeInteger(owner)) {
+        throw new AccountsError(`invalid Claude keychain lock at ${path}; refusing unsafe reclaim`);
+      }
+      if (!processAlive(owner)) {
+        throw new AccountsError(`stale Claude keychain lock at ${path}; refusing automatic reclaim without proven ownership`);
+      }
+    } catch (error) {
+      if (error instanceof AccountsError) throw error;
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (code === "ENOENT") continue;
+      throw new AccountsError(`failed to inspect Claude keychain lock: ${redactText(String(error))}`);
     }
     if (Date.now() >= deadline) throw new AccountsError("timed out waiting for the Claude keychain lock");
     await sleep(25);
@@ -387,7 +428,7 @@ export async function runToolProcess(
   });
 }
 
-/** Relay a launch directly to Claude, leasing the global keychain only when the profile needs it. */
+/** Relay a launch directly to Claude while leasing the global keychain. */
 export async function runClaudeLaunch(
   profile: Profile,
   tool: ToolDef,
@@ -397,8 +438,6 @@ export async function runClaudeLaunch(
 ): Promise<number> {
   if (tool.id !== "claude" || !keychainSupported()) return runToolProcess(tool, args, env, cwd);
   const credential = claudeKeychainCredentialFromProfile(profile.dir, profile.name);
-  if (!credential) return runToolProcess(tool, args, env, cwd);
-
   const release = await acquireClaudeKeychainLock();
   let pendingSignal: NodeJS.Signals | undefined;
   const rememberSigint = () => { pendingSignal ??= "SIGINT"; };
@@ -408,9 +447,11 @@ export async function runClaudeLaunch(
   let prior: ReturnType<typeof captureClaudeKeychain>;
   let keychainTouched = false;
   try {
-    prior = captureClaudeKeychain();
-    keychainTouched = true;
-    writeClaudeKeychain(credential);
+    if (credential) {
+      prior = captureClaudeKeychain();
+      keychainTouched = true;
+      writeClaudeKeychain(credential);
+    }
     const code = await runToolProcess(tool, args, env, cwd);
     return pendingSignal ? signalExitCode(pendingSignal) : code;
   } finally {

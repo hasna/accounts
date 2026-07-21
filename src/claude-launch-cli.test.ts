@@ -714,6 +714,54 @@ test("keychain lock timeout does not launch or alter inherited credentials", () 
   expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });
 });
 
+test("credential-less Claude launch still waits for the shared keychain lease", () => {
+  addProfile("acct");
+  setKeychain("prior", "prior-credential-value");
+  writeFileSync(keychainLock, `${process.pid}:held`, { mode: 0o600 });
+  const result = runCli(
+    ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "Prompt"],
+    {
+      env: {
+        ACCOUNTS_TEST_KEYCHAIN: "1",
+        ACCOUNTS_TEST_SECURITY_BIN: securityBin,
+        ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS: "75",
+      },
+    },
+  );
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("timed out waiting for the Claude keychain lock");
+  expect(claudeEntries()).toEqual([]);
+  expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });
+});
+
+for (const lockCase of [
+  { label: "empty", contents: "", message: "invalid Claude keychain lock" },
+  { label: "dead-owner", contents: "999999999:abandoned", message: "refusing automatic reclaim" },
+]) {
+  test(`${lockCase.label} keychain lock fails closed immediately without unsafe reclaim`, () => {
+    addProfile("acct", "profile-credential-value");
+    setKeychain("prior", "prior-credential-value");
+    writeFileSync(keychainLock, lockCase.contents, { mode: 0o600 });
+    const startedAt = Date.now();
+    const result = runCli(
+      ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "Prompt"],
+      {
+        env: {
+          ACCOUNTS_TEST_KEYCHAIN: "1",
+          ACCOUNTS_TEST_SECURITY_BIN: securityBin,
+          ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS: "10000",
+        },
+      },
+    );
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(lockCase.message);
+    expect(readFileSync(keychainLock, "utf8")).toBe(lockCase.contents);
+    expect(claudeEntries()).toEqual([]);
+    expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });
+  });
+}
+
 test("keychain capture failure aborts before credential mutation or launch", () => {
   addProfile("acct", "profile-credential-value");
   setKeychain("prior", "prior-credential-value");

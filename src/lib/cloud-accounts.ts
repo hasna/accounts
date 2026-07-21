@@ -52,6 +52,9 @@ export interface CloudCurrentSelection {
   revision?: string;
   /** Client-owned token echoed only by transactional login activation. */
   operationId?: string;
+  /** State displaced by this activation; informational because rollback is server-owned. */
+  previousName?: string;
+  previousTargetLastUsedAt?: string;
 }
 
 export interface CloudCreateInput {

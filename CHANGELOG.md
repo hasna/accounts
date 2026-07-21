@@ -48,7 +48,23 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   the mutable current row so a lost response remains an idempotent no-op even
   after a newer selection. A rollback that overtakes a queued activation now
   persists a terminal cancellation first, preventing the delayed activation
-  from committing the failed profile. Migration `0006` assigns
+  from committing the failed profile. The activation path records rollback
+  state at the write itself, so failed local and API login
+  attempts restore the selection they actually displaced instead of stale
+  pre-child client state. Existing-profile failures restore raw Claude OAuth,
+  credential, and auth-settings material while preserving unrelated JSON edits;
+  profile-auth rollback shares the apply lock and is skipped after a newer
+  applied generation takes ownership. Operation-owned current rollback is the
+  sole restorer of `lastUsedAt`, avoiding same-millisecond value collisions with
+  a later activation of the same profile.
+  Additive migration `0007` records activation-owned rollback state without
+  changing the checksum of the already-shipped `0006` migration.
+  Ordinary apply now shares the Claude keychain lease with login and launch;
+  keychain write errors fail closed and roll back live auth, profile snapshots,
+  the applied pointer, and the prior keychain credential. Keychain locks are
+  fully initialized before publication, malformed locks fail immediately, and
+  unverifiable stale keychain/apply locks are never reclaimed automatically.
+  Migration `0006` assigns
   rollback generations through a locked-down owner-scoped trigger with a
   schema-qualified sequence and no runtime sequence access. Local registry writes
   use a cross-process lock plus stale-snapshot rejection, hold the registry lock

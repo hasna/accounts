@@ -28,6 +28,7 @@ interface ClaudeLiveAuthFileSnapshot {
   path: string;
   contents?: Buffer;
   mode?: number;
+  merge?: "claude-home" | "claude-credentials" | "claude-settings" | "claude-keychain";
 }
 
 export interface ClaudeLiveAuthSnapshot {
@@ -269,22 +270,89 @@ export function captureClaudeLiveAuthSnapshot(): ClaudeLiveAuthSnapshot {
 
 /** Capture profile-owned auth snapshots that finalization may refresh. */
 export function captureClaudeProfileAuthSnapshot(profileDir: string): ClaudeProfileAuthSnapshot {
-  const paths = [
-    profileOAuthSnapshot(profileDir),
-    profileCredentialsSnapshot(profileDir),
-    profileKeychainSnapshot(profileDir),
+  const paths: Array<{ path: string; merge?: ClaudeLiveAuthFileSnapshot["merge"] }> = [
+    { path: join(profileDir, ".claude.json"), merge: "claude-home" },
+    { path: join(profileDir, ".credentials.json"), merge: "claude-credentials" },
+    { path: join(profileDir, "settings.json"), merge: "claude-settings" },
+    { path: profileOAuthSnapshot(profileDir), merge: "claude-home" },
+    { path: profileCredentialsSnapshot(profileDir), merge: "claude-credentials" },
+    { path: profileKeychainSnapshot(profileDir), merge: "claude-keychain" },
   ];
   return {
     base: profileDir,
-    files: paths.map((path) => {
-      if (!existsSync(path)) return { path };
+    files: paths.map(({ path, merge }) => {
+      if (!existsSync(path)) return { path, ...(merge ? { merge } : {}) };
       const stat = lstatSync(path);
       if (!stat.isFile() || stat.isSymbolicLink()) {
         throw new AccountsError(`refusing to snapshot unsafe Claude profile auth path ${path}`);
       }
-      return { path, contents: readFileSync(path), mode: stat.mode & 0o777 };
+      return { path, contents: readFileSync(path), mode: stat.mode & 0o777, ...(merge ? { merge } : {}) };
     }),
   };
+}
+
+function parseSnapshotJson(contents: Buffer | undefined, path: string): JsonRecord {
+  if (contents === undefined) return {};
+  try {
+    const parsed = JSON.parse(contents.toString("utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as JsonRecord;
+  } catch {
+    // Fall through to the fail-closed error below.
+  }
+  throw new AccountsError(`refusing to merge invalid Claude profile auth JSON at ${path}`);
+}
+
+function restoreMergedProfileJson(snapshot: ClaudeProfileAuthSnapshot, file: ClaudeLiveAuthFileSnapshot): void {
+  assertSafeWritePath(file.path, { mustStayUnder: snapshot.base });
+  let current: JsonRecord = {};
+  if (existsSync(file.path)) {
+    const stat = lstatSync(file.path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new AccountsError(`refusing to restore unsafe Claude profile auth path ${file.path}`);
+    }
+    current = parseSnapshotJson(readFileSync(file.path), file.path);
+  }
+  const before = parseSnapshotJson(file.contents, file.path);
+  const restored: JsonRecord = { ...before, ...current };
+
+  if (file.merge === "claude-home") {
+    if (Object.hasOwn(before, "oauthAccount")) restored.oauthAccount = before.oauthAccount;
+    else delete restored.oauthAccount;
+  } else if (file.merge === "claude-credentials") {
+    if (Object.hasOwn(before, "claudeAiOauth")) restored.claudeAiOauth = before.claudeAiOauth;
+    else delete restored.claudeAiOauth;
+  } else if (file.merge === "claude-keychain") {
+    for (const key of ["service", "account", "secret"]) {
+      if (Object.hasOwn(before, key)) restored[key] = before[key];
+      else delete restored[key];
+    }
+  } else {
+    if (Object.hasOwn(before, "apiKeyHelper")) restored.apiKeyHelper = before.apiKeyHelper;
+    else delete restored.apiKeyHelper;
+    const beforeEnv = before.env && typeof before.env === "object" && !Array.isArray(before.env)
+      ? before.env as JsonRecord
+      : {};
+    const currentEnv = current.env && typeof current.env === "object" && !Array.isArray(current.env)
+      ? current.env as JsonRecord
+      : {};
+    const restoredEnv: JsonRecord = { ...beforeEnv, ...currentEnv };
+    for (const key of CLAUDE_API_AUTH_ENV_KEYS) {
+      if (Object.hasOwn(beforeEnv, key)) restoredEnv[key] = beforeEnv[key];
+      else delete restoredEnv[key];
+    }
+    if (Object.keys(restoredEnv).length > 0 || Object.hasOwn(before, "env") || Object.hasOwn(current, "env")) {
+      restored.env = restoredEnv;
+    } else {
+      delete restored.env;
+    }
+  }
+
+  if (file.contents === undefined && Object.keys(restored).length === 0) {
+    if (existsSync(file.path)) unlinkSync(file.path);
+    return;
+  }
+  writeJsonFile(file.path, restored, snapshot.base);
+  chmodSync(file.path, file.mode ?? 0o600);
 }
 
 function restoreClaudeAuthSnapshot(
@@ -315,7 +383,10 @@ export function restoreClaudeLiveAuthSnapshot(snapshot: ClaudeLiveAuthSnapshot):
 
 /** Restore exact profile-owned auth snapshots after failed finalization. */
 export function restoreClaudeProfileAuthSnapshot(snapshot: ClaudeProfileAuthSnapshot): void {
-  restoreClaudeAuthSnapshot(snapshot, "Claude profile auth");
+  for (const file of snapshot.files) {
+    if (file.merge) restoreMergedProfileJson(snapshot, file);
+    else restoreClaudeAuthSnapshot({ base: snapshot.base, files: [file] }, "Claude profile auth");
+  }
 }
 
 /** Email address of the account currently authenticated on the live Claude paths. */
@@ -578,15 +649,11 @@ export function claudeKeychainCredentialFromProfile(
 
 export function prepareClaudeProfileKeychain(profileDir: string, tool: ToolDef, profileName?: string): boolean {
   if (tool.id !== "claude" || !keychainSupported()) return false;
-  try {
-    ensureProfileAuthSnapshot(profileDir, tool);
-    const cred = claudeKeychainCredentialFromProfile(profileDir, profileName);
-    if (!cred) return false;
-    writeClaudeKeychain(cred);
-    return true;
-  } catch {
-    return false;
-  }
+  ensureProfileAuthSnapshot(profileDir, tool);
+  const cred = claudeKeychainCredentialFromProfile(profileDir, profileName);
+  if (!cred) return false;
+  writeClaudeKeychain(cred);
+  return true;
 }
 
 /** Restore profile auth snapshots onto live Claude paths. */

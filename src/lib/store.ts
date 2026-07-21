@@ -81,6 +81,10 @@ export interface UseProfileResult {
   profile: Profile;
   toolId: string;
   currentRevision?: string;
+  /** Selection displaced by this exact activation, captured atomically at the write. */
+  previousCurrentName?: string;
+  /** Target profile timestamp displaced by this exact activation. */
+  previousProfileLastUsedAt?: string;
 }
 
 export interface RemoveResult {
@@ -133,6 +137,12 @@ export interface AccountsStore {
 /** On-box JSON registry. Delegates to the core profile library. */
 class LocalStore implements AccountsStore {
   readonly transport = "local" as const;
+  private readonly loginOperations = new Map<string, {
+    tool: string;
+    name: string;
+    previousCurrentName?: string;
+    previousProfileLastUsedAt?: string;
+  }>();
 
   async listProfiles(tool?: string): Promise<Profile[]> {
     return localList(tool);
@@ -182,7 +192,42 @@ class LocalStore implements AccountsStore {
     return localUse(name, tool);
   }
   async useProfileForLogin(name: string, tool: string | undefined, operationId: string): Promise<UseProfileResult> {
-    return localUse(name, tool, operationId);
+    return withStoreLock(() => {
+      const machine = loadMachineStore();
+      const matches = machine.profiles.filter(
+        (profile) => profile.name === name && (!tool || profile.tool === tool),
+      );
+      if (matches.length === 0) {
+        const suffix = tool ? ` for tool "${tool}"` : "";
+        throw new AccountsError(`no profile named "${name}"${suffix}. Run \`accounts list\` to see profiles.`);
+      }
+      if (matches.length > 1) {
+        throw new AccountsError(
+          `profile "${name}" exists for multiple tools (${matches.map((profile) => profile.tool).join(", ")}); pass --tool`,
+        );
+      }
+      const profile = matches[0]!;
+      const previousCurrentName = machine.current[profile.tool];
+      const previousProfileLastUsedAt = profile.lastUsedAt;
+      machine.current[profile.tool] = profile.name;
+      machine.currentRevisions[profile.tool] = operationId;
+      machine.toolLocks[profile.name] = profile.tool;
+      profile.lastUsedAt = new Date().toISOString();
+      saveStore(machine);
+      this.loginOperations.set(operationId, {
+        tool: profile.tool,
+        name: profile.name,
+        ...(previousCurrentName ? { previousCurrentName } : {}),
+        ...(previousProfileLastUsedAt ? { previousProfileLastUsedAt } : {}),
+      });
+      return {
+        profile: structuredClone(profile),
+        toolId: profile.tool,
+        currentRevision: operationId,
+        ...(previousCurrentName ? { previousCurrentName } : {}),
+        ...(previousProfileLastUsedAt ? { previousProfileLastUsedAt } : {}),
+      };
+    });
   }
   async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
     return withStoreLock(() => {
@@ -235,24 +280,33 @@ class LocalStore implements AccountsStore {
     return withStoreLock(() => {
       const machine = loadMachineStore();
       if (machine.current[tool] !== expectedName || machine.currentRevisions[tool] !== operationId) return false;
+      const operation = this.loginOperations.get(operationId);
+      if (operation && (operation.tool !== tool || operation.name !== expectedName)) {
+        throw new AccountsError("login operation id is already bound to another profile");
+      }
+      const restoreName = operation ? operation.previousCurrentName : name;
+      const restoreProfileLastUsedAt = operation
+        ? operation.previousProfileLastUsedAt ?? null
+        : restoreLastUsedAt;
       const failedProfile = machine.profiles.find(
         (profile) => profile.name === expectedName && profile.tool === tool,
       );
-      if (restoreLastUsedAt !== undefined && failedProfile) {
-        if (restoreLastUsedAt === null) delete failedProfile.lastUsedAt;
-        else failedProfile.lastUsedAt = restoreLastUsedAt;
+      if (restoreProfileLastUsedAt !== undefined && failedProfile) {
+        if (restoreProfileLastUsedAt === null) delete failedProfile.lastUsedAt;
+        else failedProfile.lastUsedAt = restoreProfileLastUsedAt;
       }
-      if (name) {
-        if (!machine.profiles.some((profile) => profile.name === name && profile.tool === tool)) {
-          throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+      if (restoreName) {
+        if (!machine.profiles.some((profile) => profile.name === restoreName && profile.tool === tool)) {
+          throw new AccountsError(`no profile named "${restoreName}" for tool "${tool}"`);
         }
-        machine.current[tool] = name;
+        machine.current[tool] = restoreName;
         machine.currentRevisions[tool] = randomUUID();
       } else {
         delete machine.current[tool];
         delete machine.currentRevisions[tool];
       }
       saveStore(machine);
+      this.loginOperations.delete(operationId);
       return true;
     });
   }
@@ -400,6 +454,10 @@ class ApiStore implements AccountsStore {
       profile: { ...profile, lastUsedAt: current.updatedAt },
       toolId: profile.tool,
       currentRevision: current.revision,
+      ...(current.previousName ? { previousCurrentName: current.previousName } : {}),
+      ...(current.previousTargetLastUsedAt
+        ? { previousProfileLastUsedAt: current.previousTargetLastUsedAt }
+        : {}),
     };
   }
 

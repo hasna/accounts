@@ -5,7 +5,7 @@ import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
-import { applyProfile } from "./apply.js";
+import { applyProfile, type ApplyTransactionTracker } from "./apply.js";
 import {
   captureClaudeLiveAuthSnapshot,
   captureClaudeProfileAuthSnapshot,
@@ -40,12 +40,7 @@ export interface LoginFinalizationState {
   applied?: { name: string; revision?: string };
   liveClaude?: ClaudeLiveAuthSnapshot;
   profileClaude?: ClaudeProfileAuthSnapshot;
-  writes: {
-    applyStarted?: boolean;
-    appliedRevision?: string;
-    currentRevision?: string;
-    currentOperationId?: string;
-    profileAuthSnapshots?: ClaudeProfileAuthSnapshot[];
+  writes: ApplyTransactionTracker & {
     profile: ProfileRollbackFields;
   };
 }
@@ -572,8 +567,8 @@ export async function rollbackLoginFinalization(
         state.tool.id,
         state.profile.name,
         state.writes.currentOperationId,
-        state.current?.name,
-        state.profile.lastUsedAt ?? null,
+        state.writes.currentPreviousName,
+        state.writes.currentPreviousProfileLastUsedAt ?? null,
       );
     } catch (error) {
       firstError ??= error;
@@ -594,25 +589,33 @@ export async function rollbackLoginFinalization(
     }
   }
 
-  for (const snapshot of state.writes.profileAuthSnapshots ?? []) {
-    await attempt(() => restoreClaudeProfileAuthSnapshot(snapshot));
-  }
-  if (state.profileClaude) {
-    await attempt(() => restoreClaudeProfileAuthSnapshot(state.profileClaude!));
-  }
-
-  if (state.liveClaude && state.writes.applyStarted) {
+  const applyRollback = state.writes.applyRollback;
+  const displacedDifferentAppliedState = Boolean(
+    applyRollback &&
+    (applyRollback.applied?.name !== state.applied?.name ||
+      applyRollback.applied?.revision !== state.applied?.revision),
+  );
+  const liveBeforeApply = displacedDifferentAppliedState
+    ? applyRollback?.liveClaude
+    : state.liveClaude ?? applyRollback?.liveClaude;
+  const appliedBeforeApply = applyRollback?.applied ?? state.applied;
+  const profileAuthSnapshots = [
+    ...(state.writes.profileAuthSnapshots ?? []),
+    ...(state.profileClaude ? [state.profileClaude] : []),
+  ];
+  if (state.writes.applyStarted) {
     await attempt(() => withApplyLockWait(() => withStoreLock(() => {
       const machine = loadMachineStore();
       const appliedNow = machine.applied[state.tool.id];
       const appliedRevisionNow = machine.appliedRevisions[state.tool.id];
-      const expectedName = state.writes.appliedRevision ? state.profile.name : state.applied?.name;
-      const expectedRevision = state.writes.appliedRevision ?? state.applied?.revision;
+      const expectedName = state.writes.appliedRevision ? state.profile.name : appliedBeforeApply?.name;
+      const expectedRevision = state.writes.appliedRevision ?? appliedBeforeApply?.revision;
       const ownsAppliedState = appliedNow === expectedName && appliedRevisionNow === expectedRevision;
       if (!ownsAppliedState) return;
-      restoreClaudeLiveAuthSnapshot(state.liveClaude!);
-      if (state.applied) {
-        machine.applied[state.tool.id] = state.applied.name;
+      for (const snapshot of profileAuthSnapshots) restoreClaudeProfileAuthSnapshot(snapshot);
+      if (liveBeforeApply) restoreClaudeLiveAuthSnapshot(liveBeforeApply);
+      if (appliedBeforeApply) {
+        machine.applied[state.tool.id] = appliedBeforeApply.name;
         machine.appliedRevisions[state.tool.id] = randomUUID();
       } else {
         delete machine.applied[state.tool.id];
@@ -620,8 +623,18 @@ export async function rollbackLoginFinalization(
       }
       saveStore(machine);
     })));
+  } else if (profileAuthSnapshots.length > 0) {
+    await attempt(() => withApplyLockWait(() => {
+      for (const snapshot of profileAuthSnapshots) restoreClaudeProfileAuthSnapshot(snapshot);
+    }));
   }
   const profileFields: ProfileRollbackFields = { ...state.writes.profile };
+  if (state.writes.currentOperationId) {
+    // Operation rollback restores lastUsedAt atomically only while it still
+    // owns the current-selection generation. A value-only profile fallback
+    // can collide with a later same-profile activation in the same millisecond.
+    delete profileFields.lastUsedAt;
+  }
   if (Object.keys(profileFields).length > 0) {
     await attempt(() => store.restoreProfileState!(state.profile, profileFields).then(() => undefined));
   }
@@ -663,6 +676,8 @@ export async function finalizeLogin(
     ? await store.useProfileForLogin!(name, tool.id, operationId!)
     : await store.useProfile(name, tool.id);
   if (state) state.writes.currentRevision = requireLoginCurrentRevision(active.currentRevision);
+  if (state) state.writes.currentPreviousName = active.previousCurrentName;
+  if (state) state.writes.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
   recordLastUsedFinalizationWrite(state, active.profile);
   return { profile: active.profile, applied: false };
 }
