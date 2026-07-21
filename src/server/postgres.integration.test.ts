@@ -178,7 +178,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migrations 0003/0004/0005 upgrade existing data and are restart-idempotent", async () => {
+  test("migrations 0003/0004/0005/0006 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
@@ -226,6 +226,16 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         "SELECT to_regclass('custom_tool_tombstones')::text AS table_name",
       ),
     ).toEqual({ table_name: "custom_tool_tombstones" });
+    expect(
+      await client.get<{ present: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'current_selections'
+              AND column_name = 'revision'
+         ) AS present`,
+      ),
+    ).toEqual({ present: true });
     expect(
       await client.many<{ tool: string; name: string }>(
         "SELECT tool, name FROM current_selections WHERE tool LIKE 'migration-%' ORDER BY tool",
@@ -286,35 +296,50 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       schema_usage: boolean;
       schema_create: boolean;
       account_dml: boolean;
+      login_operation_select: boolean;
+      login_operation_insert: boolean;
+      login_operation_update: boolean;
+      login_operation_delete: boolean;
       tombstone_select: boolean;
       tombstone_insert: boolean;
       tombstone_delete: boolean;
       tombstone_update: boolean;
       ledger_select: boolean;
       api_key_select: boolean;
+      revision_sequence_usage: boolean;
     }>(
       `SELECT current_user,
               has_schema_privilege(current_user, current_schema(), 'USAGE') AS schema_usage,
               has_schema_privilege(current_user, current_schema(), 'CREATE') AS schema_create,
               has_table_privilege(current_user, 'accounts', 'SELECT,INSERT,UPDATE,DELETE') AS account_dml,
+              has_table_privilege(current_user, 'current_login_operations', 'SELECT') AS login_operation_select,
+              has_table_privilege(current_user, 'current_login_operations', 'INSERT') AS login_operation_insert,
+              has_table_privilege(current_user, 'current_login_operations', 'UPDATE') AS login_operation_update,
+              has_table_privilege(current_user, 'current_login_operations', 'DELETE') AS login_operation_delete,
               has_table_privilege(current_user, 'custom_tool_tombstones', 'SELECT') AS tombstone_select,
               has_table_privilege(current_user, 'custom_tool_tombstones', 'INSERT') AS tombstone_insert,
               has_table_privilege(current_user, 'custom_tool_tombstones', 'DELETE') AS tombstone_delete,
               has_table_privilege(current_user, 'custom_tool_tombstones', 'UPDATE') AS tombstone_update,
               has_table_privilege(current_user, 'schema_migrations', 'SELECT') AS ledger_select,
-              has_table_privilege(current_user, 'api_keys', 'SELECT') AS api_key_select`,
+              has_table_privilege(current_user, 'api_keys', 'SELECT') AS api_key_select,
+              has_sequence_privilege(current_user, 'current_selection_revision_seq', 'USAGE') AS revision_sequence_usage`,
     );
     expect(role).toEqual({
       current_user: runtimeRole,
       schema_usage: true,
       schema_create: false,
       account_dml: true,
+      login_operation_select: true,
+      login_operation_insert: true,
+      login_operation_update: false,
+      login_operation_delete: false,
       tombstone_select: true,
       tombstone_insert: true,
       tombstone_delete: true,
       tombstone_update: false,
       ledger_select: true,
       api_key_select: true,
+      revision_sequence_usage: false,
     });
     expect(
       await client.one<{
@@ -366,13 +391,14 @@ describePostgres("PostgreSQL migration and repository integration", () => {
           "custom_tool_registration_reactivate",
           "custom_tool_registration_tombstone",
           "custom_tool_tombstone_guard",
+          "advance_current_selection_revision",
         ],
       ],
     );
-    expect(functions).toHaveLength(4);
+    expect(functions).toHaveLength(5);
     for (const fn of functions) {
       expect(fn.owner).toBe(migrationOwnerRole);
-      expect(fn.security_definer).toBe(false);
+      expect(fn.security_definer).toBe(fn.proname === "advance_current_selection_revision");
       expect(fn.config).toEqual([`search_path=pg_catalog, ${schema}`]);
       expect(fn.public_execute).toBe(false);
       expect(fn.runtime_execute).toBe(false);
@@ -388,8 +414,55 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       bin: "runtime-role",
     });
     await repo.create({ tool: "runtime-role-tool", name: "profile" });
-    await repo.setCurrent("runtime-role-tool", "profile");
+    await appClient.execute("CREATE TEMP SEQUENCE current_selection_revision_seq START 777777777");
+    const operationId = "11111111-1111-4111-8111-111111111111";
+    const activated = await repo.setCurrentForLogin("runtime-role-tool", "profile", operationId);
+    expect(activated.revision).not.toBe("777777777");
+    expect(await repo.setCurrentForLogin("runtime-role-tool", "profile", operationId)).toEqual(activated);
     expect((await repo.getCurrent("runtime-role-tool"))?.name).toBe("profile");
+    expect(await repo.restoreCurrentOperation(
+      "runtime-role-tool",
+      "profile",
+      operationId,
+      undefined,
+      null,
+    )).toBe(true);
+    expect(await repo.getCurrent("runtime-role-tool")).toBeNull();
+    expect((await repo.get("runtime-role-tool", "profile"))?.lastUsedAt).toBeUndefined();
+    const cancelledOperationId = "33333333-3333-4333-8333-333333333333";
+    expect(await repo.restoreCurrentOperation(
+      "runtime-role-tool",
+      "profile",
+      cancelledOperationId,
+    )).toBe(true);
+    await expect(repo.setCurrentForLogin(
+      "runtime-role-tool",
+      "profile",
+      cancelledOperationId,
+    )).rejects.toThrow(/cancelled before activation/);
+    expect(await repo.getCurrent("runtime-role-tool")).toBeNull();
+    await repo.create({ tool: "runtime-role-tool", name: "newer" });
+    const responseLossOperationId = "22222222-2222-4222-8222-222222222222";
+    const responseLossActivation = await repo.setCurrentForLogin(
+      "runtime-role-tool",
+      "profile",
+      responseLossOperationId,
+    );
+    await repo.setCurrent("runtime-role-tool", "newer");
+    expect(await repo.setCurrentForLogin(
+      "runtime-role-tool",
+      "profile",
+      responseLossOperationId,
+    )).toEqual(responseLossActivation);
+    expect((await repo.getCurrent("runtime-role-tool"))?.name).toBe("newer");
+    expect(await repo.restoreCurrentOperation(
+      "runtime-role-tool",
+      "profile",
+      responseLossOperationId,
+      undefined,
+      null,
+    )).toBe(false);
+    expect(await repo.remove("runtime-role-tool", "newer")).toBe(true);
     expect(await repo.remove("runtime-role-tool", "profile")).toBe(true);
     expect(await repo.removeCustomTool("runtime-role-tool")).toBe(true);
     expect(
@@ -424,6 +497,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0003_custom_tools",
       "accounts_0004_current_selection_account_fk",
       "accounts_0005_custom_tool_tombstones",
+      "accounts_0006_current_selection_revisions",
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,
@@ -509,6 +583,39 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         ["missing-tool", "missing-profile"],
       ),
     ).rejects.toThrow(/foreign key constraint/);
+  });
+
+  test("legacy current-selection updates still advance the rollback revision", async () => {
+    const repo = new AccountsRepo(client);
+    await repo.create({ tool: "claude", name: "legacy-first" });
+    await repo.create({ tool: "claude", name: "legacy-second" });
+    const first = await repo.setCurrent("claude", "legacy-first");
+    await client.execute(
+      `INSERT INTO current_selections (tool, name, updated_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (tool) DO UPDATE
+       SET name = EXCLUDED.name, updated_at = EXCLUDED.updated_at`,
+      ["claude", "legacy-second"],
+    );
+    const second = await repo.getCurrent("claude");
+    expect(second?.name).toBe("legacy-second");
+    expect(second?.revision).not.toBe(first.revision);
+  });
+
+  test("current activation timestamps round-trip for conditional last-used rollback", async () => {
+    const repo = new AccountsRepo(client);
+    await repo.create({ tool: "claude", name: "timestamp-rollback" });
+    const current = await repo.setCurrent("claude", "timestamp-rollback");
+    expect((await repo.get("claude", "timestamp-rollback"))?.lastUsedAt).toBe(current.updatedAt);
+    expect(await repo.restoreCurrent(
+      "claude",
+      "timestamp-rollback",
+      current.revision,
+      undefined,
+      null,
+    )).toBe(true);
+    expect(await repo.getCurrent("claude")).toBeNull();
+    expect((await repo.get("claude", "timestamp-rollback"))?.lastUsedAt).toBeUndefined();
   });
 
   test("setCurrent serializes with concurrent rename and remove", async () => {

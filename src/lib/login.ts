@@ -1,4 +1,5 @@
 import { accessSync, constants, existsSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline";
@@ -7,16 +8,25 @@ import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import {
   captureClaudeLiveAuthSnapshot,
+  captureClaudeProfileAuthSnapshot,
   ensureProfileAuthSnapshot,
   restoreClaudeLiveAuthSnapshot,
+  restoreClaudeProfileAuthSnapshot,
   type ClaudeLiveAuthSnapshot,
+  type ClaudeProfileAuthSnapshot,
 } from "./claude-auth.js";
 import { getProfileToolLock, lockProfileTool, restoreProfileToolLock } from "./profiles.js";
 import { withApplyLockWait } from "./apply-lock.js";
-import { resolveStore, type AccountsStore } from "./store.js";
+import { detectEmail } from "./detect.js";
+import {
+  resolveStore,
+  type AccountsStore,
+  type CurrentEntry,
+  type ProfileRollbackFields,
+} from "./store.js";
 import { getTool, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
-import { loadMachineStore, profilesDir, saveStore } from "../storage.js";
+import { loadMachineStore, profilesDir, saveStore, withStoreLock } from "../storage.js";
 
 export interface FinalizeLoginResult {
   profile: Profile;
@@ -26,9 +36,18 @@ export interface FinalizeLoginResult {
 export interface LoginFinalizationState {
   tool: ToolDef;
   profile: Profile;
-  current?: Profile;
-  applied?: string;
+  current?: CurrentEntry;
+  applied?: { name: string; revision?: string };
   liveClaude?: ClaudeLiveAuthSnapshot;
+  profileClaude?: ClaudeProfileAuthSnapshot;
+  writes: {
+    applyStarted?: boolean;
+    appliedRevision?: string;
+    currentRevision?: string;
+    currentOperationId?: string;
+    profileAuthSnapshots?: ClaudeProfileAuthSnapshot[];
+    profile: ProfileRollbackFields;
+  };
 }
 
 export interface ToolAvailability {
@@ -446,18 +465,88 @@ export async function captureLoginFinalizationState(
   tool: ToolDef,
   store: AccountsStore = resolveStore(),
 ): Promise<LoginFinalizationState> {
-  const [profile, current] = await Promise.all([
+  if (
+    !store.restoreCurrentGeneration ||
+    !store.restoreCurrentOperation ||
+    !store.restoreProfileState ||
+    !store.useProfileForLogin
+  ) {
+    throw new AccountsError(
+      "the configured Accounts store does not support transactional login activation and rollback; " +
+      "upgrade the custom store before running accounts login",
+    );
+  }
+  const currentSnapshot = store.listCurrentForLoginRollback
+    ? store.listCurrentForLoginRollback()
+    : store.transport === "local"
+      ? store.listCurrent()
+      : Promise.reject(
+          new AccountsError(
+            "the configured Accounts API store does not support transactional login rollback; " +
+            "upgrade the custom store before running accounts login",
+          ),
+        );
+  const [profile, currentSelections] = await Promise.all([
     store.getProfile(name, tool.id),
-    store.currentProfile(tool.id),
+    currentSnapshot,
   ]);
   const machine = loadMachineStore();
+  const current = currentSelections.find((selection) => selection.tool === tool.id);
+  const appliedName = machine.applied[tool.id];
   return {
     tool,
     profile,
     ...(current ? { current } : {}),
-    ...(machine.applied[tool.id] ? { applied: machine.applied[tool.id] } : {}),
+    ...(appliedName
+      ? { applied: { name: appliedName, ...(machine.appliedRevisions[tool.id] ? { revision: machine.appliedRevisions[tool.id] } : {}) } }
+      : {}),
     ...(tool.id === "claude" ? { liveClaude: captureClaudeLiveAuthSnapshot() } : {}),
+    ...(tool.id === "claude" ? { profileClaude: captureClaudeProfileAuthSnapshot(profile.dir) } : {}),
+    writes: { profile: {} },
   };
+}
+
+function recordEmailFinalizationWrite(state: LoginFinalizationState | undefined, profile: Profile): void {
+  if (!state) return;
+  const beforeEmail = state.profile.email ?? null;
+  const afterEmail = profile.email ?? null;
+  if (beforeEmail !== afterEmail) {
+    state.writes.profile.email = { expected: afterEmail, restore: beforeEmail };
+  }
+}
+
+function expectEmailFinalizationWrite(
+  state: LoginFinalizationState | undefined,
+  profile: Profile,
+  tool: ToolDef,
+): void {
+  if (!state || !profile.dir || !existsSync(profile.dir)) return;
+  const detected = detectEmail(profile.dir, tool);
+  const beforeEmail = state.profile.email ?? null;
+  if (detected && detected !== beforeEmail) {
+    // Record ownership before the awaited registry write so a committed write
+    // with a lost response can still be conditionally rolled back.
+    state.writes.profile.email = { expected: detected, restore: beforeEmail };
+  }
+}
+
+function recordLastUsedFinalizationWrite(state: LoginFinalizationState | undefined, profile: Profile): void {
+  if (!state) return;
+  const beforeLastUsedAt = state.profile.lastUsedAt ?? null;
+  const afterLastUsedAt = profile.lastUsedAt ?? null;
+  if (beforeLastUsedAt !== afterLastUsedAt) {
+    state.writes.profile.lastUsedAt = { expected: afterLastUsedAt, restore: beforeLastUsedAt };
+  }
+}
+
+function requireLoginCurrentRevision(revision: string | undefined): string {
+  if (!revision) {
+    throw new AccountsError(
+      "accounts-serve returned a current selection missing a current-selection revision; " +
+      "Redeploy accounts-serve 0.2.9 or newer before running accounts login.",
+    );
+  }
+  return revision;
 }
 
 /** Restore live auth and active/applied pointers after failed or interrupted finalization. */
@@ -474,24 +563,68 @@ export async function rollbackLoginFinalization(
     }
   };
 
-  if (state.liveClaude) {
-    await attempt(() => withApplyLockWait(() => {
+  if (state.writes.currentOperationId) {
+    try {
+      if (!store.restoreCurrentOperation) {
+        throw new AccountsError("the Accounts store lost operation-owned current rollback support");
+      }
+      await store.restoreCurrentOperation(
+        state.tool.id,
+        state.profile.name,
+        state.writes.currentOperationId,
+        state.current?.name,
+        state.profile.lastUsedAt ?? null,
+      );
+    } catch (error) {
+      firstError ??= error;
+    }
+  } else if (state.writes.currentRevision) {
+    try {
+      if (!store.restoreCurrentGeneration) {
+        throw new AccountsError("the Accounts store lost generation-aware current rollback support");
+      }
+      await store.restoreCurrentGeneration(
+        state.tool.id,
+        state.profile.name,
+        state.writes.currentRevision,
+        state.current?.name,
+      );
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+
+  for (const snapshot of state.writes.profileAuthSnapshots ?? []) {
+    await attempt(() => restoreClaudeProfileAuthSnapshot(snapshot));
+  }
+  if (state.profileClaude) {
+    await attempt(() => restoreClaudeProfileAuthSnapshot(state.profileClaude!));
+  }
+
+  if (state.liveClaude && state.writes.applyStarted) {
+    await attempt(() => withApplyLockWait(() => withStoreLock(() => {
       const machine = loadMachineStore();
       const appliedNow = machine.applied[state.tool.id];
-      const ownsAppliedState = appliedNow === state.applied || appliedNow === state.profile.name;
+      const appliedRevisionNow = machine.appliedRevisions[state.tool.id];
+      const expectedName = state.writes.appliedRevision ? state.profile.name : state.applied?.name;
+      const expectedRevision = state.writes.appliedRevision ?? state.applied?.revision;
+      const ownsAppliedState = appliedNow === expectedName && appliedRevisionNow === expectedRevision;
       if (!ownsAppliedState) return;
       restoreClaudeLiveAuthSnapshot(state.liveClaude!);
-      if (state.applied) machine.applied[state.tool.id] = state.applied;
-      else delete machine.applied[state.tool.id];
+      if (state.applied) {
+        machine.applied[state.tool.id] = state.applied.name;
+        machine.appliedRevisions[state.tool.id] = randomUUID();
+      } else {
+        delete machine.applied[state.tool.id];
+        delete machine.appliedRevisions[state.tool.id];
+      }
       saveStore(machine);
-    }));
+    })));
   }
-  await attempt(() => store.restoreProfileState(state.profile).then(() => undefined));
-  await attempt(() => store.restoreCurrent(
-    state.tool.id,
-    state.profile.name,
-    state.current?.name,
-  ).then(() => undefined));
+  const profileFields: ProfileRollbackFields = { ...state.writes.profile };
+  if (Object.keys(profileFields).length > 0) {
+    await attempt(() => store.restoreProfileState!(state.profile, profileFields).then(() => undefined));
+  }
 
   if (firstError) throw firstError;
 }
@@ -505,17 +638,31 @@ export async function finalizeLogin(
   name: string,
   toolId?: string,
   store: AccountsStore = resolveStore(),
+  state?: LoginFinalizationState,
 ): Promise<FinalizeLoginResult> {
   const profile = await store.getProfile(name, toolId);
   const tool = getTool(profile.tool);
 
   if (tool.id === "claude") {
     ensureProfileAuthSnapshot(profile.dir, tool, { overwrite: true });
-    await store.redetectEmail(name, tool.id);
-    return { profile: (await applyProfile(name, tool.id, store)).profile, applied: true };
+    expectEmailFinalizationWrite(state, profile, tool);
+    const redetected = await store.redetectEmail(name, tool.id);
+    recordEmailFinalizationWrite(state, redetected);
+    const applied = await applyProfile(name, tool.id, store, state?.writes);
+    if (state) state.writes.currentRevision = requireLoginCurrentRevision(applied.currentRevision);
+    recordLastUsedFinalizationWrite(state, applied.profile);
+    return { profile: applied.profile, applied: true };
   }
 
+  expectEmailFinalizationWrite(state, profile, tool);
   const updated = await store.redetectEmail(name, tool.id);
-  await store.useProfile(name, tool.id);
-  return { profile: updated, applied: false };
+  recordEmailFinalizationWrite(state, updated);
+  const operationId = state ? randomUUID() : undefined;
+  if (state) state.writes.currentOperationId = operationId;
+  const active = state
+    ? await store.useProfileForLogin!(name, tool.id, operationId!)
+    : await store.useProfile(name, tool.id);
+  if (state) state.writes.currentRevision = requireLoginCurrentRevision(active.currentRevision);
+  recordLastUsedFinalizationWrite(state, active.profile);
+  return { profile: active.profile, applied: false };
 }

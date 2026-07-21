@@ -559,8 +559,21 @@ test("SIGINT during finalization restores live auth, applied state, profile meta
   writeFileSync(liveSettings, '{"apiKeyHelper":"keep-me","theme":"dark"}\n', { mode: 0o600 });
   const store = readStore();
   store.applied = { ...(store.applied ?? {}), claude: "prior" };
+  store.appliedRevisions = { ...(store.appliedRevisions ?? {}), claude: "prior-generation" };
   writeFileSync(join(home, "accounts.json"), JSON.stringify({ version: 1, tools: [], ...store }, null, 2) + "\n");
   const storeBefore = readStore();
+  const priorProfileDir = store.profiles?.find((profile) => profile.name === "prior")?.dir;
+  const targetProfileDir = store.profiles?.find((profile) => profile.name === "acct")?.dir;
+  if (!priorProfileDir || !targetProfileDir) throw new Error("missing login rollback profile fixtures");
+  const trackedProfileSnapshots = [
+    join(priorProfileDir, ".accounts-auth", "oauth-account.json"),
+    join(priorProfileDir, ".accounts-auth", "credentials.json"),
+    join(priorProfileDir, ".accounts-auth", "keychain.json"),
+    join(targetProfileDir, ".accounts-auth", "oauth-account.json"),
+    join(targetProfileDir, ".accounts-auth", "credentials.json"),
+    join(targetProfileDir, ".accounts-auth", "keychain.json"),
+  ];
+  expect(trackedProfileSnapshots.every((path) => !existsSync(path))).toBe(true);
   writeFinalizationSignalTool("claude", "CLAUDE_CONFIG_DIR", "claude");
 
   const result = runCliWith(["login", "acct", "--tool", "claude"], {
@@ -577,7 +590,14 @@ test("SIGINT during finalization restores live auth, applied state, profile meta
   expect(result.status).toBe(130);
   expect(existsSync(signalSent)).toBe(true);
   expect(result.stdout).not.toContain("live/default Claude Code account");
-  expect(readStore()).toEqual(storeBefore);
+  const restoredStore = readStore();
+  expect({
+    ...restoredStore,
+    currentRevisions: storeBefore.currentRevisions,
+    appliedRevisions: storeBefore.appliedRevisions,
+  }).toEqual(storeBefore);
+  expect(restoredStore.currentRevisions.claude).not.toBe(storeBefore.currentRevisions.claude);
+  expect(restoredStore.appliedRevisions.claude).not.toBe(storeBefore.appliedRevisions.claude);
   expect(readFileSync(liveHomeJson, "utf8")).toBe('{"oauthAccount":{"emailAddress":"prior@example.com"}}\n');
   expect(readFileSync(liveCredentials, "utf8")).toBe('{"claudeAiOauth":{"refreshToken":"prior-live"}}\n');
   expect(readFileSync(liveSettings, "utf8")).toBe('{"apiKeyHelper":"keep-me","theme":"dark"}\n');
@@ -585,6 +605,7 @@ test("SIGINT during finalization restores live auth, applied state, profile meta
     account: "prior",
     secret: "prior-secret",
   });
+  expect(trackedProfileSnapshots.every((path) => !existsSync(path))).toBe(true);
   expect(existsSync(fixture.keychainLock)).toBe(false);
 });
 

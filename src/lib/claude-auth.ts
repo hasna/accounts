@@ -35,6 +35,11 @@ export interface ClaudeLiveAuthSnapshot {
   files: ClaudeLiveAuthFileSnapshot[];
 }
 
+export interface ClaudeProfileAuthSnapshot {
+  base: string;
+  files: ClaudeLiveAuthFileSnapshot[];
+}
+
 export const CLAUDE_API_AUTH_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
@@ -262,15 +267,37 @@ export function captureClaudeLiveAuthSnapshot(): ClaudeLiveAuthSnapshot {
   };
 }
 
-/** Restore an exact live Claude auth snapshot after failed finalization. */
-export function restoreClaudeLiveAuthSnapshot(snapshot: ClaudeLiveAuthSnapshot): void {
+/** Capture profile-owned auth snapshots that finalization may refresh. */
+export function captureClaudeProfileAuthSnapshot(profileDir: string): ClaudeProfileAuthSnapshot {
+  const paths = [
+    profileOAuthSnapshot(profileDir),
+    profileCredentialsSnapshot(profileDir),
+    profileKeychainSnapshot(profileDir),
+  ];
+  return {
+    base: profileDir,
+    files: paths.map((path) => {
+      if (!existsSync(path)) return { path };
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new AccountsError(`refusing to snapshot unsafe Claude profile auth path ${path}`);
+      }
+      return { path, contents: readFileSync(path), mode: stat.mode & 0o777 };
+    }),
+  };
+}
+
+function restoreClaudeAuthSnapshot(
+  snapshot: ClaudeLiveAuthSnapshot | ClaudeProfileAuthSnapshot,
+  label: string,
+): void {
   for (const file of snapshot.files) {
     assertSafeWritePath(file.path, { mustStayUnder: snapshot.base });
     if (file.contents === undefined) {
       if (!existsSync(file.path)) continue;
       const stat = lstatSync(file.path);
       if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new AccountsError(`refusing to remove unsafe live Claude auth path ${file.path}`);
+        throw new AccountsError(`refusing to remove unsafe ${label} path ${file.path}`);
       }
       unlinkSync(file.path);
       continue;
@@ -279,6 +306,16 @@ export function restoreClaudeLiveAuthSnapshot(snapshot: ClaudeLiveAuthSnapshot):
     writeFileSync(file.path, file.contents, { mode: file.mode ?? 0o600 });
     chmodSync(file.path, file.mode ?? 0o600);
   }
+}
+
+/** Restore an exact live Claude auth snapshot after failed finalization. */
+export function restoreClaudeLiveAuthSnapshot(snapshot: ClaudeLiveAuthSnapshot): void {
+  restoreClaudeAuthSnapshot(snapshot, "live Claude auth");
+}
+
+/** Restore exact profile-owned auth snapshots after failed finalization. */
+export function restoreClaudeProfileAuthSnapshot(snapshot: ClaudeProfileAuthSnapshot): void {
+  restoreClaudeAuthSnapshot(snapshot, "Claude profile auth");
 }
 
 /** Email address of the account currently authenticated on the live Claude paths. */

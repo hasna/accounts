@@ -114,11 +114,15 @@ export const storeSchema = z.object({
   version: z.literal(1),
   /** Map of toolId -> active profile name (for env/launch/shell). */
   current: z.record(z.string(), z.string()).default({}),
+  /** Mutation generation for each current selection (used by conditional rollback). */
+  currentRevisions: z.record(z.string(), z.string()).default({}),
   /**
    * Map of toolId -> profile name last applied to the tool's live default paths
    * (e.g. ~/.claude + ~/.claude.json on disk for IDE use).
    */
   applied: z.record(z.string(), z.string()).default({}),
+  /** Mutation generation for each machine-local applied selection. */
+  appliedRevisions: z.record(z.string(), z.string()).default({}),
   /** Map of profile/account name -> preferred tool id for bare commands. */
   toolLocks: z.record(slugSchema, slugSchema).default({}),
   profiles: z.array(profileSchema).default([]),
@@ -126,7 +130,18 @@ export const storeSchema = z.object({
   tools: z.array(toolDefSchema).default([]),
 });
 
-export type Store = z.infer<typeof storeSchema>;
+/** Fully normalized registry shape returned after schema parsing. */
+export type NormalizedStore = z.output<typeof storeSchema>;
+
+/**
+ * Public write shape. The revision maps were added in 0.2.9, so keep them
+ * optional for source compatibility with callers constructing legacy Store
+ * literals; storeSchema fills them before any runtime use.
+ */
+export type Store = Omit<NormalizedStore, "currentRevisions" | "appliedRevisions"> & {
+  currentRevisions?: NormalizedStore["currentRevisions"];
+  appliedRevisions?: NormalizedStore["appliedRevisions"];
+};
 
 export class AccountsError extends Error {
   constructor(message: string) {

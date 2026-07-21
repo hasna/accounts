@@ -60,7 +60,11 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    cascading account foreign key. Migration `0005` additively creates
    `custom_tool_tombstones` and database guards that serialize account
    creation, explicit removal, and explicit re-registration. All three
-   migrations are checksum-ledgered and restart-idempotent. The migrator
+   migrations are checksum-ledgered and restart-idempotent. Migration `0006`
+   also creates the durable `current_login_operations` idempotency ledger used
+   by response-loss-safe login activation. The ledger records both completed
+   activations and rollback-first terminal cancellations, so a delayed
+   activation cannot commit after its rollback has already returned. The migrator
    reapplies and verifies the runtime grant contract after migrations and on a
    current-schema no-op run. Inspect and retain
    the orphan archive for reconciliation; do not treat it as disposable
@@ -106,34 +110,42 @@ only these direct grants after revoking `PUBLIC` access on the managed schema
 and tables:
 
 - `USAGE` on the Accounts schema, without `CREATE`.
-- `SELECT, INSERT, UPDATE, DELETE` on `accounts`,
-  `current_selections`, and `custom_tools`.
+- `SELECT, INSERT, UPDATE, DELETE` on `accounts`, `current_selections`, and
+  `custom_tools`.
+- `SELECT, INSERT` on the append-only `current_login_operations` idempotency
+  ledger; no `UPDATE` or `DELETE`.
 - `SELECT, INSERT, DELETE` on `custom_tool_tombstones`; no `UPDATE`,
   `TRUNCATE`, `REFERENCES`, or `TRIGGER`.
 - `SELECT` on `schema_migrations` and `api_keys` for readiness and
   API-key revocation checks.
-- No direct `EXECUTE` on the four migration `0005` trigger functions.
+- No direct access to `current_selection_revision_seq`; its narrow trigger runs
+  as the migration owner so legacy server writes receive monotonic generations
+  without a post-migration sequence-grant window.
+- No direct `EXECUTE` on the five migration `0005`/`0006` trigger functions.
 
-The trigger functions are `SECURITY INVOKER`, owned by the migration owner,
-have `search_path` fixed to `pg_catalog` plus the migration schema, and have
-public execution revoked. Their table access therefore stays within the
-runtime role's audited direct grants. Re-run the owner migrator after every
-schema migration so grants for the current manifest are revalidated.
+The `0005` trigger functions remain `SECURITY INVOKER`. The narrow `0006`
+revision trigger is `SECURITY DEFINER`, uses only its owner-controlled sequence,
+schema-qualifies that sequence through the trigger table's trusted schema, and
+removes the column default so runtime writes never evaluate `nextval` directly.
+All five are owned by the migration owner, have `search_path` fixed
+to `pg_catalog` plus the migration schema, and have public execution revoked.
+Re-run the owner migrator after every schema migration so grants for the current
+manifest are revalidated.
 
 ## Compatibility Matrix
 
 | Client | Server | Result |
 | --- | --- | --- |
 | Old | Old | Existing account and selection operations are unchanged. |
-| Old | New | Compatible after migration 0005. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected. |
-| New | Old | Existing operations work. Minimal legacy built-in Tool responses are accepted. Rename and custom-tool mutations require a server upgrade and fail with an actionable error. |
-| New | New before migrations 0003/0004/0005 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003/0004/0005 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, rename/remove/current updates, and pointer reconciliation are available. |
+| Old | New | Compatible after migrations 0005/0006. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
+| New | Old | Existing non-login operations work. Minimal legacy built-in Tool responses are accepted. Login preflight, rename, custom-tool mutations, and generation-owned failed-login rollback require a server upgrade and fail with an actionable error. Transactional activation and rollback use new-only routes, so old replicas reject rather than partially execute them. |
+| New | New before migrations 0003/0004/0005/0006 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
+| New | New after migrations 0003/0004/0005/0006 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, durable response-loss-safe operation-owned login rollback with rollback-first cancellation, rename/remove/current updates, and pointer reconciliation are available. |
 
 ## Rollback And Forward Fix
 
 - Before client rollout, the application server image may be rolled back.
-  Leave migrations `0003`, `0004`, and `0005` in place. Database triggers
+  Leave migrations `0003`, `0004`, `0005`, and `0006` in place. Database triggers
   make older account writers observe tombstones and turn older direct
   `custom_tools` deletes into durable removals. An explicit registration is
   the only operation that clears a tombstone.
@@ -141,7 +153,7 @@ schema migration so grants for the current manifest are revalidated.
   migration `0005` functions, their locked `search_path`, and the grants
   applied by the new owner-run migrator. Do not switch the server to the owner
   DSN as a rollback shortcut.
-- Never run a pre-`0003`/`0005` `accounts-migrate` binary after newer
+- Never run a pre-`0003`/`0005`/`0006` `accounts-migrate` binary after newer
   migrations are recorded. The checksum ledger rejects migrations unknown to
   the supplied manifest as a deterministic downgrade guard. An application
   rollback must retain the new migrator binary/job; otherwise forward-fix.
@@ -164,8 +176,11 @@ schema migration so grants for the current manifest are revalidated.
 - `bun run test:postgres` requires
   `HASNA_ACCOUNTS_TEST_DATABASE_URL`. It uses an isolated schema to verify the
   `0003` upgrade, `0004` orphan archival and valid-row preservation, `0005`
+  tool tombstones, `0006` database-enforced current-selection generations,
   direct-SQL idempotency, unseen legacy ids, durable removal rejection,
-  old-server trigger behavior, both removal/creation orderings, restart
+  old-server current-update generation advancement, durable operation-token
+  replay after an intervening selection, wire-stable activation timestamps,
+  deterministic account-before-current rollback locking, both removal/creation orderings, restart
   idempotency, old-migrator downgrade rejection, rollback/forward-fix behavior,
   transaction rollback, and concurrent row/advisory locking. The suite creates
   a non-superuser migration owner and a separate DML-only app role, migrates as

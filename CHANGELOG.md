@@ -34,7 +34,41 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   exact pre-launch live Claude auth files and prior machine applied pointer,
   observes interrupts on platforms without a Claude keychain, conditionally
   restores or clears API current state, and does not overwrite a newer
-  concurrent apply.
+  concurrent apply. Local and API current selections and machine-local applies
+  carry write generations so rollback also preserves newer same-profile
+  selections/applies; profile rollback is field-scoped and compare-and-restore,
+  preserving unrelated concurrent metadata and email edits. Additive migration
+  `0006` supplies database-enforced monotonic current-selection generations to
+  self-hosted/API storage even during mixed-version server rollouts. API login
+  preflight rejects servers without generation-aware rollback before tool launch,
+  while ordinary current-selection operations and legacy rollback request bodies
+  remain rollout-compatible. Transactional activation uses a login-only endpoint
+  that old rolling replicas cannot mutate, sends conditional rollback through a
+  separate new-only route, and persists client-owned operation results outside
+  the mutable current row so a lost response remains an idempotent no-op even
+  after a newer selection. A rollback that overtakes a queued activation now
+  persists a terminal cancellation first, preventing the delayed activation
+  from committing the failed profile. Migration `0006` assigns
+  rollback generations through a locked-down owner-scoped trigger with a
+  schema-qualified sequence and no runtime sequence access. Local registry writes
+  use a cross-process lock plus stale-snapshot rejection, hold the registry lock
+  across live-auth and applied-pointer mutation, clean partial lock acquisition,
+  publish only fully initialized lock inodes, identify process incarnations
+  across Linux and macOS PID reuse with timezone-normalized macOS start times,
+  fail closed on unverifiable same-PID ownership, enforce the acquisition
+  deadline before every retry, and atomically claim a stale inode before
+  reclaiming it so competing reclaimers cannot remove a replacement.
+  Abandoned reclaim claims are recovered, and cloud rename/remove reconciliation
+  takes its snapshot only after acquiring the registry lock. The generated API
+  contract requires an operation id or revision for transactional rollback.
+  PostgreSQL rollback locks account rows in deterministic order before the
+  current row to avoid activation/rollback deadlocks. Metadata ownership is
+  recorded before awaited writes; operation rollback atomically restores the
+  owned `lastUsedAt`, and idempotent profile rollback retries across old rolling
+  replicas. Exported legacy rollback call shapes, pre-revision `Store` literals,
+  and additive API response types remain compatible. Failed Claude finalization
+  also restores any profile-owned auth snapshots refreshed during the attempt.
+  Activation timestamps use wire-stable precision for exact field rollback.
 - The default Bun test preload neutralizes inherited station Accounts cloud/API
   configuration while explicit cloud fixtures remain supported.
 - Compatible transitive overrides keep the MCP SDK graph on patched

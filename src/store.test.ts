@@ -87,7 +87,7 @@ describe("ApiStore routes registry ops to /v1", () => {
   test("useProfile resolves then PUTs the current selection", async () => {
     const { calls, fetchImpl } = mockFetch((c) => {
       if (c.method === "GET") return { status: 200, body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" } };
-      return { status: 200, body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z" } };
+      return { status: 200, body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z", revision: "7" } };
     });
     const store = resolveStore(cloudEnv, { fetchImpl });
     const { toolId } = await store.useProfile("work", "claude");
@@ -95,30 +95,53 @@ describe("ApiStore routes registry ops to /v1", () => {
     expect(calls.some((c) => c.method === "PUT" && c.url === `${BASE}/v1/current/claude`)).toBe(true);
   });
 
+  test("useProfileForLogin resolves then PUTs the transactional activation route", async () => {
+    const operationId = "11111111-1111-4111-8111-111111111111";
+    const { calls, fetchImpl } = mockFetch((c) => {
+      if (c.method === "GET") {
+        return { status: 200, body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" } };
+      }
+      return {
+        status: 200,
+        body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z", revision: "8", operationId },
+      };
+    });
+    const store = resolveStore(cloudEnv, { fetchImpl });
+    expect((await store.useProfileForLogin!(
+      "work",
+      "claude",
+      operationId,
+    )).currentRevision).toBe("8");
+    expect(calls.some((c) => c.method === "PUT" && c.url === `${BASE}/v1/current/claude/login`)).toBe(true);
+  });
+
   test("rollback helpers restore nullable profile state and conditionally clear API current", async () => {
     const { calls, fetchImpl } = mockFetch((c) => {
-      if (c.method === "PATCH") {
+      if (c.url.endsWith("/accounts/claude/work/restore")) {
         return { status: 200, body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" } };
       }
       return { status: 200, body: { restored: true } };
     });
     const store = resolveStore(cloudEnv, { fetchImpl });
-    await store.restoreProfileState({
-      name: "work",
-      tool: "claude",
-      dir: "/profiles/work",
-      createdAt: "2020-01-01T00:00:00Z",
-    });
+    await store.restoreProfileState!(
+      {
+        name: "work",
+        tool: "claude",
+        dir: "/profiles/work",
+        createdAt: "2020-01-01T00:00:00Z",
+      },
+      { email: { expected: "failed@example.com", restore: null } },
+    );
     expect(calls[0]).toMatchObject({
-      method: "PATCH",
-      url: `${BASE}/v1/accounts/claude/work`,
-      body: { email: null, lastUsedAt: null },
+      method: "POST",
+      url: `${BASE}/v1/accounts/claude/work/restore`,
+      body: { email: { expected: "failed@example.com", restore: null } },
     });
-    expect(await store.restoreCurrent("claude", "work")).toBe(true);
+    expect(await store.restoreCurrentGeneration!("claude", "work", "7")).toBe(true);
     expect(calls[1]).toMatchObject({
       method: "POST",
-      url: `${BASE}/v1/current/claude/restore`,
-      body: { expectedName: "work" },
+      url: `${BASE}/v1/current/claude/login/restore`,
+      body: { expectedName: "work", expectedRevision: "7" },
     });
   });
 
@@ -130,7 +153,12 @@ describe("ApiStore routes registry ops to /v1", () => {
 
   test("currentProfile follows getCurrent then get", async () => {
     const { calls, fetchImpl } = mockFetch((c) => {
-      if (c.url.endsWith("/current/claude")) return { status: 200, body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z" } };
+      if (c.url.endsWith("/current/claude")) {
+        return {
+          status: 200,
+          body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z", revision: "7" },
+        };
+      }
       return { status: 200, body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" } };
     });
     const store = resolveStore(cloudEnv, { fetchImpl });
@@ -627,5 +655,15 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect(active?.name).toBe("work");
     const list = await store.listProfiles("claude");
     expect(list.map((p) => p.name)).toContain("work");
+  });
+
+  test("legacy three-argument restoreCurrent still restores the named prior profile", async () => {
+    const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    await store.addProfile({ name: "prior", tool: "claude" });
+    await store.addProfile({ name: "failed", tool: "claude" });
+    await store.useProfile("failed", "claude");
+
+    expect(await store.restoreCurrent("claude", "failed", "prior")).toBe(true);
+    expect((await store.currentProfile("claude"))?.name).toBe("prior");
   });
 });

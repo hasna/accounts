@@ -27,9 +27,28 @@ describe("accounts SDK", () => {
   test("OpenAPI document covers health/ready/version + versioned CRUD", () => {
     const doc = buildOpenApiDoc("1.2.3");
     expect(doc.info.version).toBe("1.2.3");
-    for (const p of ["/health", "/ready", "/version", "/v1/accounts", "/v1/accounts/{tool}/{name}", "/v1/current", "/v1/current/{tool}", "/v1/tools"]) {
+    for (const p of ["/health", "/ready", "/version", "/v1/accounts", "/v1/accounts/{tool}/{name}", "/v1/current", "/v1/current/{tool}", "/v1/current/{tool}/login", "/v1/tools"]) {
       expect(doc.paths[p]).toBeDefined();
     }
     expect((doc.paths["/v1/accounts"] as any).post.operationId).toBe("createAccount");
+  });
+
+  test("current-selection rollback fields remain additive for old clients", () => {
+    const schemas = buildOpenApiDoc("1.2.3").components.schemas;
+    expect(schemas.CurrentSelection.required).toEqual(["tool", "name", "updatedAt"]);
+    expect(schemas.CurrentSelectionList.required).toEqual(["current"]);
+    expect(schemas.CurrentSelection.properties.revision).toBeDefined();
+    expect(schemas.CurrentSelection.properties.operationId).toBeDefined();
+    expect(schemas.CurrentSelectionList.properties.transactionalLoginRollback).toBeDefined();
+    expect(Object.keys(schemas.RestoreCurrentInput.properties).sort()).toEqual(["expectedName", "name"]);
+    expect(schemas.RestoreLoginCurrentInput.anyOf).toHaveLength(2);
+    expect(schemas.RestoreLoginCurrentInput.anyOf.map((branch: any) => branch.required).sort()).toEqual([
+      ["expectedName", "expectedOperationId"],
+      ["expectedName", "expectedRevision"],
+    ]);
+    const { code } = renderSdk();
+    expect(code).toContain('export type RestoreLoginCurrentInput =');
+    expect(code).toContain('"expectedRevision": string');
+    expect(code).toContain('"expectedOperationId": string');
   });
 });

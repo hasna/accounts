@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
-import { type Profile, type Store, AccountsError, profileNameSchema } from "../types.js";
+import { type NormalizedStore, type Profile, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
@@ -70,7 +71,7 @@ function profileMatches(name: string, toolId?: string): Profile[] {
   return loadStore().profiles.filter((p) => p.name === name && (!toolId || p.tool === toolId));
 }
 
-function resolveProfileFromStore(store: Store, name: string, toolId?: string): Profile {
+function resolveProfileFromStore(store: NormalizedStore, name: string, toolId?: string): Profile {
   const matches = store.profiles.filter((p) => p.name === name && (!toolId || p.tool === toolId));
   if (matches.length === 0) {
     const suffix = toolId ? ` for tool "${toolId}"` : "";
@@ -242,8 +243,14 @@ export function removeProfile(
   const profile = store.profiles[idx]!;
 
   store.profiles.splice(idx, 1);
-  if (store.current[profile.tool] === name) delete store.current[profile.tool];
-  if (store.applied[profile.tool] === name) delete store.applied[profile.tool];
+  if (store.current[profile.tool] === name) {
+    delete store.current[profile.tool];
+    delete store.currentRevisions[profile.tool];
+  }
+  if (store.applied[profile.tool] === name) {
+    delete store.applied[profile.tool];
+    delete store.appliedRevisions[profile.tool];
+  }
   if (store.toolLocks[profile.name] === profile.tool) delete store.toolLocks[profile.name];
   saveStore(store);
 
@@ -282,8 +289,14 @@ export function renameProfile(oldName: string, newName: string, toolId?: string)
     throw new AccountsError(`a ${profile.tool} profile named "${newName}" already exists`);
   }
 
-  if (store.current[profile.tool] === oldName) store.current[profile.tool] = newName;
-  if (store.applied[profile.tool] === oldName) store.applied[profile.tool] = newName;
+  if (store.current[profile.tool] === oldName) {
+    store.current[profile.tool] = newName;
+    store.currentRevisions[profile.tool] = randomUUID();
+  }
+  if (store.applied[profile.tool] === oldName) {
+    store.applied[profile.tool] = newName;
+    store.appliedRevisions[profile.tool] = randomUUID();
+  }
   if (store.toolLocks[oldName] === profile.tool) {
     delete store.toolLocks[oldName];
     if (!store.toolLocks[newName]) store.toolLocks[newName] = profile.tool;
@@ -362,14 +375,19 @@ export function redetectEmail(name: string, toolId?: string): Profile {
 }
 
 /** Mark a profile as the active one for its tool. */
-export function useProfile(name: string, toolId?: string): { profile: Profile; toolId: string } {
+export function useProfile(
+  name: string,
+  toolId?: string,
+  currentRevision: string = randomUUID(),
+): { profile: Profile; toolId: string; currentRevision: string } {
   const store = loadStore();
   const profile = resolveProfileFromStore(store, name, toolId);
   store.current[profile.tool] = name;
+  store.currentRevisions[profile.tool] = currentRevision;
   store.toolLocks[profile.name] = profile.tool;
   profile.lastUsedAt = nowIso();
   saveStore(store);
-  return { profile, toolId: profile.tool };
+  return { profile, toolId: profile.tool, currentRevision };
 }
 
 export function currentProfile(toolId: string): Profile | undefined {

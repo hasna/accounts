@@ -18,6 +18,7 @@ describe("accounts migrations", () => {
     expect(ids).toContain("accounts_0003_custom_tools");
     expect(ids).toContain("accounts_0004_current_selection_account_fk");
     expect(ids).toContain("accounts_0005_custom_tool_tombstones");
+    expect(ids).toContain("accounts_0006_current_selection_revisions");
     expect(ids.some((id) => id.startsWith("hasna_auth_"))).toBe(true);
     for (const m of migrations) {
       expect(m.checksum.startsWith("sha256:")).toBe(true);
@@ -29,5 +30,18 @@ describe("accounts migrations", () => {
     const a = accountsMigrations().map((m) => `${m.id}:${m.checksum}`);
     const b = accountsMigrations().map((m) => `${m.id}:${m.checksum}`);
     expect(a).toEqual(b);
+  });
+
+  test("current-selection revisions advance for legacy conflict updates", () => {
+    const migration = accountsMigrations().find((item) => item.id === "accounts_0006_current_selection_revisions");
+    expect(migration?.sql).toMatch(/BEFORE INSERT OR UPDATE ON current_selections/);
+    expect(migration?.sql).toMatch(
+      /NEW\.revision := pg_catalog\.nextval\([\s\S]*TG_TABLE_SCHEMA[\s\S]*pg_catalog\.regclass/,
+    );
+    expect(migration?.sql).toMatch(/SECURITY DEFINER/);
+    expect(migration?.sql).toMatch(/ALTER COLUMN revision DROP DEFAULT/);
+    expect(migration?.sql).toMatch(/CREATE TABLE IF NOT EXISTS current_login_operations/);
+    expect(migration?.sql).toMatch(/operation_id UUID PRIMARY KEY/);
+    expect(migration?.sql).toMatch(/REVOKE ALL PRIVILEGES ON SEQUENCE current_selection_revision_seq FROM PUBLIC/);
   });
 });

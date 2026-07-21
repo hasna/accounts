@@ -148,7 +148,7 @@ describe("resolveAccountsCloud", () => {
   });
 
   test("setCurrent PUTs /v1/current/:tool", async () => {
-    const { calls, fetchImpl } = mockFetch(() => ({ status: 200, body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z" } }));
+    const { calls, fetchImpl } = mockFetch(() => ({ status: 200, body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z", revision: "7" } }));
     const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
     if (r.transport !== "cloud-http") throw new Error("expected cloud");
     const c = await r.api.setCurrent("claude", "work");
@@ -158,18 +158,161 @@ describe("resolveAccountsCloud", () => {
     expect((calls[0]!.body as { name: string }).name).toBe("work");
   });
 
-  test("restoreCurrent conditionally restores or clears the failed selection", async () => {
+  test("ordinary current reads remain compatible with a server that predates rollback generations", async () => {
+    const { fetchImpl } = mockFetch((call) => {
+      if (call.url.endsWith("/current")) {
+        return {
+          status: 200,
+          body: { current: [{ tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z" }] },
+        };
+      }
+      return { status: 200, body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z" } };
+    });
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    expect((await r.api.listCurrent())[0]?.name).toBe("work");
+    expect((await r.api.getCurrent("claude"))?.name).toBe("work");
+    expect((await r.api.setCurrent("claude", "work")).name).toBe("work");
+  });
+
+  test("login preflight rejects a server without transactional-login generations before activation", async () => {
+    const { fetchImpl } = mockFetch(() => ({ status: 200, body: { current: [] } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    await expect(r.api.listCurrentForLoginRollback!()).rejects.toThrow(
+      /transactional login rollback.*Redeploy accounts-serve/s,
+    );
+  });
+
+  test("generic setCurrent accepts a legacy response without a rollback generation", async () => {
+    const { fetchImpl } = mockFetch(() => ({
+      status: 200,
+      body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z" },
+    }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    expect((await r.api.setCurrent("claude", "work")).revision).toBeUndefined();
+  });
+
+  test("transactional login activation uses a route old replicas cannot mutate", async () => {
+    const operationId = "11111111-1111-4111-8111-111111111111";
+    const { calls, fetchImpl } = mockFetch(() => ({
+      status: 200,
+      body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z", revision: "9", operationId },
+    }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    expect((await r.api.setCurrentForLogin!("claude", "work", operationId)).revision).toBe("9");
+    expect(calls[0]).toMatchObject({
+      method: "PUT",
+      url: `${BASE}/v1/current/claude/login`,
+      body: { name: "work", operationId },
+    });
+  });
+
+  test("old replicas reject transactional login activation without mutating generic current", async () => {
+    const { calls, fetchImpl } = mockFetch(() => ({ status: 404, body: { error: "not found" } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl, sleepImpl: async () => {} });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    await expect(
+      r.api.setCurrentForLogin!("claude", "work", "11111111-1111-4111-8111-111111111111"),
+    ).rejects.toThrow(
+      /transactional login activation.*Redeploy accounts-serve/s,
+    );
+    expect(calls).toHaveLength(9);
+    expect(calls[0]!.url).toBe(`${BASE}/v1/current/claude/login`);
+  });
+
+  test("transactional login activation retries a lost response with the same operation id", async () => {
+    const calls: Call[] = [];
+    const operationId = "22222222-2222-4222-8222-222222222222";
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+      calls.push({
+        method: init?.method ?? "GET",
+        url: String(input),
+        headers: {},
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      if (calls.length === 1) throw new Error("response lost after commit");
+      return new Response(JSON.stringify({
+        tool: "claude",
+        name: "work",
+        updatedAt: "2020-01-01T00:00:00Z",
+        revision: "11",
+        operationId,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl, sleepImpl: async () => {} });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    expect((await r.api.setCurrentForLogin!("claude", "work", operationId)).revision).toBe("11");
+    expect(calls).toHaveLength(2);
+    expect(calls.map((call) => call.body)).toEqual([
+      { name: "work", operationId },
+      { name: "work", operationId },
+    ]);
+  });
+
+  test("operation-owned rollback sends the client token", async () => {
+    const { calls, fetchImpl } = mockFetch(() => ({ status: 200, body: { restored: true } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    const operationId = "33333333-3333-4333-8333-333333333333";
+    expect(await r.api.restoreCurrentOperation!("claude", "failed", operationId, "prior", null)).toBe(true);
+    expect(calls[0]!.body).toEqual({
+      expectedName: "failed",
+      expectedOperationId: operationId,
+      name: "prior",
+      restoreLastUsedAt: null,
+    });
+    expect(calls[0]!.url).toBe(`${BASE}/v1/current/claude/login/restore`);
+  });
+
+  test("profile rollback retries route-missing replicas with one idempotency key", async () => {
+    let attempts = 0;
+    const { calls, fetchImpl } = mockFetch(() => {
+      attempts += 1;
+      if (attempts < 3) return { status: 404, body: { error: "old replica" } };
+      return {
+        status: 200,
+        body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" },
+      };
+    });
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl, sleepImpl: async () => {} });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+
+    await r.api.restoreProfile!("work", "claude", {
+      email: { expected: "failed@example.com", restore: null },
+    });
+
+    expect(calls).toHaveLength(3);
+    expect(calls.map((call) => call.headers["idempotency-key"])).toEqual([
+      calls[0]!.headers["idempotency-key"],
+      calls[0]!.headers["idempotency-key"],
+      calls[0]!.headers["idempotency-key"],
+    ]);
+    expect(calls[0]!.headers["idempotency-key"]).toBeTruthy();
+  });
+
+  test("restoreCurrentGeneration conditionally restores or clears the failed selection", async () => {
+    const { calls, fetchImpl } = mockFetch(() => ({ status: 200, body: { restored: true } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    expect(await r.api.restoreCurrentGeneration!("claude", "failed", "7", "prior")).toBe(true);
+    expect(calls[0]).toMatchObject({
+      method: "POST",
+      url: `${BASE}/v1/current/claude/login/restore`,
+      body: { expectedName: "failed", expectedRevision: "7", name: "prior" },
+    });
+    expect(await r.api.restoreCurrentGeneration!("claude", "failed", "8")).toBe(true);
+    expect(calls[1]!.body).toEqual({ expectedName: "failed", expectedRevision: "8" });
+  });
+
+  test("legacy restoreCurrent keeps its three-argument request shape", async () => {
     const { calls, fetchImpl } = mockFetch(() => ({ status: 200, body: { restored: true } }));
     const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
     if (r.transport !== "cloud-http") throw new Error("expected cloud");
     expect(await r.api.restoreCurrent("claude", "failed", "prior")).toBe(true);
-    expect(calls[0]).toMatchObject({
-      method: "POST",
-      url: `${BASE}/v1/current/claude/restore`,
-      body: { expectedName: "failed", name: "prior" },
-    });
-    expect(await r.api.restoreCurrent("claude", "failed")).toBe(true);
-    expect(calls[1]!.body).toEqual({ expectedName: "failed" });
+    expect(calls[0]!.body).toEqual({ expectedName: "failed", name: "prior" });
   });
 
   test("getCurrent returns null on 404", async () => {

@@ -125,6 +125,21 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             lastUsedAt: { type: "string", nullable: true },
           },
         },
+        RestoreFieldInput: {
+          type: "object",
+          required: ["expected", "restore"],
+          properties: {
+            expected: { type: "string", nullable: true },
+            restore: { type: "string", nullable: true },
+          },
+        },
+        RestoreAccountInput: {
+          type: "object",
+          properties: {
+            email: ref("RestoreFieldInput"),
+            lastUsedAt: ref("RestoreFieldInput"),
+          },
+        },
         CurrentSelection: {
           type: "object",
           required: ["tool", "name", "updatedAt"],
@@ -132,6 +147,8 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             tool: { type: "string" },
             name: { type: "string" },
             updatedAt: { type: "string" },
+            revision: { type: "string" },
+            operationId: { type: "string", format: "uuid" },
           },
         },
         CurrentSelectionList: {
@@ -139,12 +156,21 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           required: ["current"],
           properties: {
             current: { type: "array", items: ref("CurrentSelection") },
+            transactionalLoginRollback: { type: "boolean", enum: [true] },
           },
         },
         SetCurrentInput: {
           type: "object",
           required: ["name"],
           properties: { name: { type: "string" } },
+        },
+        SetLoginCurrentInput: {
+          type: "object",
+          required: ["name", "operationId"],
+          properties: {
+            name: { type: "string" },
+            operationId: { type: "string", format: "uuid" },
+          },
         },
         RestoreCurrentInput: {
           type: "object",
@@ -153,6 +179,43 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             expectedName: { type: "string" },
             name: { type: "string" },
           },
+          additionalProperties: false,
+        },
+        RestoreLoginCurrentInput: {
+          anyOf: [
+            {
+              type: "object",
+              required: ["expectedName", "expectedRevision"],
+              properties: {
+                expectedName: { type: "string" },
+                expectedRevision: {
+                  type: "string",
+                  pattern: "^[0-9]{1,19}$",
+                  description: "Decimal current-selection generation within PostgreSQL BIGINT bounds",
+                },
+                expectedOperationId: { type: "string", format: "uuid" },
+                name: { type: "string" },
+                restoreLastUsedAt: { type: "string", format: "date-time", nullable: true },
+              },
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              required: ["expectedName", "expectedOperationId"],
+              properties: {
+                expectedName: { type: "string" },
+                expectedRevision: {
+                  type: "string",
+                  pattern: "^[0-9]{1,19}$",
+                  description: "Decimal current-selection generation within PostgreSQL BIGINT bounds",
+                },
+                expectedOperationId: { type: "string", format: "uuid" },
+                name: { type: "string" },
+                restoreLastUsedAt: { type: "string", format: "date-time", nullable: true },
+              },
+              additionalProperties: false,
+            },
+          ],
         },
         RestoreCurrentResult: {
           type: "object",
@@ -327,6 +390,23 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           },
         },
       },
+      "/v1/accounts/{tool}/{name}/restore": {
+        post: {
+          operationId: "restoreAccount",
+          summary: "Conditionally restore fields changed by failed login finalization",
+          security: [{ apiKey: [] }],
+          parameters: [
+            { name: "tool", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: jsonBody(ref("RestoreAccountInput")),
+          responses: {
+            "200": jsonResponse("Conditionally restored account", ref("Account")),
+            "404": jsonResponse("Not found", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
       "/v1/current": {
         get: {
           operationId: "listCurrent",
@@ -373,6 +453,34 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           responses: {
             "200": jsonResponse("Conditional restore result", ref("RestoreCurrentResult")),
             "404": jsonResponse("Restore account not found", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
+      "/v1/current/{tool}/login/restore": {
+        post: {
+          operationId: "restoreLoginCurrent",
+          summary: "Conditionally restore a transactional login selection",
+          security: [{ apiKey: [] }],
+          parameters: [{ name: "tool", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: jsonBody(ref("RestoreLoginCurrentInput")),
+          responses: {
+            "200": jsonResponse("Transactional restore result", ref("RestoreCurrentResult")),
+            "404": jsonResponse("Transactional restore endpoint unavailable", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
+      "/v1/current/{tool}/login": {
+        put: {
+          operationId: "setLoginCurrent",
+          summary: "Set current through the transactional login-only endpoint",
+          security: [{ apiKey: [] }],
+          parameters: [{ name: "tool", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: jsonBody(ref("SetLoginCurrentInput")),
+          responses: {
+            "200": jsonResponse("Current selection with rollback generation", ref("CurrentSelection")),
+            "404": jsonResponse("Account not found", ref("ErrorResponse")),
             ...errorResponses,
           },
         },

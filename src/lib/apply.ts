@@ -1,17 +1,28 @@
 import type { Profile, ToolDef } from "../types.js";
+import { randomUUID } from "node:crypto";
 import { AccountsError } from "../types.js";
-import { loadAppliedMap, loadMachineStore, loadStore, saveStore } from "../storage.js";
+import { loadAppliedMap, loadMachineStore, loadStore, saveStore, withStoreLock } from "../storage.js";
 import { getTool } from "./tools.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import {
   assertRestorableProfileAuth,
+  captureClaudeProfileAuthSnapshot,
   ensureProfileAuthSnapshot,
   liveCredentialShouldUpdateProfile,
   liveOAuthEmail,
   restoreClaudeAuthFromProfile,
   snapshotLiveAuthToProfile,
+  type ClaudeProfileAuthSnapshot,
 } from "./claude-auth.js";
 import { withApplyLock } from "./apply-lock.js";
+
+export interface ApplyTransactionTracker {
+  applyStarted?: boolean;
+  appliedRevision?: string;
+  currentRevision?: string;
+  currentOperationId?: string;
+  profileAuthSnapshots?: ClaudeProfileAuthSnapshot[];
+}
 
 function singleMatch(profiles: Profile[]): Profile | undefined {
   return profiles.length === 1 ? profiles[0] : undefined;
@@ -49,7 +60,14 @@ export async function applyProfile(
   name: string,
   toolId?: string,
   store: AccountsStore = resolveStore(),
-): Promise<{ profile: Profile; previous?: string }> {
+  tracker?: ApplyTransactionTracker,
+): Promise<{ profile: Profile; previous?: string; appliedRevision: string; currentRevision?: string }> {
+  if (tracker && !store.useProfileForLogin) {
+    throw new AccountsError(
+      "the configured Accounts store does not support transactional login activation; " +
+      "upgrade the custom store before running accounts login",
+    );
+  }
   const profile = await store.getProfile(name, toolId);
   const tool = getTool(profile.tool);
 
@@ -63,9 +81,18 @@ export async function applyProfile(
   // profiles; fetch it via the Store before taking the (synchronous) lock so no
   // async work happens while the lock file is held.
   const toolProfiles = await store.listProfiles(tool.id);
-  const result = withApplyLock(() => applyProfileAuth(profile, tool, toolProfiles));
-  await store.useProfile(profile.name, tool.id);
-  return result;
+  const result = withApplyLock(() => {
+    if (tracker) tracker.applyStarted = true;
+    return applyProfileAuth(profile, tool, toolProfiles, tracker);
+  });
+  if (tracker) tracker.appliedRevision = result.appliedRevision;
+  const operationId = tracker ? randomUUID() : undefined;
+  if (tracker) tracker.currentOperationId = operationId;
+  const active = tracker
+    ? await store.useProfileForLogin!(profile.name, tool.id, operationId!)
+    : await store.useProfile(profile.name, tool.id);
+  if (tracker) tracker.currentRevision = active.currentRevision;
+  return { ...result, profile: active.profile, currentRevision: active.currentRevision };
 }
 
 /** Synchronous, machine-local disk work for apply (runs under the apply lock). */
@@ -73,34 +100,41 @@ function applyProfileAuth(
   profile: Profile,
   tool: ToolDef,
   toolProfiles: Profile[],
-): { profile: Profile; previous?: string } {
+  tracker?: ApplyTransactionTracker,
+): { profile: Profile; previous?: string; appliedRevision: string } {
   assertRestorableProfileAuth(profile.dir, tool, profile.name);
+  return withStoreLock(() => {
+    const local = loadMachineStore();
+    const previous = local.applied[tool.id];
 
-  const local = loadMachineStore();
-  const previous = local.applied[tool.id];
+    // Preserve whatever auth is currently live by snapshotting it into the
+    // profile that actually owns it. The live OAuth email is the source of
+    // truth — the applied pointer goes stale when the user logs in directly
+    // on the live paths (e.g. `claude /login`), and trusting it would clobber
+    // another profile's snapshot with the wrong account's tokens.
+    const liveEmail = liveOAuthEmail();
+    const owner =
+      (liveEmail && singleMatch(toolProfiles.filter((p) => p.email === liveEmail))) ||
+      (previous ? toolProfiles.find((p) => p.name === previous) : undefined);
+    if (
+      owner &&
+      (!(owner.name === profile.name && owner.tool === profile.tool) ||
+        liveCredentialShouldUpdateProfile(profile.dir))
+    ) {
+      if (tracker && !tracker.profileAuthSnapshots?.some((snapshot) => snapshot.base === owner.dir)) {
+        (tracker.profileAuthSnapshots ??= []).push(captureClaudeProfileAuthSnapshot(owner.dir));
+      }
+      snapshotLiveAuthToProfile(owner.dir, tool);
+    }
 
-  // Preserve whatever auth is currently live by snapshotting it into the
-  // profile that actually owns it. The live OAuth email is the source of
-  // truth — the applied pointer goes stale when the user logs in directly
-  // on the live paths (e.g. `claude /login`), and trusting it would clobber
-  // another profile's snapshot with the wrong account's tokens.
-  const liveEmail = liveOAuthEmail();
-  const owner =
-    (liveEmail && singleMatch(toolProfiles.filter((p) => p.email === liveEmail))) ||
-    (previous ? toolProfiles.find((p) => p.name === previous) : undefined);
-  if (
-    owner &&
-    (!(owner.name === profile.name && owner.tool === profile.tool) ||
-      liveCredentialShouldUpdateProfile(profile.dir))
-  ) {
-    snapshotLiveAuthToProfile(owner.dir, tool);
-  }
+    ensureProfileAuthSnapshot(profile.dir, tool);
+    restoreClaudeAuthFromProfile(profile.dir, tool, profile.name);
 
-  ensureProfileAuthSnapshot(profile.dir, tool);
-  restoreClaudeAuthFromProfile(profile.dir, tool, profile.name);
+    local.applied[tool.id] = profile.name;
+    const appliedRevision = randomUUID();
+    local.appliedRevisions[tool.id] = appliedRevision;
+    saveStore(local);
 
-  local.applied[tool.id] = profile.name;
-  saveStore(local);
-
-  return { profile, ...(previous && previous !== profile.name ? { previous } : {}) };
+    return { profile, appliedRevision, ...(previous && previous !== profile.name ? { previous } : {}) };
+  });
 }

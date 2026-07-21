@@ -9,12 +9,16 @@
 // and cloud both route through ApiStore; nothing bypasses the Store.
 
 import { homedir, hostname } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import {
   chmodSync,
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
+  lstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -22,8 +26,14 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { type Store, storeSchema, AccountsError, profileNameSchema } from "./types.js";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  type NormalizedStore,
+  type Store,
+  storeSchema,
+  AccountsError,
+  profileNameSchema,
+} from "./types.js";
 import { assertSafeWritePath } from "./lib/safe-path.js";
 
 function validateEnvPath(value: string, label: string): string {
@@ -53,7 +63,320 @@ export function profilesDir(): string {
   return join(accountsHome(), "profiles");
 }
 
-const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
+const EMPTY_STORE: NormalizedStore = {
+  version: 1,
+  current: {},
+  currentRevisions: {},
+  applied: {},
+  appliedRevisions: {},
+  toolLocks: {},
+  profiles: [],
+  tools: [],
+};
+
+const storeSnapshots = new WeakMap<object, string | null>();
+let storeLockDepth = 0;
+const REGISTRY_RECLAIM_CLAIM_STALE_MS = 1_000;
+
+function delayRegistryLockInitializationForTest(): void {
+  if (process.env.NODE_ENV !== "test") return;
+  const marker = process.env.ACCOUNTS_TEST_STORE_LOCK_INIT_MARKER;
+  if (marker) {
+    assertSafeWritePath(marker, { mustStayUnder: accountsHome() });
+    writeFileSync(marker, "initializing\n", { mode: 0o600 });
+  }
+  const delayMs = Number(process.env.ACCOUNTS_TEST_STORE_LOCK_INIT_DELAY_MS ?? 0);
+  if (Number.isFinite(delayMs) && delayMs > 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+  }
+}
+
+function currentStoreText(): string | null {
+  const path = storePath();
+  return existsSync(path) ? readFileSync(path, "utf8") : null;
+}
+
+interface RegistryLockObservation {
+  text: string;
+  dev: number;
+  ino: number;
+  stale: boolean;
+}
+
+function linuxProcessStartId(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return undefined;
+    // Fields after the command begin at procfs field 3 (state); starttime is
+    // field 22, so it is index 19 in this suffix.
+    const startTime = stat.slice(commandEnd + 1).trim().split(/\s+/)[19];
+    return startTime && /^\d+$/.test(startTime) ? `linux-${startTime}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function portableProcessStartId(pid: number): string | undefined {
+  if (process.env.NODE_ENV === "test") {
+    const override = process.env.ACCOUNTS_TEST_PROCESS_START_ID;
+    const separator = override?.indexOf(":") ?? -1;
+    if (override && separator > 0 && Number(override.slice(0, separator)) === pid) {
+      return override.slice(separator + 1) || undefined;
+    }
+  }
+  const linux = linuxProcessStartId(pid);
+  if (linux) return linux;
+  if (process.platform !== "darwin") return undefined;
+  try {
+    const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      // `lstart` is rendered in the child's timezone. Pin it so two Accounts
+      // processes with different TZ environments derive the same identity for
+      // one kernel process and never steal a live owner's lock.
+      env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_000,
+    });
+    const startedAt = result.status === 0 ? result.stdout.trim().replace(/\s+/g, " ") : "";
+    if (!startedAt) return undefined;
+    return `darwin-${createHash("sha256").update(startedAt).digest("hex").slice(0, 24)}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function isVerifiableProcessIncarnation(value: string | undefined): value is string {
+  return Boolean(value && /^(?:linux|darwin)-/.test(value));
+}
+
+const processIncarnation = portableProcessStartId(process.pid) ?? `fallback-${randomUUID()}`;
+
+function registryLockOwner(text: string): { pid?: number; incarnation?: string } {
+  const owner = text.trim();
+  const parts = owner.split(":");
+  if (parts[0] === "v2") {
+    const pid = Number(parts[1]);
+    return {
+      ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
+      ...(parts[2] ? { incarnation: parts[2] } : {}),
+    };
+  }
+  const pid = Number(parts[0]);
+  return Number.isSafeInteger(pid) && pid > 0 ? { pid } : {};
+}
+
+function observeRegistryLock(path: string): RegistryLockObservation | undefined {
+  let text = "";
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new AccountsError(`invalid accounts registry lock at ${path}`);
+    }
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  const owner = registryLockOwner(text);
+  let stale: boolean;
+  if (owner.pid) {
+    if (owner.pid === process.pid) {
+      // No in-process lease exists while this acquisition loop is running.
+      // A different token for our PID therefore belongs to an earlier process
+      // incarnation (notably PID 1 after a container restart), but only when
+      // both identities came from an OS start-time source. Worker/module
+      // isolates share a PID and may have distinct fallback tokens.
+      stale =
+        isVerifiableProcessIncarnation(owner.incarnation) &&
+        isVerifiableProcessIncarnation(processIncarnation) &&
+        owner.incarnation !== processIncarnation;
+    } else {
+      const observedIncarnation = portableProcessStartId(owner.pid);
+      if (
+        isVerifiableProcessIncarnation(owner.incarnation) &&
+        isVerifiableProcessIncarnation(observedIncarnation)
+      ) {
+        stale = owner.incarnation !== observedIncarnation;
+      } else {
+        try {
+          process.kill(owner.pid, 0);
+          stale = false;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "ESRCH") throw error;
+          stale = true;
+        }
+      }
+    }
+  } else {
+    // A process can die between exclusive creation and writing its identity.
+    // Do not steal a freshly created empty lock, but reclaim it after that tiny
+    // initialization window.
+    stale = Date.now() - stat.mtimeMs >= 1_000;
+  }
+  return { text, dev: stat.dev, ino: stat.ino, stale };
+}
+
+function removeObservedRegistryLock(path: string, observed: RegistryLockObservation): boolean {
+  const claimHash = createHash("sha256")
+    .update(`${observed.dev}:${observed.ino}:`)
+    .update(observed.text)
+    .digest("hex")
+    .slice(0, 24);
+  const claimPath = `${path}.reclaim-${claimHash}`;
+  assertSafeWritePath(claimPath, { mustStayUnder: accountsHome() });
+  let claimed = false;
+  try {
+    // Hard-linking is the atomic claim. Every reclaimer for this exact inode
+    // and owner token targets the same claim path, so only one can progress to
+    // unlinking the shared lock name. A loser re-observes on its next loop and
+    // cannot delete a replacement lease.
+    try {
+      linkSync(path, claimPath);
+      claimed = true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return false;
+      if (code === "EEXIST") {
+        // The claimant can die after creating the hard link. A fresh claim is
+        // left alone because its synchronous owner may still be validating it;
+        // an old claim bound to this exact stale inode is safe to discard and
+        // retry. The inode checks prevent touching a replacement registry lock.
+        let claim: ReturnType<typeof lstatSync>;
+        let current: ReturnType<typeof lstatSync>;
+        try {
+          claim = lstatSync(claimPath);
+          current = lstatSync(path);
+        } catch (claimError) {
+          if ((claimError as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw claimError;
+        }
+        if (
+          !claim.isFile() ||
+          claim.isSymbolicLink() ||
+          claim.dev !== observed.dev ||
+          claim.ino !== observed.ino ||
+          current.dev !== observed.dev ||
+          current.ino !== observed.ino ||
+          Date.now() - claim.ctimeMs < REGISTRY_RECLAIM_CLAIM_STALE_MS ||
+          readFileSync(path, "utf8") !== observed.text
+        ) {
+          return false;
+        }
+        rmSync(claimPath);
+        try {
+          linkSync(path, claimPath);
+          claimed = true;
+        } catch (retryError) {
+          const retryCode = (retryError as NodeJS.ErrnoException).code;
+          if (retryCode === "EEXIST" || retryCode === "ENOENT") return false;
+          throw retryError;
+        }
+      } else {
+        throw error;
+      }
+    }
+    const claim = lstatSync(claimPath);
+    if (claim.dev !== observed.dev || claim.ino !== observed.ino) return false;
+    const current = lstatSync(path);
+    if (!current.isFile() || current.isSymbolicLink()) return false;
+    if (current.dev !== observed.dev || current.ino !== observed.ino) return false;
+    if (readFileSync(path, "utf8") !== observed.text) return false;
+    rmSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  } finally {
+    if (claimed) {
+      try {
+        const claim = lstatSync(claimPath);
+        if (claim.dev === observed.dev && claim.ino === observed.ino) rmSync(claimPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  }
+}
+
+/** Serialize cross-process registry transactions. Nested calls in one process reuse the lease. */
+export function withStoreLock<T>(fn: () => T, timeoutMs = 5_000): T {
+  if (storeLockDepth > 0) return fn();
+  const home = accountsHome();
+  mkdirSync(home, { recursive: true });
+  const path = join(home, ".store.lock");
+  assertSafeWritePath(path, { mustStayUnder: home });
+  const deadline = Date.now() + timeoutMs;
+  let acquired: RegistryLockObservation | undefined;
+  while (!acquired) {
+    if (Date.now() >= deadline) {
+      throw new AccountsError(`timed out waiting for the accounts registry lock at ${path}`);
+    }
+    const candidatePath = `${path}.candidate-${process.pid}-${randomUUID()}`;
+    assertSafeWritePath(candidatePath, { mustStayUnder: home });
+    let candidateFd: number | undefined;
+    let linked = false;
+    let published: RegistryLockObservation | undefined;
+    try {
+      candidateFd = openSync(candidatePath, "wx", 0o600);
+      delayRegistryLockInitializationForTest();
+      const text = `v2:${process.pid}:${processIncarnation}:${randomUUID()}\n`;
+      writeFileSync(candidateFd, text, { encoding: "utf8", mode: 0o600 });
+      fsyncSync(candidateFd);
+      const candidate = fstatSync(candidateFd);
+      published = { text, dev: candidate.dev, ino: candidate.ino, stale: false };
+      try {
+        // Publish only a fully initialized inode. Unlike opening the canonical
+        // path directly, this leaves no empty-lock window for a reclaimer to
+        // unlink while the creator is suspended.
+        linkSync(candidatePath, path);
+        linked = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      if (linked) {
+        try {
+          const current = lstatSync(path);
+          if (
+            current.isFile() &&
+            !current.isSymbolicLink() &&
+            current.dev === candidate.dev &&
+            current.ino === candidate.ino &&
+            readFileSync(path, "utf8") === text
+          ) {
+            acquired = published;
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+    } finally {
+      if (candidateFd !== undefined) closeSync(candidateFd);
+      rmSync(candidatePath, { force: true });
+    }
+    if (linked && !acquired && published) removeObservedRegistryLock(path, published);
+    if (!acquired) {
+      const observed = observeRegistryLock(path);
+      if (!observed) continue;
+      if (observed.stale && removeObservedRegistryLock(path, observed)) {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new AccountsError(`timed out waiting for the accounts registry lock at ${path}`);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  storeLockDepth += 1;
+  try {
+    return fn();
+  } finally {
+    storeLockDepth -= 1;
+    removeObservedRegistryLock(path, acquired);
+  }
+}
 
 /**
  * Parse and schema-validate the on-box registry file WITHOUT the profile
@@ -64,12 +387,17 @@ const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}
  * machine-local `applied`/`current` pointer against the (empty) local profile
  * list would wrongly erase a valid pointer.
  */
-function parseStoreFile(): Store {
+function parseStoreFile(): NormalizedStore {
   const path = storePath();
-  if (!existsSync(path)) return structuredClone(EMPTY_STORE);
+  const source = currentStoreText();
+  if (source === null) {
+    const empty = structuredClone(EMPTY_STORE);
+    storeSnapshots.set(empty, null);
+    return empty;
+  }
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(path, "utf8"));
+    raw = JSON.parse(source);
   } catch (err) {
     throw new AccountsError(`could not parse store at ${path}: ${(err as Error).message}`);
   }
@@ -77,11 +405,12 @@ function parseStoreFile(): Store {
   if (!parsed.success) {
     throw new AccountsError(`invalid store at ${path}: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
   }
+  storeSnapshots.set(parsed.data, source);
   return parsed.data;
 }
 
 /** Raw validated machine state without pruning pointers against local profiles. */
-export function loadMachineStore(): Store {
+export function loadMachineStore(): NormalizedStore {
   return parseStoreFile();
 }
 
@@ -110,43 +439,51 @@ export function loadCurrentMap(): Record<string, string> {
 }
 
 export function reconcileMachineProfileRename(toolId: string, oldName: string, newName: string): void {
-  const store = parseStoreFile();
-  let changed = false;
-  if (store.current[toolId] === oldName) {
-    store.current[toolId] = newName;
-    changed = true;
-  }
-  if (store.applied[toolId] === oldName) {
-    store.applied[toolId] = newName;
-    changed = true;
-  }
-  if (store.toolLocks[oldName] === toolId) {
-    delete store.toolLocks[oldName];
-    store.toolLocks[newName] = toolId;
-    changed = true;
-  }
-  if (changed) saveStore(store);
+  withStoreLock(() => {
+    const store = parseStoreFile();
+    let changed = false;
+    if (store.current[toolId] === oldName) {
+      store.current[toolId] = newName;
+      store.currentRevisions[toolId] = randomUUID();
+      changed = true;
+    }
+    if (store.applied[toolId] === oldName) {
+      store.applied[toolId] = newName;
+      store.appliedRevisions[toolId] = randomUUID();
+      changed = true;
+    }
+    if (store.toolLocks[oldName] === toolId) {
+      delete store.toolLocks[oldName];
+      store.toolLocks[newName] = toolId;
+      changed = true;
+    }
+    if (changed) saveStoreLocked(store);
+  });
 }
 
 export function reconcileMachineProfileRemove(toolId: string, name: string): void {
-  const store = parseStoreFile();
-  let changed = false;
-  if (store.current[toolId] === name) {
-    delete store.current[toolId];
-    changed = true;
-  }
-  if (store.applied[toolId] === name) {
-    delete store.applied[toolId];
-    changed = true;
-  }
-  if (store.toolLocks[name] === toolId) {
-    delete store.toolLocks[name];
-    changed = true;
-  }
-  if (changed) saveStore(store);
+  withStoreLock(() => {
+    const store = parseStoreFile();
+    let changed = false;
+    if (store.current[toolId] === name) {
+      delete store.current[toolId];
+      delete store.currentRevisions[toolId];
+      changed = true;
+    }
+    if (store.applied[toolId] === name) {
+      delete store.applied[toolId];
+      delete store.appliedRevisions[toolId];
+      changed = true;
+    }
+    if (store.toolLocks[name] === toolId) {
+      delete store.toolLocks[name];
+      changed = true;
+    }
+    if (changed) saveStoreLocked(store);
+  });
 }
 
-export function loadStore(): Store {
+export function loadStore(): NormalizedStore {
   const store = parseStoreFile();
   for (const p of store.profiles) {
     const check = profileNameSchema.safeParse(p.name);
@@ -156,13 +493,29 @@ export function loadStore(): Store {
   }
   for (const toolId of Object.keys(store.current)) {
     const name = store.current[toolId];
-    if (!name || !profileNameSchema.safeParse(name).success) delete store.current[toolId];
-    else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.current[toolId];
+    if (!name || !profileNameSchema.safeParse(name).success) {
+      delete store.current[toolId];
+      delete store.currentRevisions[toolId];
+    } else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
+      delete store.current[toolId];
+      delete store.currentRevisions[toolId];
+    }
+  }
+  for (const toolId of Object.keys(store.currentRevisions)) {
+    if (!store.current[toolId]) delete store.currentRevisions[toolId];
   }
   for (const toolId of Object.keys(store.applied)) {
     const name = store.applied[toolId];
-    if (!name || !profileNameSchema.safeParse(name).success) delete store.applied[toolId];
-    else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.applied[toolId];
+    if (!name || !profileNameSchema.safeParse(name).success) {
+      delete store.applied[toolId];
+      delete store.appliedRevisions[toolId];
+    } else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
+      delete store.applied[toolId];
+      delete store.appliedRevisions[toolId];
+    }
+  }
+  for (const toolId of Object.keys(store.appliedRevisions)) {
+    if (!store.applied[toolId]) delete store.appliedRevisions[toolId];
   }
   for (const name of Object.keys(store.toolLocks)) {
     const toolId = store.toolLocks[name];
@@ -172,11 +525,15 @@ export function loadStore(): Store {
   return store;
 }
 
-export function saveStore(store: Store): void {
+function saveStoreLocked(store: Store): void {
   const path = storePath();
   const parsed = storeSchema.safeParse(store);
   if (!parsed.success) {
     throw new AccountsError(`invalid store: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
+  }
+  const expected = storeSnapshots.get(store);
+  if (expected !== undefined && currentStoreText() !== expected) {
+    throw new AccountsError("accounts registry changed concurrently; retry the operation");
   }
   assertSafeWritePath(path, { mustStayUnder: accountsHome() });
   mkdirSync(join(path, ".."), { recursive: true });
@@ -185,16 +542,22 @@ export function saveStore(store: Store): void {
   let fd: number | undefined;
   try {
     fd = openSync(temp, "wx", 0o600);
-    writeFileSync(fd, JSON.stringify(parsed.data, null, 2) + "\n", "utf8");
+    const serialized = JSON.stringify(parsed.data, null, 2) + "\n";
+    writeFileSync(fd, serialized, "utf8");
+    chmodSync(temp, 0o600);
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
     renameSync(temp, path);
-    chmodSync(path, 0o600);
+    storeSnapshots.set(store, serialized);
   } finally {
     if (fd !== undefined) closeSync(fd);
     rmSync(temp, { force: true });
   }
+}
+
+export function saveStore(store: Store): void {
+  withStoreLock(() => saveStoreLocked(store));
 }
 
 /**

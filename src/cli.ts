@@ -732,7 +732,7 @@ program
           process.exitCode = signalExitCode(pendingSignal);
           return;
         }
-        const finalized = await finalizeLogin(name, tool.id, store);
+        const finalized = await finalizeLogin(name, tool.id, store, finalizationState);
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (pendingSignal) {
           await rollback();

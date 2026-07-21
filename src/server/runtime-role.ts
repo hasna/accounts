@@ -1,12 +1,19 @@
 import type { PoolQueryClient } from "../generated/storage-kit/index.js";
 
-const RUNTIME_TABLES = ["accounts", "current_selections", "custom_tools"] as const;
+const RUNTIME_TABLES = [
+  "accounts",
+  "current_selections",
+  "custom_tools",
+] as const;
+const APPEND_ONLY_TABLES = ["current_login_operations"] as const;
 const READ_ONLY_TABLES = ["schema_migrations", "api_keys"] as const;
+const OWNER_ONLY_SEQUENCES = ["current_selection_revision_seq"] as const;
 const TRIGGER_FUNCTIONS = [
   "accounts_guard_removed_custom_tool",
   "custom_tool_tombstone_guard",
   "custom_tool_registration_reactivate",
   "custom_tool_registration_tombstone",
+  "advance_current_selection_revision",
 ] as const;
 
 function quoteIdentifier(value: string): string {
@@ -108,9 +115,11 @@ export async function grantAccountsRuntimeRole(
   const runtimeRole = quoteIdentifier(roleName);
   const qualified = (name: string) => `${schema}.${quoteIdentifier(name)}`;
   const runtimeTables = RUNTIME_TABLES.map(qualified).join(", ");
+  const appendOnlyTables = APPEND_ONLY_TABLES.map(qualified).join(", ");
   const readOnlyTables = READ_ONLY_TABLES.map(qualified).join(", ");
   const tombstones = qualified("custom_tool_tombstones");
   const triggerFunctions = TRIGGER_FUNCTIONS.map((name) => `${qualified(name)}()`).join(", ");
+  const ownerOnlySequences = OWNER_ONLY_SEQUENCES.map(qualified).join(", ");
 
   await client.transaction(async (tx) => {
     await tx.execute(`REVOKE ALL PRIVILEGES ON SCHEMA ${schema} FROM PUBLIC`);
@@ -121,12 +130,17 @@ export async function grantAccountsRuntimeRole(
     await tx.execute(
       `GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${runtimeTables} TO ${runtimeRole}`,
     );
+    await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${appendOnlyTables} FROM PUBLIC`);
+    await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${appendOnlyTables} FROM ${runtimeRole}`);
+    await tx.execute(`GRANT SELECT, INSERT ON TABLE ${appendOnlyTables} TO ${runtimeRole}`);
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${tombstones} FROM PUBLIC`);
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${tombstones} FROM ${runtimeRole}`);
     await tx.execute(`GRANT SELECT, INSERT, DELETE ON TABLE ${tombstones} TO ${runtimeRole}`);
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${readOnlyTables} FROM PUBLIC`);
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${readOnlyTables} FROM ${runtimeRole}`);
     await tx.execute(`GRANT SELECT ON TABLE ${readOnlyTables} TO ${runtimeRole}`);
+    await tx.execute(`REVOKE ALL PRIVILEGES ON SEQUENCE ${ownerOnlySequences} FROM PUBLIC`);
+    await tx.execute(`REVOKE ALL PRIVILEGES ON SEQUENCE ${ownerOnlySequences} FROM ${runtimeRole}`);
     await tx.execute(`REVOKE ALL PRIVILEGES ON FUNCTION ${triggerFunctions} FROM ${runtimeRole}`);
   });
 

@@ -1,9 +1,10 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile } from "./lib/profiles.js";
+import { pathToFileURL } from "node:url";
+import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile, updateProfile } from "./lib/profiles.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile } from "./lib/import-profile.js";
 import {
@@ -22,7 +23,7 @@ import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook
 import { resolvePickMode } from "./lib/pick.js";
 import { switchProfile } from "./lib/switch.js";
 import { profileEnv } from "./lib/env.js";
-import { loadStore } from "./storage.js";
+import { loadMachineStore, loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { resolveStore, type AccountsStore } from "./lib/store.js";
 import { AccountsError } from "./types.js";
@@ -263,7 +264,7 @@ test("finalizeLogin refreshes a stale auth snapshot from the profile dir", async
   rmSync(workDir, { recursive: true, force: true });
 });
 
-test("failed API current persistence restores prior live Claude auth and applied pointer", async () => {
+test("lost API activation response restores prior current, live Claude auth, and applied pointer", async () => {
   const prior = addProfile({ name: "prior-finalize" });
   const target = addProfile({ name: "target-finalize" });
   writeOAuth(prior.dir, "prior-finalize@example.com");
@@ -278,17 +279,32 @@ test("failed API current persistence restores prior live Claude auth and applied
   const apiLikeStore = new Proxy(localStore, {
     get(store, property, receiver) {
       if (property === "transport") return "api";
-      if (property === "useProfile") {
-        return async (name: string, tool?: string) => {
+      if (property === "useProfileForLogin") {
+        return async (name: string, tool: string | undefined, operationId: string) => {
           currentWrites.push(name);
-          if (name === target.name) throw new AccountsError("simulated current persistence failure");
-          return await store.useProfile(name, tool);
+          if (name === target.name) {
+            await store.useProfileForLogin!(name, tool, operationId);
+            throw new AccountsError("simulated lost activation response");
+          }
+          return await store.useProfileForLogin!(name, tool, operationId);
         };
       }
-      if (property === "restoreCurrent") {
-        return async (tool: string, expectedName: string, name?: string) => {
+      if (property === "restoreCurrentOperation") {
+        return async (
+          tool: string,
+          expectedName: string,
+          operationId: string,
+          name?: string,
+          restoreLastUsedAt?: string | null,
+        ) => {
           currentRestores.push({ expectedName, ...(name ? { name } : {}) });
-          return await store.restoreCurrent(tool, expectedName, name);
+          return await store.restoreCurrentOperation!(
+            tool,
+            expectedName,
+            operationId,
+            name,
+            restoreLastUsedAt,
+          );
         };
       }
       const value = Reflect.get(store, property, receiver);
@@ -297,15 +313,17 @@ test("failed API current persistence restores prior live Claude auth and applied
   }) as AccountsStore;
   const state = await captureLoginFinalizationState(target.name, getTool("claude"), apiLikeStore);
 
-  await expect(finalizeLogin(target.name, target.tool, apiLikeStore)).rejects.toThrow(
-    "simulated current persistence failure",
+  await expect(finalizeLogin(target.name, target.tool, apiLikeStore, state)).rejects.toThrow(
+    "simulated lost activation response",
   );
   expect(appliedProfile("claude")?.name).toBe(target.name);
+  expect(currentProfile("claude")?.name).toBe(target.name);
   await rollbackLoginFinalization(state, apiLikeStore);
 
   expect(appliedProfile("claude")?.name).toBe(prior.name);
   expect(currentProfile("claude")?.name).toBe(prior.name);
   expect(getProfile(target.name, target.tool).email).toBeUndefined();
+  expect(getProfile(target.name, target.tool).lastUsedAt).toBeUndefined();
   expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
     .toBe("prior-finalize@example.com");
   expect(currentWrites).toEqual([target.name]);
@@ -328,7 +346,7 @@ test("interrupted API finalization clears a newly-created current selection", as
   }) as AccountsStore;
   const state = await captureLoginFinalizationState(target.name, getTool("claude"), apiLikeStore);
 
-  await finalizeLogin(target.name, target.tool, apiLikeStore);
+  await finalizeLogin(target.name, target.tool, apiLikeStore, state);
   expect(currentProfile("claude")?.name).toBe(target.name);
   await rollbackLoginFinalization(state, apiLikeStore);
 
@@ -345,15 +363,125 @@ test("rollback does not overwrite a newer concurrent Claude apply", async () => 
   writeOAuth(newer.dir, "newer-concurrent@example.com");
   await applyProfile(prior.name, prior.tool);
   const state = await captureLoginFinalizationState(target.name, getTool("claude"));
-  await finalizeLogin(target.name, target.tool);
+  await finalizeLogin(target.name, target.tool, undefined, state);
   await applyProfile(newer.name, newer.tool);
 
   await rollbackLoginFinalization(state);
 
   expect(appliedProfile("claude")?.name).toBe(newer.name);
   expect(currentProfile("claude")?.name).toBe(newer.name);
+  expect(getProfile(target.name, target.tool).lastUsedAt).toBeUndefined();
   expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
     .toBe("newer-concurrent@example.com");
+});
+
+test("lost email write response still rolls back the owned profile field", async () => {
+  const target = addProfile({ name: "target-email-response-loss" });
+  writeOAuth(target.dir, "response-loss@example.com");
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const responseLossStore = new Proxy(localStore, {
+    get(store, property, receiver) {
+      if (property === "redetectEmail") {
+        return async (name: string, tool?: string) => {
+          await store.redetectEmail(name, tool);
+          throw new AccountsError("simulated lost email update response");
+        };
+      }
+      const value = Reflect.get(store, property, receiver);
+      return typeof value === "function" ? value.bind(store) : value;
+    },
+  }) as AccountsStore;
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"), responseLossStore);
+
+  await expect(finalizeLogin(target.name, target.tool, responseLossStore, state)).rejects.toThrow(
+    "simulated lost email update response",
+  );
+  expect(getProfile(target.name, target.tool).email).toBe("response-loss@example.com");
+  await rollbackLoginFinalization(state, responseLossStore);
+
+  expect(getProfile(target.name, target.tool).email).toBeUndefined();
+});
+
+test("rollback does not overwrite a newer same-target current selection", async () => {
+  const prior = addProfile({ name: "prior-same-current" });
+  const target = addProfile({ name: "target-same-current" });
+  writeOAuth(prior.dir, "prior-same-current@example.com");
+  writeOAuth(target.dir, "target-same-current@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+  await finalizeLogin(target.name, target.tool, undefined, state);
+
+  useProfile(target.name, target.tool);
+  await rollbackLoginFinalization(state);
+
+  expect(currentProfile("claude")?.name).toBe(target.name);
+});
+
+test("rollback does not overwrite a newer same-target Claude apply", async () => {
+  const prior = addProfile({ name: "prior-same-apply" });
+  const target = addProfile({ name: "target-same-apply" });
+  writeOAuth(prior.dir, "prior-same-apply@example.com");
+  writeOAuth(target.dir, "target-same-apply@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+  await finalizeLogin(target.name, target.tool, undefined, state);
+
+  await applyProfile(target.name, target.tool);
+  await rollbackLoginFinalization(state);
+
+  expect(appliedProfile("claude")?.name).toBe(target.name);
+  expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
+    .toBe("target-same-apply@example.com");
+});
+
+test("rollback preserves unrelated concurrent profile edits", async () => {
+  const prior = addProfile({ name: "prior-profile-edit" });
+  const target = addProfile({ name: "target-profile-edit", description: "before" });
+  writeOAuth(prior.dir, "prior-profile-edit@example.com");
+  writeOAuth(target.dir, "target-profile-edit@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+  await finalizeLogin(target.name, target.tool, undefined, state);
+
+  updateProfile(target.name, { tool: target.tool, description: "concurrent edit" });
+  await rollbackLoginFinalization(state);
+
+  expect(getProfile(target.name, target.tool).description).toBe("concurrent edit");
+});
+
+test("rollback preserves an email edit made after login redetection", async () => {
+  const prior = addProfile({ name: "prior-email-race" });
+  const target = addProfile({ name: "target-email-race" });
+  writeOAuth(prior.dir, "prior-email-race@example.com");
+  writeOAuth(target.dir, "detected-email-race@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const concurrentEmail = "concurrent-email-race@example.com";
+  const racingStore = new Proxy(localStore, {
+    get(store, property, receiver) {
+      if (property === "redetectEmail") {
+        return async (name: string, tool?: string) => {
+          const redetected = await store.redetectEmail(name, tool);
+          await store.updateProfile(name, { tool, email: concurrentEmail });
+          return redetected;
+        };
+      }
+      const value = Reflect.get(store, property, receiver);
+      return typeof value === "function" ? value.bind(store) : value;
+    },
+  }) as AccountsStore;
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"), racingStore);
+
+  await finalizeLogin(target.name, target.tool, racingStore, state);
+  await rollbackLoginFinalization(state, racingStore);
+
+  expect(getProfile(target.name, target.tool).email).toBe(concurrentEmail);
 });
 
 test("rename and remove keep applied pointer coherent", async () => {
@@ -425,6 +553,53 @@ test("switchProfile applies Claude and returns a continue handoff command", asyn
   };
   expect(live.oauthAccount.emailAddress).toBe("switch@example.com");
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("apply holds the registry lock across live-auth and pointer mutation", async () => {
+  const priorDir = mkdtempSync(join(tmpdir(), "apply-lock-prior-"));
+  const targetDir = mkdtempSync(join(tmpdir(), "apply-lock-target-"));
+  writeOAuth(priorDir, "apply-lock-prior@example.com");
+  writeOAuth(targetDir, "apply-lock-target@example.com");
+  addProfile({ name: "apply-lock-prior", dir: priorDir });
+  addProfile({ name: "apply-lock-target", dir: targetDir });
+  await applyProfile("apply-lock-prior");
+
+  const marker = join(home, "concurrent-store-locked");
+  const storageUrl = pathToFileURL(join(process.cwd(), "src/storage.ts")).href;
+  const source = `
+    import { writeFileSync } from "node:fs";
+    import { loadMachineStore, saveStore, withStoreLock } from ${JSON.stringify(storageUrl)};
+    withStoreLock(() => {
+      const store = loadMachineStore();
+      writeFileSync(process.env.ACCOUNTS_LOCK_MARKER, "locked");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+      const profile = store.profiles.find((item) => item.name === "apply-lock-target");
+      if (!profile) throw new Error("target profile missing");
+      profile.description = "concurrent registry edit";
+      saveStore(store);
+    });
+  `;
+  const worker = spawn(process.execPath, ["-e", source], {
+    cwd: process.cwd(),
+    env: { ...process.env, ACCOUNTS_HOME: home, ACCOUNTS_LOCK_MARKER: marker },
+    stdio: "pipe",
+  });
+  const workerExitPromise = new Promise<number | null>((resolve) => worker.once("exit", resolve));
+  for (let attempt = 0; attempt < 100 && !existsSync(marker); attempt += 1) {
+    await Bun.sleep(5);
+  }
+  expect(existsSync(marker)).toBe(true);
+
+  await applyProfile("apply-lock-target");
+  const workerExit = await workerExitPromise;
+  expect(workerExit).toBe(0);
+  expect(loadMachineStore().applied.claude).toBe("apply-lock-target");
+  expect(getProfile("apply-lock-target", "claude").description).toBe("concurrent registry edit");
+  expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
+    .toBe("apply-lock-target@example.com");
+
+  rmSync(priorDir, { recursive: true, force: true });
+  rmSync(targetDir, { recursive: true, force: true });
 });
 
 test("switchProfile includes Claude dangerous permission preset before resume args", async () => {

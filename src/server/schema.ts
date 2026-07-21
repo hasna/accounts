@@ -71,12 +71,48 @@ export const updateAccountSchema = z
   .refine((v) => Object.keys(v).length > 0, "update requires at least one field");
 export type UpdateAccountInput = z.infer<typeof updateAccountSchema>;
 
+export const restoreAccountSchema = z
+  .object({
+    email: z.object({
+      expected: z.string().email().nullable(),
+      restore: z.string().email().nullable(),
+    }).optional(),
+    lastUsedAt: z.object({
+      expected: z.string().datetime().nullable(),
+      restore: z.string().datetime().nullable(),
+    }).optional(),
+  })
+  .refine((value) => value.email !== undefined || value.lastUsedAt !== undefined, "restore requires at least one field");
+export type RestoreAccountInput = z.infer<typeof restoreAccountSchema>;
+
 export const setCurrentSchema = z.object({ name: profileNameSchema });
+export const setLoginCurrentSchema = z.object({
+  name: profileNameSchema,
+  operationId: z.string().uuid(),
+});
+
+const postgresRevisionSchema = z
+  .string()
+  .regex(/^\d+$/, "expectedRevision must be a decimal generation")
+  .refine((value) => {
+    const normalized = value.replace(/^0+(?=\d)/, "");
+    return normalized.length < 19 || (
+      normalized.length === 19 && normalized <= "9223372036854775807"
+    );
+  }, "expectedRevision must fit a PostgreSQL bigint");
 
 export const restoreCurrentSchema = z.object({
   expectedName: profileNameSchema,
   name: profileNameSchema.optional(),
-});
+}).strict();
+
+export const restoreLoginCurrentSchema = z.object({
+  expectedName: profileNameSchema,
+  expectedRevision: postgresRevisionSchema.optional(),
+  expectedOperationId: z.string().uuid().optional(),
+  name: profileNameSchema.optional(),
+  restoreLastUsedAt: z.string().datetime().nullable().optional(),
+}).strict();
 
 export const renameAccountSchema = z.object({ name: profileNameSchema });
 export type RenameAccountInput = z.infer<typeof renameAccountSchema>;

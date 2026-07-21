@@ -20,13 +20,21 @@ export interface CreateAccountInput { "name": string; "tool": string; "email"?: 
 
 export interface UpdateAccountInput { "email"?: string | null; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string; "lastUsedAt"?: string | null }
 
-export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string }
+export interface RestoreFieldInput { "expected": string | null; "restore": string | null }
 
-export interface CurrentSelectionList { "current": Array<CurrentSelection> }
+export interface RestoreAccountInput { "email"?: RestoreFieldInput; "lastUsedAt"?: RestoreFieldInput }
+
+export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string; "revision"?: string; "operationId"?: string }
+
+export interface CurrentSelectionList { "current": Array<CurrentSelection>; "transactionalLoginRollback"?: true }
 
 export interface SetCurrentInput { "name": string }
 
+export interface SetLoginCurrentInput { "name": string; "operationId": string }
+
 export interface RestoreCurrentInput { "expectedName": string; "name"?: string }
+
+export type RestoreLoginCurrentInput = { "expectedName": string; "expectedRevision": string; "expectedOperationId"?: string; "name"?: string; "restoreLastUsedAt"?: string | null } | { "expectedName": string; "expectedRevision"?: string; "expectedOperationId": string; "name"?: string; "restoreLastUsedAt"?: string | null };
 
 export interface RestoreCurrentResult { "restored": boolean }
 
@@ -165,6 +173,15 @@ export class AccountsClient {
       });
     }
 
+    /** Conditionally restore fields changed by failed login finalization */
+    async restoreAccount(tool: string, name: string, body: RestoreAccountInput, init?: RequestInit): Promise<Account> {
+      return this.request("POST", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/restore`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
     /** List current active selections per tool */
     async listCurrent(init?: RequestInit): Promise<CurrentSelectionList> {
       return this.request("GET", `/v1/current`, {
@@ -186,6 +203,24 @@ export class AccountsClient {
     /** Set the current active account for a tool */
     async setCurrent(tool: string, body: SetCurrentInput, init?: RequestInit): Promise<CurrentSelection> {
       return this.request("PUT", `/v1/current/${encodeURIComponent(String(tool))}`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Set current through the transactional login-only endpoint */
+    async setLoginCurrent(tool: string, body: SetLoginCurrentInput, init?: RequestInit): Promise<CurrentSelection> {
+      return this.request("PUT", `/v1/current/${encodeURIComponent(String(tool))}/login`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Conditionally restore a transactional login selection */
+    async restoreLoginCurrent(tool: string, body: RestoreLoginCurrentInput, init?: RequestInit): Promise<RestoreCurrentResult> {
+      return this.request("POST", `/v1/current/${encodeURIComponent(String(tool))}/login/restore`, {
         body,
         query: undefined,
         init,

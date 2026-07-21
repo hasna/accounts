@@ -8,7 +8,7 @@
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
-import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
+import type { CreateAccountInput, RestoreAccountInput, UpdateAccountInput } from "./schema.js";
 
 export interface Account {
   tool: string;
@@ -28,6 +28,11 @@ export interface CurrentSelection {
   tool: string;
   name: string;
   updatedAt: string;
+  revision: string;
+}
+
+export interface LoginCurrentSelection extends CurrentSelection {
+  operationId: string;
 }
 
 /** The storage surface the HTTP handler depends on (implemented by AccountsRepo). */
@@ -36,12 +41,27 @@ export interface AccountsStore {
   get(tool: string, name: string): Promise<Account | null>;
   create(input: CreateAccountInput): Promise<Account>;
   update(tool: string, name: string, input: UpdateAccountInput): Promise<Account>;
+  restoreProfile(tool: string, name: string, input: RestoreAccountInput): Promise<Account>;
   rename(tool: string, oldName: string, newName: string): Promise<Account>;
   remove(tool: string, name: string): Promise<boolean>;
   listCurrent(): Promise<CurrentSelection[]>;
   getCurrent(tool: string): Promise<CurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CurrentSelection>;
-  restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
+  setCurrentForLogin(tool: string, name: string, operationId: string): Promise<LoginCurrentSelection>;
+  restoreCurrent(
+    tool: string,
+    expectedName: string,
+    expectedRevision?: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean>;
+  restoreCurrentOperation(
+    tool: string,
+    expectedName: string,
+    operationId: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean>;
   listCustomTools(): Promise<ToolDef[]>;
   addCustomTool(def: ToolDef): Promise<ToolDef>;
   removeCustomTool(id: string): Promise<boolean>;
@@ -136,6 +156,31 @@ export class AccountsRepo implements AccountsStore {
     );
   }
 
+  private async lockLoginOperation(client: TypedQueryClient, operationId: string): Promise<void> {
+    await client.execute(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`accounts:login-operation:${operationId}`],
+    );
+  }
+
+  private async lockAccounts(
+    client: TypedQueryClient,
+    tool: string,
+    names: string[],
+  ): Promise<Set<string>> {
+    const uniqueNames = [...new Set(names)].sort();
+    if (uniqueNames.length === 0) return new Set();
+    const rows = await client.many<{ name: string }>(
+      `SELECT name
+         FROM accounts
+        WHERE tool = $1 AND name = ANY($2::text[])
+        ORDER BY name
+        FOR UPDATE`,
+      [tool, uniqueNames],
+    );
+    return new Set(rows.map((row) => row.name));
+  }
+
   async create(input: CreateAccountInput): Promise<Account> {
     return this.client.transaction(async (client) => {
       await this.lockToolRegistry(client, input.tool);
@@ -221,6 +266,32 @@ export class AccountsRepo implements AccountsStore {
     });
   }
 
+  async restoreProfile(tool: string, name: string, input: RestoreAccountInput): Promise<Account> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    let index = 1;
+    if (input.email) {
+      sets.push(`email = CASE WHEN email IS NOT DISTINCT FROM $${index} THEN $${index + 1} ELSE email END`);
+      params.push(input.email.expected, input.email.restore);
+      index += 2;
+    }
+    if (input.lastUsedAt) {
+      sets.push(
+        `last_used_at = CASE WHEN last_used_at IS NOT DISTINCT FROM $${index}::timestamptz ` +
+        `THEN $${index + 1}::timestamptz ELSE last_used_at END`,
+      );
+      params.push(input.lastUsedAt.expected, input.lastUsedAt.restore);
+      index += 2;
+    }
+    params.push(tool, name);
+    const row = await this.client.get<AccountRow>(
+      `UPDATE accounts SET ${sets.join(", ")} WHERE tool = $${index} AND name = $${index + 1} RETURNING *`,
+      params,
+    );
+    if (!row) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+    return rowToAccount(row);
+  }
+
   async remove(tool: string, name: string): Promise<boolean> {
     return this.client.transaction(async (client) => {
       const existing = await this.getWith(client, tool, name, { forUpdate: true });
@@ -235,58 +306,303 @@ export class AccountsRepo implements AccountsStore {
   }
 
   async listCurrent(): Promise<CurrentSelection[]> {
-    const rows = await this.client.many<{ tool: string; name: string; updated_at: string | Date }>(
-      "SELECT tool, name, updated_at FROM current_selections ORDER BY tool",
+    const rows = await this.client.many<{ tool: string; name: string; updated_at: string | Date; revision: string | number }>(
+      "SELECT tool, name, updated_at, revision FROM current_selections ORDER BY tool",
     );
-    return rows.map((r) => ({ tool: r.tool, name: r.name, updatedAt: iso(r.updated_at)! }));
+    return rows.map((r) => ({ tool: r.tool, name: r.name, updatedAt: iso(r.updated_at)!, revision: String(r.revision) }));
   }
 
   async getCurrent(tool: string): Promise<CurrentSelection | null> {
-    const row = await this.client.get<{ tool: string; name: string; updated_at: string | Date }>(
-      "SELECT tool, name, updated_at FROM current_selections WHERE tool = $1",
+    const row = await this.client.get<{ tool: string; name: string; updated_at: string | Date; revision: string | number }>(
+      "SELECT tool, name, updated_at, revision FROM current_selections WHERE tool = $1",
       [tool],
     );
-    return row ? { tool: row.tool, name: row.name, updatedAt: iso(row.updated_at)! } : null;
+    return row
+      ? { tool: row.tool, name: row.name, updatedAt: iso(row.updated_at)!, revision: String(row.revision) }
+      : null;
   }
 
   async setCurrent(tool: string, name: string): Promise<CurrentSelection> {
     return this.client.transaction(async (client) => {
       const account = await this.getWith(client, tool, name, { forUpdate: true });
       if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
-      await client.execute("UPDATE accounts SET last_used_at = now() WHERE tool = $1 AND name = $2", [
-        tool,
-        name,
-      ]);
-      const row = await client.one<{ tool: string; name: string; updated_at: string | Date }>(
-        `INSERT INTO current_selections (tool, name, updated_at)
-         VALUES ($1, $2, now())
-         ON CONFLICT (tool) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
-         RETURNING tool, name, updated_at`,
+      const row = await client.one<{
+        tool: string;
+        name: string;
+        updated_at: string | Date;
+        revision: string | number;
+      }>(
+        `WITH stamp AS (
+           SELECT date_trunc('milliseconds', now()) AS at
+         ), touched_account AS (
+           UPDATE accounts
+              SET last_used_at = stamp.at
+             FROM stamp
+            WHERE tool = $1 AND name = $2
+            RETURNING stamp.at
+         )
+         INSERT INTO current_selections (tool, name, updated_at)
+         SELECT $1, $2, at FROM touched_account
+         ON CONFLICT (tool) DO UPDATE
+           SET name = EXCLUDED.name, updated_at = EXCLUDED.updated_at,
+               revision = DEFAULT, login_operation_id = NULL
+         RETURNING tool, name, updated_at, revision`,
         [tool, name],
       );
-      return { tool: row.tool, name: row.name, updatedAt: iso(row.updated_at)! };
+      return {
+        tool: row.tool,
+        name: row.name,
+        updatedAt: iso(row.updated_at)!,
+        revision: String(row.revision),
+      };
     });
   }
 
-  async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
+  async setCurrentForLogin(
+    tool: string,
+    name: string,
+    operationId: string,
+  ): Promise<LoginCurrentSelection> {
     return this.client.transaction(async (client) => {
-      if (name) {
+      // Serialize duplicate operation IDs independently of the mutable current
+      // row. The durable result makes response-loss retries no-ops even after
+      // another actor has selected a newer profile.
+      await this.lockLoginOperation(client, operationId);
+      const completed = await client.get<{
+        operation_id: string;
+        tool: string;
+        name: string;
+        state: "completed" | "cancelled";
+        updated_at: string | Date | null;
+        revision: string | number | null;
+      }>(
+        `SELECT operation_id, tool, name, state, updated_at, revision
+           FROM current_login_operations
+          WHERE operation_id = $1`,
+        [operationId],
+      );
+      if (completed) {
+        if (completed.tool !== tool || completed.name !== name) {
+          throw new AccountsError("login operation id is already bound to another profile");
+        }
+        if (completed.state === "cancelled") {
+          throw new AccountsError("login operation was cancelled before activation");
+        }
+        if (completed.updated_at === null || completed.revision === null) {
+          throw new AccountsError("completed login operation is missing its activation result");
+        }
+        return {
+          tool: completed.tool,
+          name: completed.name,
+          updatedAt: iso(completed.updated_at)!,
+          revision: String(completed.revision),
+          operationId: completed.operation_id,
+        };
+      }
+      const account = await this.getWith(client, tool, name, { forUpdate: true });
+      if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+      const row = await client.one<{
+        tool: string;
+        name: string;
+        updated_at: string | Date;
+        revision: string | number;
+        login_operation_id: string;
+      }>(
+        `WITH stamp AS (
+           SELECT date_trunc('milliseconds', now()) AS at
+         ), touched_account AS (
+           UPDATE accounts
+              SET last_used_at = stamp.at
+             FROM stamp
+            WHERE tool = $1 AND name = $2
+            RETURNING stamp.at
+         )
+         INSERT INTO current_selections (tool, name, updated_at, login_operation_id)
+         SELECT $1, $2, at, $3 FROM touched_account
+         ON CONFLICT (tool) DO UPDATE
+           SET name = EXCLUDED.name, updated_at = EXCLUDED.updated_at,
+               revision = DEFAULT, login_operation_id = EXCLUDED.login_operation_id
+         RETURNING tool, name, updated_at, revision, login_operation_id`,
+        [tool, name, operationId],
+      );
+      await client.execute(
+        `INSERT INTO current_login_operations (operation_id, tool, name, state, updated_at, revision)
+         VALUES ($1::uuid, $2, $3, 'completed', $4::timestamptz, $5::bigint)`,
+        [operationId, row.tool, row.name, iso(row.updated_at), String(row.revision)],
+      );
+      return {
+        tool: row.tool,
+        name: row.name,
+        updatedAt: iso(row.updated_at)!,
+        revision: String(row.revision),
+        operationId: row.login_operation_id,
+      };
+    });
+  }
+
+  async restoreCurrent(
+    tool: string,
+    expectedName: string,
+    expectedRevision?: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean> {
+    return this.client.transaction(async (client) => {
+      let ownedUpdatedAt: string | undefined;
+      if (restoreLastUsedAt !== undefined) {
+        const lockedNames = await this.lockAccounts(client, tool, name ? [expectedName, name] : [expectedName]);
+        if (!lockedNames.has(expectedName)) return false;
+        if (name && !lockedNames.has(name)) {
+          throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+        }
+        const owned = expectedRevision
+          ? await client.get<{ updated_at: string | Date }>(
+              `SELECT updated_at
+                 FROM current_selections
+                WHERE tool = $1 AND name = $2 AND revision = $3::bigint
+                FOR UPDATE`,
+              [tool, expectedName, expectedRevision],
+            )
+          : await client.get<{ updated_at: string | Date }>(
+              `SELECT updated_at
+                 FROM current_selections
+                WHERE tool = $1 AND name = $2
+                FOR UPDATE`,
+              [tool, expectedName],
+            );
+        if (!owned) return false;
+        ownedUpdatedAt = iso(owned.updated_at);
+      } else if (name) {
         const account = await this.getWith(client, tool, name, { forUpdate: true });
         if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+      }
+      let restored: boolean;
+      if (name) {
+        const result = expectedRevision
+          ? await client.query(
+              `UPDATE current_selections
+                  SET name = $4, updated_at = now(), revision = DEFAULT
+                WHERE tool = $1 AND name = $2 AND revision = $3::bigint
+                RETURNING tool`,
+              [tool, expectedName, expectedRevision, name],
+            )
+          : await client.query(
+              `UPDATE current_selections
+                  SET name = $3, updated_at = now()
+                WHERE tool = $1 AND name = $2
+                RETURNING tool`,
+              [tool, expectedName, name],
+            );
+        restored = result.rowCount > 0;
+      } else {
+        const result = expectedRevision
+          ? await client.query(
+              "DELETE FROM current_selections WHERE tool = $1 AND name = $2 AND revision = $3::bigint RETURNING tool",
+              [tool, expectedName, expectedRevision],
+            )
+          : await client.query(
+              "DELETE FROM current_selections WHERE tool = $1 AND name = $2 RETURNING tool",
+              [tool, expectedName],
+            );
+        restored = result.rowCount > 0;
+      }
+      if (restored && restoreLastUsedAt !== undefined && ownedUpdatedAt) {
+        await client.execute(
+          `UPDATE accounts
+              SET last_used_at = $4::timestamptz
+            WHERE tool = $1 AND name = $2
+              AND last_used_at IS NOT DISTINCT FROM $3::timestamptz`,
+          [tool, expectedName, ownedUpdatedAt, restoreLastUsedAt],
+        );
+      }
+      return restored;
+    });
+  }
+
+  async restoreCurrentOperation(
+    tool: string,
+    expectedName: string,
+    operationId: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean> {
+    return this.client.transaction(async (client) => {
+      await this.lockLoginOperation(client, operationId);
+      const operation = await client.get<{
+        tool: string;
+        name: string;
+        state: "completed" | "cancelled";
+        updated_at: string | Date | null;
+      }>(
+        `SELECT tool, name, state, updated_at
+           FROM current_login_operations
+          WHERE operation_id = $1::uuid`,
+        [operationId],
+      );
+      if (!operation) {
+        // A rollback can overtake a timed-out activation that is still queued
+        // before this advisory lock. Persisting cancellation under the same
+        // operation lock makes that later activation fail closed.
+        await client.execute(
+          `INSERT INTO current_login_operations (operation_id, tool, name, state, updated_at, revision)
+           VALUES ($1::uuid, $2, $3, 'cancelled', NULL, NULL)`,
+          [operationId, tool, expectedName],
+        );
+        return true;
+      }
+      if (operation.tool !== tool || operation.name !== expectedName) {
+        throw new AccountsError("login operation id is already bound to another profile");
+      }
+      if (operation.state === "cancelled") return true;
+      if (operation.updated_at === null) {
+        throw new AccountsError("completed login operation is missing its activation timestamp");
+      }
+
+      // Account rows are always locked in name order before the current row.
+      // This matches activation's account-before-current order and prevents a
+      // rollback-to-prior / concurrent-activation deadlock cycle.
+      const requiredNames = name ? [expectedName, name] : [expectedName];
+      const lockedNames = await this.lockAccounts(client, tool, requiredNames);
+      if (!lockedNames.has(expectedName)) return false;
+      if (name && !lockedNames.has(name)) {
+        throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+      }
+      const owned = await client.get<{ updated_at: string | Date }>(
+        `SELECT updated_at
+           FROM current_selections
+          WHERE tool = $1
+            AND name = $2
+            AND login_operation_id = $3
+          FOR UPDATE`,
+        [tool, expectedName, operationId],
+      );
+      if (!owned) return false;
+      if (name) {
         const result = await client.query(
           `UPDATE current_selections
-              SET name = $3, updated_at = now()
-            WHERE tool = $1 AND name = $2
+              SET name = $4, updated_at = now(), revision = DEFAULT, login_operation_id = NULL
+            WHERE tool = $1 AND name = $2 AND login_operation_id = $3
             RETURNING tool`,
-          [tool, expectedName, name],
+          [tool, expectedName, operationId, name],
         );
-        return result.rowCount > 0;
+        if (result.rowCount === 0) return false;
+      } else {
+        const result = await client.query(
+          "DELETE FROM current_selections WHERE tool = $1 AND name = $2 AND login_operation_id = $3 RETURNING tool",
+          [tool, expectedName, operationId],
+        );
+        if (result.rowCount === 0) return false;
       }
-      const result = await client.query(
-        "DELETE FROM current_selections WHERE tool = $1 AND name = $2 RETURNING tool",
-        [tool, expectedName],
-      );
-      return result.rowCount > 0;
+      if (restoreLastUsedAt !== undefined) {
+        await client.execute(
+          `UPDATE accounts
+              SET last_used_at = $4::timestamptz
+            WHERE tool = $1 AND name = $2
+              AND last_used_at IS NOT DISTINCT FROM $3::timestamptz`,
+          [tool, expectedName, iso(operation.updated_at), restoreLastUsedAt],
+        );
+      }
+      return true;
     });
   }
 

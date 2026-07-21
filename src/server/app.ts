@@ -18,9 +18,12 @@ import { AccountsRepo, type AccountsStore } from "./repo.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
 import {
   createAccountSchema,
+  restoreAccountSchema,
+  setLoginCurrentSchema,
   updateAccountSchema,
   renameAccountSchema,
   restoreCurrentSchema,
+  restoreLoginCurrentSchema,
   setCurrentSchema,
   toolIdSchema,
 } from "./schema.js";
@@ -216,6 +219,20 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         return json(renamed, 200);
       }
 
+      const profileRestoreMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)\/restore$/);
+      if (profileRestoreMatch && method === "POST") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = restoreAccountSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        const tool = decodeURIComponent(profileRestoreMatch[1]!);
+        const name = decodeURIComponent(profileRestoreMatch[2]!);
+        const restored = await ctx.repo.restoreProfile(tool, name, input.data);
+        return json(restored, 200);
+      }
+
       const accountMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)$/);
       if (accountMatch) {
         const tool = decodeURIComponent(accountMatch[1]!);
@@ -250,7 +267,7 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         const denied = await authorize(req, url, SCOPES.read);
         if (denied) return denied;
         const current = await ctx.repo.listCurrent();
-        return json({ current }, 200);
+        return json({ current, transactionalLoginRollback: true }, 200);
       }
 
       const currentRestoreMatch = pathname.match(/^\/v1\/current\/([^/]+)\/restore$/);
@@ -262,8 +279,59 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         const input = restoreCurrentSchema.safeParse(parsedBody.value);
         if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
         const tool = decodeURIComponent(currentRestoreMatch[1]!);
-        const restored = await ctx.repo.restoreCurrent(tool, input.data.expectedName, input.data.name);
+        const restored = await ctx.repo.restoreCurrent(
+          tool,
+          input.data.expectedName,
+          undefined,
+          input.data.name,
+        );
         return json({ restored }, 200);
+      }
+
+      // New-only route: pre-0.2.9 replicas must return 404 instead of parsing
+      // away the conditional generation/operation fields and performing an
+      // unsafe legacy name-only rollback during a rolling deployment.
+      const currentLoginRestoreMatch = pathname.match(/^\/v1\/current\/([^/]+)\/login\/restore$/);
+      if (currentLoginRestoreMatch && method === "POST") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = restoreLoginCurrentSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        if (!input.data.expectedOperationId && !input.data.expectedRevision) {
+          return json(errorBody("transactional login restore requires an expected operation id or revision"), 400);
+        }
+        const tool = decodeURIComponent(currentLoginRestoreMatch[1]!);
+        const restored = input.data.expectedOperationId
+          ? await ctx.repo.restoreCurrentOperation(
+              tool,
+              input.data.expectedName,
+              input.data.expectedOperationId,
+              input.data.name,
+              input.data.restoreLastUsedAt,
+            )
+          : await ctx.repo.restoreCurrent(
+              tool,
+              input.data.expectedName,
+              input.data.expectedRevision,
+              input.data.name,
+              input.data.restoreLastUsedAt,
+            );
+        return json({ restored }, 200);
+      }
+
+      const currentLoginMatch = pathname.match(/^\/v1\/current\/([^/]+)\/login$/);
+      if (currentLoginMatch && method === "PUT") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = setLoginCurrentSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        const tool = decodeURIComponent(currentLoginMatch[1]!);
+        const current = await ctx.repo.setCurrentForLogin(tool, input.data.name, input.data.operationId);
+        return json(current, 200);
       }
 
       const currentMatch = pathname.match(/^\/v1\/current\/([^/]+)$/);

@@ -22,7 +22,9 @@
 // inside the contracts transport.
 
 import type { Profile, ToolDef } from "../types.js";
+import { randomUUID } from "node:crypto";
 import { AccountsError, toolDefSchema } from "../types.js";
+import type { ProfileRollbackFields } from "./store.js";
 import { resolveStorageClient, type HasnaStorageClient } from "@hasna/contracts";
 
 const APP_SLUG = "accounts";
@@ -46,6 +48,10 @@ export interface CloudCurrentSelection {
   tool: string;
   name: string;
   updatedAt: string;
+  /** Added in 0.2.9; absent on older servers outside login preflight. */
+  revision?: string;
+  /** Client-owned token echoed only by transactional login activation. */
+  operationId?: string;
 }
 
 export interface CloudCreateInput {
@@ -85,12 +91,23 @@ export interface AccountsCloudApi {
   get(name: string, tool?: string): Promise<Profile | undefined>;
   create(input: CloudCreateInput): Promise<Profile>;
   update(name: string, tool: string, input: CloudUpdateInput): Promise<Profile>;
+  restoreProfile?(name: string, tool: string, fields: ProfileRollbackFields): Promise<Profile>;
   rename(oldName: string, newName: string, tool: string): Promise<Profile>;
   remove(name: string, tool?: string): Promise<Profile>;
   listCurrent(): Promise<CloudCurrentSelection[]>;
+  listCurrentForLoginRollback?(): Promise<Array<CloudCurrentSelection & { revision: string }>>;
   getCurrent(tool: string): Promise<CloudCurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CloudCurrentSelection>;
+  setCurrentForLogin?(tool: string, name: string, operationId: string): Promise<CloudCurrentSelection & { revision: string }>;
   restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
+  restoreCurrentGeneration?(tool: string, expectedName: string, expectedRevision: string, name?: string): Promise<boolean>;
+  restoreCurrentOperation?(
+    tool: string,
+    expectedName: string,
+    operationId: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean>;
   listTools(): Promise<CloudTool[]>;
   createTool(def: ToolDef): Promise<ToolDef>;
   removeTool(id: string): Promise<void>;
@@ -114,6 +131,28 @@ function toProfile(account: CloudAccount): Profile {
     createdAt: account.createdAt,
     ...(account.lastUsedAt ? { lastUsedAt: account.lastUsedAt } : {}),
   };
+}
+
+function transactionalLoginServerError(detail: string): AccountsError {
+  return new AccountsError(
+    `${detail}; accounts-serve does not support transactional login rollback. ` +
+    "Redeploy accounts-serve 0.2.9 or newer before running accounts login.",
+  );
+}
+
+const LOGIN_ROLLOUT_RETRY = {
+  retries: 8,
+  baseDelayMs: 25,
+  maxDelayMs: 250,
+  retryStatuses: [404, 408, 425, 429, 500, 502, 503, 504],
+};
+
+function requireCurrentRevision(value: unknown): CloudCurrentSelection {
+  const current = value as Partial<CloudCurrentSelection> | null;
+  if (!current || typeof current.revision !== "string" || !/^\d+$/.test(current.revision)) {
+    throw transactionalLoginServerError("accounts-serve returned a current selection missing a current-selection revision");
+  }
+  return current as CloudCurrentSelection;
 }
 
 /** Canonical storage modes. Unknown words are rejected; retired aliases are
@@ -199,6 +238,9 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
     return Array.isArray(raw?.accounts) ? raw.accounts : [];
   };
 
+  const currentListResponse = () =>
+    t.get<{ current?: CloudCurrentSelection[]; transactionalLoginRollback?: boolean }>("/current");
+
   const api: AccountsCloudApi = {
     baseUrl: client.baseUrl,
 
@@ -254,6 +296,20 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       return toProfile(updated);
     },
 
+    async restoreProfile(name: string, tool: string, fields: ProfileRollbackFields): Promise<Profile> {
+      try {
+        const restored = await t.post<CloudAccount>(
+          `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/restore`,
+          fields,
+          { idempotencyKey: randomUUID(), retry: LOGIN_ROLLOUT_RETRY },
+        );
+        return toProfile(restored);
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts login profile rollback");
+        throw err;
+      }
+    },
+
     async rename(oldName: string, newName: string, tool: string): Promise<Profile> {
       try {
         const renamed = await t.post<CloudAccount>(
@@ -284,8 +340,18 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
     },
 
     async listCurrent(): Promise<CloudCurrentSelection[]> {
-      const raw = await t.get<{ current?: CloudCurrentSelection[] }>("/current");
+      const raw = await currentListResponse();
       return Array.isArray(raw?.current) ? raw.current : [];
+    },
+
+    async listCurrentForLoginRollback(): Promise<Array<CloudCurrentSelection & { revision: string }>> {
+      const raw = await currentListResponse();
+      if (raw?.transactionalLoginRollback !== true) {
+        throw transactionalLoginServerError("accounts-serve did not advertise transactional login rollback");
+      }
+      return Array.isArray(raw.current)
+        ? raw.current.map(requireCurrentRevision) as Array<CloudCurrentSelection & { revision: string }>
+        : [];
     },
 
     async getCurrent(tool: string): Promise<CloudCurrentSelection | null> {
@@ -301,12 +367,85 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       return t.put<CloudCurrentSelection>(`/current/${encodeURIComponent(tool)}`, { name });
     },
 
+    async setCurrentForLogin(
+      tool: string,
+      name: string,
+      operationId: string,
+    ): Promise<CloudCurrentSelection & { revision: string }> {
+      try {
+        const current = await t.put<CloudCurrentSelection>(
+          `/current/${encodeURIComponent(tool)}/login`,
+          { name, operationId },
+          { retry: LOGIN_ROLLOUT_RETRY },
+        );
+        if (current.operationId !== operationId) {
+          throw transactionalLoginServerError("accounts-serve did not echo the transactional login operation id");
+        }
+        return requireCurrentRevision(current) as CloudCurrentSelection & { revision: string };
+      } catch (err) {
+        if (isEndpointMissing(err)) {
+          throw transactionalLoginServerError("accounts-serve does not expose transactional login activation");
+        }
+        throw err;
+      }
+    },
+
     async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
-      const result = await t.post<{ restored: boolean }>(
-        `/current/${encodeURIComponent(tool)}/restore`,
-        { expectedName, ...(name ? { name } : {}) },
-      );
-      return result.restored === true;
+      try {
+        const result = await t.post<{ restored: boolean }>(
+          `/current/${encodeURIComponent(tool)}/restore`,
+          { expectedName, ...(name ? { name } : {}) },
+        );
+        return result.restored === true;
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts current rollback");
+        throw err;
+      }
+    },
+
+    async restoreCurrentGeneration(
+      tool: string,
+      expectedName: string,
+      expectedRevision: string,
+      name?: string,
+    ): Promise<boolean> {
+      try {
+        const result = await t.post<{ restored: boolean }>(
+          `/current/${encodeURIComponent(tool)}/login/restore`,
+          { expectedName, expectedRevision, ...(name ? { name } : {}) },
+        );
+        return result.restored === true;
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts login current rollback");
+        throw err;
+      }
+    },
+
+    async restoreCurrentOperation(
+      tool: string,
+      expectedName: string,
+      operationId: string,
+      name?: string,
+      restoreLastUsedAt?: string | null,
+    ): Promise<boolean> {
+      try {
+        const result = await t.post<{ restored: boolean }>(
+          `/current/${encodeURIComponent(tool)}/login/restore`,
+          {
+            expectedName,
+            expectedOperationId: operationId,
+            ...(name ? { name } : {}),
+            ...(restoreLastUsedAt !== undefined ? { restoreLastUsedAt } : {}),
+          },
+          { idempotencyKey: operationId, retry: LOGIN_ROLLOUT_RETRY },
+        );
+        if (result.restored) return true;
+        const current = await api.getCurrent(tool);
+        return name ? current?.name === name : current === null;
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts login operation rollback");
+        throw err;
+      }
     },
 
     async listTools(): Promise<CloudTool[]> {

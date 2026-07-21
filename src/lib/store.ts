@@ -23,6 +23,7 @@
 // transport). The bearer key never appears in output or logs.
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -60,13 +61,26 @@ import {
   type RemoveOptions,
   type UpdateOptions,
 } from "./profiles.js";
-import { loadMachineStore, loadStore, saveStore } from "../storage.js";
+import { loadMachineStore, loadStore, saveStore, withStoreLock } from "../storage.js";
 import { resolveAccountsCloud, type AccountsCloudApi } from "./cloud-accounts.js";
 import { assertSafeWritePath } from "./safe-path.js";
 
 export interface CurrentEntry {
   tool: string;
   name: string;
+  /** Present for generation-aware stores; optional for source compatibility with custom stores. */
+  revision?: string;
+}
+
+export interface ProfileRollbackFields {
+  email?: { expected: string | null; restore: string | null };
+  lastUsedAt?: { expected: string | null; restore: string | null };
+}
+
+export interface UseProfileResult {
+  profile: Profile;
+  toolId: string;
+  currentRevision?: string;
 }
 
 export interface RemoveResult {
@@ -87,12 +101,25 @@ export interface AccountsStore {
   removeProfile(name: string, opts?: RemoveOptions): Promise<RemoveResult>;
   redetectEmail(name: string, tool?: string): Promise<Profile>;
   /** Restore fields that login finalization may have changed. */
-  restoreProfileState(profile: Profile): Promise<Profile>;
-  useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }>;
-  /** Conditionally restore/clear current only when it still names the failed login target. */
+  restoreProfileState?(profile: Profile, fields: ProfileRollbackFields): Promise<Profile>;
+  useProfile(name: string, tool?: string): Promise<UseProfileResult>;
+  /** Activate through a generation-capable endpoint that old API replicas cannot mutate. */
+  useProfileForLogin?(name: string, tool: string | undefined, operationId: string): Promise<UseProfileResult>;
+  /** Legacy name-only conditional restore/clear retained for public API compatibility. */
   restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
+  /** Conditionally restore/clear current only when it still has the failed login write generation. */
+  restoreCurrentGeneration?(tool: string, expectedName: string, expectedRevision: string, name?: string): Promise<boolean>;
+  restoreCurrentOperation?(
+    tool: string,
+    expectedName: string,
+    operationId: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean>;
   currentProfile(tool: string): Promise<Profile | undefined>;
   listCurrent(): Promise<CurrentEntry[]>;
+  /** Strict generation-aware current snapshot used only before transactional login. */
+  listCurrentForLoginRollback?(): Promise<CurrentEntry[]>;
   /** All tools (built-in + custom) known to the active registry. */
   listTools(): Promise<ToolDef[]>;
   /** Resolve a tool after hydrating the active registry's custom definitions. */
@@ -131,39 +158,117 @@ class LocalStore implements AccountsStore {
   async redetectEmail(name: string, tool?: string): Promise<Profile> {
     return localRedetect(name, tool);
   }
-  async restoreProfileState(profile: Profile): Promise<Profile> {
-    const machine = loadMachineStore();
-    const index = machine.profiles.findIndex(
-      (candidate) => candidate.name === profile.name && candidate.tool === profile.tool,
-    );
-    if (index < 0) throw new AccountsError(`no profile named "${profile.name}" for tool "${profile.tool}"`);
-    machine.profiles[index] = structuredClone(profile);
-    saveStore(machine);
-    return structuredClone(profile);
+  async restoreProfileState(profile: Profile, fields: ProfileRollbackFields): Promise<Profile> {
+    return withStoreLock(() => {
+      const machine = loadMachineStore();
+      const index = machine.profiles.findIndex(
+        (candidate) => candidate.name === profile.name && candidate.tool === profile.tool,
+      );
+      if (index < 0) throw new AccountsError(`no profile named "${profile.name}" for tool "${profile.tool}"`);
+      const current = machine.profiles[index]!;
+      if (fields.email && (current.email ?? null) === fields.email.expected) {
+        if (fields.email.restore === null) delete current.email;
+        else current.email = fields.email.restore;
+      }
+      if (fields.lastUsedAt && (current.lastUsedAt ?? null) === fields.lastUsedAt.expected) {
+        if (fields.lastUsedAt.restore === null) delete current.lastUsedAt;
+        else current.lastUsedAt = fields.lastUsedAt.restore;
+      }
+      saveStore(machine);
+      return structuredClone(current);
+    });
   }
-  async useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }> {
+  async useProfile(name: string, tool?: string): Promise<UseProfileResult> {
     return localUse(name, tool);
   }
+  async useProfileForLogin(name: string, tool: string | undefined, operationId: string): Promise<UseProfileResult> {
+    return localUse(name, tool, operationId);
+  }
   async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
-    const machine = loadMachineStore();
-    if (machine.current[tool] !== expectedName) return false;
-    if (name) {
-      if (!machine.profiles.some((profile) => profile.name === name && profile.tool === tool)) {
-        throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+    return withStoreLock(() => {
+      const machine = loadMachineStore();
+      if (machine.current[tool] !== expectedName) return false;
+      if (name) {
+        if (!machine.profiles.some((profile) => profile.name === name && profile.tool === tool)) {
+          throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+        }
+        machine.current[tool] = name;
+        machine.currentRevisions[tool] = randomUUID();
+      } else {
+        delete machine.current[tool];
+        delete machine.currentRevisions[tool];
       }
-      machine.current[tool] = name;
-    } else {
-      delete machine.current[tool];
-    }
-    saveStore(machine);
-    return true;
+      saveStore(machine);
+      return true;
+    });
+  }
+  async restoreCurrentGeneration(
+    tool: string,
+    expectedName: string,
+    expectedRevision: string,
+    name?: string,
+  ): Promise<boolean> {
+    return withStoreLock(() => {
+      const machine = loadMachineStore();
+      if (machine.current[tool] !== expectedName || machine.currentRevisions[tool] !== expectedRevision) return false;
+      if (name) {
+        if (!machine.profiles.some((profile) => profile.name === name && profile.tool === tool)) {
+          throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+        }
+        machine.current[tool] = name;
+        machine.currentRevisions[tool] = randomUUID();
+      } else {
+        delete machine.current[tool];
+        delete machine.currentRevisions[tool];
+      }
+      saveStore(machine);
+      return true;
+    });
+  }
+  async restoreCurrentOperation(
+    tool: string,
+    expectedName: string,
+    operationId: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean> {
+    return withStoreLock(() => {
+      const machine = loadMachineStore();
+      if (machine.current[tool] !== expectedName || machine.currentRevisions[tool] !== operationId) return false;
+      const failedProfile = machine.profiles.find(
+        (profile) => profile.name === expectedName && profile.tool === tool,
+      );
+      if (restoreLastUsedAt !== undefined && failedProfile) {
+        if (restoreLastUsedAt === null) delete failedProfile.lastUsedAt;
+        else failedProfile.lastUsedAt = restoreLastUsedAt;
+      }
+      if (name) {
+        if (!machine.profiles.some((profile) => profile.name === name && profile.tool === tool)) {
+          throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+        }
+        machine.current[tool] = name;
+        machine.currentRevisions[tool] = randomUUID();
+      } else {
+        delete machine.current[tool];
+        delete machine.currentRevisions[tool];
+      }
+      saveStore(machine);
+      return true;
+    });
   }
   async currentProfile(tool: string): Promise<Profile | undefined> {
     return localCurrent(tool);
   }
   async listCurrent(): Promise<CurrentEntry[]> {
-    const current = loadStore().current;
-    return Object.entries(current).map(([tool, name]) => ({ tool, name }));
+    const machine = loadStore();
+    return Object.entries(machine.current).map(([tool, name]) => ({
+      tool,
+      name,
+      revision: machine.currentRevisions[tool] ?? "",
+    }));
+  }
+  async listCurrentForLoginRollback(): Promise<CurrentEntry[]> {
+    return this.listCurrent();
   }
   async listTools(): Promise<ToolDef[]> {
     return localListTools();
@@ -278,21 +383,75 @@ class ApiStore implements AccountsStore {
     return this.api.update(name, profile.tool, { email });
   }
 
-  async restoreProfileState(profile: Profile): Promise<Profile> {
-    return this.api.update(profile.name, profile.tool, {
-      email: profile.email ?? null,
-      lastUsedAt: profile.lastUsedAt ?? null,
-    });
+  async restoreProfileState(profile: Profile, fields: ProfileRollbackFields): Promise<Profile> {
+    if (!this.api.restoreProfile) {
+      throw new AccountsError(
+        "the configured Accounts API store does not support transactional profile rollback; " +
+        "upgrade the custom store before running accounts login",
+      );
+    }
+    return this.api.restoreProfile(profile.name, profile.tool, fields);
   }
 
-  async useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }> {
+  async useProfile(name: string, tool?: string): Promise<UseProfileResult> {
     const profile = await this.resolve(name, tool);
-    await this.api.setCurrent(profile.tool, profile.name);
-    return { profile, toolId: profile.tool };
+    const current = await this.api.setCurrent(profile.tool, profile.name);
+    return {
+      profile: { ...profile, lastUsedAt: current.updatedAt },
+      toolId: profile.tool,
+      currentRevision: current.revision,
+    };
+  }
+
+  async useProfileForLogin(name: string, tool: string | undefined, operationId: string): Promise<UseProfileResult> {
+    if (!this.api.setCurrentForLogin) {
+      throw new AccountsError(
+        "the configured Accounts API store does not support transactional login activation; " +
+        "upgrade the custom store before running accounts login",
+      );
+    }
+    const profile = await this.resolve(name, tool);
+    const current = await this.api.setCurrentForLogin(profile.tool, profile.name, operationId);
+    return {
+      profile: { ...profile, lastUsedAt: current.updatedAt },
+      toolId: profile.tool,
+      currentRevision: current.revision,
+    };
   }
 
   async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
     return this.api.restoreCurrent(tool, expectedName, name);
+  }
+
+  async restoreCurrentGeneration(
+    tool: string,
+    expectedName: string,
+    expectedRevision: string,
+    name?: string,
+  ): Promise<boolean> {
+    if (!this.api.restoreCurrentGeneration) {
+      throw new AccountsError(
+        "the configured Accounts API store does not support generation-aware current rollback; " +
+        "upgrade the custom store before running accounts login",
+      );
+    }
+    return this.api.restoreCurrentGeneration(tool, expectedName, expectedRevision, name);
+  }
+
+  async restoreCurrentOperation(
+    tool: string,
+    expectedName: string,
+    operationId: string,
+    name?: string,
+    restoreLastUsedAt?: string | null,
+  ): Promise<boolean> {
+    if (!this.api.restoreCurrentOperation) {
+      throw new AccountsError(
+        "the configured Accounts API store does not support operation-owned current rollback; " +
+        "upgrade the custom store before running accounts login",
+      );
+    }
+    return this.api.restoreCurrentOperation(tool, expectedName, operationId, name, restoreLastUsedAt);
   }
 
   async currentProfile(tool: string): Promise<Profile | undefined> {
@@ -305,7 +464,21 @@ class ApiStore implements AccountsStore {
 
   async listCurrent(): Promise<CurrentEntry[]> {
     const current = await this.api.listCurrent();
-    return current.map((c) => ({ tool: c.tool, name: c.name }));
+    return current.map((c) => ({
+      tool: c.tool,
+      name: c.name,
+      ...(c.revision ? { revision: c.revision } : {}),
+    }));
+  }
+
+  async listCurrentForLoginRollback(): Promise<CurrentEntry[]> {
+    if (!this.api.listCurrentForLoginRollback) {
+      throw new AccountsError(
+        "the configured Accounts API store does not support transactional login rollback; " +
+        "upgrade the custom store before running accounts login",
+      );
+    }
+    return this.api.listCurrentForLoginRollback();
   }
 
   async listTools(): Promise<ToolDef[]> {
