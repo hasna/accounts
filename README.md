@@ -136,7 +136,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 |---------|-------------|
 | `accounts add <name>` | Create a profile. `--tool`, `--email`, `--display-name`, `--identity`, `--card-last4`, `--metadata key=value`, `--dir`, `--description`. |
 | `accounts import [name]` | Import existing config dir (default `~/.claude`). `--copy` for managed copy. |
-| `accounts login <name>` | Choose a tool when needed, lock the profile name to that tool, then launch that tool's login flow in an isolated profile dir. Use `--tool` to bypass or change the chooser. |
+| `accounts login <name>` | Choose a tool when needed, lock the profile name to that tool, then launch that tool's login flow in an isolated profile dir. Supports `--permissions <preset>`; use `--tool` to bypass or change the chooser. |
 | `accounts apply <name>` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
 | `accounts switch <name>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. Use `--tool` only when ambiguous. |
@@ -148,7 +148,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts active [tool]` | Print active profile name (scripting). |
 | `accounts applied [tool]` | Print applied profile name (scripting). |
 | `accounts env [name]` | Print one or more `export ...` lines for the profile. Use `--tool` only when ambiguous or when no name is passed. |
-| `accounts launch <name>` | Launch tool once with profile env. Supports `--permissions <preset>`. |
+| `accounts launch <name>` | Launch tool once with profile env. Supports `--permissions <preset>` and the Claude compatibility flag `--dangerously-skip-permissions`. |
 | `accounts run <tool> [args...]` | Run a tool under the supervisor so MCP/CLI can switch and restart it. Supports `--permissions <preset>`. |
 | `accounts supervisor status [tool]` | Show running supervisors. |
 | `accounts supervisor switch <name>` | Switch a running supervisor to another profile. Use `--tool` only when ambiguous. |
@@ -253,11 +253,16 @@ include redacted prelaunch diagnostics: last run mode/result, audited
 skip/bypass reason, OpenConfigs manifest path/hash, generated timestamp, source
 ids/counts, and missing/stale/drift status.
 
-`--permissions <preset>` maps a permission mode to the tool's own flags. For
-example, `--permissions dangerous` launches Claude/Takumi with
+`--permissions <preset>` on `login`, `launch`, `run`, and switching commands
+maps a permission mode to the tool's own flags. For example,
+`--permissions dangerous` launches Claude/Takumi with
 `--dangerously-skip-permissions`, Codex with
 `--dangerously-bypass-approvals-and-sandbox`, and Gemini/Hermes/Kimi with their
 YOLO mode flags. Unsupported tools fail with a list of configured presets.
+Historical Claude invocations may also pass `--dangerously-skip-permissions`
+directly to `accounts login` or `accounts launch`; this Claude-only compatibility
+form is equivalent to `--permissions dangerous`. Do not combine permission
+forms. Raw tool arguments remain available after `--`.
 
 ## Shell hook (optional)
 

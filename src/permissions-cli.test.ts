@@ -18,7 +18,13 @@ function runCli(...args: string[]) {
   return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
     cwd: process.cwd(),
     encoding: "utf8",
-    env: { ...process.env, ACCOUNTS_HOME: home },
+    env: {
+      ...process.env,
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+      HASNA_ACCOUNTS_API_URL: "",
+      HASNA_ACCOUNTS_API_KEY: "",
+    },
   });
 }
 

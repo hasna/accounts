@@ -471,6 +471,82 @@ test("headless launch keeps Claude stdout clean and returns its exit code", () =
   expect(storeCurrent()).toEqual({});
 });
 
+test("launch accepts the historical direct Claude dangerous-permissions flag", () => {
+  addProfile("acct");
+  const direct = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--headless",
+    "--dangerously-skip-permissions",
+    "--",
+    "Prompt",
+  ]);
+  const passthrough = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--headless",
+    "--",
+    "--dangerously-skip-permissions",
+    "Prompt",
+  ]);
+
+  expectStatus(direct, 0);
+  expectStatus(passthrough, 0);
+  expect(claudeEntries().map((entry) => entry.args)).toEqual([
+    ["--dangerously-skip-permissions", "-p", "Prompt"],
+    ["-p", "--dangerously-skip-permissions", "Prompt"],
+  ]);
+});
+
+test("launch rejects duplicate or non-Claude direct dangerous-permissions inputs before spawning", () => {
+  addProfile("acct");
+  expect(runCli(["add", "codexer", "--tool", "codex"]).status).toBe(0);
+
+  const duplicate = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--permissions",
+    "dangerous",
+    "--dangerously-skip-permissions",
+  ]);
+  const nonClaude = runCli([
+    "launch",
+    "codexer",
+    "--tool",
+    "codex",
+    "--skip-configs",
+    "--dangerously-skip-permissions",
+  ]);
+  const duplicatePassthrough = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--permissions",
+    "dangerous",
+    "--",
+    "--dangerously-skip-permissions",
+  ]);
+
+  expect(duplicate.status).toBe(1);
+  expect(duplicate.stderr).toContain("cannot be combined");
+  expect(nonClaude.status).toBe(1);
+  expect(nonClaude.stderr).toContain("only supported for Claude");
+  expect(duplicatePassthrough.status).toBe(1);
+  expect(duplicatePassthrough.stderr).toContain("cannot be combined");
+  expect(claudeEntries()).toEqual([]);
+});
+
 test("background convenience relays exact native bg and name argv", () => {
   addProfile("acct");
   const result = runCli(

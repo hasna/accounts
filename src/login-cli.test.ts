@@ -33,7 +33,11 @@ function runCliWith(args: string[], opts: RunOptions = {}) {
     env: {
       ...process.env,
       NODE_ENV: "test",
+      HOME: home,
       ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+      HASNA_ACCOUNTS_API_URL: "",
+      HASNA_ACCOUNTS_API_KEY: "",
       FAKE_LOGIN_LOG: logPath,
       PATH: opts.path ?? `${binDir}:${process.env.PATH ?? ""}`,
       ...opts.env,
@@ -165,6 +169,45 @@ function readStore() {
     profiles?: Array<{ name: string; tool: string; dir: string }>;
   };
 }
+
+test("login forwards documented and native-compatible Claude dangerous permissions", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+
+  const documented = runCli("login", "acct", "--tool", "claude", "--permissions", "dangerous");
+  const compatible = runCli("login", "acct", "--tool", "claude", "--dangerously-skip-permissions");
+
+  expect(documented.status).toBe(23);
+  expect(compatible.status).toBe(23);
+  expect(readLogEntries().map((entry) => entry.args)).toEqual([
+    "--dangerously-skip-permissions",
+    "--dangerously-skip-permissions",
+  ]);
+});
+
+test("login rejects unsupported and duplicate permission inputs before launching the tool", () => {
+  writeFakeTool("opencode", "OPENCODE_CONFIG_DIR", "opencode");
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  expect(runCli("add", "open", "--tool", "opencode").status).toBe(0);
+  expect(runCli("add", "claude", "--tool", "claude").status).toBe(0);
+
+  const unsupported = runCli("login", "open", "--tool", "opencode", "--permissions", "dangerous");
+  const duplicate = runCli(
+    "login",
+    "claude",
+    "--tool",
+    "claude",
+    "--permissions",
+    "dangerous",
+    "--dangerously-skip-permissions",
+  );
+
+  expect(unsupported.status).toBe(1);
+  expect(unsupported.stderr).toContain('tool "opencode" does not support permissions "dangerous"');
+  expect(duplicate.status).toBe(1);
+  expect(duplicate.stderr).toContain("cannot be combined");
+  expect(readLogEntries()).toEqual([]);
+});
 
 test("launch syncs Claude profile credentials into keychain before spawning", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");

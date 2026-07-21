@@ -7,13 +7,14 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
 import chalk from "chalk";
-import { AccountsError, type Profile } from "./types.js";
+import { AccountsError, type Profile, type ToolDef } from "./types.js";
 import {
   DEFAULT_TOOL,
   getTool,
   isBuiltinTool,
   mergeToolArgs,
   normalizePermissionPreset,
+  permissionArgsFor,
 } from "./lib/tools.js";
 import {
   expandPath,
@@ -297,6 +298,37 @@ function parsePermissionArgs(entries?: string[]): Record<string, string[]> {
   return permissionArgs;
 }
 
+interface PermissionCliOptions {
+  permissions?: string;
+  dangerouslySkipPermissions?: boolean;
+}
+
+const CLAUDE_DANGEROUS_PERMISSION_ARG = "--dangerously-skip-permissions";
+
+function resolveCliPermissionPreset(
+  tool: ToolDef,
+  opts: PermissionCliOptions,
+  passthroughArgs: string[] = [],
+): string | undefined {
+  const hasNativePassthrough = tool.id === "claude" && passthroughArgs.includes(CLAUDE_DANGEROUS_PERMISSION_ARG);
+  if (opts.dangerouslySkipPermissions && opts.permissions) {
+    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be combined with --permissions`);
+  }
+  if (opts.dangerouslySkipPermissions && hasNativePassthrough) {
+    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be supplied both directly and after --`);
+  }
+  if (opts.permissions && hasNativePassthrough) {
+    throw new AccountsError(`--permissions cannot be combined with ${CLAUDE_DANGEROUS_PERMISSION_ARG} after --`);
+  }
+  if (opts.dangerouslySkipPermissions && tool.id !== "claude") {
+    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} is only supported for Claude; use --permissions <preset> for tool-specific modes`);
+  }
+
+  const preset = opts.dangerouslySkipPermissions ? "dangerous" : opts.permissions;
+  permissionArgsFor(tool, preset);
+  return preset;
+}
+
 interface ConfigsCliOptions {
   configs?: ConfigsPrelaunchMode;
   configsDryRun?: boolean;
@@ -576,8 +608,10 @@ program
   .argument("<name>", "profile name")
   .description("choose or launch a tool login flow inside an isolated profile dir")
   .option("-t, --tool <tool>", "tool to use for this profile; locks bare commands to that tool")
+  .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
+  .option("--dangerously-skip-permissions", "compatibility alias for Claude --permissions dangerous")
   .action(
-    action(async (name: string, opts: { tool?: string }) => {
+    action(async (name: string, opts: { tool?: string } & PermissionCliOptions) => {
       const store = resolveStore();
       const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env, store });
       if (prepared.status === "stopped") {
@@ -585,7 +619,12 @@ program
         console.error(chalk.dim(`Selected tool kept: ${prepared.tool.id}`));
         process.exit(1);
       }
-      const { profile, tool, args: loginArgs } = prepared;
+      const { profile, tool, args: baseLoginArgs } = prepared;
+      const permissions = resolveCliPermissionPreset(tool, opts);
+      const loginArgs = [
+        ...permissionArgsFor(tool, permissions).filter((arg) => !baseLoginArgs.includes(arg)),
+        ...baseLoginArgs,
+      ];
       const env = profileEnv(profile, tool);
       await store.useProfile(name, tool.id);
       console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
@@ -808,19 +847,21 @@ addConfigsOptions(program
   .description("launch the tool's binary with the profile's config dir active")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
+  .option("--dangerously-skip-permissions", "compatibility alias for Claude --permissions dangerous")
   .option("--headless", "run Claude in native print mode")
   .option("--background", "run Claude with its native --bg flag")
   .option("--bg", "alias for --background")
   .option("--name <name>", "pass a validated native name to a background Claude session")
   .action(
-    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string } & ClaudeLaunchOptions & ConfigsCliOptions) => {
+    action(async (name: string, args: string[], opts: { tool?: string } & PermissionCliOptions & ClaudeLaunchOptions & ConfigsCliOptions) => {
       const store = resolveStore();
       const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
+      const permissions = resolveCliPermissionPreset(tool, opts, args);
       const plan = planClaudeLaunch(tool, args, opts);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
       const env = profileEnv(profile, tool);
-      const launchArgs = mergeToolArgs(tool, plan.args, { permissions: opts.permissions, profile });
+      const launchArgs = mergeToolArgs(tool, plan.args, { permissions, profile });
       if (!plan.nonInteractive) await store.useProfile(name, tool.id);
       console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([tool.bin, ...launchArgs]).join(" ")}`));
       const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;

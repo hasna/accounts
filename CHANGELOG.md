@@ -6,6 +6,18 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- `accounts login <name> --permissions <preset>` now validates the selected
+  tool's existing permission mapping and forwards the mapped arguments to the
+  login process before its native login arguments.
+- Historical Claude `login` and `launch` invocations accept the direct
+  `--dangerously-skip-permissions` compatibility flag without requiring `--`.
+  Other tools and conflicting permission inputs fail before configs or tool
+  launch, while standalone raw `-- ...` passthrough remains unchanged.
+- Login and permissions CLI subprocess tests explicitly use local Accounts
+  storage instead of inheriting a station-level cloud/API mode.
+
 ## [0.2.8] - 2026-07-15
 
 ### Changed
