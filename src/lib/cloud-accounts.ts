@@ -62,14 +62,14 @@ export interface CloudCreateInput {
 
 /** Fields updatable through `PATCH /v1/accounts/:tool/:name`. */
 export interface CloudUpdateInput {
-  email?: string;
+  email?: string | null;
   displayName?: string;
   identity?: string;
   cardLast4?: string;
   metadata?: Record<string, string | number | boolean | null>;
   dir?: string;
   description?: string;
-  lastUsedAt?: string;
+  lastUsedAt?: string | null;
 }
 
 /**
@@ -90,6 +90,7 @@ export interface AccountsCloudApi {
   listCurrent(): Promise<CloudCurrentSelection[]>;
   getCurrent(tool: string): Promise<CloudCurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CloudCurrentSelection>;
+  restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
   listTools(): Promise<CloudTool[]>;
   createTool(def: ToolDef): Promise<ToolDef>;
   removeTool(id: string): Promise<void>;
@@ -298,6 +299,14 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
 
     async setCurrent(tool: string, name: string): Promise<CloudCurrentSelection> {
       return t.put<CloudCurrentSelection>(`/current/${encodeURIComponent(tool)}`, { name });
+    },
+
+    async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
+      const result = await t.post<{ restored: boolean }>(
+        `/current/${encodeURIComponent(tool)}/restore`,
+        { expectedName, ...(name ? { name } : {}) },
+      );
+      return result.restored === true;
     },
 
     async listTools(): Promise<CloudTool[]> {

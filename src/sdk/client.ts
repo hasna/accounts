@@ -18,13 +18,17 @@ export interface AccountList { "accounts": Array<Account> }
 
 export interface CreateAccountInput { "name": string; "tool": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string }
 
-export interface UpdateAccountInput { "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string; "lastUsedAt"?: string }
+export interface UpdateAccountInput { "email"?: string | null; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string; "lastUsedAt"?: string | null }
 
 export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string }
 
 export interface CurrentSelectionList { "current": Array<CurrentSelection> }
 
 export interface SetCurrentInput { "name": string }
+
+export interface RestoreCurrentInput { "expectedName": string; "name"?: string }
+
+export interface RestoreCurrentResult { "restored": boolean }
 
 export interface RenameAccountInput { "name": string }
 
@@ -182,6 +186,15 @@ export class AccountsClient {
     /** Set the current active account for a tool */
     async setCurrent(tool: string, body: SetCurrentInput, init?: RequestInit): Promise<CurrentSelection> {
       return this.request("PUT", `/v1/current/${encodeURIComponent(String(tool))}`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Conditionally restore or clear a failed current selection */
+    async restoreCurrent(tool: string, body: RestoreCurrentInput, init?: RequestInit): Promise<RestoreCurrentResult> {
+      return this.request("POST", `/v1/current/${encodeURIComponent(String(tool))}/restore`, {
         body,
         query: undefined,
         init,

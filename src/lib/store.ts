@@ -60,7 +60,7 @@ import {
   type RemoveOptions,
   type UpdateOptions,
 } from "./profiles.js";
-import { loadStore } from "../storage.js";
+import { loadMachineStore, loadStore, saveStore } from "../storage.js";
 import { resolveAccountsCloud, type AccountsCloudApi } from "./cloud-accounts.js";
 import { assertSafeWritePath } from "./safe-path.js";
 
@@ -86,7 +86,11 @@ export interface AccountsStore {
   renameProfile(oldName: string, newName: string, tool?: string): Promise<Profile>;
   removeProfile(name: string, opts?: RemoveOptions): Promise<RemoveResult>;
   redetectEmail(name: string, tool?: string): Promise<Profile>;
+  /** Restore fields that login finalization may have changed. */
+  restoreProfileState(profile: Profile): Promise<Profile>;
   useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }>;
+  /** Conditionally restore/clear current only when it still names the failed login target. */
+  restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
   currentProfile(tool: string): Promise<Profile | undefined>;
   listCurrent(): Promise<CurrentEntry[]>;
   /** All tools (built-in + custom) known to the active registry. */
@@ -127,8 +131,32 @@ class LocalStore implements AccountsStore {
   async redetectEmail(name: string, tool?: string): Promise<Profile> {
     return localRedetect(name, tool);
   }
+  async restoreProfileState(profile: Profile): Promise<Profile> {
+    const machine = loadMachineStore();
+    const index = machine.profiles.findIndex(
+      (candidate) => candidate.name === profile.name && candidate.tool === profile.tool,
+    );
+    if (index < 0) throw new AccountsError(`no profile named "${profile.name}" for tool "${profile.tool}"`);
+    machine.profiles[index] = structuredClone(profile);
+    saveStore(machine);
+    return structuredClone(profile);
+  }
   async useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }> {
     return localUse(name, tool);
+  }
+  async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
+    const machine = loadMachineStore();
+    if (machine.current[tool] !== expectedName) return false;
+    if (name) {
+      if (!machine.profiles.some((profile) => profile.name === name && profile.tool === tool)) {
+        throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+      }
+      machine.current[tool] = name;
+    } else {
+      delete machine.current[tool];
+    }
+    saveStore(machine);
+    return true;
   }
   async currentProfile(tool: string): Promise<Profile | undefined> {
     return localCurrent(tool);
@@ -250,10 +278,21 @@ class ApiStore implements AccountsStore {
     return this.api.update(name, profile.tool, { email });
   }
 
+  async restoreProfileState(profile: Profile): Promise<Profile> {
+    return this.api.update(profile.name, profile.tool, {
+      email: profile.email ?? null,
+      lastUsedAt: profile.lastUsedAt ?? null,
+    });
+  }
+
   async useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }> {
     const profile = await this.resolve(name, tool);
     await this.api.setCurrent(profile.tool, profile.name);
     return { profile, toolId: profile.tool };
+  }
+
+  async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
+    return this.api.restoreCurrent(tool, expectedName, name);
   }
 
   async currentProfile(tool: string): Promise<Profile | undefined> {

@@ -665,14 +665,6 @@ program
         ...permissionArgs.filter((arg) => !baseLoginArgs.includes(arg)),
         ...baseLoginArgs,
       ];
-      const env = profileEnv(profile, tool);
-      console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
-      console.log(chalk.dim(`  config dir: ${profile.dir}`));
-      console.log(chalk.dim(`  env: ${formatEnvAssignments(env)}`));
-      console.log(chalk.yellow(`  ${tool.loginHint ?? "complete the login flow, then exit when done"}`));
-      if (tool.id === "claude") {
-        console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
-      }
       let priorKeychain: ReturnType<typeof captureClaudeKeychain>;
       let keychainCaptured = false;
       let releaseKeychainLock: (() => void) | undefined;
@@ -699,11 +691,20 @@ program
           }
         }
       };
-      if (tool.id === "claude" && keychainSupported()) {
-        process.on("SIGINT", onSigint);
-        process.on("SIGTERM", onSigterm);
-      }
+      process.on("SIGINT", onSigint);
+      process.on("SIGTERM", onSigterm);
       try {
+        finalizationState = await captureLoginFinalizationState(name, tool, store);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (pendingSignal) throw new AccountsError("login interrupted before tool launch");
+        const env = profileEnv(profile, tool);
+        console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
+        console.log(chalk.dim(`  config dir: ${profile.dir}`));
+        console.log(chalk.dim(`  env: ${formatEnvAssignments(env)}`));
+        console.log(chalk.yellow(`  ${tool.loginHint ?? "complete the login flow, then exit when done"}`));
+        if (tool.id === "claude") {
+          console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
+        }
         if (tool.id === "claude" && keychainSupported()) {
           releaseKeychainLock = await acquireClaudeKeychainLock(lockAbort.signal);
           if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
@@ -719,7 +720,12 @@ program
           process.exitCode = exitCode;
           return;
         }
-        finalizationState = await captureLoginFinalizationState(name, tool, store);
+        const testFinalizeDelay = process.env.NODE_ENV === "test"
+          ? Number(process.env.ACCOUNTS_TEST_LOGIN_FINALIZE_DELAY_MS ?? 0)
+          : 0;
+        if (Number.isFinite(testFinalizeDelay) && testFinalizeDelay > 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, testFinalizeDelay));
+        }
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (pendingSignal) {
           await rollback();

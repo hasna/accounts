@@ -66,12 +66,17 @@ export const updateAccountSchema = z
     metadata: metadataSchema.optional(),
     dir: profileDirSchema.nullable().optional(),
     description: z.string().nullable().optional(),
-    lastUsedAt: z.string().datetime().optional(),
+    lastUsedAt: z.string().datetime().nullable().optional(),
   })
   .refine((v) => Object.keys(v).length > 0, "update requires at least one field");
 export type UpdateAccountInput = z.infer<typeof updateAccountSchema>;
 
 export const setCurrentSchema = z.object({ name: profileNameSchema });
+
+export const restoreCurrentSchema = z.object({
+  expectedName: profileNameSchema,
+  name: profileNameSchema.optional(),
+});
 
 export const renameAccountSchema = z.object({ name: profileNameSchema });
 export type RenameAccountInput = z.infer<typeof renameAccountSchema>;

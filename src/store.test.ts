@@ -95,6 +95,33 @@ describe("ApiStore routes registry ops to /v1", () => {
     expect(calls.some((c) => c.method === "PUT" && c.url === `${BASE}/v1/current/claude`)).toBe(true);
   });
 
+  test("rollback helpers restore nullable profile state and conditionally clear API current", async () => {
+    const { calls, fetchImpl } = mockFetch((c) => {
+      if (c.method === "PATCH") {
+        return { status: 200, body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" } };
+      }
+      return { status: 200, body: { restored: true } };
+    });
+    const store = resolveStore(cloudEnv, { fetchImpl });
+    await store.restoreProfileState({
+      name: "work",
+      tool: "claude",
+      dir: "/profiles/work",
+      createdAt: "2020-01-01T00:00:00Z",
+    });
+    expect(calls[0]).toMatchObject({
+      method: "PATCH",
+      url: `${BASE}/v1/accounts/claude/work`,
+      body: { email: null, lastUsedAt: null },
+    });
+    expect(await store.restoreCurrent("claude", "work")).toBe(true);
+    expect(calls[1]).toMatchObject({
+      method: "POST",
+      url: `${BASE}/v1/current/claude/restore`,
+      body: { expectedName: "work" },
+    });
+  });
+
   test("getProfile throws AccountsError on unknown profile (no local fallthrough)", async () => {
     const { fetchImpl } = mockFetch(() => ({ status: 404, body: { error: "nope" } }));
     const store = resolveStore(cloudEnv, { fetchImpl });

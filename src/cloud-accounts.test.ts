@@ -158,6 +158,20 @@ describe("resolveAccountsCloud", () => {
     expect((calls[0]!.body as { name: string }).name).toBe("work");
   });
 
+  test("restoreCurrent conditionally restores or clears the failed selection", async () => {
+    const { calls, fetchImpl } = mockFetch(() => ({ status: 200, body: { restored: true } }));
+    const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
+    if (r.transport !== "cloud-http") throw new Error("expected cloud");
+    expect(await r.api.restoreCurrent("claude", "failed", "prior")).toBe(true);
+    expect(calls[0]).toMatchObject({
+      method: "POST",
+      url: `${BASE}/v1/current/claude/restore`,
+      body: { expectedName: "failed", name: "prior" },
+    });
+    expect(await r.api.restoreCurrent("claude", "failed")).toBe(true);
+    expect(calls[1]!.body).toEqual({ expectedName: "failed" });
+  });
+
   test("getCurrent returns null on 404", async () => {
     const { fetchImpl } = mockFetch(() => ({ status: 404, body: { error: "none" } }));
     const r = resolveAccountsCloud(cloudEnv, { fetchImpl });

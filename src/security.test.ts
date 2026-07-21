@@ -14,7 +14,7 @@ import {
 import { CLAUDE_KEYCHAIN_SERVICE } from "./lib/claude-layout.js";
 import { saveStore, loadStore } from "./storage.js";
 import { shellQuotePath, hookScript } from "./lib/hook.js";
-import { withApplyLock } from "./lib/apply-lock.js";
+import { withApplyLock, withApplyLockWait } from "./lib/apply-lock.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -297,4 +297,12 @@ test("withApplyLock rejects concurrent apply", () => {
   writeFileSync(lock, "99999\n");
   chmodSync(lock, 0o600);
   expect(() => withApplyLock(() => undefined)).toThrow(AccountsError);
+});
+
+test("withApplyLockWait serializes rollback behind an in-flight apply", async () => {
+  const lock = join(home, ".apply.lock");
+  writeFileSync(lock, "99999\n", { mode: 0o600 });
+  setTimeout(() => rmSync(lock, { force: true }), 30);
+  expect(await withApplyLockWait(() => "restored", { timeoutMs: 500, pollMs: 5 })).toBe("restored");
+  expect(existsSync(lock)).toBe(false);
 });

@@ -41,6 +41,7 @@ export interface AccountsStore {
   listCurrent(): Promise<CurrentSelection[]>;
   getCurrent(tool: string): Promise<CurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CurrentSelection>;
+  restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
   listCustomTools(): Promise<ToolDef[]>;
   addCustomTool(def: ToolDef): Promise<ToolDef>;
   removeCustomTool(id: string): Promise<boolean>;
@@ -264,6 +265,28 @@ export class AccountsRepo implements AccountsStore {
         [tool, name],
       );
       return { tool: row.tool, name: row.name, updatedAt: iso(row.updated_at)! };
+    });
+  }
+
+  async restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean> {
+    return this.client.transaction(async (client) => {
+      if (name) {
+        const account = await this.getWith(client, tool, name, { forUpdate: true });
+        if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+        const result = await client.query(
+          `UPDATE current_selections
+              SET name = $3, updated_at = now()
+            WHERE tool = $1 AND name = $2
+            RETURNING tool`,
+          [tool, expectedName, name],
+        );
+        return result.rowCount > 0;
+      }
+      const result = await client.query(
+        "DELETE FROM current_selections WHERE tool = $1 AND name = $2 RETURNING tool",
+        [tool, expectedName],
+      );
+      return result.rowCount > 0;
     });
   }
 

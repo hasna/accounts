@@ -115,14 +115,14 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
         UpdateAccountInput: {
           type: "object",
           properties: {
-            email: { type: "string" },
+            email: { type: "string", nullable: true },
             displayName: { type: "string" },
             identity: { type: "string" },
             cardLast4: { type: "string" },
             metadata: { type: "object", additionalProperties: true },
             dir: { type: "string" },
             description: { type: "string" },
-            lastUsedAt: { type: "string" },
+            lastUsedAt: { type: "string", nullable: true },
           },
         },
         CurrentSelection: {
@@ -145,6 +145,19 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           type: "object",
           required: ["name"],
           properties: { name: { type: "string" } },
+        },
+        RestoreCurrentInput: {
+          type: "object",
+          required: ["expectedName"],
+          properties: {
+            expectedName: { type: "string" },
+            name: { type: "string" },
+          },
+        },
+        RestoreCurrentResult: {
+          type: "object",
+          required: ["restored"],
+          properties: { restored: { type: "boolean" } },
         },
         RenameAccountInput: {
           type: "object",
@@ -346,6 +359,20 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           responses: {
             "200": jsonResponse("Current selection", ref("CurrentSelection")),
             "404": jsonResponse("Account not found", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
+      "/v1/current/{tool}/restore": {
+        post: {
+          operationId: "restoreCurrent",
+          summary: "Conditionally restore or clear a failed current selection",
+          security: [{ apiKey: [] }],
+          parameters: [{ name: "tool", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: jsonBody(ref("RestoreCurrentInput")),
+          responses: {
+            "200": jsonResponse("Conditional restore result", ref("RestoreCurrentResult")),
+            "404": jsonResponse("Restore account not found", ref("ErrorResponse")),
             ...errorResponses,
           },
         },

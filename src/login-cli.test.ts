@@ -118,6 +118,12 @@ function writeFinalizationSignalTool(binName: string, envVar: string, toolName =
       "#!/bin/sh",
       `home="\${${envVar}:-}"`,
       `printf '{"tool":"${toolName}","args":"%s","home":"%s"}\\n' "$*" "$home" >> "$FAKE_LOGIN_LOG"`,
+      'if [ "${FAKE_LOGIN_MUTATE_LIVE:-}" = "1" ]; then',
+      '  mkdir -p "$ACCOUNTS_TEST_LIVE_DIR/.claude"',
+      '  printf \'{"oauthAccount":{"emailAddress":"child@example.com"}}\\n\' > "$ACCOUNTS_TEST_LIVE_DIR/.claude.json"',
+      '  printf \'{"claudeAiOauth":{"refreshToken":"child-live"}}\\n\' > "$ACCOUNTS_TEST_LIVE_DIR/.claude/.credentials.json"',
+      '  printf \'{"theme":"child"}\\n\' > "$ACCOUNTS_TEST_LIVE_DIR/.claude/settings.json"',
+      "fi",
       'printf completed > "$FAKE_LOGIN_COMPLETED"',
       "exit 0",
     ].join("\n"),
@@ -463,6 +469,32 @@ test("signalled Claude login returns nonzero and restores active profile and key
   expect(readLogEntries()).toHaveLength(1);
 });
 
+test("post-child SIGTERM rolls back finalization without Claude keychain support", async () => {
+  const completed = join(home, "non-keychain-login-completed");
+  writeFinalizationSignalTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  addFakeLoginTool();
+  expect(runCli("add", "prior", "--tool", "fake-login").status).toBe(0);
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+  expect(runCli("use", "prior", "--tool", "fake-login").status).toBe(0);
+  const storeBefore = readStore();
+  const child = spawnCliWith(["login", "acct", "--tool", "fake-login"], {
+    env: {
+      FAKE_LOGIN_COMPLETED: completed,
+      ACCOUNTS_TEST_LOGIN_FINALIZE_DELAY_MS: "500",
+    },
+  });
+  const resultPromise = collect(child);
+
+  await waitFor(() => existsSync(completed));
+  child.kill("SIGTERM");
+  const result = await resultPromise;
+
+  expect(result.code).toBe(143);
+  expect(result.signal).toBeNull();
+  expect(readStore()).toEqual(storeBefore);
+  expect(readLogEntries()).toHaveLength(1);
+});
+
 test("repeated parent SIGINT rolls back while holding the shared Claude keychain lease", async () => {
   const fixture = setupClaudeLogin("success");
   const ready = join(home, "blocking-login.ready");
@@ -536,6 +568,7 @@ test("SIGINT during finalization restores live auth, applied state, profile meta
       ...fixture.env,
       ACCOUNTS_TEST_LIVE_DIR: liveBase,
       FAKE_SECURITY_DELAY_MS: "40",
+      FAKE_LOGIN_MUTATE_LIVE: "1",
       FAKE_LOGIN_COMPLETED: loginCompleted,
       FAKE_FINALIZE_SIGNAL_SENT: signalSent,
     },

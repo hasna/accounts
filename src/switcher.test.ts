@@ -274,6 +274,7 @@ test("failed API current persistence restores prior live Claude auth and applied
     HASNA_ACCOUNTS_STORAGE_MODE: "local",
   } as NodeJS.ProcessEnv);
   const currentWrites: string[] = [];
+  const currentRestores: Array<{ expectedName: string; name?: string }> = [];
   const apiLikeStore = new Proxy(localStore, {
     get(store, property, receiver) {
       if (property === "transport") return "api";
@@ -282,6 +283,12 @@ test("failed API current persistence restores prior live Claude auth and applied
           currentWrites.push(name);
           if (name === target.name) throw new AccountsError("simulated current persistence failure");
           return await store.useProfile(name, tool);
+        };
+      }
+      if (property === "restoreCurrent") {
+        return async (tool: string, expectedName: string, name?: string) => {
+          currentRestores.push({ expectedName, ...(name ? { name } : {}) });
+          return await store.restoreCurrent(tool, expectedName, name);
         };
       }
       const value = Reflect.get(store, property, receiver);
@@ -298,9 +305,55 @@ test("failed API current persistence restores prior live Claude auth and applied
 
   expect(appliedProfile("claude")?.name).toBe(prior.name);
   expect(currentProfile("claude")?.name).toBe(prior.name);
+  expect(getProfile(target.name, target.tool).email).toBeUndefined();
   expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
     .toBe("prior-finalize@example.com");
-  expect(currentWrites).toEqual([target.name, prior.name]);
+  expect(currentWrites).toEqual([target.name]);
+  expect(currentRestores).toEqual([{ expectedName: target.name, name: prior.name }]);
+});
+
+test("interrupted API finalization clears a newly-created current selection", async () => {
+  const target = addProfile({ name: "target-no-prior" });
+  writeOAuth(target.dir, "target-no-prior@example.com");
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const apiLikeStore = new Proxy(localStore, {
+    get(store, property, receiver) {
+      if (property === "transport") return "api";
+      const value = Reflect.get(store, property, receiver);
+      return typeof value === "function" ? value.bind(store) : value;
+    },
+  }) as AccountsStore;
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"), apiLikeStore);
+
+  await finalizeLogin(target.name, target.tool, apiLikeStore);
+  expect(currentProfile("claude")?.name).toBe(target.name);
+  await rollbackLoginFinalization(state, apiLikeStore);
+
+  expect(currentProfile("claude")).toBeUndefined();
+  expect(appliedProfile("claude")).toBeUndefined();
+});
+
+test("rollback does not overwrite a newer concurrent Claude apply", async () => {
+  const prior = addProfile({ name: "prior-concurrent" });
+  const target = addProfile({ name: "target-concurrent" });
+  const newer = addProfile({ name: "newer-concurrent" });
+  writeOAuth(prior.dir, "prior-concurrent@example.com");
+  writeOAuth(target.dir, "target-concurrent@example.com");
+  writeOAuth(newer.dir, "newer-concurrent@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+  await finalizeLogin(target.name, target.tool);
+  await applyProfile(newer.name, newer.tool);
+
+  await rollbackLoginFinalization(state);
+
+  expect(appliedProfile("claude")?.name).toBe(newer.name);
+  expect(currentProfile("claude")?.name).toBe(newer.name);
+  expect(JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")).oauthAccount.emailAddress)
+    .toBe("newer-concurrent@example.com");
 });
 
 test("rename and remove keep applied pointer coherent", async () => {

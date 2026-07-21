@@ -12,6 +12,7 @@ import {
   type ClaudeLiveAuthSnapshot,
 } from "./claude-auth.js";
 import { getProfileToolLock, lockProfileTool, restoreProfileToolLock } from "./profiles.js";
+import { withApplyLockWait } from "./apply-lock.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
@@ -473,24 +474,24 @@ export async function rollbackLoginFinalization(
     }
   };
 
-  if (state.liveClaude) await attempt(() => restoreClaudeLiveAuthSnapshot(state.liveClaude!));
-  await attempt(() => {
-    const machine = loadMachineStore();
-    if (state.applied) machine.applied[state.tool.id] = state.applied;
-    else delete machine.applied[state.tool.id];
-    if (store.transport === "local") {
-      if (state.current) machine.current[state.tool.id] = state.current.name;
-      else delete machine.current[state.tool.id];
-      const profileIndex = machine.profiles.findIndex(
-        (profile) => profile.name === state.profile.name && profile.tool === state.profile.tool,
-      );
-      if (profileIndex >= 0) machine.profiles[profileIndex] = structuredClone(state.profile);
-    }
-    saveStore(machine);
-  });
-  if (store.transport === "api" && state.current) {
-    await attempt(() => store.useProfile(state.current!.name, state.tool.id).then(() => undefined));
+  if (state.liveClaude) {
+    await attempt(() => withApplyLockWait(() => {
+      const machine = loadMachineStore();
+      const appliedNow = machine.applied[state.tool.id];
+      const ownsAppliedState = appliedNow === state.applied || appliedNow === state.profile.name;
+      if (!ownsAppliedState) return;
+      restoreClaudeLiveAuthSnapshot(state.liveClaude!);
+      if (state.applied) machine.applied[state.tool.id] = state.applied;
+      else delete machine.applied[state.tool.id];
+      saveStore(machine);
+    }));
   }
+  await attempt(() => store.restoreProfileState(state.profile).then(() => undefined));
+  await attempt(() => store.restoreCurrent(
+    state.tool.id,
+    state.profile.name,
+    state.current?.name,
+  ).then(() => undefined));
 
   if (firstError) throw firstError;
 }

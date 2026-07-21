@@ -31,7 +31,10 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   failed attempt. Claude login holds the shared keychain lease throughout the
   child process and finalization, including repeated interrupt signals while
   the child is shutting down. Failed or interrupted finalization restores the
-  exact live Claude auth files and prior machine applied pointer.
+  exact pre-launch live Claude auth files and prior machine applied pointer,
+  observes interrupts on platforms without a Claude keychain, conditionally
+  restores or clears API current state, and does not overwrite a newer
+  concurrent apply.
 - The default Bun test preload neutralizes inherited station Accounts cloud/API
   configuration while explicit cloud fixtures remain supported.
 - Compatible transitive overrides keep the MCP SDK graph on patched

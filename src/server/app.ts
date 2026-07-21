@@ -16,7 +16,14 @@ import { AccountsError, toolDefSchema } from "../types.js";
 import { BUILTIN_TOOLS, isBuiltinTool } from "../lib/tools.js";
 import { AccountsRepo, type AccountsStore } from "./repo.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
-import { createAccountSchema, updateAccountSchema, renameAccountSchema, setCurrentSchema, toolIdSchema } from "./schema.js";
+import {
+  createAccountSchema,
+  updateAccountSchema,
+  renameAccountSchema,
+  restoreCurrentSchema,
+  setCurrentSchema,
+  toolIdSchema,
+} from "./schema.js";
 import { APP_SLUG, API_KEYS_TABLE, SCOPES, resolveSigningSecret } from "./config.js";
 import { packageVersion } from "./version.js";
 
@@ -244,6 +251,19 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         if (denied) return denied;
         const current = await ctx.repo.listCurrent();
         return json({ current }, 200);
+      }
+
+      const currentRestoreMatch = pathname.match(/^\/v1\/current\/([^/]+)\/restore$/);
+      if (currentRestoreMatch && method === "POST") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = restoreCurrentSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        const tool = decodeURIComponent(currentRestoreMatch[1]!);
+        const restored = await ctx.repo.restoreCurrent(tool, input.data.expectedName, input.data.name);
+        return json({ restored }, 200);
       }
 
       const currentMatch = pathname.match(/^\/v1\/current\/([^/]+)$/);

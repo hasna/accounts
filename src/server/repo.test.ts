@@ -27,6 +27,8 @@ function transactionalClient(failOnAccountWrite: boolean) {
     async query(sql) {
       statements.push(sql);
       if (sql.startsWith("DELETE FROM accounts")) return { rows: [{ tool: "claude" }], rowCount: 1 };
+      if (sql.includes("UPDATE current_selections")) return { rows: [{ tool: "claude" }], rowCount: 1 };
+      if (sql.includes("DELETE FROM current_selections")) return { rows: [{ tool: "claude" }], rowCount: 1 };
       throw new Error("unexpected query: " + sql);
     },
     async many() {
@@ -94,5 +96,15 @@ describe("AccountsRepo account/current atomicity", () => {
     expect(fixture.evidence().transactions).toBe(1);
     expect(fixture.evidence().statements.some((sql) => /FOR UPDATE/.test(sql))).toBe(true);
     expect(fixture.evidence().statements.some((sql) => /DELETE FROM current_selections/.test(sql))).toBe(false);
+  });
+
+  test("restoreCurrent conditionally replaces or clears only the expected selection", async () => {
+    const fixture = transactionalClient(false);
+    const repo = new AccountsRepo(fixture.client);
+    expect(await repo.restoreCurrent("claude", "failed", "old")).toBe(true);
+    expect(await repo.restoreCurrent("claude", "failed")).toBe(true);
+    const statements = fixture.evidence().statements;
+    expect(statements.some((sql) => /UPDATE current_selections[\s\S]*name = \$2/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /DELETE FROM current_selections[\s\S]*name = \$2/.test(sql))).toBe(true);
   });
 });
