@@ -94,6 +94,22 @@ export interface MigrationStatus {
   checksumMismatches: string[];
 }
 
+export const LOGIN_CLEANUP_MIGRATION_BLOCKER_TASK =
+  "f799e8a5-fc9e-4735-bfb9-8a0c17b90b25";
+
+/**
+ * Source merge must not make migration 0010 deployable. Its SQL and ledger
+ * commit need the advisory-lock atomic runner fixed by the named critical task.
+ */
+export function assertAccountsMigrationDeploySafe(status: MigrationStatus): void {
+  if (status.pending.includes("accounts_0010_login_cleanup_operations")) {
+    throw new Error(
+      "accounts migration 0010 is deployment-blocked until critical task " +
+        `${LOGIN_CLEANUP_MIGRATION_BLOCKER_TASK} fixes SQL and ledger atomicity under advisory lock`,
+    );
+  }
+}
+
 export function assertMigrationStatusCompatible(status: MigrationStatus): void {
   if (status.unknown.length > 0) {
     throw new Error(

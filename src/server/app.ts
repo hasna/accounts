@@ -278,8 +278,8 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
         const tool = decodeURIComponent(removeCreatedOperationMatch[1]!);
         const name = decodeURIComponent(removeCreatedOperationMatch[2]!);
-        const removed = await ctx.repo.removeCreated(tool, name, input.data);
-        return json({ removed }, 200);
+        const result = await ctx.repo.removeCreated(tool, name, input.data);
+        return json(result, 200);
       }
 
       const accountMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)$/);

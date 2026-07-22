@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
-import { AccountsRepo } from "./repo.js";
+import {
+  AccountsRepo,
+  LOGIN_CLEANUP_MAX_PER_TARGET,
+  loginCleanupRequestDigest,
+} from "./repo.js";
 
 const OLD_ROW = {
   tool: "claude",
@@ -131,11 +135,55 @@ function transactionalClient(failOnAccountWrite: boolean) {
 }
 
 describe("AccountsRepo account/current atomicity", () => {
+  test("cleanup request digest is canonical and binds every conditional field", () => {
+    const base = {
+      cleanupOperationId: "33333333-3333-4333-8333-333333333333",
+      cleanupRequestedAt: "2026-07-22T00:00:00.000Z",
+      expectedIncarnationId: OLD_ROW.incarnation_id,
+      expectedCreatedAt: new Date(OLD_ROW.created_at).toISOString(),
+      expectedEmail: "old@example.test",
+      expectedDisplayName: "Old",
+      expectedIdentity: "identity-old",
+      expectedCardLast4: "4242",
+      expectedMetadata: { z: true, a: "first" },
+      expectedDir: "/profiles/old",
+      expectedDescription: "old profile",
+      expectedLastUsedAt: "2026-07-21T00:00:00.000Z",
+    };
+    const digest = loginCleanupRequestDigest("claude", "old", base);
+    expect(loginCleanupRequestDigest("claude", "old", {
+      ...base,
+      expectedMetadata: { a: "first", z: true },
+    })).toBe(digest);
+    const variants = [
+      ["tool", () => loginCleanupRequestDigest("codex", "old", base)],
+      ["name", () => loginCleanupRequestDigest("claude", "new", base)],
+      ["cleanupOperationId", () => loginCleanupRequestDigest("claude", "old", { ...base, cleanupOperationId: "44444444-4444-4444-8444-444444444444" })],
+      ["cleanupRequestedAt", () => loginCleanupRequestDigest("claude", "old", { ...base, cleanupRequestedAt: "2026-07-22T00:00:01.000Z" })],
+      ["expectedIncarnationId", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedIncarnationId: "55555555-5555-4555-8555-555555555555" })],
+      ["expectedCreatedAt", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedCreatedAt: "2020-01-02T00:00:00.000Z" })],
+      ["expectedEmail", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedEmail: null })],
+      ["expectedDisplayName", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedDisplayName: null })],
+      ["expectedIdentity", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedIdentity: null })],
+      ["expectedCardLast4", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedCardLast4: null })],
+      ["expectedMetadata", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedMetadata: { a: "changed", z: true } })],
+      ["expectedDir", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedDir: null })],
+      ["expectedDescription", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedDescription: null })],
+      ["expectedLastUsedAt", () => loginCleanupRequestDigest("claude", "old", { ...base, expectedLastUsedAt: null })],
+    ] as const;
+    for (const [field, variant] of variants) {
+      expect({ field, changed: variant() !== digest }).toEqual({ field, changed: true });
+    }
+  });
+
   test("login cleanup deletes only an unchanged created account that is not currently selected", async () => {
     const statements: string[] = [];
     const tx = {
       async get(sql: string) {
         statements.push(sql);
+        if (/incomplete_count/.test(sql)) {
+          return { incomplete_count: "0", terminal_count: "0" };
+        }
         if (/account_login_cleanup_operations/.test(sql)) return null;
         if (/FROM current_selections/.test(sql)) return null;
         return OLD_ROW;
@@ -157,6 +205,7 @@ describe("AccountsRepo account/current atomicity", () => {
     } as unknown as PoolQueryClient;
     const removed = await (new AccountsRepo(client) as any).removeCreated("claude", "old", {
       cleanupOperationId: "11111111-1111-4111-8111-111111111111",
+      cleanupRequestedAt: new Date().toISOString(),
       expectedIncarnationId: OLD_ROW.incarnation_id,
       expectedCreatedAt: new Date(OLD_ROW.created_at).toISOString(),
       expectedEmail: OLD_ROW.email,
@@ -169,17 +218,34 @@ describe("AccountsRepo account/current atomicity", () => {
       expectedLastUsedAt: OLD_ROW.last_used_at,
     });
 
-    expect(removed).toBe(true);
+    expect(removed).toMatchObject({ removed: true, currentExists: false, expired: false });
     expect(statements.some((sql) => /FROM accounts[\s\S]*FOR UPDATE/.test(sql))).toBe(true);
     expect(statements.some((sql) => /FROM current_selections[\s\S]*FOR UPDATE/.test(sql))).toBe(true);
     const deletion = statements.find((sql) => /DELETE FROM accounts/.test(sql)) ?? "";
     expect(deletion).toContain("incarnation_id");
     expect(deletion).toContain("IS NOT DISTINCT FROM");
+    expect(statements.some((sql) => /requested_at < now\(\)/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /incomplete_count/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /OFFSET \$4/.test(sql))).toBe(true);
   });
 
-  test("login cleanup response-loss replay returns the durable result without touching the account", async () => {
+  test("login cleanup response-loss replay returns the durable result after an authoritative row check", async () => {
     const statements: string[] = [];
     const cleanupOperationId = "11111111-1111-4111-8111-111111111111";
+    const input = {
+      cleanupOperationId,
+      cleanupRequestedAt: new Date().toISOString(),
+      expectedIncarnationId: OLD_ROW.incarnation_id,
+      expectedCreatedAt: new Date(OLD_ROW.created_at).toISOString(),
+      expectedEmail: OLD_ROW.email,
+      expectedDisplayName: OLD_ROW.display_name,
+      expectedIdentity: OLD_ROW.identity,
+      expectedCardLast4: OLD_ROW.card_last4,
+      expectedMetadata: OLD_ROW.metadata,
+      expectedDir: OLD_ROW.dir,
+      expectedDescription: OLD_ROW.description,
+      expectedLastUsedAt: OLD_ROW.last_used_at,
+    };
     const tx = {
       async get(sql: string) {
         statements.push(sql);
@@ -188,10 +254,13 @@ describe("AccountsRepo account/current atomicity", () => {
             tool: "claude",
             name: "old",
             target_incarnation_id: OLD_ROW.incarnation_id,
+            request_digest: loginCleanupRequestDigest("claude", "old", input),
             removed: true,
+            completed_at: new Date().toISOString(),
           };
         }
-        throw new Error("durable cleanup replay must not read the account");
+        if (/FROM accounts/.test(sql)) return null;
+        throw new Error("unexpected replay read");
       },
       async execute(sql: string) {
         statements.push(sql);
@@ -205,8 +274,76 @@ describe("AccountsRepo account/current atomicity", () => {
       },
     } as unknown as PoolQueryClient;
 
-    const removed = await new AccountsRepo(client).removeCreated("claude", "old", {
-      cleanupOperationId,
+    const removed = await new AccountsRepo(client).removeCreated("claude", "old", input);
+
+    expect(removed).toMatchObject({ removed: true, expired: false });
+    expect(statements.some((sql) => /FROM accounts[\s\S]*FOR UPDATE/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /DELETE FROM accounts/.test(sql))).toBe(false);
+  });
+
+  test("login cleanup replay rejects reuse with any changed conditional field", async () => {
+    const tx = {
+      async get(sql: string) {
+        if (/account_login_cleanup_operations/.test(sql)) {
+          return {
+            tool: "claude",
+            name: "old",
+            target_incarnation_id: OLD_ROW.incarnation_id,
+            request_digest: "a".repeat(64),
+            removed: true,
+            completed_at: new Date().toISOString(),
+          };
+        }
+        throw new Error("digest-mismatched replay must not read the account");
+      },
+      async execute() {},
+    };
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async transaction<T>(fn: (client: any) => Promise<T>): Promise<T> {
+        return fn(tx);
+      },
+    } as unknown as PoolQueryClient;
+
+    await expect(new AccountsRepo(client).removeCreated("claude", "old", {
+      cleanupOperationId: "11111111-1111-4111-8111-111111111111",
+      cleanupRequestedAt: new Date().toISOString(),
+      expectedIncarnationId: OLD_ROW.incarnation_id,
+      expectedCreatedAt: new Date(OLD_ROW.created_at).toISOString(),
+      expectedEmail: OLD_ROW.email,
+      expectedDisplayName: OLD_ROW.display_name,
+      expectedIdentity: OLD_ROW.identity,
+      expectedCardLast4: OLD_ROW.card_last4,
+      expectedMetadata: OLD_ROW.metadata,
+      expectedDir: OLD_ROW.dir,
+      expectedDescription: "changed-on-replay",
+      expectedLastUsedAt: OLD_ROW.last_used_at,
+    } as never)).rejects.toThrow(/conditional request/);
+  });
+
+  test("expired cleanup replay prunes the journal and never re-executes account deletion", async () => {
+    const statements: string[] = [];
+    const tx = {
+      async get(sql: string) {
+        statements.push(sql);
+        throw new Error("expired cleanup must not read an account or replay row");
+      },
+      async execute(sql: string) {
+        statements.push(sql);
+      },
+    };
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async transaction<T>(fn: (client: any) => Promise<T>): Promise<T> {
+        return fn(tx);
+      },
+    } as unknown as PoolQueryClient;
+
+    const result = await new AccountsRepo(client).removeCreated("claude", "old", {
+      cleanupOperationId: "22222222-2222-4222-8222-222222222222",
+      cleanupRequestedAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000).toISOString(),
       expectedIncarnationId: OLD_ROW.incarnation_id,
       expectedCreatedAt: new Date(OLD_ROW.created_at).toISOString(),
       expectedEmail: OLD_ROW.email,
@@ -219,9 +356,118 @@ describe("AccountsRepo account/current atomicity", () => {
       expectedLastUsedAt: OLD_ROW.last_used_at,
     });
 
-    expect(removed).toBe(true);
-    expect(statements.some((sql) => /FROM accounts/.test(sql))).toBe(false);
+    expect(result).toEqual({ removed: false, currentExists: false, expired: true });
+    expect(statements.some((sql) => /DELETE FROM account_login_cleanup_operations/.test(sql))).toBe(true);
     expect(statements.some((sql) => /DELETE FROM accounts/.test(sql))).toBe(false);
+    expect(statements.some((sql) => /INSERT INTO account_login_cleanup_operations/.test(sql))).toBe(false);
+  });
+
+  test("more than 64 terminal cleanup operations do not block a new login cleanup", async () => {
+    const statements: string[] = [];
+    let transactions = 0;
+    const tx = {
+      async get(sql: string) {
+        statements.push(sql);
+        if (/incomplete_count/.test(sql)) {
+          return {
+            incomplete_count: "0",
+            terminal_count: String(LOGIN_CLEANUP_MAX_PER_TARGET + 1),
+          };
+        }
+        if (/account_login_cleanup_operations/.test(sql)) return null;
+        if (/FROM current_selections/.test(sql)) return null;
+        if (/FROM accounts/.test(sql)) return OLD_ROW;
+        throw new Error("unexpected cleanup read");
+      },
+      async execute(sql: string) {
+        statements.push(sql);
+      },
+      async query(sql: string) {
+        statements.push(sql);
+        return { rows: [OLD_ROW], rowCount: 1 };
+      },
+    };
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async transaction<T>(fn: (client: any) => Promise<T>): Promise<T> {
+        transactions += 1;
+        return fn(tx);
+      },
+    } as unknown as PoolQueryClient;
+
+    const result = await new AccountsRepo(client).removeCreated("claude", "old", {
+      cleanupOperationId: "66666666-6666-4666-8666-666666666666",
+      cleanupRequestedAt: new Date().toISOString(),
+      expectedIncarnationId: OLD_ROW.incarnation_id,
+      expectedCreatedAt: new Date(OLD_ROW.created_at).toISOString(),
+      expectedEmail: OLD_ROW.email,
+      expectedDisplayName: OLD_ROW.display_name,
+      expectedIdentity: OLD_ROW.identity,
+      expectedCardLast4: OLD_ROW.card_last4,
+      expectedMetadata: OLD_ROW.metadata,
+      expectedDir: OLD_ROW.dir,
+      expectedDescription: OLD_ROW.description,
+      expectedLastUsedAt: OLD_ROW.last_used_at,
+    });
+
+    expect(result).toEqual({ removed: true, currentExists: false, expired: false });
+    expect(transactions).toBe(1);
+    expect(statements.some((sql) => /pg_advisory_xact_lock/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /DELETE FROM accounts/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /INSERT INTO account_login_cleanup_operations/.test(sql))).toBe(true);
+    expect(statements.some((sql) => /completed_at IS NOT NULL[\s\S]*OFFSET \$4/.test(sql))).toBe(true);
+  });
+
+  test("incomplete cleanup saturation fails closed without deleting active idempotency state", async () => {
+    const statements: string[] = [];
+    const tx = {
+      async get(sql: string) {
+        statements.push(sql);
+        if (/incomplete_count/.test(sql)) {
+          return {
+            incomplete_count: String(LOGIN_CLEANUP_MAX_PER_TARGET),
+            terminal_count: "0",
+          };
+        }
+        if (/account_login_cleanup_operations/.test(sql)) return null;
+        throw new Error("incomplete saturation must fail before reading the account");
+      },
+      async execute(sql: string) {
+        statements.push(sql);
+      },
+    };
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async transaction<T>(fn: (client: any) => Promise<T>): Promise<T> {
+        return fn(tx);
+      },
+    } as unknown as PoolQueryClient;
+
+    const cleanup = new AccountsRepo(client).removeCreated("claude", "old", {
+      cleanupOperationId: "77777777-7777-4777-8777-777777777777",
+      cleanupRequestedAt: new Date().toISOString(),
+      expectedIncarnationId: OLD_ROW.incarnation_id,
+      expectedCreatedAt: new Date(OLD_ROW.created_at).toISOString(),
+      expectedEmail: OLD_ROW.email,
+      expectedDisplayName: OLD_ROW.display_name,
+      expectedIdentity: OLD_ROW.identity,
+      expectedCardLast4: OLD_ROW.card_last4,
+      expectedMetadata: OLD_ROW.metadata,
+      expectedDir: OLD_ROW.dir,
+      expectedDescription: OLD_ROW.description,
+      expectedLastUsedAt: OLD_ROW.last_used_at,
+    });
+
+    await expect(cleanup).rejects.toThrow(/too many incomplete operations/);
+    expect(statements.some((sql) => /DELETE FROM accounts/.test(sql))).toBe(false);
+    expect(statements.some((sql) => /INSERT INTO account_login_cleanup_operations/.test(sql))).toBe(false);
+    const journalDeletes = statements.filter(
+      (sql) => /DELETE FROM account_login_cleanup_operations/.test(sql),
+    );
+    expect(journalDeletes.length).toBeGreaterThanOrEqual(2);
+    expect(journalDeletes.every((sql) => /completed_at IS NOT NULL/.test(sql))).toBe(true);
   });
 
   test("login email redetection is a no-op after a concurrent same-incarnation edit", async () => {

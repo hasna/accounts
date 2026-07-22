@@ -82,6 +82,24 @@ const storeSnapshots = new WeakMap<object, string | null>();
 let storeLockDepth = 0;
 const REGISTRY_RECLAIM_CLAIM_STALE_MS = 1_000;
 
+function fsyncDirectoryIfSupported(path: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // Directory fsync is unavailable on Windows and some filesystems. The
+    // registry file itself remains fsynced; do not claim power-loss durability
+    // for the rename on platforms that reject the parent-directory sync.
+    if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES", "EISDIR"].includes(code ?? "")) {
+      throw error;
+    }
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 function delayRegistryLockInitializationForTest(): void {
   if (process.env.NODE_ENV !== "test") return;
   const marker = process.env.ACCOUNTS_TEST_STORE_LOCK_INIT_MARKER;
@@ -527,6 +545,7 @@ export function captureMachineProfileAuthSlotExpectation(
 export function reconcileMachineProfileCreate(
   profile: Pick<NormalizableProfile, "tool" | "name" | "createdAt" | "dir">,
   expected: MachineProfileAuthSlotExpectation,
+  plannedAuthIdentity: string = randomUUID(),
 ): void {
   withStoreLock(() => {
     const store = parseStoreFile();
@@ -539,7 +558,7 @@ export function reconcileMachineProfileCreate(
     ) {
       return;
     }
-    store.profileAuthRevisions[authKey] = randomUUID();
+    store.profileAuthRevisions[authKey] = plannedAuthIdentity;
     delete store.profileAuthCommitRevisions[authKey];
     store.profileAuthIncarnations[authKey] = profileAuthIncarnation(profile);
     saveStoreLocked(store);
@@ -795,7 +814,10 @@ function saveStoreLocked(store: Store): void {
     throw new AccountsError("accounts registry changed concurrently; retry the operation");
   }
   assertSafeWritePath(path, { mustStayUnder: accountsHome() });
-  mkdirSync(join(path, ".."), { recursive: true });
+  const parent = join(path, "..");
+  const parentExisted = existsSync(parent);
+  mkdirSync(parent, { recursive: true });
+  if (!parentExisted) fsyncDirectoryIfSupported(join(parent, ".."));
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   assertSafeWritePath(temp, { mustStayUnder: accountsHome() });
   let fd: number | undefined;
@@ -808,6 +830,7 @@ function saveStoreLocked(store: Store): void {
     closeSync(fd);
     fd = undefined;
     renameSync(temp, path);
+    fsyncDirectoryIfSupported(parent);
     storeSnapshots.set(store, serialized);
   } finally {
     if (fd !== undefined) closeSync(fd);

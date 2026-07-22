@@ -114,6 +114,7 @@ const removeCreatedAccountFields = {
 /** Response-loss-safe cleanup request used only on the new-only operation route. */
 export const removeCreatedAccountSchema = z.object({
   cleanupOperationId: z.string().uuid(),
+  cleanupRequestedAt: z.string().datetime(),
   ...removeCreatedAccountFields,
 }).strict();
 export type RemoveCreatedAccountInput = z.infer<typeof removeCreatedAccountSchema>;

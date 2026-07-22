@@ -11,8 +11,13 @@ This change consolidates registry access behind `AccountsStore`:
 - Machine-local profile directories, applied pointers, and launch processes stay local.
 - Profile creation and conditional failed-login cleanup share a machine-local
   directory lease so cleanup cannot purge a same-name recreation. Once exact
-  rollback ownership is proven, managed-directory removal is journaled locally;
-  a later authorized login can finish a purge interrupted after registry commit.
+  rollback ownership is proven, a minimal operation/incarnation cleanup intent
+  is published before profile, directory, server, or tool-lock mutation and is
+  evolved as exact generations become known. Marker, intent, and local registry
+  files are fsynced before atomic rename, and the parent directory is fsynced where the
+  platform/filesystem supports directory fsync. This does not claim power-loss
+  durability on platforms that reject directory fsync. A later authorized login
+  can finish an interrupted conditional rollback.
 - Cloud custom tool definitions hydrate a process-only cache. Readiness, health,
   list, and lookup operations do not create or rewrite `accounts.json`.
 
@@ -63,7 +68,15 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    `LOGIN NOINHERIT` roles with no elevated attributes or memberships. The
    migration owner owns the Accounts schema and its objects and is used only by
    `accounts-migrate`; the other role is used only by `accounts-serve`.
-3. Run `accounts-migrate` with the owner DSN and
+3. **Deployment is blocked for this branch. Do not run `accounts-migrate` or
+   deploy source containing migration `0010`.** Critical task
+   `f799e8a5-fc9e-4735-bfb9-8a0c17b90b25` must first make SQL execution and the
+   checksum-ledger write atomic under the same advisory lock. Source merge does not apply migrations,
+   and this branch's executable migrator rejects a
+   non-dry-run plan while `0010` is pending. A dry run may inspect the blocked
+   plan without applying it.
+4. After that critical task lands and this explicit gate is removed in a
+   reviewed follow-up, run `accounts-migrate` with the owner DSN and
    `HASNA_ACCOUNTS_RUNTIME_ROLE=<accounts-serve-role>`. Migration
    `0003` is additive and creates `custom_tools`. Migration `0004` copies
    orphan current selections to `current_selection_orphan_archive`, removes
@@ -76,17 +89,17 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    by response-loss-safe login activation. The ledger records both completed
    activations and rollback-first terminal cancellations, so a delayed
    activation cannot commit after its rollback has already returned. The migrator
-   applies migration `0010` for the append-only cleanup-operation ledger used
+   applies migration `0010` for the bounded cleanup-operation journal used
    by response-loss-safe conditional removal of a login-created account. New
    clients use a new-only cleanup route. The migrator reapplies and verifies
    the runtime grant contract after migrations and on a
    current-schema no-op run. Inspect and retain
    the orphan archive for reconciliation; do not treat it as disposable
    migration scratch state.
-4. Deploy `accounts-serve` with the DML-only role DSN and verify `/health`,
+5. Deploy `accounts-serve` with the DML-only role DSN and verify `/health`,
    `/ready`, `/version`,
    `GET /v1/tools`, and the OpenAPI document.
-5. Roll out new clients only after the server is ready.
+6. Roll out new clients only after the server is ready.
 
 Server-before-client is required for `accounts rename`, `accounts tools add`,
 and `accounts tools remove`. A new client connected to an older server returns
@@ -126,9 +139,15 @@ and tables:
 - `USAGE` on the Accounts schema, without `CREATE`.
 - `SELECT, INSERT, UPDATE, DELETE` on `accounts`, `current_selections`, and
   `custom_tools`.
-- `SELECT, INSERT` on the append-only `current_login_operations` and
-  `account_login_cleanup_operations` idempotency ledgers; no `UPDATE` or
-  `DELETE`.
+- `SELECT, INSERT` on the append-only `current_login_operations` idempotency
+  ledger; no `UPDATE` or `DELETE`.
+- `SELECT, INSERT, DELETE` only on the bounded
+  `account_login_cleanup_operations` journal. Runtime deletion is limited to
+  expired rows and the oldest terminal results beyond 64 per target/operation
+  class. Incomplete rows are never deleted; saturation by incomplete ownership
+  fails closed. Replaying an evicted terminal result safely reruns the fully
+  conditional delete and the client still performs its authoritative current-row
+  check before local purge; no `UPDATE`, `TRUNCATE`, `REFERENCES`, or `TRIGGER`.
 - `SELECT, INSERT, DELETE` on `custom_tool_tombstones`; no `UPDATE`,
   `TRUNCATE`, `REFERENCES`, or `TRIGGER`.
 - `SELECT` on `schema_migrations` and `api_keys` for readiness and
@@ -152,10 +171,10 @@ manifest are revalidated.
 | Client | Server | Result |
 | --- | --- | --- |
 | Old | Old | Existing account and selection operations are unchanged. |
-| Old | New | Compatible after migrations through 0010. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
+| Old | New | Compatibility is testable after migrations through 0010, but deployment remains blocked by critical task `f799e8a5-fc9e-4735-bfb9-8a0c17b90b25`. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
 | New | Old | Existing non-login operations work, including Account reads whose legacy response omits `incarnationId` or `email`. Minimal legacy built-in Tool responses are accepted. Login preflight, rename, custom-tool mutations, conditional created-profile cleanup, and generation-owned failed-login rollback require a server upgrade and fail with an actionable error. Transactional activation and rollback use new-only routes, so old replicas reject rather than partially execute them. |
 | New | New before migrations 0003 through 0010 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003 through 0010 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, incarnation-owned profile-field rollback, response-loss-safe conditional cleanup of unchanged login-created profiles, target-incarnation-bound operation-owned login rollback with rollback-first cancellation, rename/remove/current updates, and pointer reconciliation are available. |
+| New | New after migrations 0003 through 0010 | Not deploy-approved on this branch. After the critical migration-runner task and a fresh review remove the gate, the tested runtime contract includes full AccountsStore routing, durable tool lifecycle state, conditional created-profile cleanup, rollback fencing, and pointer reconciliation. |
 
 ## Rollback And Forward Fix
 
@@ -209,6 +228,12 @@ manifest are revalidated.
   the owner, reconnects as the app role, proves normal account/custom-tool
   operations, and runs both forced raw `INSERT accounts` versus
   `DELETE custom_tools` orderings without `AccountsRepo` locks.
+- Cleanup journal tests bind replay to a canonical SHA-256 digest of the entire
+  conditional request, recheck the current account row before local purge,
+  reject expired destructive replay, prune expired journal rows, and cap the
+  `remove-created` operation class per `(tool,name)` target. Journal rows store
+  the digest, routing identifiers, result, and timestamp—not duplicate raw
+  conditional metadata or credential material.
 - Pull requests install gitleaks `v8.30.1` from its checksum-pinned official
   Linux x64 archive and scan the complete base-to-head commit range with full
   redaction. The scan job has read-only contents permission, persists no

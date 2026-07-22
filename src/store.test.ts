@@ -4,10 +4,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
-import { resolveStore, type AccountsStore } from "./lib/store.js";
+import {
+  resolveStore,
+  setLoginCleanupFaultInjectorForTests,
+  type AccountsStore,
+  type LoginCleanupFaultPoint,
+} from "./lib/store.js";
 import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
-import { loginToolChoices, prepareLogin, rollbackLoginPreparation } from "./lib/login.js";
+import {
+  commitLoginPreparation,
+  loginToolChoices,
+  prepareLogin,
+  rollbackLoginPreparation,
+} from "./lib/login.js";
 import { importProfile } from "./lib/import-profile.js";
 import {
   loadMachineStore,
@@ -215,6 +225,7 @@ describe("ApiStore routes registry ops to /v1", () => {
       delete process.env.ACCOUNTS_STORE_PATH;
     });
     afterEach(() => {
+      setLoginCleanupFaultInjectorForTests();
       clearCustomToolsCache();
       rmSync(home, { recursive: true, force: true });
       delete process.env.ACCOUNTS_HOME;
@@ -404,7 +415,7 @@ describe("ApiStore routes registry ops to /v1", () => {
         }
         if (call.method === "POST" && call.url.endsWith("/accounts/acme/response-loss/login/remove-created-operation")) {
           committed = undefined;
-          return { status: 200, body: { removed: true } };
+          return { status: 200, body: { removed: true, currentExists: false, expired: false } };
         }
         return { status: 500, body: { error: "unexpected request" } };
       });
@@ -491,7 +502,7 @@ describe("ApiStore routes registry ops to /v1", () => {
         }
         if (call.method === "POST" && call.url.endsWith("/accounts/acme/failed/login/remove-created-operation")) {
           created = false;
-          return { status: 200, body: { removed: true } };
+          return { status: 200, body: { removed: true, currentExists: false, expired: false } };
         }
         return { status: 500, body: { error: "unexpected request" } };
       });
@@ -541,7 +552,7 @@ describe("ApiStore routes registry ops to /v1", () => {
         }
         if (call.method === "POST" && call.url.endsWith("/accounts/acme/deleted-before-cleanup/login/remove-created-operation")) {
           created = false;
-          return { status: 200, body: { removed: false } };
+          return { status: 200, body: { removed: false, currentExists: false, expired: false } };
         }
         return { status: 500, body: { error: "unexpected request" } };
       });
@@ -609,6 +620,170 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(cleanupAttempts).toBeGreaterThan(1);
       expect(cleanupBodies.every((body) => JSON.stringify(body) === JSON.stringify(cleanupBodies[0]))).toBe(true);
       expect(existsSync(profile.dir)).toBe(false);
+    });
+
+    test("cleanup replay preserves a replacement server incarnation and its replacement-owned file", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const dir = join(home, "profiles", "acme", "cleanup-aba-replacement");
+      const original = {
+        tool: "acme",
+        name: "cleanup-aba-replacement",
+        dir,
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      };
+      const replacement = {
+        ...original,
+        createdAt: "2020-01-02T00:00:00Z",
+        incarnationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        description: "replacement",
+      };
+      let current: typeof original | typeof replacement | undefined;
+      let cleanupAttempts = 0;
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/cleanup-aba-replacement")) {
+          return current
+            ? { status: 200, body: current }
+            : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          original.incarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
+          current = original;
+          return { status: 201, body: original };
+        }
+        if (
+          call.method === "POST" &&
+          call.url.endsWith("/accounts/acme/cleanup-aba-replacement/login/remove-created-operation")
+        ) {
+          cleanupAttempts += 1;
+          if (cleanupAttempts === 1) {
+            current = replacement;
+            writeFileSync(join(dir, "replacement-owned.json"), "{}\n", { mode: 0o600 });
+            throw new TypeError("simulated committed cleanup response loss");
+          }
+          // Durable replay returns the old operation result. The client must
+          // still consult the authoritative current row before local purge.
+          return { status: 200, body: { removed: true, currentExists: true, expired: false } };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const preparation = await prepareLogin("cleanup-aba-replacement", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+
+      await rollbackLoginPreparation(preparation, store);
+
+      expect(cleanupAttempts).toBeGreaterThan(1);
+      expect(current).toEqual(replacement);
+      expect(existsSync(dir)).toBe(true);
+      expect(existsSync(join(dir, "replacement-owned.json"))).toBe(true);
+    });
+
+    test("expired cleanup replay preserves local directory state without a destructive retry", async () => {
+      const profile = {
+        tool: "acme",
+        name: "expired-cleanup",
+        dir: join(home, "profiles", "acme", "expired-cleanup"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      };
+      mkdirSync(profile.dir, { recursive: true });
+      writeFileSync(join(profile.dir, "preserve.json"), "{}\n", { mode: 0o600 });
+      const { calls, fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/login/remove-created-operation")) {
+          return {
+            status: 200,
+            body: { removed: false, currentExists: false, expired: true },
+          };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      const result = await store.removeProfileIncarnation!(
+        profile,
+        {
+          cleanupOperationId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          cleanupRequestedAt: "2020-01-01T00:00:00.000Z",
+        },
+        { tool: profile.tool, purge: true },
+      );
+
+      expect(result).toBeUndefined();
+      expect(existsSync(join(profile.dir, "preserve.json"))).toBe(true);
+      expect(calls.filter((call) => call.method === "GET")).toHaveLength(0);
+    });
+
+    test("API preparation intent recovers crashes before and after profile creation", async () => {
+      for (const point of ["pre-create", "post-create"] as const) {
+        const name = `api-${point}`;
+        const dir = join(home, "profiles", "acme", name);
+        const executableTool = { ...acme, bin: process.execPath };
+        let current: Record<string, unknown> | undefined;
+        const { fetchImpl } = mockFetch((call) => {
+          if (call.url.endsWith("/tools")) {
+            return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+          }
+          if (call.method === "GET" && call.url.endsWith(`/accounts/acme/${name}`)) {
+            return current
+              ? { status: 200, body: current }
+              : { status: 404, body: { error: "not found" } };
+          }
+          if (call.method === "GET" && call.url.endsWith("/current")) {
+            return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+          }
+          if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+            current = {
+              tool: "acme",
+              name,
+              dir,
+              createdAt: "2020-01-01T00:00:00Z",
+              incarnationId: String(
+                (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+              ),
+            };
+            return { status: 201, body: current };
+          }
+          if (
+            call.method === "POST" &&
+            call.url.endsWith(`/accounts/acme/${name}/login/remove-created-operation`)
+          ) {
+            current = undefined;
+            return {
+              status: 200,
+              body: { removed: true, currentExists: false, expired: false },
+            };
+          }
+          return { status: 500, body: { error: "unexpected request" } };
+        });
+        const store = resolveStore(cloudEnv, { fetchImpl });
+        setLoginCleanupFaultInjectorForTests((candidate) => {
+          if (candidate === point) throw new Error(`crash:${point}`);
+        });
+
+        await expect(prepareLogin(name, {
+          toolId: "acme",
+          env: process.env,
+          store,
+        })).rejects.toThrow(`injected login cleanup fault at ${point}`);
+        setLoginCleanupFaultInjectorForTests();
+        await store.reconcileInterruptedLoginCleanup!(name, "acme");
+
+        expect(current).toBeUndefined();
+        expect(existsSync(dir)).toBe(false);
+      }
     });
 
     test("cleanup response loss fails closed on a legacy replica response missing the rollback fence", async () => {
@@ -706,6 +881,7 @@ describe("ApiStore routes registry ops to /v1", () => {
         store,
       });
       if (first.status !== "ready") throw new Error("expected ready login preparation");
+      commitLoginPreparation(first, store);
       writeFileSync(join(dir, "stale-auth.json"), "{}\n", { mode: 0o600 });
       writeFileSync(join(dir, ".accounts-login-cleanup.json"), JSON.stringify({
         version: 1,
@@ -756,7 +932,7 @@ describe("ApiStore routes registry ops to /v1", () => {
           return { status: 201, body: profile };
         }
         if (call.method === "POST" && call.url.endsWith("/accounts/acme/changed/login/remove-created-operation")) {
-          return { status: 200, body: { removed: false } };
+          return { status: 200, body: { removed: false, currentExists: true, expired: false } };
         }
         return { status: 500, body: { error: "unexpected request" } };
       });
@@ -820,7 +996,7 @@ describe("ApiStore routes registry ops to /v1", () => {
           cleanupStarted();
           await cleanupReleasePromise;
           generation = 0;
-          return { status: 200, body: { removed: true } };
+          return { status: 200, body: { removed: true, currentExists: false, expired: false } };
         }
         return { status: 500, body: { error: "unexpected request" } };
       });
@@ -866,12 +1042,15 @@ describe("ApiStore routes registry ops to /v1", () => {
       before.profileAuthIncarnations[authKey] = profileAuthIncarnation(profile);
       saveStore(before);
       const { fetchImpl } = mockFetch((call) => {
+        if (call.method === "GET" && call.url.endsWith("/accounts/claude/claude-auth-race")) {
+          return { status: 404, body: { error: "not found" } };
+        }
         if (call.url.endsWith("/accounts/claude/claude-auth-race/login/remove-created-operation")) {
           const concurrent = loadMachineStore();
           concurrent.profileAuthRevisions[authKey] = "concurrent-auth";
           concurrent.profileAuthCommitRevisions[authKey] = "concurrent-commit";
           saveStore(concurrent);
-          return { status: 200, body: { removed: true } };
+          return { status: 200, body: { removed: true, currentExists: false, expired: false } };
         }
         return { status: 500, body: { error: "unexpected request" } };
       });
@@ -1390,6 +1569,7 @@ describe("LocalStore reads/writes the on-box registry", () => {
     delete process.env.HASNA_ACCOUNTS_API_KEY;
   });
   afterEach(() => {
+    setLoginCleanupFaultInjectorForTests();
     rmSync(home, { recursive: true, force: true });
     delete process.env.ACCOUNTS_HOME;
     if (previousUrl === undefined) delete process.env.HASNA_ACCOUNTS_API_URL;
@@ -1477,12 +1657,15 @@ describe("LocalStore reads/writes the on-box registry", () => {
       store,
     });
     if (first.status !== "ready") throw new Error("expected ready login preparation");
+    commitLoginPreparation(first, store);
     writeFileSync(join(first.profile.dir, "stale-auth.json"), "{}\n", { mode: 0o600 });
     writeFileSync(join(first.profile.dir, ".accounts-login-cleanup.json"), JSON.stringify({
       version: 1,
-      cleanupOperationId: "88888888-8888-4888-8888-888888888888",
+      cleanupOperationId: first.cleanupOperationId,
       profile: first.profile,
       ownership: {
+        cleanupOperationId: first.cleanupOperationId,
+        cleanupRequestedAt: first.cleanupRequestedAt,
         toolLockRevision: first.toolLockRevision,
         previousToolLock: first.previousToolLock,
         previousToolLockRevision: first.previousToolLockRevision,
@@ -1526,6 +1709,7 @@ describe("LocalStore reads/writes the on-box registry", () => {
       store,
     });
     if (first.status !== "ready") throw new Error("expected ready login preparation");
+    commitLoginPreparation(first, store);
     writeFileSync(join(first.profile.dir, "stale-auth.json"), "{}\n", { mode: 0o600 });
     writeFileSync(join(first.profile.dir, ".accounts-login-cleanup.json"), JSON.stringify({
       version: 1,
@@ -1549,6 +1733,112 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect(second.profile.incarnationId).not.toBe(first.profile.incarnationId);
     expect(existsSync(join(second.profile.dir, "stale-auth.json"))).toBe(false);
     expect(existsSync(join(second.profile.dir, ".accounts-login-cleanup.json"))).toBe(false);
+  });
+
+  test("durable preparation intent recovers every local preparation and rollback crash boundary", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const tool = {
+      id: "intent-tool",
+      label: "Intent Tool",
+      envVar: "INTENT_TOOL_HOME",
+      defaultDir: join(home, "intent-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(tool);
+    const preparationFaults: LoginCleanupFaultPoint[] = ["pre-create", "post-create", "post-lock"];
+    const rollbackFaults: LoginCleanupFaultPoint[] = [
+      "post-delete",
+      "post-lock-restore",
+      "pre-purge",
+    ];
+
+    for (const point of [...preparationFaults, ...rollbackFaults]) {
+      const name = `intent-${point}`;
+      await store.addProfile({ name, tool: "codex" });
+      await store.useProfile(name, "codex");
+      const before = loadMachineStore();
+      const previousRevision = before.toolLockRevisions[name];
+      setLoginCleanupFaultInjectorForTests((candidate) => {
+        if (candidate === point) throw new Error(`crash:${point}`);
+      });
+
+      if (preparationFaults.includes(point)) {
+        await expect(prepareLogin(name, {
+          toolId: tool.id,
+          env: process.env,
+          store,
+        })).rejects.toThrow(`injected login cleanup fault at ${point}`);
+      } else {
+        const prepared = await prepareLogin(name, {
+          toolId: tool.id,
+          env: process.env,
+          store,
+        });
+        if (prepared.status !== "ready") throw new Error("expected ready login preparation");
+        writeFileSync(join(prepared.profile.dir, "interrupted.json"), "{}\n", { mode: 0o600 });
+        await expect(rollbackLoginPreparation(prepared, store)).rejects.toThrow(
+          `injected login cleanup fault at ${point}`,
+        );
+      }
+
+      setLoginCleanupFaultInjectorForTests();
+      await store.reconcileInterruptedLoginCleanup!(name, tool.id);
+      const recovered = loadMachineStore();
+      expect({
+        point,
+        createdProfileSurvived: recovered.profiles.some(
+          (profile) => profile.name === name && profile.tool === tool.id,
+        ),
+      }).toEqual({ point, createdProfileSurvived: false });
+      expect(recovered.profiles.some((profile) => profile.name === name && profile.tool === "codex")).toBe(true);
+      expect(recovered.toolLocks[name]).toBe("codex");
+      expect(recovered.toolLockRevisions[name]).toBe(previousRevision);
+      expect(existsSync(join(home, "profiles", tool.id, name))).toBe(false);
+    }
+  });
+
+  test("a concurrent same-target login cannot reconcile a live preparation intent", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const tool = {
+      id: "live-intent-tool",
+      label: "Live Intent Tool",
+      envVar: "LIVE_INTENT_TOOL_HOME",
+      defaultDir: join(home, "live-intent-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(tool);
+    const first = await prepareLogin("live-intent", {
+      toolId: tool.id,
+      env: process.env,
+      store,
+    });
+    if (first.status !== "ready") throw new Error("expected ready login preparation");
+    writeFileSync(join(first.profile.dir, "first-owned.json"), "{}\n", { mode: 0o600 });
+    const before = loadMachineStore();
+
+    await expect(prepareLogin("live-intent", {
+      toolId: tool.id,
+      env: process.env,
+      store,
+    })).rejects.toThrow(/login preparation is still in progress/);
+
+    expect(await store.getProfile("live-intent", tool.id)).toEqual(first.profile);
+    expect(existsSync(join(first.profile.dir, "first-owned.json"))).toBe(true);
+    const after = loadMachineStore();
+    expect(after.toolLocks["live-intent"]).toBe(before.toolLocks["live-intent"]);
+    expect(after.toolLockRevisions["live-intent"]).toBe(
+      before.toolLockRevisions["live-intent"],
+    );
+
+    await rollbackLoginPreparation(first, store);
+    expect(await store.findProfile("live-intent", tool.id)).toBeUndefined();
+    expect(existsSync(first.profile.dir)).toBe(false);
   });
 
   test("legacy three-argument restoreCurrent still restores the named prior profile", async () => {

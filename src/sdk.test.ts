@@ -70,4 +70,18 @@ describe("accounts SDK", () => {
     const { code } = renderSdk();
     expect(code).toContain('"expectedEmail": string | null');
   });
+
+  test("generated cleanup contract carries bounded replay time and authoritative row state", () => {
+    const schemas = buildOpenApiDoc("1.2.3").components.schemas;
+    expect(schemas.RemoveCreatedAccountInput.required).toContain("cleanupRequestedAt");
+    expect(schemas.RemoveCreatedAccountResult.required).toEqual([
+      "removed",
+      "currentExists",
+      "expired",
+    ]);
+    const { code } = renderSdk();
+    expect(code).toContain('"cleanupRequestedAt": string');
+    expect(code).toContain('"currentExists": boolean');
+    expect(code).toContain('"expired": boolean');
+  });
 });

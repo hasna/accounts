@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { accountsMigrations, resolveMigrationsDir, APP_MIGRATION_FILES } from "./migrations.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  accountsMigrations,
+  assertAccountsMigrationDeploySafe,
+  resolveMigrationsDir,
+  APP_MIGRATION_FILES,
+} from "./migrations.js";
 
 describe("accounts migrations", () => {
   test("resolves the migrations dir and loads the app SQL files", () => {
@@ -74,5 +81,31 @@ describe("accounts migrations", () => {
       /CREATE TABLE IF NOT EXISTS account_login_cleanup_operations/,
     );
     expect(cleanupOperations?.sql).toMatch(/operation_id UUID PRIMARY KEY/);
+    expect(cleanupOperations?.sql).toMatch(/request_digest/);
+    expect(cleanupOperations?.sql).toMatch(/operation_class/);
+    expect(cleanupOperations?.sql).toMatch(/requested_at TIMESTAMPTZ NOT NULL/);
+    expect(cleanupOperations?.sql).toMatch(/completed_at TIMESTAMPTZ/);
+    expect(cleanupOperations?.sql).toMatch(/completed_at IS NULL AND removed IS NULL/);
+  });
+
+  test("deployment remains blocked while cleanup migration atomicity is unresolved", () => {
+    expect(() => assertAccountsMigrationDeploySafe({
+      ledgerPresent: true,
+      pending: ["accounts_0010_login_cleanup_operations"],
+      unknown: [],
+      checksumMismatches: [],
+    })).toThrow(/f799e8a5-fc9e-4735-bfb9-8a0c17b90b25/);
+    const deploymentGuide = readFileSync(
+      join(process.cwd(), "docs", "STORAGE_STABILIZATION.md"),
+      "utf8",
+    );
+    expect(deploymentGuide).toContain("Do not run `accounts-migrate`");
+    expect(deploymentGuide).toContain("Source merge does not apply migrations");
+    expect(deploymentGuide).toContain("f799e8a5-fc9e-4735-bfb9-8a0c17b90b25");
+    const migrator = readFileSync(join(process.cwd(), "src", "server", "migrate.ts"), "utf8");
+    const gate = migrator.indexOf("assertAccountsMigrationDeploySafe(status);");
+    const apply = migrator.indexOf("const ledger = new MigrationLedger");
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(apply).toBeGreaterThan(gate);
   });
 });

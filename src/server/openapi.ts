@@ -174,6 +174,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           type: "object",
           required: [
             "cleanupOperationId",
+            "cleanupRequestedAt",
             "expectedIncarnationId",
             "expectedCreatedAt",
             "expectedEmail",
@@ -187,6 +188,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           ],
           properties: {
             cleanupOperationId: { type: "string", format: "uuid" },
+            cleanupRequestedAt: { type: "string", format: "date-time" },
             expectedIncarnationId: { type: "string", format: "uuid" },
             expectedCreatedAt: { type: "string", format: "date-time" },
             expectedEmail: { type: "string", format: "email", nullable: true },
@@ -202,8 +204,12 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
         },
         RemoveCreatedAccountResult: {
           type: "object",
-          required: ["removed"],
-          properties: { removed: { type: "boolean" } },
+          required: ["removed", "currentExists", "expired"],
+          properties: {
+            removed: { type: "boolean" },
+            currentExists: { type: "boolean" },
+            expired: { type: "boolean" },
+          },
         },
         CurrentSelection: {
           type: "object",

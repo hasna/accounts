@@ -9,6 +9,7 @@
 import { createCloudPoolFromEnv, MigrationLedger, resolveStorageMode } from "../generated/storage-kit/index.js";
 import {
   accountsMigrations,
+  assertAccountsMigrationDeploySafe,
   assertMigrationStatusCompatible,
   readMigrationStatus,
 } from "./migrations.js";
@@ -62,6 +63,7 @@ async function main(): Promise<void> {
       );
       return;
     }
+    assertAccountsMigrationDeploySafe(status);
     // Pending work exists -> apply via the checksum-guarded ledger (owner role
     // required for the CREATE/DDL).
     const ledger = new MigrationLedger(client, migrations);

@@ -395,7 +395,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       cleanup_operation_select: true,
       cleanup_operation_insert: true,
       cleanup_operation_update: false,
-      cleanup_operation_delete: false,
+      cleanup_operation_delete: true,
       tombstone_select: true,
       tombstone_insert: true,
       tombstone_delete: true,

@@ -145,11 +145,42 @@ export interface ProfileToolLockClaim {
   previousProfileIncarnation?: string;
 }
 
-/** Claim a profile-name tool lock and capture the displaced lock atomically. */
-export function claimProfileToolLock(name: string, toolId: string): ProfileToolLockClaim {
+/** Capture the exact lock state and choose its replacement generation without writing. */
+export function planProfileToolLockClaim(name: string, toolId: string): ProfileToolLockClaim {
   getTool(toolId);
   const nameCheck = profileNameSchema.safeParse(name);
   if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
+  return withStoreLock(() => {
+    const store = loadStore();
+    if (!store.profiles.some((profile) => profile.name === name && profile.tool === toolId)) {
+      throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
+    }
+    const previousTool = store.toolLocks[name];
+    const previousRevision = store.toolLockRevisions[name];
+    const previousProfile = previousTool
+      ? store.profiles.find((profile) => profile.name === name && profile.tool === previousTool)
+      : undefined;
+    return {
+      revision: randomUUID(),
+      ...(previousTool ? { previousTool } : {}),
+      ...(previousRevision ? { previousRevision } : {}),
+      ...(previousProfile
+        ? { previousProfileIncarnation: profileAuthIncarnation(previousProfile) }
+        : {}),
+    };
+  });
+}
+
+/** Claim a profile-name tool lock and capture the displaced lock atomically. */
+export function claimProfileToolLock(
+  name: string,
+  toolId: string,
+  planned?: ProfileToolLockClaim,
+): ProfileToolLockClaim {
+  getTool(toolId);
+  const nameCheck = profileNameSchema.safeParse(name);
+  if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
+  const claim = planned ?? planProfileToolLockClaim(name, toolId);
   return withStoreLock(() => {
     const store = loadStore();
     if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
@@ -160,7 +191,15 @@ export function claimProfileToolLock(name: string, toolId: string): ProfileToolL
     const previousProfile = previousTool
       ? store.profiles.find((profile) => profile.name === name && profile.tool === previousTool)
       : undefined;
-    const revision = randomUUID();
+    if (
+      previousTool !== claim.previousTool ||
+      previousRevision !== claim.previousRevision ||
+      (previousProfile ? profileAuthIncarnation(previousProfile) : undefined) !==
+        claim.previousProfileIncarnation
+    ) {
+      throw new AccountsError("profile tool lock changed concurrently; retry the operation");
+    }
+    const revision = claim.revision;
     store.toolLocks[name] = toolId;
     store.toolLockRevisions[name] = revision;
     saveStore(store);
@@ -227,6 +266,8 @@ export interface AddOptions {
   metadata?: ProfileMetadata;
   dir?: string;
   description?: string;
+  /** Internal rollback fence fixed before login profile/directory mutation. */
+  incarnationId?: string;
 }
 
 export function addProfile(opts: AddOptions): Profile {
@@ -264,7 +305,7 @@ export function addProfile(opts: AddOptions): Profile {
     dir,
     ...(opts.description ? { description: opts.description } : {}),
     createdAt: nowIso(),
-    incarnationId: randomUUID(),
+    incarnationId: opts.incarnationId ?? randomUUID(),
   };
 
   store.profiles.push(profile);

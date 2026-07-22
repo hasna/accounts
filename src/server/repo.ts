@@ -7,6 +7,7 @@
 // requires the account to exist and stamps last_used_at.
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
 import type {
@@ -46,6 +47,64 @@ export interface LoginCurrentSelection extends CurrentSelection {
   previousTargetLastUsedAt?: string;
 }
 
+export interface CreatedAccountCleanupResult {
+  removed: boolean;
+  /** Authoritative same-transaction observation after applying/replaying the operation. */
+  currentExists: boolean;
+  /** True when the caller's bounded replay window has elapsed; no account mutation ran. */
+  expired: boolean;
+}
+
+export const LOGIN_CLEANUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+export const LOGIN_CLEANUP_MAX_PER_TARGET = 64;
+const LOGIN_CLEANUP_FUTURE_SKEW_MS = 5 * 60 * 1_000;
+const LOGIN_CLEANUP_OPERATION_CLASS = "remove-created";
+
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new AccountsError("login cleanup request contains a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(",")}}`;
+  }
+  throw new AccountsError("login cleanup request contains an unsupported value");
+}
+
+/** Bind one operation id to the complete canonical conditional cleanup request. */
+export function loginCleanupRequestDigest(
+  tool: string,
+  name: string,
+  input: RemoveCreatedAccountInput,
+): string {
+  const canonical = canonicalJson({
+    cleanupOperationId: input.cleanupOperationId,
+    cleanupRequestedAt: new Date(input.cleanupRequestedAt).toISOString(),
+    expectedCardLast4: input.expectedCardLast4,
+    expectedCreatedAt: new Date(input.expectedCreatedAt).toISOString(),
+    expectedDescription: input.expectedDescription,
+    expectedDir: input.expectedDir,
+    expectedDisplayName: input.expectedDisplayName,
+    expectedEmail: input.expectedEmail,
+    expectedIdentity: input.expectedIdentity,
+    expectedIncarnationId: input.expectedIncarnationId,
+    expectedLastUsedAt: input.expectedLastUsedAt
+      ? new Date(input.expectedLastUsedAt).toISOString()
+      : null,
+    expectedMetadata: input.expectedMetadata,
+    name,
+    operationClass: LOGIN_CLEANUP_OPERATION_CLASS,
+    tool,
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
 /** The storage surface the HTTP handler depends on (implemented by AccountsRepo). */
 export interface AccountsStore {
   list(tool?: string): Promise<Account[]>;
@@ -55,7 +114,11 @@ export interface AccountsStore {
   update(tool: string, name: string, input: UpdateAccountInput): Promise<Account>;
   updateForLogin(tool: string, name: string, input: LoginUpdateAccountInput): Promise<Account>;
   restoreProfile(tool: string, name: string, input: RestoreAccountInput): Promise<Account>;
-  removeCreated(tool: string, name: string, input: RemoveCreatedAccountInput): Promise<boolean>;
+  removeCreated(
+    tool: string,
+    name: string,
+    input: RemoveCreatedAccountInput,
+  ): Promise<CreatedAccountCleanupResult>;
   rename(tool: string, oldName: string, newName: string): Promise<Account>;
   remove(tool: string, name: string): Promise<boolean>;
   listCurrent(): Promise<CurrentSelection[]>;
@@ -181,6 +244,17 @@ export class AccountsRepo implements AccountsStore {
     await client.execute(
       "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
       [`accounts:login-operation:${operationId}`],
+    );
+  }
+
+  private async lockCleanupJournalTarget(
+    client: TypedQueryClient,
+    tool: string,
+    name: string,
+  ): Promise<void> {
+    await client.execute(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`accounts:cleanup-journal:${JSON.stringify([LOGIN_CLEANUP_OPERATION_CLASS, tool, name])}`],
     );
   }
 
@@ -390,16 +464,47 @@ export class AccountsRepo implements AccountsStore {
     tool: string,
     name: string,
     input: RemoveCreatedAccountInput,
-  ): Promise<boolean> {
+  ): Promise<CreatedAccountCleanupResult> {
     return this.client.transaction(async (client) => {
       await this.lockLoginOperation(client, input.cleanupOperationId);
+      await this.lockCleanupJournalTarget(client, tool, name);
+      await client.execute(
+        `DELETE FROM account_login_cleanup_operations
+          WHERE completed_at IS NOT NULL
+            AND requested_at < now() - ($1::double precision * interval '1 millisecond')`,
+        [LOGIN_CLEANUP_RETENTION_MS],
+      );
+      const capTerminalRows = () => client.execute(
+        `DELETE FROM account_login_cleanup_operations
+          WHERE operation_id IN (
+            SELECT operation_id
+              FROM account_login_cleanup_operations
+             WHERE operation_class = $1 AND tool = $2 AND name = $3
+               AND completed_at IS NOT NULL
+             ORDER BY completed_at DESC, operation_id DESC
+            OFFSET $4
+          )`,
+        [LOGIN_CLEANUP_OPERATION_CLASS, tool, name, LOGIN_CLEANUP_MAX_PER_TARGET],
+      );
+      await capTerminalRows();
+      const requestedAt = new Date(input.cleanupRequestedAt).getTime();
+      const age = Date.now() - requestedAt;
+      if (age > LOGIN_CLEANUP_RETENTION_MS) {
+        return { removed: false, currentExists: false, expired: true };
+      }
+      if (age < -LOGIN_CLEANUP_FUTURE_SKEW_MS) {
+        throw new AccountsError("login cleanup request time is too far in the future");
+      }
+      const requestDigest = loginCleanupRequestDigest(tool, name, input);
       const completed = await client.get<{
         tool: string;
         name: string;
         target_incarnation_id: string;
-        removed: boolean;
+        request_digest: string;
+        removed: boolean | null;
+        completed_at: string | null;
       }>(
-        `SELECT tool, name, target_incarnation_id, removed
+        `SELECT tool, name, target_incarnation_id, request_digest, removed, completed_at
            FROM account_login_cleanup_operations
           WHERE operation_id = $1`,
         [input.cleanupOperationId],
@@ -408,23 +513,62 @@ export class AccountsRepo implements AccountsStore {
         if (
           completed.tool !== tool ||
           completed.name !== name ||
-          completed.target_incarnation_id !== input.expectedIncarnationId
+          completed.target_incarnation_id !== input.expectedIncarnationId ||
+          completed.request_digest !== requestDigest
         ) {
-          throw new AccountsError("login cleanup operation id is already bound to another profile");
+          throw new AccountsError(
+            "login cleanup operation id is already bound to another conditional request",
+          );
         }
-        return completed.removed;
+        if (!completed.completed_at || completed.removed === null) {
+          throw new AccountsError("login cleanup operation is still incomplete; retry later");
+        }
+        const current = await this.getWith(client, tool, name, { forUpdate: true });
+        return { removed: completed.removed, currentExists: Boolean(current), expired: false };
       }
-      const finish = async (removed: boolean): Promise<boolean> => {
+      const retained = await client.get<{
+        incomplete_count: string | number;
+        terminal_count: string | number;
+      }>(
+        `SELECT count(*) FILTER (WHERE completed_at IS NULL) AS incomplete_count,
+                count(*) FILTER (WHERE completed_at IS NOT NULL) AS terminal_count
+           FROM account_login_cleanup_operations
+          WHERE operation_class = $1 AND tool = $2 AND name = $3`,
+        [LOGIN_CLEANUP_OPERATION_CLASS, tool, name],
+      );
+      if (Number(retained?.incomplete_count ?? 0) >= LOGIN_CLEANUP_MAX_PER_TARGET) {
+        // Terminal results are safely evictable because the account delete is
+        // still fully conditional and the client rechecks the current row.
+        // Incomplete ownership must never be evicted or bypassed.
+        throw new AccountsError(
+          "login cleanup journal has too many incomplete operations for this profile; retry later",
+        );
+      }
+      const finish = async (
+        removed: boolean,
+        currentExists: boolean,
+      ): Promise<CreatedAccountCleanupResult> => {
         await client.execute(
           `INSERT INTO account_login_cleanup_operations
-             (operation_id, tool, name, target_incarnation_id, removed)
-           VALUES ($1::uuid, $2, $3, $4::uuid, $5)`,
-          [input.cleanupOperationId, tool, name, input.expectedIncarnationId, removed],
+             (operation_id, operation_class, tool, name, target_incarnation_id,
+              request_digest, removed, requested_at, completed_at)
+           VALUES ($1::uuid, $2, $3, $4, $5::uuid, $6, $7, $8::timestamptz, now())`,
+          [
+            input.cleanupOperationId,
+            LOGIN_CLEANUP_OPERATION_CLASS,
+            tool,
+            name,
+            input.expectedIncarnationId,
+            requestDigest,
+            removed,
+            input.cleanupRequestedAt,
+          ],
         );
-        return removed;
+        await capTerminalRows();
+        return { removed, currentExists, expired: false };
       };
       const current = await this.getWith(client, tool, name, { forUpdate: true });
-      if (!current) return finish(false);
+      if (!current) return finish(false, false);
       const unchanged =
         current.incarnationId === input.expectedIncarnationId &&
         current.createdAt === new Date(input.expectedCreatedAt).toISOString() &&
@@ -436,7 +580,7 @@ export class AccountsRepo implements AccountsStore {
         (current.dir ?? null) === input.expectedDir &&
         (current.description ?? null) === input.expectedDescription &&
         (current.lastUsedAt ?? null) === input.expectedLastUsedAt;
-      if (!unchanged) return finish(false);
+      if (!unchanged) return finish(false, true);
 
       const selected = await client.get<{ name: string }>(
         `SELECT name
@@ -445,7 +589,7 @@ export class AccountsRepo implements AccountsStore {
           FOR UPDATE`,
         [tool],
       );
-      if (selected?.name === name) return finish(false);
+      if (selected?.name === name) return finish(false, true);
 
       const result = await client.query<AccountRow>(
         `DELETE FROM accounts
@@ -475,7 +619,8 @@ export class AccountsRepo implements AccountsStore {
           input.expectedLastUsedAt,
         ],
       );
-      return finish(result.rowCount === 1);
+      const removed = result.rowCount === 1;
+      return finish(removed, !removed);
     });
   }
 

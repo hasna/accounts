@@ -28,9 +28,9 @@ export interface RestoreAccountInput { "expectedIncarnationId": string; "email"?
 
 export interface LoginUpdateAccountInput { "expectedIncarnationId": string; "expectedEmail": string | null; "email": string }
 
-export interface RemoveCreatedAccountInput { "cleanupOperationId": string; "expectedIncarnationId": string; "expectedCreatedAt": string; "expectedEmail": string | null; "expectedDisplayName": string | null; "expectedIdentity": string | null; "expectedCardLast4": string | null; "expectedMetadata": Record<string, unknown>; "expectedDir": string | null; "expectedDescription": string | null; "expectedLastUsedAt": string | null }
+export interface RemoveCreatedAccountInput { "cleanupOperationId": string; "cleanupRequestedAt": string; "expectedIncarnationId": string; "expectedCreatedAt": string; "expectedEmail": string | null; "expectedDisplayName": string | null; "expectedIdentity": string | null; "expectedCardLast4": string | null; "expectedMetadata": Record<string, unknown>; "expectedDir": string | null; "expectedDescription": string | null; "expectedLastUsedAt": string | null }
 
-export interface RemoveCreatedAccountResult { "removed": boolean }
+export interface RemoveCreatedAccountResult { "removed": boolean; "currentExists": boolean; "expired": boolean }
 
 export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string; "revision"?: string; "operationId"?: string; "previousName"?: string; "previousTargetLastUsedAt"?: string }
 

@@ -5,7 +5,8 @@ const RUNTIME_TABLES = [
   "current_selections",
   "custom_tools",
 ] as const;
-const APPEND_ONLY_TABLES = ["current_login_operations", "account_login_cleanup_operations"] as const;
+const APPEND_ONLY_TABLES = ["current_login_operations"] as const;
+const RETAINED_JOURNAL_TABLES = ["account_login_cleanup_operations"] as const;
 const READ_ONLY_TABLES = ["schema_migrations", "api_keys"] as const;
 const OWNER_ONLY_SEQUENCES = ["current_selection_revision_seq"] as const;
 const TRIGGER_FUNCTIONS = [
@@ -116,6 +117,7 @@ export async function grantAccountsRuntimeRole(
   const qualified = (name: string) => `${schema}.${quoteIdentifier(name)}`;
   const runtimeTables = RUNTIME_TABLES.map(qualified).join(", ");
   const appendOnlyTables = APPEND_ONLY_TABLES.map(qualified).join(", ");
+  const retainedJournalTables = RETAINED_JOURNAL_TABLES.map(qualified).join(", ");
   const readOnlyTables = READ_ONLY_TABLES.map(qualified).join(", ");
   const tombstones = qualified("custom_tool_tombstones");
   const triggerFunctions = TRIGGER_FUNCTIONS.map((name) => `${qualified(name)}()`).join(", ");
@@ -133,6 +135,11 @@ export async function grantAccountsRuntimeRole(
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${appendOnlyTables} FROM PUBLIC`);
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${appendOnlyTables} FROM ${runtimeRole}`);
     await tx.execute(`GRANT SELECT, INSERT ON TABLE ${appendOnlyTables} TO ${runtimeRole}`);
+    await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${retainedJournalTables} FROM PUBLIC`);
+    await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${retainedJournalTables} FROM ${runtimeRole}`);
+    await tx.execute(
+      `GRANT SELECT, INSERT, DELETE ON TABLE ${retainedJournalTables} TO ${runtimeRole}`,
+    );
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${tombstones} FROM PUBLIC`);
     await tx.execute(`REVOKE ALL PRIVILEGES ON TABLE ${tombstones} FROM ${runtimeRole}`);
     await tx.execute(`GRANT SELECT, INSERT, DELETE ON TABLE ${tombstones} TO ${runtimeRole}`);

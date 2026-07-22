@@ -23,14 +23,23 @@ import {
 import {
   claimProfileToolLock,
   getProfileToolLock,
+  planProfileToolLockClaim,
   restoreProfileToolLock,
 } from "./profiles.js";
 import { withApplyLockWait } from "./apply-lock.js";
 import { detectEmail } from "./detect.js";
 import {
   resolveStore,
+  beginLoginCleanupIntent,
+  abandonLoginCleanupIntentInProcess,
+  clearLoginCleanupIntentByOperation,
+  evolveLoginCleanupIntent,
+  injectLoginCleanupFaultForTests,
+  isInjectedLoginCleanupFault,
+  LoginCleanupInProgressError,
   type AccountsStore,
   type CurrentEntry,
+  type LoginCleanupIntent,
   type ProfileRollbackFields,
 } from "./store.js";
 import { mergeToolArgs } from "./tools.js";
@@ -110,6 +119,11 @@ export interface PrepareLoginOptions {
   forceInteractive?: boolean;
   /** Validate the final selected tool before creating a profile or tool lock. */
   validateTool?: (tool: ToolDef) => void | Promise<void>;
+  /** Optionally serialize preparation through a tool-specific profile lease. */
+  acquireProfileLease?: (
+    profileDir: string,
+    tool: ToolDef,
+  ) => Promise<(() => void) | undefined>;
   /** Registry store to route reads/writes through (defaults to `resolveStore()`). */
   store?: AccountsStore;
 }
@@ -125,6 +139,9 @@ export interface LoginPreparationReady {
   previousToolLockRevision?: string;
   previousToolLockProfileIncarnation?: string;
   toolLockRevision?: string;
+  cleanupOperationId?: string;
+  cleanupRequestedAt?: string;
+  releaseProfileLease?: () => void;
 }
 
 export interface LoginPreparationStopped {
@@ -138,6 +155,9 @@ export interface LoginPreparationStopped {
   previousToolLockRevision?: string;
   previousToolLockProfileIncarnation?: string;
   toolLockRevision?: string;
+  cleanupOperationId?: string;
+  cleanupRequestedAt?: string;
+  releaseProfileLease?: () => void;
 }
 
 export type LoginPreparation = LoginPreparationReady | LoginPreparationStopped;
@@ -382,47 +402,213 @@ interface PreparedProfile {
   previousToolLockRevision?: string;
   previousToolLockProfileIncarnation?: string;
   toolLockRevision?: string;
+  cleanupOperationId?: string;
+  cleanupRequestedAt?: string;
+  releaseProfileLease?: () => void;
 }
 
-async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<PreparedProfile> {
-  await store.reconcileInterruptedLoginCleanup?.(name, tool.id);
-  let existing = await store.findProfile(name, tool.id);
-  if (existing && store.upgradeProfileIncarnationForLogin) {
-    existing = await store.upgradeProfileIncarnationForLogin(existing);
-  } else if (!existing) {
+async function existingOrCreateProfile(
+  name: string,
+  tool: ToolDef,
+  store: AccountsStore,
+  reconciledExisting?: { profile: Profile | undefined },
+): Promise<PreparedProfile> {
+  if (!reconciledExisting) {
+    await store.reconcileInterruptedLoginCleanup?.(name, tool.id);
+  }
+  let existing = reconciledExisting
+    ? reconciledExisting.profile
+    : await store.findProfile(name, tool.id);
+  if (!existing) {
     await store.assertCreatedProfileCleanup?.();
   }
   const managedDir = managedProfileDir(name, tool.id);
-  const fallbackCreatedProfileDir = !existing && !existsSync(managedDir);
-  const createdProfile = existing
-    ? undefined
-    : store.addProfileForLogin
-      ? await store.addProfileForLogin({ name, tool: tool.id, description: "created for login" })
-      : {
-          profile: await store.addProfile({ name, tool: tool.id, description: "created for login" }),
-          createdProfileDir: fallbackCreatedProfileDir,
-        };
-  const profile = existing ?? createdProfile!.profile;
-  const createdProfileDir = createdProfile?.createdProfileDir ?? false;
-  // The tool lock is a machine-local disambiguation for bare commands; only the
-  // LocalStore keeps it. In api mode the shared registry (+ explicit --tool)
-  // resolves the profile, so there is no local lock to write.
-  const toolLockClaim = store.transport === "local"
-    ? claimProfileToolLock(profile.name, profile.tool)
+  let intent: LoginCleanupIntent = beginLoginCleanupIntent(
+    name,
+    tool.id,
+    store.transport,
+    existing?.dir ?? managedDir,
+    Boolean(existing),
+    existing?.incarnationId ?? randomUUID(),
+  );
+  const plannedAuthIdentity = store.transport === "api" && tool.id === "claude"
+    ? randomUUID()
     : undefined;
-  return {
-    profile,
-    created: !existing,
-    createdProfileDir,
-    ...(toolLockClaim?.previousTool ? { previousToolLock: toolLockClaim.previousTool } : {}),
-    ...(toolLockClaim?.previousRevision
-      ? { previousToolLockRevision: toolLockClaim.previousRevision }
-      : {}),
-    ...(toolLockClaim?.previousProfileIncarnation
-      ? { previousToolLockProfileIncarnation: toolLockClaim.previousProfileIncarnation }
-      : {}),
-    ...(toolLockClaim ? { toolLockRevision: toolLockClaim.revision } : {}),
-  };
+  if (plannedAuthIdentity) {
+    intent = evolveLoginCleanupIntent(intent, {
+      ownership: {
+        cleanupOperationId: intent.cleanupOperationId,
+        cleanupRequestedAt: intent.cleanupRequestedAt,
+        authIdentity: plannedAuthIdentity,
+      },
+    });
+  }
+  try {
+    // This durable registry record is now the first login preparation write.
+    injectLoginCleanupFaultForTests("pre-create", intent.cleanupOperationId);
+    if (existing && store.upgradeProfileIncarnationForLogin) {
+      existing = await store.upgradeProfileIncarnationForLogin(
+        existing,
+        intent.plannedIncarnationId,
+      );
+    }
+    const fallbackCreatedProfileDir = !existing && intent.createdProfileDir;
+    const createdProfile = existing
+      ? undefined
+      : store.addProfileForLogin
+        ? await store.addProfileForLogin(
+            { name, tool: tool.id, description: "created for login" },
+            {
+              cleanupOperationId: intent.cleanupOperationId,
+              cleanupRequestedAt: intent.cleanupRequestedAt,
+              plannedIncarnationId: intent.plannedIncarnationId,
+              ...(plannedAuthIdentity ? { plannedAuthIdentity } : {}),
+            },
+          )
+        : {
+            profile: await store.addProfile({ name, tool: tool.id, description: "created for login" }),
+            createdProfileDir: fallbackCreatedProfileDir,
+          };
+    const profile = existing ?? createdProfile!.profile;
+    const builtInFenceWasPlanned = Boolean(
+      (existing && store.upgradeProfileIncarnationForLogin) ||
+      (!existing && store.addProfileForLogin),
+    );
+    if (builtInFenceWasPlanned && profile.incarnationId !== intent.plannedIncarnationId) {
+      throw new AccountsError("login profile did not retain its planned rollback fence");
+    }
+    if (
+      !builtInFenceWasPlanned &&
+      profile.incarnationId &&
+      profile.incarnationId !== intent.plannedIncarnationId
+    ) {
+      intent = evolveLoginCleanupIntent(intent, {
+        plannedIncarnationId: profile.incarnationId,
+      });
+    }
+    const createdProfileDir = createdProfile?.createdProfileDir ?? false;
+    intent = evolveLoginCleanupIntent(intent, {
+      phase: "profile-created",
+      createdProfileDir,
+      ownership: {
+        cleanupOperationId: intent.cleanupOperationId,
+        cleanupRequestedAt: intent.cleanupRequestedAt,
+        ...(plannedAuthIdentity ? { authIdentity: plannedAuthIdentity } : {}),
+      },
+    });
+
+    // The tool lock is machine-local. Plan its generation and persist exact
+    // displaced fields before claiming it, so a crash immediately after the
+    // registry write remains conditionally reversible.
+    const toolLockPlan = store.transport === "local"
+      ? planProfileToolLockClaim(profile.name, profile.tool)
+      : undefined;
+    if (toolLockPlan) {
+      intent = evolveLoginCleanupIntent(intent, {
+        phase: "lock-planned",
+        ownership: {
+          cleanupOperationId: intent.cleanupOperationId,
+          cleanupRequestedAt: intent.cleanupRequestedAt,
+          ...(plannedAuthIdentity ? { authIdentity: plannedAuthIdentity } : {}),
+          toolLockRevision: toolLockPlan.revision,
+          ...(toolLockPlan.previousTool
+            ? { previousToolLock: toolLockPlan.previousTool }
+            : {}),
+          ...(toolLockPlan.previousRevision
+            ? { previousToolLockRevision: toolLockPlan.previousRevision }
+            : {}),
+          ...(toolLockPlan.previousProfileIncarnation
+            ? { previousToolLockProfileIncarnation: toolLockPlan.previousProfileIncarnation }
+            : {}),
+        },
+      });
+    }
+    const toolLockClaim = toolLockPlan
+      ? claimProfileToolLock(profile.name, profile.tool, toolLockPlan)
+      : undefined;
+    if (toolLockClaim) {
+      injectLoginCleanupFaultForTests("post-lock", intent.cleanupOperationId);
+    }
+    return {
+      profile,
+      created: !existing,
+      createdProfileDir,
+      cleanupOperationId: intent.cleanupOperationId,
+      cleanupRequestedAt: intent.cleanupRequestedAt,
+      ...(toolLockClaim?.previousTool ? { previousToolLock: toolLockClaim.previousTool } : {}),
+      ...(toolLockClaim?.previousRevision
+        ? { previousToolLockRevision: toolLockClaim.previousRevision }
+        : {}),
+      ...(toolLockClaim?.previousProfileIncarnation
+        ? { previousToolLockProfileIncarnation: toolLockClaim.previousProfileIncarnation }
+        : {}),
+      ...(toolLockClaim ? { toolLockRevision: toolLockClaim.revision } : {}),
+    };
+  } catch (error) {
+    if (isInjectedLoginCleanupFault(error)) throw error;
+    abandonLoginCleanupIntentInProcess(intent.cleanupOperationId);
+    try {
+      await store.reconcileInterruptedLoginCleanup?.(name, tool.id);
+    } catch (rollbackError) {
+      throw new AccountsError(
+        `login preparation failed and cleanup could not be reconciled: ${
+          rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+        }`,
+      );
+    }
+    throw error;
+  }
+}
+
+function samePreparationProfile(
+  expected: Profile,
+  current: Profile | undefined,
+): boolean {
+  if (!current || expected.tool !== current.tool || expected.name !== current.name) return false;
+  if (expected.incarnationId) return current.incarnationId === expected.incarnationId;
+  return profileAuthIncarnation(current) === profileAuthIncarnation(expected);
+}
+
+async function prepareSelectedProfile(
+  name: string,
+  tool: ToolDef,
+  opts: PrepareLoginOptions,
+  store: AccountsStore,
+): Promise<PreparedProfile> {
+  await opts.validateTool?.(tool);
+  if (!opts.acquireProfileLease) return existingOrCreateProfile(name, tool, store);
+
+  // Recover stale work before acquiring the live-login lease. A live owner is
+  // expected here: wait on the established profile lease instead of treating
+  // its durable intent as interrupted.
+  try {
+    await store.reconcileInterruptedLoginCleanup?.(name, tool.id);
+  } catch (error) {
+    if (!(error instanceof LoginCleanupInProgressError)) throw error;
+  }
+  const expected = await store.findProfile(name, tool.id);
+  const profileDir = expected?.dir ?? managedProfileDir(name, tool.id);
+  const release = await opts.acquireProfileLease(profileDir, tool);
+  try {
+    await store.reconcileInterruptedLoginCleanup?.(name, tool.id);
+    const current = await store.findProfile(name, tool.id);
+    if (expected && !samePreparationProfile(expected, current)) {
+      throw new AccountsError("profile changed before Claude auth capture");
+    }
+    const prepared = await existingOrCreateProfile(
+      name,
+      tool,
+      store,
+      { profile: current },
+    );
+    return {
+      ...prepared,
+      ...(release ? { releaseProfileLease: release } : {}),
+    };
+  } catch (error) {
+    release?.();
+    throw error;
+  }
 }
 
 async function selectLoginTool(
@@ -462,8 +648,7 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
     while (true) {
       const availability = detectToolAvailability(tool, opts.env);
       if (availability.available) {
-        await opts.validateTool?.(tool);
-        const prepared = await existingOrCreateProfile(name, tool, store);
+        const prepared = await prepareSelectedProfile(name, tool, opts, store);
         return {
           status: "ready",
           ...prepared,
@@ -478,14 +663,17 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
         continue;
       }
       if (action === "keep") {
-        await opts.validateTool?.(tool);
-        const prepared = await existingOrCreateProfile(name, tool, store);
-        return {
+        const prepared = await prepareSelectedProfile(name, tool, opts, store);
+        const stopped: LoginPreparationStopped = {
           status: "stopped",
           ...prepared,
           tool,
           message: await unavailableToolMessage(name, tool, availability, store),
         };
+        commitLoginPreparation(stopped, store);
+        stopped.releaseProfileLease?.();
+        delete stopped.releaseProfileLease;
+        return stopped;
       }
       throw new AccountsError("cancelled; no profile tool was changed");
     }
@@ -502,6 +690,7 @@ export async function rollbackLoginPreparation(
   expectedProfileAuthCommitRevision?: string,
 ): Promise<void> {
   let removed = false;
+  let rollbackReachedTerminalState = false;
   try {
     if (
       preparation.created &&
@@ -510,6 +699,12 @@ export async function rollbackLoginPreparation(
       removed = Boolean(await store.removeProfileIncarnation(
         preparation.profile,
         {
+          ...(preparation.cleanupOperationId
+            ? { cleanupOperationId: preparation.cleanupOperationId }
+            : {}),
+          ...(preparation.cleanupRequestedAt
+            ? { cleanupRequestedAt: preparation.cleanupRequestedAt }
+            : {}),
           ...(preparation.toolLockRevision
             ? { toolLockRevision: preparation.toolLockRevision }
             : {}),
@@ -532,6 +727,12 @@ export async function rollbackLoginPreparation(
         { tool: preparation.tool.id, purge: preparation.createdProfileDir },
       ));
     }
+    rollbackReachedTerminalState = true;
+  } catch (error) {
+    if (preparation.cleanupOperationId) {
+      abandonLoginCleanupIntentInProcess(preparation.cleanupOperationId);
+    }
+    throw error;
   } finally {
     if (store.transport === "local" && !removed) {
       const currentIncarnation = (await store.listProfiles(preparation.tool.id)).find(
@@ -551,7 +752,28 @@ export async function rollbackLoginPreparation(
         }
       }
     }
+    if (rollbackReachedTerminalState) {
+      clearLoginCleanupIntentByOperation(
+        preparation.profile.name,
+        preparation.tool.id,
+        store.transport,
+        preparation.cleanupOperationId,
+      );
+    }
   }
+}
+
+/** Mark preparation ownership terminal after a successful or intentional login. */
+export function commitLoginPreparation(
+  preparation: LoginPreparationReady | LoginPreparationStopped,
+  store: AccountsStore = resolveStore(),
+): void {
+  clearLoginCleanupIntentByOperation(
+    preparation.profile.name,
+    preparation.tool.id,
+    store.transport,
+    preparation.cleanupOperationId,
+  );
 }
 
 async function resolveUnchangedLoginTool(

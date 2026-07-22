@@ -39,7 +39,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -82,7 +82,7 @@ import {
   type RemoveOptions,
   type UpdateOptions,
 } from "./profiles.js";
-import { loadMachineStore, loadStore, saveStore, withStoreLock } from "../storage.js";
+import { accountsHome, loadMachineStore, loadStore, saveStore, withStoreLock } from "../storage.js";
 import { resolveAccountsCloud, type AccountsCloudApi } from "./cloud-accounts.js";
 import { assertSafeWritePath } from "./safe-path.js";
 
@@ -124,9 +124,18 @@ export interface LoginCreatedProfile {
   createdProfileDir: boolean;
 }
 
+export interface LoginProfileCreationPlan {
+  cleanupOperationId: string;
+  cleanupRequestedAt: string;
+  plannedIncarnationId: string;
+  plannedAuthIdentity?: string;
+}
+
 export interface CreatedProfileRollbackOwnership {
   /** Durable cleanup replay token; supplied internally when resuming an interrupted rollback. */
   cleanupOperationId?: string;
+  /** Original operation time used to bound destructive replay retention. */
+  cleanupRequestedAt?: string;
   toolLockRevision?: string;
   previousToolLock?: string;
   previousToolLockRevision?: string;
@@ -145,12 +154,18 @@ export interface AccountsStore {
   findProfile(name: string, tool?: string): Promise<Profile | undefined>;
   addProfile(opts: AddOptions): Promise<Profile>;
   /** Create a login profile while atomically recording ownership of its managed directory. */
-  addProfileForLogin?(opts: AddOptions): Promise<LoginCreatedProfile>;
+  addProfileForLogin?(
+    opts: AddOptions,
+    plan?: LoginProfileCreationPlan,
+  ): Promise<LoginCreatedProfile>;
   updateProfile(name: string, opts: UpdateOptions): Promise<Profile>;
   renameProfile(oldName: string, newName: string, tool?: string): Promise<Profile>;
   removeProfile(name: string, opts?: RemoveOptions): Promise<RemoveResult>;
   /** Upgrade a legacy local profile only after login permission/tool validation authorized mutation. */
-  upgradeProfileIncarnationForLogin?(profile: Profile): Promise<Profile>;
+  upgradeProfileIncarnationForLogin?(
+    profile: Profile,
+    plannedIncarnationId?: string,
+  ): Promise<Profile>;
   /** Fail closed before creating an API profile unless exact conditional cleanup is supported. */
   assertCreatedProfileCleanup?(): Promise<void>;
   /** Finish directory cleanup journaled by an interrupted, already-authorized login rollback. */
@@ -447,12 +462,381 @@ async function withProfileDirectoryLease<T>(dir: string, operation: () => Promis
 }
 
 const LOGIN_CLEANUP_MARKER = ".accounts-login-cleanup.json";
+const LOGIN_CLEANUP_INTENTS_DIR = "login-cleanup-intents";
+
+export type LoginCleanupFaultPoint =
+  | "pre-create"
+  | "post-create"
+  | "post-lock"
+  | "post-delete"
+  | "post-lock-restore"
+  | "pre-purge";
+
+let loginCleanupFaultInjector: ((point: LoginCleanupFaultPoint) => void) | undefined;
+const activeLoginCleanupOperations = new Set<string>();
+
+export class LoginCleanupInProgressError extends AccountsError {}
+
+class InjectedLoginCleanupFault extends Error {
+  constructor(readonly point: LoginCleanupFaultPoint, options?: ErrorOptions) {
+    super(`injected login cleanup fault at ${point}`, options);
+    this.name = "InjectedLoginCleanupFault";
+  }
+}
+
+/** Test-only abrupt-fault injection; production callers never install it. */
+export function setLoginCleanupFaultInjectorForTests(
+  injector?: (point: LoginCleanupFaultPoint) => void,
+): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new AccountsError("login cleanup fault injection is test-only");
+  }
+  loginCleanupFaultInjector = injector;
+}
+
+export function injectLoginCleanupFaultForTests(
+  point: LoginCleanupFaultPoint,
+  cleanupOperationId?: string,
+): void {
+  if (!loginCleanupFaultInjector) return;
+  try {
+    loginCleanupFaultInjector(point);
+  } catch (error) {
+    if (cleanupOperationId) activeLoginCleanupOperations.delete(cleanupOperationId);
+    throw new InjectedLoginCleanupFault(point, { cause: error });
+  }
+}
+
+export function isInjectedLoginCleanupFault(error: unknown): boolean {
+  return error instanceof InjectedLoginCleanupFault;
+}
+
+type LoginCleanupPhase =
+  | "planned"
+  | "profile-created"
+  | "lock-planned"
+  | "rollback";
+
+export interface LoginCleanupIntent {
+  version: 1;
+  transport: "local" | "api";
+  cleanupOperationId: string;
+  cleanupRequestedAt: string;
+  plannedIncarnationId: string;
+  name: string;
+  tool: string;
+  dir: string;
+  profileExisted: boolean;
+  createdProfileDir: boolean;
+  phase: LoginCleanupPhase;
+  ownership: CreatedProfileRollbackOwnership;
+  ownerPid: number;
+  ownerProcessStartId: string;
+}
 
 interface LoginCleanupMarker {
   version: 1;
   cleanupOperationId: string;
   profile: Profile;
   ownership: CreatedProfileRollbackOwnership;
+}
+
+function fsyncDirectoryIfSupported(path: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // Windows and a few filesystems reject directory handles/fsync. File data
+    // is still fsynced, but we intentionally make no power-loss claim there.
+    if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES", "EISDIR"].includes(code ?? "")) {
+      throw error;
+    }
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function publishAtomicJson(path: string, value: unknown, mustStayUnder: string): void {
+  const parent = dirname(path);
+  assertSafeWritePath(path, { mustStayUnder });
+  const boundaryExisted = existsSync(mustStayUnder);
+  mkdirSync(mustStayUnder, { recursive: true });
+  if (!boundaryExisted) fsyncDirectoryIfSupported(dirname(mustStayUnder));
+  const parentExisted = existsSync(parent);
+  mkdirSync(parent, { recursive: true });
+  if (!parentExisted) fsyncDirectoryIfSupported(dirname(parent));
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  assertSafeWritePath(temp, { mustStayUnder });
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(value) + "\n", "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, path);
+    fsyncDirectoryIfSupported(parent);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
+}
+
+function removePublishedFile(path: string, mustStayUnder: string): void {
+  assertSafeWritePath(path, { mustStayUnder });
+  if (!existsSync(path)) return;
+  unlinkSync(path);
+  fsyncDirectoryIfSupported(dirname(path));
+}
+
+function loginCleanupIntentPath(
+  name: string,
+  tool: string,
+  transport: "local" | "api",
+): string {
+  const identity = createHash("sha256")
+    .update(JSON.stringify([transport, tool, name]))
+    .digest("hex");
+  return join(accountsHome(), LOGIN_CLEANUP_INTENTS_DIR, `${identity}.json`);
+}
+
+function parseLoginCleanupIntent(
+  name: string,
+  tool: string,
+  transport: "local" | "api",
+): LoginCleanupIntent | undefined {
+  const path = loginCleanupIntentPath(name, tool, transport);
+  if (!existsSync(path)) return undefined;
+  assertSafeWritePath(path, { mustStayUnder: accountsHome() });
+  let value: unknown;
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("not a regular file");
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new AccountsError(`invalid interrupted login cleanup intent: ${String(error)}`);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AccountsError("invalid interrupted login cleanup intent");
+  }
+  const intent = value as Partial<LoginCleanupIntent>;
+  const ownership = intent.ownership;
+  const allowedIntent = new Set([
+    "version",
+    "transport",
+    "cleanupOperationId",
+    "cleanupRequestedAt",
+    "plannedIncarnationId",
+    "name",
+    "tool",
+    "dir",
+    "profileExisted",
+    "createdProfileDir",
+    "phase",
+    "ownership",
+    "ownerPid",
+    "ownerProcessStartId",
+  ]);
+  const allowedOwnership = new Set([
+    "cleanupOperationId",
+    "cleanupRequestedAt",
+    "toolLockRevision",
+    "previousToolLock",
+    "previousToolLockRevision",
+    "previousToolLockProfileIncarnation",
+    "authIdentity",
+    "authCommitRevision",
+  ]);
+  if (
+    Reflect.ownKeys(intent).some(
+      (key) => typeof key !== "string" || !allowedIntent.has(key),
+    ) ||
+    intent.version !== 1 ||
+    intent.transport !== transport ||
+    intent.name !== name ||
+    intent.tool !== tool ||
+    typeof intent.cleanupOperationId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(intent.cleanupOperationId) ||
+    typeof intent.cleanupRequestedAt !== "string" ||
+    !Number.isFinite(Date.parse(intent.cleanupRequestedAt)) ||
+    typeof intent.plannedIncarnationId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(intent.plannedIncarnationId) ||
+    typeof intent.dir !== "string" ||
+    !isAbsolute(intent.dir) ||
+    !profileNameSchema.safeParse(intent.name).success ||
+    typeof intent.tool !== "string" ||
+    intent.tool.length === 0 ||
+    intent.tool.includes("\0") ||
+    /[\r\n]/.test(intent.tool) ||
+    typeof intent.profileExisted !== "boolean" ||
+    typeof intent.createdProfileDir !== "boolean" ||
+    typeof intent.ownerPid !== "number" ||
+    !Number.isSafeInteger(intent.ownerPid) ||
+    intent.ownerPid <= 0 ||
+    typeof intent.ownerProcessStartId !== "string" ||
+    !/^(?:(?:linux|darwin)-[A-Za-z0-9-]+|fallback-[0-9a-f-]+)$/i.test(intent.ownerProcessStartId) ||
+    (!intent.profileExisted &&
+      resolve(intent.dir) !== resolve(managedProfileDirectory(name, tool))) ||
+    !["planned", "profile-created", "lock-planned", "rollback"].includes(intent.phase ?? "") ||
+    !ownership ||
+    typeof ownership !== "object" ||
+    Array.isArray(ownership) ||
+    Reflect.ownKeys(ownership).some(
+      (key) => typeof key !== "string" || !allowedOwnership.has(key),
+    ) ||
+    Object.values(ownership).some((entry) => entry !== undefined && typeof entry !== "string")
+  ) {
+    throw new AccountsError("invalid interrupted login cleanup intent");
+  }
+  if (
+    ownership.cleanupOperationId !== intent.cleanupOperationId ||
+    ownership.cleanupRequestedAt !== intent.cleanupRequestedAt
+  ) {
+    throw new AccountsError("invalid interrupted login cleanup intent");
+  }
+  return intent as LoginCleanupIntent;
+}
+
+export function beginLoginCleanupIntent(
+  name: string,
+  tool: string,
+  transport: "local" | "api",
+  dir: string,
+  profileExisted: boolean,
+  plannedIncarnationId: string = randomUUID(),
+): LoginCleanupIntent {
+  return withStoreLock(() => {
+    const existing = parseLoginCleanupIntent(name, tool, transport);
+    if (existing) {
+      throw new AccountsError("an interrupted login cleanup must be reconciled before preparing another login");
+    }
+    const cleanupOperationId = randomUUID();
+    const cleanupRequestedAt = new Date().toISOString();
+    const intent: LoginCleanupIntent = {
+      version: 1,
+      transport,
+      cleanupOperationId,
+      cleanupRequestedAt,
+      plannedIncarnationId,
+      name,
+      tool,
+      dir,
+      profileExisted,
+      createdProfileDir: !profileExisted && !existsSync(dir),
+      phase: "planned",
+      ownership: { cleanupOperationId, cleanupRequestedAt },
+      ownerPid: process.pid,
+      ownerProcessStartId: profileDirectoryProcessIncarnation,
+    };
+    publishAtomicJson(
+      loginCleanupIntentPath(name, tool, transport),
+      intent,
+      accountsHome(),
+    );
+    activeLoginCleanupOperations.add(cleanupOperationId);
+    return intent;
+  });
+}
+
+export function evolveLoginCleanupIntent(
+  intent: LoginCleanupIntent,
+  patch: Partial<Pick<
+    LoginCleanupIntent,
+    "phase" | "createdProfileDir" | "ownership" | "plannedIncarnationId"
+  >>,
+): LoginCleanupIntent {
+  return withStoreLock(() => {
+    const current = parseLoginCleanupIntent(intent.name, intent.tool, intent.transport);
+    if (!current || current.cleanupOperationId !== intent.cleanupOperationId) {
+      throw new AccountsError("login cleanup intent changed concurrently");
+    }
+    const next: LoginCleanupIntent = {
+      ...current,
+      ...patch,
+      ownership: patch.ownership ? { ...patch.ownership } : current.ownership,
+    };
+    publishAtomicJson(
+      loginCleanupIntentPath(next.name, next.tool, next.transport),
+      next,
+      accountsHome(),
+    );
+    return next;
+  });
+}
+
+export function clearLoginCleanupIntent(intent: LoginCleanupIntent): void {
+  withStoreLock(() => {
+    const current = parseLoginCleanupIntent(intent.name, intent.tool, intent.transport);
+    if (!current || current.cleanupOperationId !== intent.cleanupOperationId) {
+      activeLoginCleanupOperations.delete(intent.cleanupOperationId);
+      return;
+    }
+    removePublishedFile(
+      loginCleanupIntentPath(intent.name, intent.tool, intent.transport),
+      accountsHome(),
+    );
+    activeLoginCleanupOperations.delete(intent.cleanupOperationId);
+  });
+}
+
+export function abandonLoginCleanupIntentInProcess(cleanupOperationId: string): void {
+  activeLoginCleanupOperations.delete(cleanupOperationId);
+}
+
+function loginCleanupIntentOwnerIsLive(intent: LoginCleanupIntent): boolean {
+  if (activeLoginCleanupOperations.has(intent.cleanupOperationId)) return true;
+  if (intent.ownerPid === process.pid) {
+    if (
+      isVerifiableDirectoryProcessStartId(intent.ownerProcessStartId) &&
+      isVerifiableDirectoryProcessStartId(profileDirectoryProcessIncarnation)
+    ) {
+      return intent.ownerProcessStartId === profileDirectoryProcessIncarnation &&
+        activeLoginCleanupOperations.has(intent.cleanupOperationId);
+    }
+    return false;
+  }
+  const observed = profileDirectoryProcessStartId(intent.ownerPid);
+  if (
+    isVerifiableDirectoryProcessStartId(intent.ownerProcessStartId) &&
+    isVerifiableDirectoryProcessStartId(observed)
+  ) {
+    return intent.ownerProcessStartId === observed;
+  }
+  try {
+    process.kill(intent.ownerPid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function assertLoginCleanupIntentRecoverable(intent: LoginCleanupIntent): void {
+  if (loginCleanupIntentOwnerIsLive(intent)) {
+    throw new LoginCleanupInProgressError(
+      `login preparation is still in progress for profile "${intent.name}" and tool "${intent.tool}"`,
+    );
+  }
+}
+
+export function clearLoginCleanupIntentByOperation(
+  name: string,
+  tool: string,
+  transport: "local" | "api",
+  cleanupOperationId: string | undefined,
+): void {
+  if (!cleanupOperationId) return;
+  const intent = parseLoginCleanupIntent(name, tool, transport);
+  if (!intent || intent.cleanupOperationId !== cleanupOperationId) {
+    activeLoginCleanupOperations.delete(cleanupOperationId);
+    return;
+  }
+  if (existsSync(loginCleanupMarkerPath(intent.dir))) {
+    clearLoginCleanupMarker(intent.dir, cleanupOperationId);
+  }
+  clearLoginCleanupIntent(intent);
 }
 
 function managedProfileDirectory(name: string, tool: string): string {
@@ -489,8 +873,10 @@ function parseLoginCleanupMarker(dir: string): LoginCleanupMarker | undefined {
   const marker = value as Partial<LoginCleanupMarker>;
   const profile = profileSchema.safeParse(marker.profile);
   const ownership = marker.ownership;
+  const markerKeys = new Set(["version", "cleanupOperationId", "profile", "ownership"]);
   const ownershipKeys = new Set([
     "cleanupOperationId",
+    "cleanupRequestedAt",
     "toolLockRevision",
     "previousToolLock",
     "previousToolLockRevision",
@@ -499,6 +885,9 @@ function parseLoginCleanupMarker(dir: string): LoginCleanupMarker | undefined {
     "authCommitRevision",
   ]);
   if (
+    Reflect.ownKeys(marker).some(
+      (key) => typeof key !== "string" || !markerKeys.has(key),
+    ) ||
     marker.version !== 1 ||
     typeof marker.cleanupOperationId !== "string" ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(marker.cleanupOperationId) ||
@@ -532,33 +921,23 @@ function writeLoginCleanupMarker(
   }
   assertManagedDirectory(profile.dir);
   const path = loginCleanupMarkerPath(profile.dir);
-  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  assertSafeWritePath(path, { mustStayUnder: profilesDir() });
-  assertSafeWritePath(temp, { mustStayUnder: profilesDir() });
-  let fd: number | undefined;
-  try {
-    fd = openSync(temp, "wx", 0o600);
-    writeFileSync(fd, JSON.stringify({
+  publishAtomicJson(
+    path,
+    {
       version: 1,
       cleanupOperationId,
       profile,
       ownership: { ...ownership, cleanupOperationId },
-    } satisfies LoginCleanupMarker) + "\n", "utf8");
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = undefined;
-    renameSync(temp, path);
-    return true;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-    rmSync(temp, { force: true });
-  }
+    } satisfies LoginCleanupMarker,
+    profilesDir(),
+  );
+  return true;
 }
 
 function clearLoginCleanupMarker(dir: string, cleanupOperationId: string): void {
   const marker = parseLoginCleanupMarker(dir);
   if (marker?.cleanupOperationId !== cleanupOperationId) return;
-  rmSync(loginCleanupMarkerPath(dir), { force: true });
+  removePublishedFile(loginCleanupMarkerPath(dir), profilesDir());
 }
 
 function canPurgeInterruptedLoginDirectory(profile: Profile): boolean {
@@ -675,10 +1054,79 @@ function ownsCreatedProfileMachineState(
   return !hasAuthOwnership || Boolean(
     authKey &&
     ownership.authIdentity &&
-    ownership.authCommitRevision &&
     machine.profileAuthRevisions[authKey] === ownership.authIdentity &&
-    machine.profileAuthCommitRevisions[authKey] === ownership.authCommitRevision,
+    (
+      machine.profileAuthCommitRevisions[authKey]
+        ? Boolean(
+            ownership.authCommitRevision &&
+            machine.profileAuthCommitRevisions[authKey] === ownership.authCommitRevision
+          )
+        : !ownership.authCommitRevision
+    ),
   );
+}
+
+function restoreLoginIntentToolLock(
+  intent: LoginCleanupIntent,
+  injectFault: boolean,
+): boolean {
+  const ownership = intent.ownership;
+  if (!ownership.toolLockRevision) return true;
+  return withStoreLock(() => {
+    const machine = loadMachineStore();
+    const currentTool = machine.toolLocks[intent.name];
+    const currentRevision = machine.toolLockRevisions[intent.name];
+    const previousProfile = ownership.previousToolLock
+      ? machine.profiles.find(
+          (profile) =>
+            profile.name === intent.name &&
+            profile.tool === ownership.previousToolLock &&
+            (!ownership.previousToolLockProfileIncarnation ||
+              profileAuthIncarnation(profile) === ownership.previousToolLockProfileIncarnation),
+        )
+      : undefined;
+    const previousAlreadyRestored = ownership.previousToolLock
+      ? Boolean(
+          previousProfile &&
+          currentTool === ownership.previousToolLock &&
+          currentRevision === ownership.previousToolLockRevision
+        )
+      : currentTool === undefined && currentRevision === undefined;
+    if (previousAlreadyRestored) return true;
+
+    const ownsWrittenLock =
+      currentTool === intent.tool && currentRevision === ownership.toolLockRevision;
+    const deletionClearedOwnedLock =
+      intent.phase === "rollback" && currentTool === undefined && currentRevision === undefined;
+    if (!ownsWrittenLock && !deletionClearedOwnedLock) return false;
+    if (ownership.previousToolLock) {
+      if (!previousProfile) return false;
+      machine.toolLocks[intent.name] = ownership.previousToolLock;
+      if (ownership.previousToolLockRevision) {
+        machine.toolLockRevisions[intent.name] = ownership.previousToolLockRevision;
+      } else {
+        delete machine.toolLockRevisions[intent.name];
+      }
+    } else {
+      delete machine.toolLocks[intent.name];
+      delete machine.toolLockRevisions[intent.name];
+    }
+    saveStore(machine);
+    if (injectFault) {
+      injectLoginCleanupFaultForTests("post-lock-restore", intent.cleanupOperationId);
+    }
+    return true;
+  });
+}
+
+function profileFromLoginCleanupIntent(intent: LoginCleanupIntent): Profile {
+  return {
+    name: intent.name,
+    tool: intent.tool,
+    dir: intent.dir,
+    createdAt: new Date(0).toISOString(),
+    incarnationId: intent.plannedIncarnationId,
+  };
 }
 
 /** On-box JSON registry. Delegates to the core profile library. */
@@ -709,16 +1157,26 @@ class LocalStore implements AccountsStore {
   async addProfile(opts: AddOptions): Promise<Profile> {
     return (await this.addProfileForLogin(opts)).profile;
   }
-  async addProfileForLogin(opts: AddOptions): Promise<LoginCreatedProfile> {
+  async addProfileForLogin(
+    opts: AddOptions,
+    plan?: LoginProfileCreationPlan,
+  ): Promise<LoginCreatedProfile> {
     const toolId = opts.tool ?? DEFAULT_TOOL;
     const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, opts.name);
     return withProfileDirectoryLease(dir, () => {
       const existed = existsSync(dir);
       const profileExisted = Boolean(localFind(opts.name, toolId));
       try {
-        const profile = localAdd(opts);
+        const profile = localAdd({
+          ...opts,
+          ...(plan ? { incarnationId: plan.plannedIncarnationId } : {}),
+        });
+        if (plan) {
+          injectLoginCleanupFaultForTests("post-create", plan.cleanupOperationId);
+        }
         return { profile, createdProfileDir: !existed };
       } catch (error) {
+        if (isInjectedLoginCleanupFault(error)) throw error;
         const committed = localFind(opts.name, toolId);
         if (!profileExisted && committed && resolve(committed.dir) === resolve(dir)) {
           return { profile: committed, createdProfileDir: !existed };
@@ -744,7 +1202,10 @@ class LocalStore implements AccountsStore {
       return localRemove(name, opts);
     }));
   }
-  async upgradeProfileIncarnationForLogin(profile: Profile): Promise<Profile> {
+  async upgradeProfileIncarnationForLogin(
+    profile: Profile,
+    plannedIncarnationId: string = randomUUID(),
+  ): Promise<Profile> {
     return withStoreLock(() => {
       const machine = loadMachineStore();
       const current = machine.profiles.find(
@@ -758,7 +1219,7 @@ class LocalStore implements AccountsStore {
         throw new AccountsError("profile changed while login preparation was in progress");
       }
       if (!current.incarnationId) {
-        current.incarnationId = randomUUID();
+        current.incarnationId = plannedIncarnationId;
         saveStore(machine);
       }
       return structuredClone(current);
@@ -766,6 +1227,91 @@ class LocalStore implements AccountsStore {
   }
   async reconcileInterruptedLoginCleanup(name: string, tool: string): Promise<void> {
     const dir = managedProfileDirectory(name, tool);
+    const intent = parseLoginCleanupIntent(name, tool, this.transport);
+    if (intent) {
+      assertLoginCleanupIntentRecoverable(intent);
+      const observed = intent.profileExisted ? undefined : localFind(name, tool);
+      if (observed && observed.incarnationId !== intent.plannedIncarnationId) {
+        clearLoginCleanupIntentByOperation(
+          name,
+          tool,
+          this.transport,
+          intent.cleanupOperationId,
+        );
+        return;
+      }
+      if (observed) {
+        await this.removeProfileIncarnation(
+          observed,
+          intent.ownership,
+          { tool, purge: intent.createdProfileDir },
+        );
+        clearLoginCleanupIntentByOperation(
+          name,
+          tool,
+          this.transport,
+          intent.cleanupOperationId,
+        );
+        return;
+      }
+      return withProfileDirectoryLease(intent.dir, () => {
+        if (intent.profileExisted) {
+          restoreLoginIntentToolLock(intent, false);
+          clearLoginCleanupIntentByOperation(
+            name,
+            tool,
+            this.transport,
+            intent.cleanupOperationId,
+          );
+          return;
+        }
+        const latest = localFind(name, tool);
+        if (latest) {
+          clearLoginCleanupIntentByOperation(
+            name,
+            tool,
+            this.transport,
+            intent.cleanupOperationId,
+          );
+          return;
+        }
+        const marker = existsSync(loginCleanupMarkerPath(intent.dir))
+          ? parseLoginCleanupMarker(intent.dir)
+          : undefined;
+        const recoveryIntent = marker?.cleanupOperationId === intent.cleanupOperationId
+          ? evolveLoginCleanupIntent(intent, {
+              phase: "rollback",
+              ownership: marker.ownership,
+            })
+          : intent;
+        if (!restoreLoginIntentToolLock(recoveryIntent, false)) {
+          clearLoginCleanupIntentByOperation(
+            name,
+            tool,
+            this.transport,
+            intent.cleanupOperationId,
+          );
+          return;
+        }
+        const synthetic = profileFromLoginCleanupIntent(recoveryIntent);
+        if (
+          recoveryIntent.createdProfileDir &&
+          existsSync(recoveryIntent.dir) &&
+          isExactManagedProfileDirectory(synthetic) &&
+          ownsCreatedProfileMachineState(synthetic, recoveryIntent.ownership)
+        ) {
+          injectLoginCleanupFaultForTests("pre-purge", recoveryIntent.cleanupOperationId);
+          assertManagedDirectory(recoveryIntent.dir);
+          rmSync(recoveryIntent.dir, { recursive: true, force: true });
+        }
+        clearLoginCleanupIntentByOperation(
+          name,
+          tool,
+          this.transport,
+          intent.cleanupOperationId,
+        );
+      });
+    }
     if (!existsSync(loginCleanupMarkerPath(dir))) return;
     const marker = parseLoginCleanupMarker(dir)!;
     if (marker.profile.name !== name || marker.profile.tool !== tool) {
@@ -786,10 +1332,30 @@ class LocalStore implements AccountsStore {
     ownership: CreatedProfileRollbackOwnership,
     opts: RemoveOptions = {},
   ): Promise<RemoveResult | undefined> {
+    const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
+    ownership = {
+      ...ownership,
+      cleanupOperationId,
+      cleanupRequestedAt: ownership.cleanupRequestedAt ?? new Date().toISOString(),
+    };
+    const intent = parseLoginCleanupIntent(profile.name, profile.tool, this.transport);
+    const createdBeforeToolLock = Boolean(
+      intent?.cleanupOperationId === cleanupOperationId &&
+      (intent.phase === "planned" || intent.phase === "profile-created") &&
+      !intent.ownership.toolLockRevision,
+    );
+    if (intent?.cleanupOperationId === cleanupOperationId) {
+      ownership = evolveLoginCleanupIntent(intent, {
+        phase: "rollback",
+        ownership,
+      }).ownership;
+    }
     return withProfileDirectoryLease(profile.dir, () => {
       let absentMarker: LoginCleanupMarker | undefined;
       const result = withStoreLock(() => {
-      if (!profile.incarnationId || !ownership.toolLockRevision) return undefined;
+      if (!profile.incarnationId || (!ownership.toolLockRevision && !createdBeforeToolLock)) {
+        return undefined;
+      }
       const machine = loadMachineStore();
       const current = machine.profiles.find(
         (candidate) =>
@@ -803,7 +1369,6 @@ class LocalStore implements AccountsStore {
           existsSync(profile.dir) &&
           ownsCreatedProfileMachineState(profile, ownership)
         ) {
-          const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
           if (writeLoginCleanupMarker(profile, ownership, cleanupOperationId)) {
             absentMarker = {
               version: 1,
@@ -818,7 +1383,11 @@ class LocalStore implements AccountsStore {
       if (
         current.incarnationId !== profile.incarnationId ||
         !isDeepStrictEqual(current, profile) ||
-        machine.toolLockRevisions[current.name] !== ownership.toolLockRevision ||
+        (
+          ownership.toolLockRevision
+            ? machine.toolLockRevisions[current.name] !== ownership.toolLockRevision
+            : machine.toolLocks[current.name] === current.tool
+        ) ||
         machine.current[current.tool] === current.name ||
         machine.applied[current.tool] === current.name
       ) {
@@ -836,19 +1405,23 @@ class LocalStore implements AccountsStore {
           hasAuthOwnership && (
             !authKey ||
             !ownership.authIdentity ||
-            !ownership.authCommitRevision ||
             machine.profileAuthRevisions[authKey] !== ownership.authIdentity ||
-            machine.profileAuthCommitRevisions[authKey] !== ownership.authCommitRevision
+            (
+              machine.profileAuthCommitRevisions[authKey]
+                ? !ownership.authCommitRevision ||
+                  machine.profileAuthCommitRevisions[authKey] !== ownership.authCommitRevision
+                : Boolean(ownership.authCommitRevision)
+            )
           )
         ) {
           return undefined;
         }
       }
-      const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
       const journaled = Boolean(
         opts.purge && writeLoginCleanupMarker(current, ownership, cleanupOperationId),
       );
       const removed = localRemove(current.name, { tool: current.tool });
+      injectLoginCleanupFaultForTests("post-delete", cleanupOperationId);
       const after = loadMachineStore();
       if (
         ownership.previousToolLock &&
@@ -868,12 +1441,14 @@ class LocalStore implements AccountsStore {
         }
         saveStore(after);
       }
+      injectLoginCleanupFaultForTests("post-lock-restore", cleanupOperationId);
       let purged = false;
       if (
         opts.purge &&
         resolve(profile.dir) === resolve(join(profilesDir(), profile.tool, profile.name)) &&
         existsSync(profile.dir)
       ) {
+        injectLoginCleanupFaultForTests("pre-purge", cleanupOperationId);
         assertManagedDirectory(profile.dir);
         rmSync(profile.dir, { recursive: true, force: true });
         purged = true;
@@ -1205,11 +1780,18 @@ class ApiStore implements AccountsStore {
     return (await this.createProfile(opts, false)).profile;
   }
 
-  async addProfileForLogin(opts: AddOptions): Promise<LoginCreatedProfile> {
-    return this.createProfile(opts, true);
+  async addProfileForLogin(
+    opts: AddOptions,
+    plan?: LoginProfileCreationPlan,
+  ): Promise<LoginCreatedProfile> {
+    return this.createProfile(opts, true, plan);
   }
 
-  private async createProfile(opts: AddOptions, forLogin: boolean): Promise<LoginCreatedProfile> {
+  private async createProfile(
+    opts: AddOptions,
+    forLogin: boolean,
+    plan?: LoginProfileCreationPlan,
+  ): Promise<LoginCreatedProfile> {
     assertProfileName(opts.name);
     const toolId = opts.tool ?? DEFAULT_TOOL;
     const tool = await this.resolveTool(toolId);
@@ -1232,7 +1814,9 @@ class ApiStore implements AccountsStore {
         dir,
         description: opts.description,
       };
-      const expectedIncarnationId = forLogin ? randomUUID() : undefined;
+      const expectedIncarnationId = forLogin
+        ? plan?.plannedIncarnationId ?? randomUUID()
+        : undefined;
       try {
         if (forLogin && !this.api.createForLogin) {
           throw new AccountsError(
@@ -1247,14 +1831,26 @@ class ApiStore implements AccountsStore {
             "the Accounts API returned a different login profile incarnation than the requested rollback fence",
           );
         }
-        if (authExpectation) reconcileMachineProfileCreate(profile, authExpectation);
+        if (authExpectation) {
+          reconcileMachineProfileCreate(profile, authExpectation, plan?.plannedAuthIdentity);
+        }
+        if (plan) {
+          injectLoginCleanupFaultForTests("post-create", plan.cleanupOperationId);
+        }
         return { profile, createdProfileDir };
       } catch (error) {
+        if (isInjectedLoginCleanupFault(error)) throw error;
         if (forLogin && expectedIncarnationId) {
           try {
             const committed = await this.api.get(opts.name, toolId);
             if (committed?.incarnationId === expectedIncarnationId) {
-              if (authExpectation) reconcileMachineProfileCreate(committed, authExpectation);
+              if (authExpectation) {
+                reconcileMachineProfileCreate(
+                  committed,
+                  authExpectation,
+                  plan?.plannedAuthIdentity,
+                );
+              }
               return { profile: committed, createdProfileDir };
             }
             if (!committed && createdProfileDir) rmSync(dir, { recursive: true, force: true });
@@ -1327,6 +1923,91 @@ class ApiStore implements AccountsStore {
 
   async reconcileInterruptedLoginCleanup(name: string, tool: string): Promise<void> {
     const dir = managedProfileDirectory(name, tool);
+    const intent = parseLoginCleanupIntent(name, tool, this.transport);
+    if (intent) {
+      assertLoginCleanupIntentRecoverable(intent);
+      if (intent.profileExisted) {
+        restoreLoginIntentToolLock(intent, false);
+        clearLoginCleanupIntentByOperation(
+          name,
+          tool,
+          this.transport,
+          intent.cleanupOperationId,
+        );
+        return;
+      }
+      const observed = await this.api.get(name, tool);
+      if (observed && observed.incarnationId !== intent.plannedIncarnationId) {
+        clearLoginCleanupIntentByOperation(
+          name,
+          tool,
+          this.transport,
+          intent.cleanupOperationId,
+        );
+        return;
+      }
+      if (observed) {
+        await this.removeProfileIncarnation(
+          observed,
+          intent.ownership,
+          { tool, purge: intent.createdProfileDir },
+        );
+        clearLoginCleanupIntentByOperation(
+          name,
+          tool,
+          this.transport,
+          intent.cleanupOperationId,
+        );
+        return;
+      }
+      return withProfileDirectoryLease(intent.dir, async () => {
+        const authoritative = await this.api.get(name, tool);
+        if (authoritative) {
+          clearLoginCleanupIntentByOperation(
+            name,
+            tool,
+            this.transport,
+            intent.cleanupOperationId,
+          );
+          return;
+        }
+        const synthetic = profileFromLoginCleanupIntent(intent);
+        const expectation = withStoreLock(() => {
+          if (!ownsCreatedProfileMachineState(synthetic, intent.ownership)) return undefined;
+          return captureMachineProfileReconcileExpectation(synthetic);
+        });
+        if (!expectation) {
+          clearLoginCleanupIntentByOperation(
+            name,
+            tool,
+            this.transport,
+            intent.cleanupOperationId,
+          );
+          return;
+        }
+        reconcileMachineProfileRemove(
+          tool,
+          name,
+          profileAuthIncarnation(synthetic),
+          expectation,
+        );
+        if (
+          intent.createdProfileDir &&
+          existsSync(intent.dir) &&
+          isExactManagedProfileDirectory(synthetic)
+        ) {
+          injectLoginCleanupFaultForTests("pre-purge", intent.cleanupOperationId);
+          assertManagedDirectory(intent.dir);
+          rmSync(intent.dir, { recursive: true, force: true });
+        }
+        clearLoginCleanupIntentByOperation(
+          name,
+          tool,
+          this.transport,
+          intent.cleanupOperationId,
+        );
+      });
+    }
     if (!existsSync(loginCleanupMarkerPath(dir))) return;
     const marker = parseLoginCleanupMarker(dir)!;
     if (marker.profile.name !== name || marker.profile.tool !== tool) {
@@ -1350,45 +2031,66 @@ class ApiStore implements AccountsStore {
     opts: RemoveOptions = {},
   ): Promise<RemoveResult | undefined> {
     if (!profile.incarnationId || !this.api.removeCreatedProfile) return undefined;
+    const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
+    const cleanupRequestedAt = ownership.cleanupRequestedAt ?? new Date().toISOString();
+    ownership = { ...ownership, cleanupOperationId, cleanupRequestedAt };
+    const intent = parseLoginCleanupIntent(profile.name, profile.tool, this.transport);
+    if (intent?.cleanupOperationId === cleanupOperationId) {
+      ownership = evolveLoginCleanupIntent(intent, {
+        phase: "rollback",
+        ownership,
+      }).ownership;
+    }
     return withProfileDirectoryLease(profile.dir, async () => {
       const expectation = withStoreLock(() => {
         if (!ownsCreatedProfileMachineState(profile, ownership)) return undefined;
         return captureMachineProfileReconcileExpectation(profile);
       });
       if (!expectation) return undefined;
-      const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
       const journaled = Boolean(
-        opts.purge && writeLoginCleanupMarker(profile, ownership, cleanupOperationId),
+        opts.purge && writeLoginCleanupMarker(
+          profile,
+          { ...ownership, cleanupRequestedAt },
+          cleanupOperationId,
+        ),
       );
-      let removed: boolean;
       try {
-        removed = await this.api.removeCreatedProfile!(profile, cleanupOperationId);
+        const result = await this.api.removeCreatedProfile!(
+          profile,
+          cleanupOperationId,
+          cleanupRequestedAt,
+        );
+        if (result.expired || result.currentExists) {
+          if (journaled) clearLoginCleanupMarker(profile.dir, cleanupOperationId);
+          return undefined;
+        }
+        injectLoginCleanupFaultForTests("post-delete", cleanupOperationId);
       } catch (error) {
         try {
           const current = await this.api.get(profile.name, profile.tool);
-          if (
-            current &&
-            (!current.incarnationId || current.incarnationId === profile.incarnationId)
-          ) {
-            throw error;
+          if (current) {
+            if (!current.incarnationId || current.incarnationId === profile.incarnationId) {
+              throw error;
+            }
+            if (journaled) clearLoginCleanupMarker(profile.dir, cleanupOperationId);
+            return undefined;
           }
-          removed = true;
         } catch (reconcileError) {
           if (reconcileError === error) throw error;
           throw error;
         }
       }
-      if (!removed) {
-        const current = await this.api.get(profile.name, profile.tool);
-        if (current) {
-          if (journaled) clearLoginCleanupMarker(profile.dir, cleanupOperationId);
-          return undefined;
-        }
-        // A concurrent exact deletion already removed the registry row. The
-        // operation still owns its local managed directory unless machine
-        // state changed while the conditional request was in flight.
-        removed = true;
+      // A durable replay may truthfully return the old removal result after a
+      // replacement incarnation was created. Consult the authoritative row on
+      // every terminal path before local recursive purge; the directory lease
+      // closes the same-machine recreation window around this final check.
+      const authoritativeCurrent = await this.api.get(profile.name, profile.tool);
+      if (authoritativeCurrent) {
+        if (journaled) clearLoginCleanupMarker(profile.dir, cleanupOperationId);
+        return undefined;
       }
+      // Either this operation removed the row or another exact deletion won.
+      // Both are locally purgeable only after the authoritative absence above.
       return withStoreLock(() => {
         const currentExpectation = captureMachineProfileReconcileExpectation(profile);
         if (
@@ -1409,6 +2111,7 @@ class ApiStore implements AccountsStore {
           resolve(profile.dir) === resolve(join(profilesDir(), profile.tool, profile.name)) &&
           existsSync(profile.dir)
         ) {
+          injectLoginCleanupFaultForTests("pre-purge", cleanupOperationId);
           assertManagedDirectory(profile.dir);
           rmSync(profile.dir, { recursive: true, force: true });
           purged = true;

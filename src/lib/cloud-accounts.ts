@@ -82,6 +82,12 @@ export interface CloudUpdateInput {
   lastUsedAt?: string | null;
 }
 
+export interface RemoveCreatedProfileResult {
+  removed: boolean;
+  currentExists: boolean;
+  expired: boolean;
+}
+
 /**
  * Tool payload accepted from GET /v1/tools. Older servers only guaranteed
  * id/label, so all enriched ToolDef fields and builtin remain optional on read.
@@ -96,7 +102,11 @@ export interface AccountsCloudApi {
   create(input: CloudCreateInput): Promise<Profile>;
   createForLogin?(input: CloudCreateInput, expectedIncarnationId: string): Promise<Profile>;
   assertLoginProfileCleanup?(): Promise<void>;
-  removeCreatedProfile?(profile: Profile, cleanupOperationId: string): Promise<boolean>;
+  removeCreatedProfile?(
+    profile: Profile,
+    cleanupOperationId: string,
+    cleanupRequestedAt: string,
+  ): Promise<RemoveCreatedProfileResult>;
   update(name: string, tool: string, input: CloudUpdateInput): Promise<Profile>;
   restoreProfile?(
     name: string,
@@ -336,13 +346,20 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       }
     },
 
-    async removeCreatedProfile(profile: Profile, cleanupOperationId: string): Promise<boolean> {
-      if (!profile.incarnationId) return false;
+    async removeCreatedProfile(
+      profile: Profile,
+      cleanupOperationId: string,
+      cleanupRequestedAt: string,
+    ): Promise<RemoveCreatedProfileResult> {
+      if (!profile.incarnationId) {
+        return { removed: false, currentExists: true, expired: false };
+      }
       try {
-        const result = await t.post<{ removed: boolean }>(
+        const result = await t.post<RemoveCreatedProfileResult>(
           `/accounts/${encodeURIComponent(profile.tool)}/${encodeURIComponent(profile.name)}/login/remove-created-operation`,
           {
             cleanupOperationId,
+            cleanupRequestedAt,
             expectedIncarnationId: profile.incarnationId,
             expectedCreatedAt: profile.createdAt,
             expectedEmail: profile.email ?? null,
@@ -356,7 +373,16 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
           },
           { idempotencyKey: cleanupOperationId, ...LOGIN_TRANSACTION_REQUEST },
         );
-        return result.removed === true;
+        if (
+          typeof result?.removed !== "boolean" ||
+          typeof result?.currentExists !== "boolean" ||
+          typeof result?.expired !== "boolean"
+        ) {
+          throw new AccountsError(
+            "accounts-serve returned an incomplete conditional cleanup result; upgrade the server",
+          );
+        }
+        return result;
       } catch (err) {
         if (isEndpointMissing(err)) throw endpointMissingError("accounts login-created profile cleanup");
         throw err;

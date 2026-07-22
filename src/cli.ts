@@ -47,6 +47,7 @@ import {
   prepareLogin,
   rollbackLoginFinalization,
   rollbackLoginPreparation,
+  commitLoginPreparation,
   type LoginFinalizationState,
 } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
@@ -641,6 +642,9 @@ program
         validateTool: (tool) => {
           permissionArgs = resolveCliPermissions(tool, opts).args;
         },
+        acquireProfileLease: (dir, tool) => tool.id === "claude"
+          ? acquireClaudeProfileLoginLock(dir)
+          : Promise.resolve(undefined),
         store,
       });
       if (prepared.status === "stopped") {
@@ -656,7 +660,7 @@ program
       let priorKeychain: ReturnType<typeof captureClaudeKeychain>;
       let keychainCaptured = false;
       let releaseKeychainLock: (() => void) | undefined;
-      let releaseProfileLoginLock: (() => void) | undefined;
+      let releaseProfileLoginLock = prepared.releaseProfileLease;
       let finalizationState: LoginFinalizationState | undefined;
       let pendingSignal: NodeJS.Signals | undefined;
       const lockAbort = new AbortController();
@@ -689,10 +693,7 @@ program
       process.on("SIGINT", onSigint);
       process.on("SIGTERM", onSigterm);
       try {
-        if (tool.id === "claude") {
-          releaseProfileLoginLock = await acquireClaudeProfileLoginLock(profile.dir, lockAbort.signal);
-          if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
-        }
+        if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
         finalizationState = await captureLoginFinalizationState(name, tool, store, profile);
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (pendingSignal) throw new AccountsError("login interrupted before tool launch");
@@ -745,6 +746,7 @@ program
           process.exitCode = signalExitCode(pendingSignal!);
           return;
         }
+        commitLoginPreparation(prepared, store);
         if (finalized.applied) {
           console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
         } else {
