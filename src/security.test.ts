@@ -1,12 +1,13 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { execSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, existsSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync, chmodSync, statSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertSafeWritePath } from "./lib/safe-path.js";
 import {
   assertAllowedKeychainCredential,
   keychainWriteFailureMessage,
+  readClaudeKeychain,
   securityExecutable,
   writeClaudeKeychain,
 } from "./lib/keychain.js";
@@ -208,37 +209,76 @@ test("test security executable override is gated by NODE_ENV=test", () => {
   }
 });
 
-test.skipIf(platform() !== "darwin")("keychain executable ignores PATH shadowing", () => {
+test("keychain test seam ignores PATH shadowing and executes only the configured runner", () => {
   const fakeBinDir = mkdtempSync(join(tmpdir(), "fake-security-bin-"));
-  const fakeSecurity = join(fakeBinDir, "security");
-  const fakeLog = join(fakeBinDir, "called.log");
-  writeFileSync(
-    fakeSecurity,
-    ["#!/usr/bin/env bash", `printf 'shadowed security called\\n' >> ${JSON.stringify(fakeLog)}`, "exit 1"].join("\n"),
+  const pathSecurity = join(fakeBinDir, platform() === "win32" ? "security.cmd" : "security");
+  const pathLog = join(fakeBinDir, "path-called.log");
+  const configuredSecurity = join(
+    fakeBinDir,
+    platform() === "win32" ? "configured-security.cmd" : "configured-security",
   );
-  chmodSync(fakeSecurity, 0o755);
+  const configuredLog = join(fakeBinDir, "configured-called.log");
+  const pathSecuritySource = platform() === "win32"
+    ? ["@echo off", `echo path security called>> ${JSON.stringify(pathLog)}`, "exit /b 1"].join("\r\n")
+    : ["#!/bin/sh", `printf 'path security called\\n' >> ${JSON.stringify(pathLog)}`, "exit 1"].join("\n");
+  const configuredSecuritySource = platform() === "win32"
+    ? [
+      "@echo off",
+      `echo %*>> ${JSON.stringify(configuredLog)}`,
+      "echo %* | findstr /C:\" -w\" >nul",
+      "if %errorlevel% equ 0 (",
+      "  echo fixture-oauth-payload",
+      ") else (",
+      "  echo \"acct\"^<blob^>=\"fixture-account\"",
+      ")",
+    ].join("\r\n")
+    : [
+      "#!/bin/sh",
+      `printf '%s\\n' \"$*\" >> ${JSON.stringify(configuredLog)}`,
+      "case \"$*\" in",
+      "  *\" -w\") printf 'fixture-oauth-payload\\n' ;;",
+      "  *) printf '\"acct\"<blob>=\"fixture-account\"\\n' ;;",
+      "esac",
+    ].join("\n");
+  writeFileSync(
+    pathSecurity,
+    pathSecuritySource,
+    { mode: 0o700 },
+  );
+  writeFileSync(
+    configuredSecurity,
+    configuredSecuritySource,
+    { mode: 0o700 },
+  );
 
   const originalPath = process.env.PATH;
   const originalNodeEnv = process.env.NODE_ENV;
+  const originalTestKeychain = process.env.ACCOUNTS_TEST_KEYCHAIN;
   const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
   process.env.PATH = `${fakeBinDir}:${originalPath ?? ""}`;
-  let fakeCalled = false;
   try {
-    delete process.env.NODE_ENV;
-    delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
-    expect(securityExecutable()).toBe("/usr/bin/security");
-    fakeCalled = existsSync(fakeLog);
+    process.env.NODE_ENV = "test";
+    process.env.ACCOUNTS_TEST_KEYCHAIN = "1";
+    process.env.ACCOUNTS_TEST_SECURITY_BIN = configuredSecurity;
+
+    expect(readClaudeKeychain()).toEqual({
+      service: CLAUDE_KEYCHAIN_SERVICE,
+      account: "fixture-account",
+      secret: "fixture-oauth-payload",
+    });
+    expect(readFileSync(configuredLog, "utf8").trim().split("\n")).toHaveLength(2);
+    expect(existsSync(pathLog)).toBe(false);
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
     if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = originalNodeEnv;
+    if (originalTestKeychain === undefined) delete process.env.ACCOUNTS_TEST_KEYCHAIN;
+    else process.env.ACCOUNTS_TEST_KEYCHAIN = originalTestKeychain;
     if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
     else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
     rmSync(fakeBinDir, { recursive: true, force: true });
   }
-
-  expect(fakeCalled).toBe(false);
 });
 
 test.skipIf(!existsSync("/var/folders"))("saveStore works when ACCOUNTS_HOME is under /var/folders temp", () => {

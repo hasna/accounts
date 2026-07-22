@@ -48,7 +48,7 @@
     "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:postgres": "ACCOUNTS_REQUIRE_POSTGRES=1 bun test src/server/postgres.integration.test.ts"
+    "test:postgres": "bun run ./test/run-postgres.ts"
   },
   "keywords": [
     "claude",
