@@ -7,7 +7,6 @@ import { assertSafeWritePath } from "./lib/safe-path.js";
 import {
   assertAllowedKeychainCredential,
   keychainWriteFailureMessage,
-  readClaudeKeychain,
   securityExecutable,
   writeClaudeKeychain,
 } from "./lib/keychain.js";
@@ -172,7 +171,18 @@ test("keychain write failure messages do not include command arguments", () => {
 });
 
 test.skipIf(platform() !== "darwin")("keychain commands use the macOS security executable", () => {
-  expect(securityExecutable()).toBe("/usr/bin/security");
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
+  try {
+    delete process.env.NODE_ENV;
+    delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
+    expect(securityExecutable()).toBe("/usr/bin/security");
+  } finally {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
+    else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
+  }
 });
 
 test("test security executable override is gated by NODE_ENV=test", () => {
@@ -198,7 +208,7 @@ test("test security executable override is gated by NODE_ENV=test", () => {
   }
 });
 
-test.skipIf(platform() !== "darwin")("keychain reads use macOS security when PATH is shadowed", () => {
+test.skipIf(platform() !== "darwin")("keychain executable ignores PATH shadowing", () => {
   const fakeBinDir = mkdtempSync(join(tmpdir(), "fake-security-bin-"));
   const fakeSecurity = join(fakeBinDir, "security");
   const fakeLog = join(fakeBinDir, "called.log");
@@ -209,14 +219,22 @@ test.skipIf(platform() !== "darwin")("keychain reads use macOS security when PAT
   chmodSync(fakeSecurity, 0o755);
 
   const originalPath = process.env.PATH;
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
   process.env.PATH = `${fakeBinDir}:${originalPath ?? ""}`;
   let fakeCalled = false;
   try {
-    readClaudeKeychain();
+    delete process.env.NODE_ENV;
+    delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
+    expect(securityExecutable()).toBe("/usr/bin/security");
     fakeCalled = existsSync(fakeLog);
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
+    else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
     rmSync(fakeBinDir, { recursive: true, force: true });
   }
 
