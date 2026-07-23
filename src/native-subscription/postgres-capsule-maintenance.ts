@@ -13,7 +13,12 @@ import {
   CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR,
   CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
   CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+  maintenanceCanonicalRequestDigest,
+  maintenanceOperationDigest,
+  maintenanceReservationKeyDigest,
+  maintenanceSourceLineageDigest,
   maintenanceTargetDigest,
+  maintenanceUseIdDigest,
 } from "./capsule-maintenance.js";
 import { parseCounter } from "./counter.js";
 import { isUuidV7 } from "./ids.js";
@@ -96,6 +101,28 @@ const ACTION_STEP = Object.freeze({
   REVOKE_PROVIDER_SESSION: "revoke_provider_session",
   ROTATE_BROKERED: "rotate_brokered",
 } as const);
+const CONSUME_GRANT_BINDING_FIELDS = Object.freeze([
+  "issuer",
+  "issuer_incarnation",
+  "key_id",
+  "audience",
+  "effect_namespace_id",
+  "maintenance_authority_epoch",
+  "maintenance_operation_id",
+  "operation_digest",
+  "operation_execution_epoch",
+  "operation_execution_expires_at",
+  "action",
+  "subject",
+  "actor_principal",
+  "maintenance_executor_principal",
+  "sender_key_thumbprint",
+  "channel_binding_digest",
+  "execution_fence_digest",
+  "catalog_incarnation",
+  "recovery_frontier_sequence",
+  "recovery_frontier_hash",
+] as const);
 
 /**
  * Durable self-hosted maintenance ledger. Reservation and consume are each a
@@ -219,9 +246,17 @@ export class PostgresCapsuleMaintenanceLedger implements CapsuleMaintenanceLedge
         FOR UPDATE
       `;
       if (grant === undefined || grant.owner_ref !== input.ownerRef) return { status: "not_found" };
-      if (receipt.grant_digest !== grant.grant_digest) {
-        throw new AccountsError("VALIDATION_FAILED", "Maintenance receipt grant digest mismatch");
-      }
+      const storedGrant = validateGrantReservation({
+        grantId: grant.grant_id,
+        ownerRef: grant.owner_ref,
+        idempotencyKeyDigest: grant.idempotency_key_digest,
+        requestDigest: grant.request_digest,
+        reservationKeyDigest: grant.reservation_key_digest,
+        grantDigest: grant.grant_digest,
+        grantBytes: decodeCanonicalBase64(grant.grant_jcs_base64url),
+        expiresAt: grant.expires_at,
+      });
+      assertConsumeGrantBindings(receipt, storedGrant, grant.grant_digest);
       if (grant.state !== "live" || grant.expired) {
         if (grant.state === "live") {
           await transaction`
@@ -472,20 +507,34 @@ function validateGrantReservation(
   ]) {
     assertPositiveCounter(grant[field], field);
   }
+  const targetDigest = maintenanceTargetDigest(grant);
+  const canonicalRequestDigest = maintenanceCanonicalRequestDigest(
+    grant,
+    targetDigest,
+  );
+  const sourceLineageDigest = action === "PROBE_NATIVE"
+    ? undefined
+    : maintenanceSourceLineageDigest(
+        grant,
+        targetDigest,
+        canonicalRequestDigest,
+      );
+  const operationDigest = maintenanceOperationDigest(
+    grant,
+    targetDigest,
+    canonicalRequestDigest,
+    sourceLineageDigest,
+  );
   if (
     grant.grant_id !== input.grantId ||
     grant.owner_ref !== input.ownerRef ||
     grant.expires_at !== expiresAt ||
+    grant.canonical_request_digest !== canonicalRequestDigest ||
+    grant.operation_digest !== operationDigest ||
+    (sourceLineageDigest !== undefined &&
+      grant.source_lineage_digest !== sourceLineageDigest) ||
     canonicalSha256(grant) !== input.grantDigest ||
-    canonicalSha256({
-      effect_namespace_id: grant.effect_namespace_id,
-      execution_fence_digest: grant.execution_fence_digest,
-      expected_credential_generation: grant.expected_credential_generation,
-      expected_record_revision: grant.expected_record_revision,
-      schema_version: "accounts.capsule-maintenance-reservation-key.v1",
-      serialization_key_digest: grant.serialization_key_digest,
-      target_digest: maintenanceTargetDigest(grant),
-    }) !== input.reservationKeyDigest
+    maintenanceReservationKeyDigest(grant) !== input.reservationKeyDigest
   ) {
     throw validationFailed("grantBytes");
   }
@@ -566,15 +615,36 @@ function validateUseCommit(input: CapsuleMaintenanceUseCommit): JsonRecord {
   ]) {
     assertPositiveCounter(receipt[field], field);
   }
+  const maintenanceUseId = maintenanceUseIdDigest(receipt);
   if (
     receipt.grant_id !== input.grantId ||
     receipt.maintenance_use_id !== input.maintenanceUseId ||
+    receipt.maintenance_use_id !== maintenanceUseId ||
     receipt.committed_at !== committedAt ||
     canonicalSha256(receipt) !== input.consumeReceiptDigest
   ) {
     throw validationFailed("consumeReceiptBytes");
   }
   return receipt;
+}
+
+function assertConsumeGrantBindings(
+  receipt: JsonRecord,
+  grant: JsonRecord,
+  grantDigest: string,
+): void {
+  if (
+    receipt.grant_id !== grant.grant_id ||
+    receipt.grant_digest !== grantDigest ||
+    receipt.target_digest !== maintenanceTargetDigest(grant) ||
+    CONSUME_GRANT_BINDING_FIELDS.some(
+      (field) => receipt[field] !== grant[field],
+    ) ||
+    (grant.action !== "PROBE_NATIVE" &&
+      receipt.source_lineage_digest !== grant.source_lineage_digest)
+  ) {
+    throw validationFailed("consumeReceiptBytes");
+  }
 }
 
 function parseCanonicalEvidence(bytes: Uint8Array, field: string): JsonRecord {
@@ -733,6 +803,7 @@ function assertTimestamp(value: unknown, field: string): string {
   const milliseconds = Date.parse(value);
   if (
     !Number.isFinite(milliseconds) ||
+    milliseconds <= 0 ||
     new Date(milliseconds).toISOString() !== value
   ) {
     throw validationFailed(field);

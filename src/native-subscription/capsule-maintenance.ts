@@ -488,7 +488,7 @@ export class CapsuleMaintenanceAuthority {
         hold_receipt_digest: held === undefined ? null : canonicalSha256Bytes(request.holdReceiptBytes!),
         transport: binding,
       }),
-      reservationKeyDigest: reservationKeyDigest(grant, targetDigest),
+      reservationKeyDigest: maintenanceReservationKeyDigest(grant),
       grantDigest: canonicalSha256Bytes(grantBytes),
       grantBytes,
       expiresAt: grant.expires_at,
@@ -529,8 +529,7 @@ export class CapsuleMaintenanceAuthority {
     const now = this.now();
     const operationStepId = ACTION_STEPS[grant.action];
     const grantDigest = canonicalSha256Bytes(request.grantBytes);
-    const maintenanceUseId = canonicalSha256({
-      schema_version: "accounts.capsule-maintenance-use.v1",
+    const maintenanceUseId = maintenanceUseIdDigest({
       grant_id: grant.grant_id,
       grant_digest: grantDigest,
       maintenance_operation_id: grant.maintenance_operation_id,
@@ -1050,7 +1049,10 @@ function parseConsumeReceipt(
   return Object.freeze({ ...value }) as CapsuleMaintenanceConsumeReceipt;
 }
 
-function maintenanceCanonicalRequestDigest(source: Readonly<Record<string, unknown>>, targetDigest: string): string {
+export function maintenanceCanonicalRequestDigest(
+  source: Readonly<Record<string, unknown>>,
+  targetDigest: string,
+): string {
   return canonicalSha256(source.action === "PROBE_NATIVE"
     ? {
         action: "PROBE_NATIVE",
@@ -1084,7 +1086,7 @@ function maintenanceCanonicalRequestDigest(source: Readonly<Record<string, unkno
   });
 }
 
-function maintenanceSourceLineageDigest(
+export function maintenanceSourceLineageDigest(
   source: Readonly<Record<string, unknown>>,
   targetDigest: string,
   requestDigest: string,
@@ -1101,7 +1103,7 @@ function maintenanceSourceLineageDigest(
   });
 }
 
-function maintenanceOperationDigest(
+export function maintenanceOperationDigest(
   source: Readonly<Record<string, unknown>>,
   targetDigest: string,
   requestDigest: string,
@@ -1129,7 +1131,9 @@ function maintenanceOperationDigest(
       });
 }
 
-function reservationKeyDigest(grant: CapsuleMaintenanceGrant, targetDigest: string): string {
+export function maintenanceReservationKeyDigest(
+  grant: Readonly<Record<string, unknown>>,
+): string {
   return canonicalSha256({
     effect_namespace_id: grant.effect_namespace_id,
     execution_fence_digest: grant.execution_fence_digest,
@@ -1137,7 +1141,23 @@ function reservationKeyDigest(grant: CapsuleMaintenanceGrant, targetDigest: stri
     expected_record_revision: grant.expected_record_revision,
     schema_version: "accounts.capsule-maintenance-reservation-key.v1",
     serialization_key_digest: grant.serialization_key_digest,
-    target_digest: targetDigest,
+    target_digest: maintenanceTargetDigest(grant),
+  });
+}
+
+export function maintenanceUseIdDigest(
+  source: Readonly<Record<string, unknown>>,
+): string {
+  return canonicalSha256({
+    schema_version: "accounts.capsule-maintenance-use.v1",
+    grant_id: source.grant_id,
+    grant_digest: source.grant_digest,
+    maintenance_operation_id: source.maintenance_operation_id,
+    operation_step_id: source.operation_step_id,
+    operation_execution_epoch: source.operation_execution_epoch,
+    sender_key_thumbprint: source.sender_key_thumbprint,
+    channel_binding_digest: source.channel_binding_digest,
+    use_ordinal: source.use_ordinal,
   });
 }
 

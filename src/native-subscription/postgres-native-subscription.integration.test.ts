@@ -12,7 +12,11 @@ import {
   CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
   CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
   CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+  maintenanceCanonicalRequestDigest,
+  maintenanceOperationDigest,
+  maintenanceReservationKeyDigest,
   maintenanceTargetDigest,
+  maintenanceUseIdDigest,
 } from "./capsule-maintenance.js";
 import { canonicalJson, canonicalSha256 } from "./json.js";
 import { PostgresCapsuleMaintenanceLedger } from "./postgres-capsule-maintenance.js";
@@ -81,7 +85,7 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
   }
 
   function grantEvidence(): Record<string, string> {
-    return {
+    const evidence: Record<string, string> = {
       schema_version: CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
       schema_digest: CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
       grant_id: grantId,
@@ -92,7 +96,6 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       effect_namespace_id: "accounts-native-subscription",
       maintenance_authority_epoch: "1",
       maintenance_operation_id: maintenanceOperationId,
-      operation_digest: digest("0"),
       operation_execution_epoch: "1",
       operation_execution_expires_at: "2030-07-18T12:20:00.000Z",
       execution_fence_digest: digest("1"),
@@ -118,7 +121,6 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       expected_record_revision: "1",
       expected_credential_generation: "1",
       maintenance_decision_digest: digest("5"),
-      canonical_request_digest: digest("6"),
       approval_mode: "NOT_REQUIRED",
       policy_digest: digest("7"),
       catalog_incarnation: "catalog-1",
@@ -138,6 +140,21 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       expected_auth_generation: "1",
       expected_auth_state_revision: "1",
     };
+    const targetDigest = maintenanceTargetDigest(evidence);
+    const canonicalRequestDigest = maintenanceCanonicalRequestDigest(
+      evidence,
+      targetDigest,
+    );
+    return {
+      ...evidence,
+      operation_digest: maintenanceOperationDigest(
+        evidence,
+        targetDigest,
+        canonicalRequestDigest,
+        undefined,
+      ),
+      canonical_request_digest: canonicalRequestDigest,
+    };
   }
 
   function grant(): CapsuleMaintenanceGrantReservation {
@@ -147,15 +164,7 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       ownerRef: ownerA,
       idempotencyKeyDigest: digest("0"),
       requestDigest: digest("1"),
-      reservationKeyDigest: canonicalSha256({
-        effect_namespace_id: evidence.effect_namespace_id,
-        execution_fence_digest: evidence.execution_fence_digest,
-        expected_credential_generation: evidence.expected_credential_generation,
-        expected_record_revision: evidence.expected_record_revision,
-        schema_version: "accounts.capsule-maintenance-reservation-key.v1",
-        serialization_key_digest: evidence.serialization_key_digest,
-        target_digest: maintenanceTargetDigest(evidence),
-      }),
+      reservationKeyDigest: maintenanceReservationKeyDigest(evidence),
       grantDigest: canonicalSha256(evidence),
       grantBytes: Uint8Array.from(Buffer.from(canonicalJson(evidence), "utf8")),
       expiresAt: "2030-07-18T12:10:00.000Z",
@@ -163,42 +172,46 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
   }
 
   function consumeEvidence(): Record<string, string> {
-    return {
+    const sourceGrant = grantEvidence();
+    const evidence: Record<string, string> = {
       schema_version: CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
       schema_digest: CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST,
       consume_receipt_id: consumeReceiptId,
       grant_id: grantId,
-      grant_digest: grant().grantDigest,
-      issuer: "accounts-maintenance",
-      issuer_incarnation: "accounts-maintenance-1",
-      key_id: "accounts-maintenance-key-1",
-      audience: "infinity",
-      effect_namespace_id: "accounts-native-subscription",
-      maintenance_authority_epoch: "1",
-      maintenance_operation_id: maintenanceOperationId,
-      operation_digest: digest("0"),
+      grant_digest: canonicalSha256(sourceGrant),
+      issuer: sourceGrant.issuer!,
+      issuer_incarnation: sourceGrant.issuer_incarnation!,
+      key_id: sourceGrant.key_id!,
+      audience: sourceGrant.audience!,
+      effect_namespace_id: sourceGrant.effect_namespace_id!,
+      maintenance_authority_epoch: sourceGrant.maintenance_authority_epoch!,
+      maintenance_operation_id: sourceGrant.maintenance_operation_id!,
+      operation_digest: sourceGrant.operation_digest!,
       operation_step_id: "probe_native",
-      operation_execution_epoch: "1",
-      operation_execution_expires_at: "2030-07-18T12:20:00.000Z",
-      action: "PROBE_NATIVE",
-      target_digest: digest("1"),
-      subject: ownerA,
-      actor_principal: ownerA,
-      maintenance_executor_principal: ownerA,
-      sender_key_thumbprint: digest("2"),
-      channel_binding_digest: digest("3"),
-      execution_fence_digest: digest("4"),
+      operation_execution_epoch: sourceGrant.operation_execution_epoch!,
+      operation_execution_expires_at: sourceGrant.operation_execution_expires_at!,
+      action: sourceGrant.action!,
+      target_digest: maintenanceTargetDigest(sourceGrant),
+      subject: sourceGrant.subject!,
+      actor_principal: sourceGrant.actor_principal!,
+      maintenance_executor_principal: sourceGrant.maintenance_executor_principal!,
+      sender_key_thumbprint: sourceGrant.sender_key_thumbprint!,
+      channel_binding_digest: sourceGrant.channel_binding_digest!,
+      execution_fence_digest: sourceGrant.execution_fence_digest!,
       max_uses: "1",
       prior_use_count: "0",
       next_use_count: "1",
       use_ordinal: "1",
-      maintenance_use_id: digest("6"),
       committed_at: "2030-07-18T12:01:00.000Z",
       expires_at: "2030-07-18T12:02:00.000Z",
-      catalog_incarnation: "catalog-1",
-      recovery_frontier_sequence: "1",
-      recovery_frontier_hash: digest("5"),
+      catalog_incarnation: sourceGrant.catalog_incarnation!,
+      recovery_frontier_sequence: sourceGrant.recovery_frontier_sequence!,
+      recovery_frontier_hash: sourceGrant.recovery_frontier_hash!,
       signature,
+    };
+    return {
+      ...evidence,
+      maintenance_use_id: maintenanceUseIdDigest(evidence),
     };
   }
 
@@ -209,7 +222,7 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       ownerRef: ownerA,
       idempotencyKeyDigest: digest("4"),
       requestDigest: digest("5"),
-      maintenanceUseId: digest("6"),
+      maintenanceUseId: evidence.maintenance_use_id!,
       consumeReceiptDigest: canonicalSha256(evidence),
       consumeReceiptBytes: Uint8Array.from(
         Buffer.from(canonicalJson(evidence), "utf8"),
