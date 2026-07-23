@@ -7,6 +7,14 @@ import type {
   CapsuleMaintenanceGrantReservation,
   CapsuleMaintenanceUseCommit,
 } from "./capsule-maintenance.js";
+import {
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
+  CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
+  CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+  maintenanceTargetDigest,
+} from "./capsule-maintenance.js";
+import { canonicalJson, canonicalSha256 } from "./json.js";
 import { PostgresCapsuleMaintenanceLedger } from "./postgres-capsule-maintenance.js";
 import {
   POSTGRES_MIGRATIONS,
@@ -50,6 +58,14 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
   const ownerA = "principal:service:hasna:native-integration-a";
   const ownerB = "principal:service:hasna:native-integration-b";
   const grantId = "018f0f00-1001-7000-8000-000000000001";
+  const maintenanceOperationId = "018f0f00-1002-7000-8000-000000000002";
+  const providerAccountId = "018f0f00-1003-7000-8000-000000000003";
+  const accountLaneId = "018f0f00-1004-7000-8000-000000000004";
+  const capacityPoolId = "018f0f00-1005-7000-8000-000000000005";
+  const authCapsuleId = "018f0f00-1006-7000-8000-000000000006";
+  const canonicalNodeId = "018f0f00-1007-7000-8000-000000000007";
+  const consumeReceiptId = "018f0f00-1008-7000-8000-000000000008";
+  const signature = Buffer.alloc(64, 9).toString("base64url");
   const digest = (character: string) => `sha256:${character.repeat(64)}`;
 
   let admin: Pool;
@@ -64,28 +80,140 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
     return url.toString();
   }
 
+  function grantEvidence(): Record<string, string> {
+    return {
+      schema_version: CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+      schema_digest: CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
+      grant_id: grantId,
+      issuer: "accounts-maintenance",
+      issuer_incarnation: "accounts-maintenance-1",
+      key_id: "accounts-maintenance-key-1",
+      audience: "infinity",
+      effect_namespace_id: "accounts-native-subscription",
+      maintenance_authority_epoch: "1",
+      maintenance_operation_id: maintenanceOperationId,
+      operation_digest: digest("0"),
+      operation_execution_epoch: "1",
+      operation_execution_expires_at: "2030-07-18T12:20:00.000Z",
+      execution_fence_digest: digest("1"),
+      action: "PROBE_NATIVE",
+      effect_class: "read_only",
+      target_kind: "native_capsule",
+      subject: ownerA,
+      actor_principal: ownerA,
+      maintenance_executor_principal: ownerA,
+      sender_key_thumbprint: digest("2"),
+      channel_binding_digest: digest("3"),
+      owner_ref: ownerA,
+      provider_account_id: providerAccountId,
+      provider_subject_ref: "provider-subject",
+      account_lane_id: accountLaneId,
+      capacity_pool_id: capacityPoolId,
+      capacity_domain_ref: "capacity-domain",
+      serialization_key_digest: digest("4"),
+      access_transport: "native_session",
+      credential_family_id: "credential-family",
+      capacity_generation: "1",
+      deny_generation: "0",
+      expected_record_revision: "1",
+      expected_credential_generation: "1",
+      maintenance_decision_digest: digest("5"),
+      canonical_request_digest: digest("6"),
+      approval_mode: "NOT_REQUIRED",
+      policy_digest: digest("7"),
+      catalog_incarnation: "catalog-1",
+      recovery_frontier_sequence: "1",
+      recovery_frontier_hash: digest("8"),
+      issued_at: "2030-07-18T12:00:00.000Z",
+      not_before: "2030-07-18T12:00:00.000Z",
+      expires_at: "2030-07-18T12:10:00.000Z",
+      nonce: "nonce-1",
+      max_uses: "1",
+      signature,
+      auth_capsule_id: authCapsuleId,
+      canonical_node_id: canonicalNodeId,
+      node_key_thumbprint: digest("9"),
+      node_generation: "1",
+      placement_generation: "1",
+      expected_auth_generation: "1",
+      expected_auth_state_revision: "1",
+    };
+  }
+
   function grant(): CapsuleMaintenanceGrantReservation {
+    const evidence = grantEvidence();
     return {
       grantId,
       ownerRef: ownerA,
       idempotencyKeyDigest: digest("0"),
       requestDigest: digest("1"),
-      reservationKeyDigest: digest("2"),
-      grantDigest: digest("3"),
-      grantBytes: Uint8Array.from(Buffer.from('{"grant":"live-concurrency"}')),
+      reservationKeyDigest: canonicalSha256({
+        effect_namespace_id: evidence.effect_namespace_id,
+        execution_fence_digest: evidence.execution_fence_digest,
+        expected_credential_generation: evidence.expected_credential_generation,
+        expected_record_revision: evidence.expected_record_revision,
+        schema_version: "accounts.capsule-maintenance-reservation-key.v1",
+        serialization_key_digest: evidence.serialization_key_digest,
+        target_digest: maintenanceTargetDigest(evidence),
+      }),
+      grantDigest: canonicalSha256(evidence),
+      grantBytes: Uint8Array.from(Buffer.from(canonicalJson(evidence), "utf8")),
       expiresAt: "2030-07-18T12:10:00.000Z",
     };
   }
 
+  function consumeEvidence(): Record<string, string> {
+    return {
+      schema_version: CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
+      schema_digest: CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+      consume_receipt_id: consumeReceiptId,
+      grant_id: grantId,
+      grant_digest: grant().grantDigest,
+      issuer: "accounts-maintenance",
+      issuer_incarnation: "accounts-maintenance-1",
+      key_id: "accounts-maintenance-key-1",
+      audience: "infinity",
+      effect_namespace_id: "accounts-native-subscription",
+      maintenance_authority_epoch: "1",
+      maintenance_operation_id: maintenanceOperationId,
+      operation_digest: digest("0"),
+      operation_step_id: "probe_native",
+      operation_execution_epoch: "1",
+      operation_execution_expires_at: "2030-07-18T12:20:00.000Z",
+      action: "PROBE_NATIVE",
+      target_digest: digest("1"),
+      subject: ownerA,
+      actor_principal: ownerA,
+      maintenance_executor_principal: ownerA,
+      sender_key_thumbprint: digest("2"),
+      channel_binding_digest: digest("3"),
+      execution_fence_digest: digest("4"),
+      max_uses: "1",
+      prior_use_count: "0",
+      next_use_count: "1",
+      use_ordinal: "1",
+      maintenance_use_id: digest("6"),
+      committed_at: "2030-07-18T12:01:00.000Z",
+      expires_at: "2030-07-18T12:02:00.000Z",
+      catalog_incarnation: "catalog-1",
+      recovery_frontier_sequence: "1",
+      recovery_frontier_hash: digest("5"),
+      signature,
+    };
+  }
+
   function use(): CapsuleMaintenanceUseCommit {
+    const evidence = consumeEvidence();
     return {
       grantId,
       ownerRef: ownerA,
       idempotencyKeyDigest: digest("4"),
       requestDigest: digest("5"),
       maintenanceUseId: digest("6"),
-      consumeReceiptDigest: digest("7"),
-      consumeReceiptBytes: Uint8Array.from(Buffer.from('{"receipt":"live-concurrency"}')),
+      consumeReceiptDigest: canonicalSha256(evidence),
+      consumeReceiptBytes: Uint8Array.from(
+        Buffer.from(canonicalJson(evidence), "utf8"),
+      ),
       committedAt: "2030-07-18T12:01:00.000Z",
     };
   }
@@ -380,6 +508,149 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
     }
   });
 
+  test("rejects malformed DTOs and evidence without persisting a live reservation or use", async () => {
+    const ledger = new PostgresCapsuleMaintenanceLedger(
+      loginSql as unknown as PostgresSqlClient,
+      ownerA,
+      roleBoundary,
+    );
+    const [{ live_before: liveBefore, uses_before: usesBefore }] = await ownerSql<
+      Array<{ live_before: string; uses_before: string }>
+    >`
+      SELECT
+        (
+          SELECT count(*)::text
+          FROM accounts.capsule_maintenance_grants
+          WHERE owner_ref = ${ownerA} AND state = 'live'
+        ) AS live_before,
+        (
+          SELECT count(*)::text
+          FROM accounts.capsule_maintenance_uses
+          WHERE owner_ref = ${ownerA}
+        ) AS uses_before
+    `;
+    const malformedIds = [
+      "018f0f00-1101-7000-8000-000000000001",
+      "018f0f00-1102-7000-8000-000000000002",
+      "018f0f00-1103-7000-8000-000000000003",
+      "018f0f00-1104-7000-8000-000000000004",
+      "018f0f00-1105-7000-8000-000000000005",
+      "018f0f00-1106-7000-8000-000000000006",
+      "018f0f00-1107-7000-8000-000000000007",
+      "018f0f00-1108-7000-8000-000000000008",
+      "018f0f00-1109-7000-8000-000000000009",
+    ] as const;
+    const reservation = (
+      id: string,
+      mutate: (evidence: Record<string, string>) => void,
+      canonical = true,
+    ): CapsuleMaintenanceGrantReservation => {
+      const evidence = { ...grantEvidence(), grant_id: id };
+      mutate(evidence);
+      const encoded = canonicalJson(evidence);
+      return {
+        ...grant(),
+        grantId: id,
+        idempotencyKeyDigest: digest("a"),
+        reservationKeyDigest: digest("b"),
+        grantDigest: canonicalSha256(evidence),
+        grantBytes: Uint8Array.from(
+          Buffer.from(canonical ? encoded : ` ${encoded}`, "utf8"),
+        ),
+        expiresAt: String(evidence.expires_at),
+      };
+    };
+    const malformedReservations = [
+      {
+        ...reservation(malformedIds[0], () => {}),
+        unexpected: "closed-dto-violation",
+      },
+      {
+        ...reservation(malformedIds[1], () => {}),
+        expiresAt: "infinity",
+      },
+      reservation(malformedIds[2], (evidence) => {
+        evidence.schema_version = "accounts.capsule-maintenance/v2";
+      }),
+      reservation(malformedIds[3], (evidence) => {
+        evidence.unexpected = "closed-envelope-violation";
+      }),
+      reservation(malformedIds[4], (evidence) => {
+        evidence.grant_id = grantId;
+      }),
+      reservation(malformedIds[5], () => {}, false),
+      {
+        ...reservation(malformedIds[6], () => {}),
+        expiresAt: Number.POSITIVE_INFINITY,
+      },
+      {
+        ...reservation(malformedIds[7], () => {}),
+        expiresAt: "2030-07-18 12:00:00+00",
+      },
+      {
+        ...reservation(malformedIds[8], () => {}),
+        grantBytes: Uint8Array.from([0xde, 0xad, 0xbe, 0xef]),
+      },
+    ] as unknown as CapsuleMaintenanceGrantReservation[];
+    for (const malformed of malformedReservations) {
+      expect(() => ledger.reserve(malformed)).toThrow(expect.objectContaining({
+        code: "VALIDATION_FAILED",
+      }));
+    }
+
+    const receipt = consumeEvidence();
+    const unsupportedReceipt = {
+      ...receipt,
+      schema_version: "accounts.capsule-maintenance-consume-receipt.v2",
+    };
+    const malformedCommits = [
+      { ...use(), unexpected: "closed-dto-violation" },
+      { ...use(), committedAt: "infinity" },
+      { ...use(), committedAt: Number.POSITIVE_INFINITY },
+      { ...use(), committedAt: "2030-07-18 12:00:00+00" },
+      {
+        ...use(),
+        consumeReceiptBytes: Uint8Array.from(
+          Buffer.from(canonicalJson(unsupportedReceipt), "utf8"),
+        ),
+        consumeReceiptDigest: canonicalSha256(unsupportedReceipt),
+      },
+      {
+        ...use(),
+        consumeReceiptBytes: Uint8Array.from(
+          Buffer.from(` ${canonicalJson(receipt)}`, "utf8"),
+        ),
+      },
+      {
+        ...use(),
+        consumeReceiptBytes: Uint8Array.from([0xde, 0xad, 0xbe, 0xef]),
+      },
+    ] as unknown as CapsuleMaintenanceUseCommit[];
+    for (const malformed of malformedCommits) {
+      expect(() => ledger.consume(malformed)).toThrow(expect.objectContaining({
+        code: "VALIDATION_FAILED",
+      }));
+    }
+
+    const [{ live_after: liveAfter, uses_after: usesAfter }] = await ownerSql<
+      Array<{ live_after: string; uses_after: string }>
+    >`
+      SELECT
+        (
+          SELECT count(*)::text
+          FROM accounts.capsule_maintenance_grants
+          WHERE owner_ref = ${ownerA} AND state = 'live'
+        ) AS live_after,
+        (
+          SELECT count(*)::text
+          FROM accounts.capsule_maintenance_uses
+          WHERE owner_ref = ${ownerA}
+        ) AS uses_after
+    `;
+    expect(liveAfter).toBe(liveBefore);
+    expect(usesAfter).toBe(usesBefore);
+  });
+
   test("enforces forced RLS isolation and append-only evidence at runtime", async () => {
     const otherOwner = new PostgresCapsuleMaintenanceLedger(
       loginSql as unknown as PostgresSqlClient,
@@ -440,6 +711,50 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       ownerSql as unknown as PostgresSqlClient,
       { runtimeRole: roleBoundary },
     )).appliedVersions).toEqual([]);
+  });
+
+  test("rejects standalone type and non-table relation drift in the final catalog", async () => {
+    const fixtures = [
+      [
+        "CREATE TYPE accounts.unexpected_status AS ENUM ('active')",
+        "DROP TYPE accounts.unexpected_status",
+      ],
+      [
+        "CREATE DOMAIN accounts.unexpected_digest AS text",
+        "DROP DOMAIN accounts.unexpected_digest",
+      ],
+      [
+        "CREATE VIEW accounts.unexpected_view AS SELECT version FROM accounts.schema_migrations",
+        "DROP VIEW accounts.unexpected_view",
+      ],
+      [
+        "CREATE MATERIALIZED VIEW accounts.unexpected_materialized AS SELECT version FROM accounts.schema_migrations WITH NO DATA",
+        "DROP MATERIALIZED VIEW accounts.unexpected_materialized",
+      ],
+      [
+        "CREATE SEQUENCE accounts.unexpected_sequence",
+        "DROP SEQUENCE accounts.unexpected_sequence",
+      ],
+    ] as const;
+    for (const [mutation, restoration] of fixtures) {
+      await expectSchemaDrift([mutation], [restoration]);
+    }
+  });
+
+  test("rejects ACL drift on an allowed schema type", async () => {
+    await ownerSql`REVOKE USAGE ON TYPE accounts.provider_accounts FROM PUBLIC`;
+    try {
+      await expect(runPostgresMigrations(
+        ownerSql as unknown as PostgresSqlClient,
+        { runtimeRole: roleBoundary },
+      )).rejects.toMatchObject({ code: "SCHEMA_CHECKSUM_MISMATCH" });
+    } finally {
+      await resetAccountsSchema();
+      await runPostgresMigrations(
+        ownerSql as unknown as PostgresSqlClient,
+        { runtimeRole: roleBoundary },
+      );
+    }
   });
 
   test("rejects every dropped CAS and maintenance PK/UNIQUE/CHECK/FK invariant", async () => {

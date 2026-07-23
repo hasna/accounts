@@ -4,6 +4,14 @@ import type {
   CapsuleMaintenanceGrantReservation,
   CapsuleMaintenanceUseCommit,
 } from "./capsule-maintenance.js";
+import {
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
+  CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
+  CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+  maintenanceTargetDigest,
+} from "./capsule-maintenance.js";
+import { canonicalJson, canonicalSha256 } from "./json.js";
 import { PostgresCapsuleMaintenanceLedger } from "./postgres-capsule-maintenance.js";
 import type { PostgresSqlClient, PostgresTransaction } from "./postgres-sql.js";
 
@@ -14,6 +22,14 @@ const D1 = `sha256:${"1".repeat(64)}`;
 const D2 = `sha256:${"2".repeat(64)}`;
 const D3 = `sha256:${"3".repeat(64)}`;
 const D4 = `sha256:${"4".repeat(64)}`;
+const MAINTENANCE_OPERATION_ID = "018f0f00-0002-7000-8000-000000000002";
+const PROVIDER_ACCOUNT_ID = "018f0f00-0003-7000-8000-000000000003";
+const ACCOUNT_LANE_ID = "018f0f00-0004-7000-8000-000000000004";
+const CAPACITY_POOL_ID = "018f0f00-0005-7000-8000-000000000005";
+const AUTH_CAPSULE_ID = "018f0f00-0006-7000-8000-000000000006";
+const CANONICAL_NODE_ID = "018f0f00-0007-7000-8000-000000000007";
+const CONSUME_RECEIPT_ID = "018f0f00-0008-7000-8000-000000000008";
+const SIGNATURE = Buffer.alloc(64, 7).toString("base64url");
 
 interface FakeGrant {
   grant_id: string;
@@ -131,28 +147,135 @@ function fakeClient(state: FakeState): PostgresSqlClient {
 }
 
 function grant(overrides: Partial<CapsuleMaintenanceGrantReservation> = {}): CapsuleMaintenanceGrantReservation {
+  const evidence = {
+    schema_version: CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+    schema_digest: CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
+    grant_id: GRANT_ID,
+    issuer: "accounts-maintenance",
+    issuer_incarnation: "accounts-maintenance-1",
+    key_id: "accounts-maintenance-key-1",
+    audience: "infinity",
+    effect_namespace_id: "accounts-native-subscription",
+    maintenance_authority_epoch: "1",
+    maintenance_operation_id: MAINTENANCE_OPERATION_ID,
+    operation_digest: D0,
+    operation_execution_epoch: "1",
+    operation_execution_expires_at: "2030-07-18T12:05:00.000Z",
+    execution_fence_digest: D1,
+    action: "PROBE_NATIVE",
+    effect_class: "read_only",
+    target_kind: "native_capsule",
+    subject: OWNER,
+    actor_principal: OWNER,
+    maintenance_executor_principal: OWNER,
+    sender_key_thumbprint: D2,
+    channel_binding_digest: D3,
+    owner_ref: OWNER,
+    provider_account_id: PROVIDER_ACCOUNT_ID,
+    provider_subject_ref: "provider-subject",
+    account_lane_id: ACCOUNT_LANE_ID,
+    capacity_pool_id: CAPACITY_POOL_ID,
+    capacity_domain_ref: "capacity-domain",
+    serialization_key_digest: D4,
+    access_transport: "native_session",
+    credential_family_id: "credential-family",
+    capacity_generation: "1",
+    deny_generation: "0",
+    expected_record_revision: "1",
+    expected_credential_generation: "1",
+    maintenance_decision_digest: D0,
+    canonical_request_digest: D1,
+    approval_mode: "NOT_REQUIRED",
+    policy_digest: D2,
+    catalog_incarnation: "catalog-1",
+    recovery_frontier_sequence: "1",
+    recovery_frontier_hash: D3,
+    issued_at: "2030-07-18T12:00:00.000Z",
+    not_before: "2030-07-18T12:00:00.000Z",
+    expires_at: "2030-07-18T12:01:00.000Z",
+    nonce: "nonce-1",
+    max_uses: "1",
+    signature: SIGNATURE,
+    auth_capsule_id: AUTH_CAPSULE_ID,
+    canonical_node_id: CANONICAL_NODE_ID,
+    node_key_thumbprint: D4,
+    node_generation: "1",
+    placement_generation: "1",
+    expected_auth_generation: "1",
+    expected_auth_state_revision: "1",
+  };
+  const grantBytes = Uint8Array.from(Buffer.from(canonicalJson(evidence), "utf8"));
   return {
     grantId: GRANT_ID,
     ownerRef: OWNER,
     idempotencyKeyDigest: D0,
     requestDigest: D1,
-    reservationKeyDigest: D2,
-    grantDigest: D3,
-    grantBytes: Uint8Array.from(Buffer.from('{"grant":"one"}', "utf8")),
+    reservationKeyDigest: canonicalSha256({
+      effect_namespace_id: evidence.effect_namespace_id,
+      execution_fence_digest: evidence.execution_fence_digest,
+      expected_credential_generation: evidence.expected_credential_generation,
+      expected_record_revision: evidence.expected_record_revision,
+      schema_version: "accounts.capsule-maintenance-reservation-key.v1",
+      serialization_key_digest: evidence.serialization_key_digest,
+      target_digest: maintenanceTargetDigest(evidence),
+    }),
+    grantDigest: canonicalSha256(evidence),
+    grantBytes,
     expiresAt: "2030-07-18T12:01:00.000Z",
     ...overrides,
   };
 }
 
 function use(overrides: Partial<CapsuleMaintenanceUseCommit> = {}): CapsuleMaintenanceUseCommit {
+  const grantDigest = grant().grantDigest;
+  const evidence = {
+    schema_version: CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
+    schema_digest: CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+    consume_receipt_id: CONSUME_RECEIPT_ID,
+    grant_id: GRANT_ID,
+    grant_digest: grantDigest,
+    issuer: "accounts-maintenance",
+    issuer_incarnation: "accounts-maintenance-1",
+    key_id: "accounts-maintenance-key-1",
+    audience: "infinity",
+    effect_namespace_id: "accounts-native-subscription",
+    maintenance_authority_epoch: "1",
+    maintenance_operation_id: MAINTENANCE_OPERATION_ID,
+    operation_digest: D0,
+    operation_step_id: "probe_native",
+    operation_execution_epoch: "1",
+    operation_execution_expires_at: "2030-07-18T12:05:00.000Z",
+    action: "PROBE_NATIVE",
+    target_digest: D1,
+    subject: OWNER,
+    actor_principal: OWNER,
+    maintenance_executor_principal: OWNER,
+    sender_key_thumbprint: D2,
+    channel_binding_digest: D3,
+    execution_fence_digest: D4,
+    max_uses: "1",
+    prior_use_count: "0",
+    next_use_count: "1",
+    use_ordinal: "1",
+    maintenance_use_id: D4,
+    committed_at: "2030-07-18T12:00:00.000Z",
+    expires_at: "2030-07-18T12:01:00.000Z",
+    catalog_incarnation: "catalog-1",
+    recovery_frontier_sequence: "1",
+    recovery_frontier_hash: D0,
+    signature: SIGNATURE,
+  };
+  const consumeReceiptBytes = Uint8Array.from(
+    Buffer.from(canonicalJson(evidence), "utf8"),
+  );
   return {
     grantId: GRANT_ID,
     ownerRef: OWNER,
     idempotencyKeyDigest: D3,
     requestDigest: D4,
     maintenanceUseId: D4,
-    consumeReceiptDigest: D2,
-    consumeReceiptBytes: Uint8Array.from(Buffer.from('{"receipt":"one"}', "utf8")),
+    consumeReceiptDigest: canonicalSha256(evidence),
+    consumeReceiptBytes,
     committedAt: "2030-07-18T12:00:00.000Z",
     ...overrides,
   };
@@ -218,5 +341,39 @@ describe("Postgres capsule maintenance ledger", () => {
     }))).toThrow(expect.objectContaining({ code: "VALIDATION_FAILED" }));
     expect(state.grants).toEqual([]);
     expect(state.uses).toEqual([]);
+  });
+
+  test("rejects malformed public DTOs and arbitrary evidence before opening a transaction", async () => {
+    const role = { mode: "direct", roleName: "accounts_runtime" } as const;
+    const malformedReservations = [
+      { ...grant(), unexpected: "accepted-by-structural-typing" },
+      grant({ grantId: "not-a-uuid" }),
+      grant({ expiresAt: "infinity" }),
+      grant({ grantBytes: Uint8Array.from(Buffer.from('{"grant":"arbitrary"}')) }),
+    ] as unknown as CapsuleMaintenanceGrantReservation[];
+    for (const reservation of malformedReservations) {
+      const state: FakeState = { grants: [], uses: [], modes: [] };
+      const ledger = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER, role);
+      expect(() => ledger.reserve(reservation)).toThrow(expect.objectContaining({
+        code: "VALIDATION_FAILED",
+      }));
+      expect(state.modes).toEqual([]);
+      expect(state.grants).toEqual([]);
+    }
+
+    const malformedCommits = [
+      { ...use(), unexpected: "accepted-by-structural-typing" },
+      use({ committedAt: "2030-07-18T12:00:00Z" }),
+      use({ consumeReceiptBytes: Uint8Array.from(Buffer.from('{"receipt":"arbitrary"}')) }),
+    ] as unknown as CapsuleMaintenanceUseCommit[];
+    for (const commit of malformedCommits) {
+      const state: FakeState = { grants: [], uses: [], modes: [] };
+      const ledger = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER, role);
+      expect(() => ledger.consume(commit)).toThrow(expect.objectContaining({
+        code: "VALIDATION_FAILED",
+      }));
+      expect(state.modes).toEqual([]);
+      expect(state.uses).toEqual([]);
+    }
   });
 });

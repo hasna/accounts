@@ -72,6 +72,9 @@ interface FakeMigrationState {
   hasLedgerSequence?: boolean;
   residualObjectCount?: number;
   driftRls?: boolean;
+  extraSchemaObject?: boolean;
+  extraSchemaType?: boolean;
+  driftTypeAcl?: boolean;
 }
 
 function fakeClient(state: FakeMigrationState): PostgresSqlClient {
@@ -180,6 +183,98 @@ function fakeClient(state: FakeMigrationState): PostgresSqlClient {
         foreign_objects: 0,
         foreign_grants: 0,
       }];
+    }
+    if (query.includes("relation.relname AS object_name")) {
+      const rows = [
+        ...POSTGRES_FINAL_TABLES.map((object_name) => ({
+          object_name,
+          object_kind: "r",
+          owner_is_current: true,
+          acl_is_null: true,
+        })),
+        ...POSTGRES_SCHEMA_MANIFEST.constraints
+          .filter((entry) => entry[2] === "p" || entry[2] === "u")
+          .map((entry) => ({
+            object_name: entry[1],
+            object_kind: "i",
+            owner_is_current: true,
+            acl_is_null: true,
+          })),
+        ...POSTGRES_SCHEMA_MANIFEST.indexes.map((entry) => ({
+          object_name: entry[1],
+          object_kind: "i",
+          owner_is_current: true,
+          acl_is_null: true,
+        })),
+        {
+          object_name: "schema_migrations_ledger_sequence_seq",
+          object_kind: "S",
+          owner_is_current: true,
+          acl_is_null: false,
+        },
+      ];
+      if (state.extraSchemaObject === true) {
+        rows.push({
+          object_name: "unexpected_view",
+          object_kind: "v",
+          owner_is_current: true,
+          acl_is_null: true,
+        });
+      }
+      return rows.sort((left, right) =>
+        left.object_name.localeCompare(right.object_name) ||
+        left.object_kind.localeCompare(right.object_kind)
+      );
+    }
+    if (query.includes("type_entry.typname AS type_name")) {
+      const rows = POSTGRES_FINAL_TABLES.flatMap((tableName) => [
+        {
+          type_name: tableName,
+          type_kind: "c",
+          type_category: "C",
+          relation_name: tableName,
+          relation_kind: "r",
+          element_type_name: null,
+          owner_is_current: true,
+          public_usage: !(state.driftTypeAcl === true &&
+            tableName === "provider_accounts"),
+          runtime_usage: true,
+          foreign_grants: "0",
+          acl_is_null: !(state.driftTypeAcl === true &&
+            tableName === "provider_accounts"),
+        },
+        {
+          type_name: `_${tableName}`,
+          type_kind: "b",
+          type_category: "A",
+          relation_name: null,
+          relation_kind: null,
+          element_type_name: tableName,
+          owner_is_current: true,
+          public_usage: true,
+          runtime_usage: true,
+          foreign_grants: "0",
+          acl_is_null: true,
+        },
+      ]);
+      if (state.extraSchemaType === true) {
+        rows.push({
+          type_name: "unexpected_status",
+          type_kind: "e",
+          type_category: "E",
+          relation_name: null,
+          relation_kind: null,
+          element_type_name: null,
+          owner_is_current: true,
+          public_usage: true,
+          runtime_usage: true,
+          foreign_grants: "0",
+          acl_is_null: true,
+        });
+      }
+      return rows.sort((left, right) =>
+        left.type_name.localeCompare(right.type_name)
+      );
     }
     if (query.includes("pg_catalog.pg_sequence AS sequence")) {
       return [{
@@ -580,6 +675,30 @@ describe("Postgres migration runner", () => {
     const client = fakeClient(state);
     await runPostgresMigrations(client, { runtimeRole: RUNTIME_ROLE });
     state.driftRls = true;
+    await expect(
+      runPostgresMigrations(client, { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    });
+
+    state.driftRls = false;
+    state.extraSchemaObject = true;
+    await expect(
+      runPostgresMigrations(client, { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    });
+
+    state.extraSchemaObject = false;
+    state.extraSchemaType = true;
+    await expect(
+      runPostgresMigrations(client, { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    });
+
+    state.extraSchemaType = false;
+    state.driftTypeAcl = true;
     await expect(
       runPostgresMigrations(client, { runtimeRole: RUNTIME_ROLE }),
     ).rejects.toMatchObject({

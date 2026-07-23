@@ -80,6 +80,27 @@ interface TableCatalogRow {
   readonly public_any: boolean;
 }
 
+interface SchemaObjectCatalogRow {
+  readonly object_name: string;
+  readonly object_kind: string;
+  readonly owner_is_current: boolean;
+  readonly acl_is_null: boolean;
+}
+
+interface SchemaTypeCatalogRow {
+  readonly type_name: string;
+  readonly type_kind: string;
+  readonly type_category: string;
+  readonly relation_name: string | null;
+  readonly relation_kind: string | null;
+  readonly element_type_name: string | null;
+  readonly owner_is_current: boolean;
+  readonly public_usage: boolean;
+  readonly runtime_usage: boolean;
+  readonly foreign_grants: string | number | bigint;
+  readonly acl_is_null: boolean;
+}
+
 interface SequenceCatalogRow {
   readonly sequence_name: string;
   readonly owner_is_current: boolean;
@@ -187,6 +208,17 @@ const EXPECTED_FUNCTIONS = Object.freeze([
 
 const SECURITY_DEFINER_FUNCTION =
   "delete_credential_handle_for_revocation(target_binding_id uuid, target_owner_ref text)";
+
+const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
+  ...POSTGRES_FINAL_TABLES.map((name) => [name, "r"] as const),
+  ...POSTGRES_SCHEMA_MANIFEST.constraints
+    .filter((entry) => entry[2] === "p" || entry[2] === "u")
+    .map((entry) => [entry[1], "i"] as const),
+  ...POSTGRES_SCHEMA_MANIFEST.indexes.map((entry) => [entry[1], "i"] as const),
+  ["schema_migrations_ledger_sequence_seq", "S"] as const,
+].sort(([leftName, leftKind], [rightName, rightKind]) =>
+  leftName.localeCompare(rightName) || leftKind.localeCompare(rightKind)
+));
 
 const EXPECTED_TRIGGERS = new Map<string, {
   readonly tableName: string;
@@ -720,12 +752,134 @@ async function attestCatalog(
     throw catalogMismatch("schema_ownership_or_grants");
   }
 
+  await attestSchemaObjects(transaction);
+  await attestSchemaTypes(transaction, runtimeRole);
   await attestTables(transaction, runtimeRole);
   await attestSequences(transaction, runtimeRole);
   await attestSchemaManifest(transaction);
   await attestFunctions(transaction, runtimeRole);
   await attestTriggers(transaction);
   await attestPolicies(transaction);
+}
+
+async function attestSchemaObjects(
+  transaction: PostgresTransaction,
+): Promise<void> {
+  const rows = await transaction<SchemaObjectCatalogRow[]>`
+    SELECT
+      relation.relname AS object_name,
+      relation.relkind::text AS object_kind,
+      relation.relowner = pg_catalog.to_regrole(current_user) AS owner_is_current,
+      relation.relacl IS NULL AS acl_is_null
+    FROM pg_catalog.pg_class AS relation
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'accounts'
+    ORDER BY relation.relname, relation.relkind
+  `;
+  const actual = rows.map((row) => [row.object_name, row.object_kind] as const);
+  if (
+    JSON.stringify(actual) !== JSON.stringify(EXPECTED_SCHEMA_OBJECTS) ||
+    rows.some((row) =>
+      !row.owner_is_current ||
+      (row.object_kind === "i" && !row.acl_is_null)
+    )
+  ) {
+    const unexpected = rows.find((row, index) =>
+      !row.owner_is_current ||
+      (row.object_kind === "i" && !row.acl_is_null) ||
+      row.object_name !== EXPECTED_SCHEMA_OBJECTS[index]?.[0] ||
+      row.object_kind !== EXPECTED_SCHEMA_OBJECTS[index]?.[1]
+    );
+    throw catalogMismatch("schema_objects", unexpected?.object_name);
+  }
+}
+
+async function attestSchemaTypes(
+  transaction: PostgresTransaction,
+  runtimeRole: string,
+): Promise<void> {
+  const rows = await transaction<SchemaTypeCatalogRow[]>`
+    SELECT
+      type_entry.typname AS type_name,
+      type_entry.typtype::text AS type_kind,
+      type_entry.typcategory::text AS type_category,
+      relation.relname AS relation_name,
+      relation.relkind::text AS relation_kind,
+      element_type.typname AS element_type_name,
+      type_entry.typowner = pg_catalog.to_regrole(current_user) AS owner_is_current,
+      pg_catalog.has_type_privilege(
+        'public',
+        type_entry.oid,
+        'USAGE'
+      ) AS public_usage,
+      pg_catalog.has_type_privilege(
+        ${runtimeRole},
+        type_entry.oid,
+        'USAGE'
+      ) AS runtime_usage,
+      (
+        SELECT count(*)::bigint
+        FROM pg_catalog.aclexplode(
+          COALESCE(
+            type_entry.typacl,
+            pg_catalog.acldefault('T', type_entry.typowner)
+          )
+        ) AS grant_entry
+        WHERE grant_entry.grantee NOT IN (
+          0::oid,
+          pg_catalog.to_regrole(current_user)::oid,
+          pg_catalog.to_regrole(${runtimeRole})::oid
+        )
+      ) AS foreign_grants,
+      type_entry.typacl IS NULL AS acl_is_null
+    FROM pg_catalog.pg_type AS type_entry
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = type_entry.typnamespace
+    LEFT JOIN pg_catalog.pg_class AS relation
+      ON relation.oid = type_entry.typrelid
+    LEFT JOIN pg_catalog.pg_type AS element_type
+      ON element_type.oid = type_entry.typelem
+    WHERE namespace.nspname = 'accounts'
+    ORDER BY type_entry.typname
+  `;
+  const allowedTables = new Set<string>(POSTGRES_FINAL_TABLES);
+  const rowTypes = new Set<string>();
+  const arrayElementTypes = new Set<string>();
+  for (const row of rows) {
+    const rowType = row.type_kind === "c" &&
+      row.type_category === "C" &&
+      row.relation_kind === "r" &&
+      row.relation_name === row.type_name &&
+      allowedTables.has(row.type_name) &&
+      row.element_type_name === null;
+    const arrayType = row.type_kind === "b" &&
+      row.type_category === "A" &&
+      row.relation_name === null &&
+      row.relation_kind === null &&
+      row.element_type_name !== null &&
+      allowedTables.has(row.element_type_name) &&
+      row.type_name === `_${row.element_type_name}`;
+    if (
+      (!rowType && !arrayType) ||
+      !row.owner_is_current ||
+      !row.public_usage ||
+      !row.runtime_usage ||
+      BigInt(row.foreign_grants) !== 0n ||
+      !row.acl_is_null
+    ) {
+      throw catalogMismatch("schema_types", row.type_name);
+    }
+    if (rowType) rowTypes.add(row.type_name);
+    if (arrayType) arrayElementTypes.add(row.element_type_name!);
+  }
+  if (
+    rows.length !== POSTGRES_FINAL_TABLES.length * 2 ||
+    !sameStrings([...rowTypes].sort(), [...POSTGRES_FINAL_TABLES].sort()) ||
+    !sameStrings([...arrayElementTypes].sort(), [...POSTGRES_FINAL_TABLES].sort())
+  ) {
+    throw catalogMismatch("schema_types");
+  }
 }
 
 async function attestSequences(

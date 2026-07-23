@@ -6,7 +6,23 @@ import type {
   CapsuleMaintenanceReserveResult,
   CapsuleMaintenanceUseCommit,
 } from "./capsule-maintenance.js";
-import { assertNoSensitiveFields, parseClosedJsonBytes } from "./json.js";
+import {
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_DESCRIPTOR,
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST,
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
+  CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR,
+  CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
+  CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+  maintenanceTargetDigest,
+} from "./capsule-maintenance.js";
+import { parseCounter } from "./counter.js";
+import { isUuidV7 } from "./ids.js";
+import {
+  assertNoSensitiveFields,
+  canonicalJson,
+  canonicalSha256,
+  parseClosedJsonBytes,
+} from "./json.js";
 import {
   installPostgresRuntimeContext,
   type PostgresRuntimeRoleBoundary,
@@ -37,6 +53,49 @@ interface UseRow {
 }
 
 const PRINCIPAL = /^principal:(?:human|service):hasna:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
+const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/;
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
+const RESERVATION_FIELDS = Object.freeze([
+  "grantId",
+  "ownerRef",
+  "idempotencyKeyDigest",
+  "requestDigest",
+  "reservationKeyDigest",
+  "grantDigest",
+  "grantBytes",
+  "expiresAt",
+] as const);
+const USE_COMMIT_FIELDS = Object.freeze([
+  "grantId",
+  "ownerRef",
+  "idempotencyKeyDigest",
+  "requestDigest",
+  "maintenanceUseId",
+  "consumeReceiptDigest",
+  "consumeReceiptBytes",
+  "committedAt",
+] as const);
+const ACTION_TARGET_KIND = Object.freeze({
+  BOOTSTRAP_NATIVE: "native_capsule",
+  CLEANUP_CREDENTIAL: "account_record",
+  PROBE_NATIVE: "native_capsule",
+  REAUTHENTICATE_NATIVE: "native_capsule",
+  REFRESH_NATIVE: "native_capsule",
+  REVOKE_BROKERED: "account_record",
+  REVOKE_PROVIDER_SESSION: "native_capsule",
+  ROTATE_BROKERED: "account_record",
+} as const);
+const ACTION_STEP = Object.freeze({
+  BOOTSTRAP_NATIVE: "bootstrap_native",
+  CLEANUP_CREDENTIAL: "cleanup_credential",
+  PROBE_NATIVE: "probe_native",
+  REAUTHENTICATE_NATIVE: "reauthenticate_native",
+  REFRESH_NATIVE: "refresh_native",
+  REVOKE_BROKERED: "revoke_brokered",
+  REVOKE_PROVIDER_SESSION: "revoke_provider_session",
+  ROTATE_BROKERED: "rotate_brokered",
+} as const);
 
 /**
  * Durable self-hosted maintenance ledger. Reservation and consume are each a
@@ -58,9 +117,9 @@ export class PostgresCapsuleMaintenanceLedger implements CapsuleMaintenanceLedge
   }
 
   reserve(input: CapsuleMaintenanceGrantReservation): Promise<CapsuleMaintenanceReserveResult> {
+    validateGrantReservation(input);
     this.assertOwnedInput(input.ownerRef);
     assertNoSensitiveFields(input);
-    assertNoSensitiveFields(parseClosedJsonBytes(input.grantBytes));
     return this.serializable(async (transaction) => {
       await lockSorted(transaction, [
         maintenanceLockKey(input.ownerRef, "grant", input.grantId),
@@ -120,9 +179,9 @@ export class PostgresCapsuleMaintenanceLedger implements CapsuleMaintenanceLedge
   }
 
   consume(input: CapsuleMaintenanceUseCommit): Promise<CapsuleMaintenanceConsumeResult> {
+    const receipt = validateUseCommit(input);
     this.assertOwnedInput(input.ownerRef);
     assertNoSensitiveFields(input);
-    assertNoSensitiveFields(parseClosedJsonBytes(input.consumeReceiptBytes));
     return this.serializable(async (transaction) => {
       await lockSorted(transaction, [
         maintenanceLockKey(input.ownerRef, "grant", input.grantId),
@@ -160,6 +219,9 @@ export class PostgresCapsuleMaintenanceLedger implements CapsuleMaintenanceLedge
         FOR UPDATE
       `;
       if (grant === undefined || grant.owner_ref !== input.ownerRef) return { status: "not_found" };
+      if (receipt.grant_digest !== grant.grant_digest) {
+        throw new AccountsError("VALIDATION_FAILED", "Maintenance receipt grant digest mismatch");
+      }
       if (grant.state !== "live" || grant.expired) {
         if (grant.state === "live") {
           await transaction`
@@ -310,6 +372,380 @@ export class PostgresCapsuleMaintenanceLedger implements CapsuleMaintenanceLedge
       throw new AccountsError("FORBIDDEN", "Postgres maintenance owner does not match context");
     }
   }
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function validateGrantReservation(
+  input: CapsuleMaintenanceGrantReservation,
+): JsonRecord {
+  assertExactDto(input, RESERVATION_FIELDS);
+  assertUuid(input.grantId, "grantId");
+  assertPrincipal(input.ownerRef, "ownerRef");
+  for (const field of [
+    "idempotencyKeyDigest",
+    "requestDigest",
+    "reservationKeyDigest",
+    "grantDigest",
+  ] as const) {
+    assertDigest(input[field], field);
+  }
+  const expiresAt = assertTimestamp(input.expiresAt, "expiresAt");
+  const grant = parseCanonicalEvidence(input.grantBytes, "grantBytes");
+  const action = String(grant.action);
+  const effectClass = String(grant.effect_class);
+  const targetKind = String(grant.target_kind);
+  const approvalMode = String(grant.approval_mode);
+  const allowedEffects = Reflect.get(
+    CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR.action_effect_classes,
+    action,
+  );
+  if (
+    !Array.isArray(allowedEffects) ||
+    !allowedEffects.includes(effectClass) ||
+    (targetKind !== "native_capsule" && targetKind !== "account_record") ||
+    (approvalMode !== "NOT_REQUIRED" && approvalMode !== "REQUIRED") ||
+    Reflect.get(ACTION_TARGET_KIND, action) !== targetKind ||
+    (targetKind === "native_capsule" && grant.access_transport !== "native_session") ||
+    (targetKind === "account_record" && grant.access_transport === "native_session")
+  ) {
+    throw validationFailed("grantBytes");
+  }
+  const expectedFields = [
+    ...CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR.common_fields,
+    ...(targetKind === "native_capsule"
+      ? CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR.target_variants.native_capsule
+      : CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR.target_variants.account_record),
+    ...(approvalMode === "REQUIRED" ? ["approval_ref", "approval_digest"] : []),
+    ...(effectClass === "read_only"
+      ? []
+      : CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR.mutation_only_fields),
+    ...(effectClass === "containment_mutation"
+      ? CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR.containment_only_fields
+      : []),
+  ];
+  assertExactRecord(grant, expectedFields, "grantBytes");
+  assertStringRecord(grant, "grantBytes");
+  if (
+    grant.schema_version !== CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION ||
+    grant.schema_digest !== CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST ||
+    grant.max_uses !== "1"
+  ) {
+    throw validationFailed("grantBytes");
+  }
+  validateEnvelopeScalars(grant, [
+    "grant_id",
+    "maintenance_operation_id",
+    "provider_account_id",
+    "account_lane_id",
+    "capacity_pool_id",
+    ...(targetKind === "native_capsule"
+      ? ["auth_capsule_id", "canonical_node_id"]
+      : ["credential_binding_id"]),
+  ]);
+  for (const field of [
+    "owner_ref",
+    "subject",
+    "actor_principal",
+    "maintenance_executor_principal",
+  ]) {
+    assertPrincipal(grant[field], field);
+  }
+  for (const field of [
+    "issuer",
+    "issuer_incarnation",
+    "key_id",
+    "audience",
+    "effect_namespace_id",
+    "provider_subject_ref",
+    "capacity_domain_ref",
+    "credential_family_id",
+    "catalog_incarnation",
+    "nonce",
+    ...(approvalMode === "REQUIRED" ? ["approval_ref"] : []),
+  ]) {
+    assertReference(grant[field], field);
+  }
+  for (const field of [
+    "maintenance_authority_epoch",
+    "operation_execution_epoch",
+  ]) {
+    assertPositiveCounter(grant[field], field);
+  }
+  if (
+    grant.grant_id !== input.grantId ||
+    grant.owner_ref !== input.ownerRef ||
+    grant.expires_at !== expiresAt ||
+    canonicalSha256(grant) !== input.grantDigest ||
+    canonicalSha256({
+      effect_namespace_id: grant.effect_namespace_id,
+      execution_fence_digest: grant.execution_fence_digest,
+      expected_credential_generation: grant.expected_credential_generation,
+      expected_record_revision: grant.expected_record_revision,
+      schema_version: "accounts.capsule-maintenance-reservation-key.v1",
+      serialization_key_digest: grant.serialization_key_digest,
+      target_digest: maintenanceTargetDigest(grant),
+    }) !== input.reservationKeyDigest
+  ) {
+    throw validationFailed("grantBytes");
+  }
+  return grant;
+}
+
+function validateUseCommit(input: CapsuleMaintenanceUseCommit): JsonRecord {
+  assertExactDto(input, USE_COMMIT_FIELDS);
+  assertUuid(input.grantId, "grantId");
+  assertPrincipal(input.ownerRef, "ownerRef");
+  for (const field of [
+    "idempotencyKeyDigest",
+    "requestDigest",
+    "maintenanceUseId",
+    "consumeReceiptDigest",
+  ] as const) {
+    assertDigest(input[field], field);
+  }
+  const committedAt = assertTimestamp(input.committedAt, "committedAt");
+  const receipt = parseCanonicalEvidence(
+    input.consumeReceiptBytes,
+    "consumeReceiptBytes",
+  );
+  const action = String(receipt.action);
+  const mutation = (
+    CAPSULE_MAINTENANCE_CONSUME_RECEIPT_DESCRIPTOR.mutation_actions as readonly string[]
+  ).includes(action);
+  if (
+    !(CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR.actions as readonly string[])
+      .includes(action)
+  ) {
+    throw validationFailed("consumeReceiptBytes");
+  }
+  const expectedFields = [
+    ...CAPSULE_MAINTENANCE_CONSUME_RECEIPT_DESCRIPTOR.common_fields,
+    ...(mutation
+      ? CAPSULE_MAINTENANCE_CONSUME_RECEIPT_DESCRIPTOR.mutation_only_fields
+      : []),
+  ];
+  assertExactRecord(receipt, expectedFields, "consumeReceiptBytes");
+  assertStringRecord(receipt, "consumeReceiptBytes");
+  if (
+    receipt.schema_version !== CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION ||
+    receipt.schema_digest !== CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST ||
+    receipt.max_uses !== "1" ||
+    receipt.prior_use_count !== "0" ||
+    receipt.next_use_count !== "1" ||
+    receipt.use_ordinal !== "1" ||
+    Reflect.get(ACTION_STEP, action) !== receipt.operation_step_id
+  ) {
+    throw validationFailed("consumeReceiptBytes");
+  }
+  validateEnvelopeScalars(receipt, [
+    "consume_receipt_id",
+    "grant_id",
+    "maintenance_operation_id",
+  ]);
+  for (const field of [
+    "subject",
+    "actor_principal",
+    "maintenance_executor_principal",
+  ]) {
+    assertPrincipal(receipt[field], field);
+  }
+  for (const field of [
+    "issuer",
+    "issuer_incarnation",
+    "key_id",
+    "audience",
+    "effect_namespace_id",
+    "catalog_incarnation",
+  ]) {
+    assertReference(receipt[field], field);
+  }
+  for (const field of [
+    "maintenance_authority_epoch",
+    "operation_execution_epoch",
+  ]) {
+    assertPositiveCounter(receipt[field], field);
+  }
+  if (
+    receipt.grant_id !== input.grantId ||
+    receipt.maintenance_use_id !== input.maintenanceUseId ||
+    receipt.committed_at !== committedAt ||
+    canonicalSha256(receipt) !== input.consumeReceiptDigest
+  ) {
+    throw validationFailed("consumeReceiptBytes");
+  }
+  return receipt;
+}
+
+function parseCanonicalEvidence(bytes: Uint8Array, field: string): JsonRecord {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+    throw validationFailed(field);
+  }
+  const parsed = parseClosedJsonBytes(bytes);
+  assertNoSensitiveFields(parsed);
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    !Buffer.from(bytes).equals(Buffer.from(canonicalJson(parsed), "utf8"))
+  ) {
+    throw validationFailed(field);
+  }
+  return parsed as JsonRecord;
+}
+
+function validateEnvelopeScalars(
+  value: JsonRecord,
+  identifierFields: readonly string[],
+): void {
+  for (const field of identifierFields) assertUuid(value[field], field);
+  for (const [field, candidate] of Object.entries(value)) {
+    if (
+      field.endsWith("_digest") ||
+      field.endsWith("_hash") ||
+      field.endsWith("_thumbprint")
+    ) {
+      assertDigest(candidate, field);
+    } else if (
+      field.endsWith("_epoch") ||
+      field.endsWith("_generation") ||
+      field.endsWith("_revision") ||
+      field.endsWith("_sequence")
+    ) {
+      try {
+        parseCounter(candidate, field);
+      } catch {
+        throw validationFailed(field);
+      }
+    } else if (
+      field.endsWith("_at") ||
+      field.endsWith("_expires_at") ||
+      field === "not_before"
+    ) {
+      assertTimestamp(candidate, field);
+    }
+  }
+  const signature = value.signature;
+  if (typeof signature !== "string" || !BASE64URL.test(signature)) {
+    throw validationFailed("signature");
+  }
+  const decoded = Buffer.from(signature, "base64url");
+  if (decoded.byteLength !== 64 || decoded.toString("base64url") !== signature) {
+    throw validationFailed("signature");
+  }
+}
+
+function assertExactDto(
+  value: unknown,
+  expectedFields: readonly string[],
+): asserts value is Record<string, unknown> {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype &&
+      Object.getPrototypeOf(value) !== null) ||
+    Object.getOwnPropertySymbols(value).length !== 0
+  ) {
+    throw validationFailed("input");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const fields = Object.keys(descriptors);
+  if (
+    fields.length !== expectedFields.length ||
+    fields.some((field) => !expectedFields.includes(field)) ||
+    expectedFields.some((field) => !Object.hasOwn(value, field))
+  ) {
+    throw validationFailed("input");
+  }
+  for (const field of fields) {
+    const descriptor = descriptors[field]!;
+    if (
+      !descriptor.enumerable ||
+      !("value" in descriptor) ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      throw validationFailed(field);
+    }
+  }
+}
+
+function assertExactRecord(
+  value: JsonRecord,
+  expectedFields: readonly string[],
+  field: string,
+): void {
+  const fields = Object.keys(value);
+  if (
+    fields.length !== expectedFields.length ||
+    fields.some((candidate) => !expectedFields.includes(candidate)) ||
+    expectedFields.some((candidate) => !Object.hasOwn(value, candidate))
+  ) {
+    throw validationFailed(field);
+  }
+}
+
+function assertStringRecord(value: JsonRecord, field: string): void {
+  if (Object.values(value).some((candidate) => typeof candidate !== "string")) {
+    throw validationFailed(field);
+  }
+}
+
+function assertUuid(value: unknown, field: string): string {
+  if (typeof value !== "string" || !isUuidV7(value)) {
+    throw validationFailed(field);
+  }
+  return value;
+}
+
+function assertDigest(value: unknown, field: string): string {
+  if (typeof value !== "string" || !DIGEST.test(value)) {
+    throw validationFailed(field);
+  }
+  return value;
+}
+
+function assertPrincipal(value: unknown, field: string): string {
+  if (typeof value !== "string" || !PRINCIPAL.test(value)) {
+    throw validationFailed(field);
+  }
+  return value;
+}
+
+function assertReference(value: unknown, field: string): string {
+  if (typeof value !== "string" || !REFERENCE.test(value)) {
+    throw validationFailed(field);
+  }
+  return value;
+}
+
+function assertPositiveCounter(value: unknown, field: string): void {
+  try {
+    if (parseCounter(value, field) === "0") throw validationFailed(field);
+  } catch {
+    throw validationFailed(field);
+  }
+}
+
+function assertTimestamp(value: unknown, field: string): string {
+  if (typeof value !== "string") throw validationFailed(field);
+  const milliseconds = Date.parse(value);
+  if (
+    !Number.isFinite(milliseconds) ||
+    new Date(milliseconds).toISOString() !== value
+  ) {
+    throw validationFailed(field);
+  }
+  return value;
+}
+
+function validationFailed(field: string): AccountsError {
+  return new AccountsError(
+    "VALIDATION_FAILED",
+    "Postgres maintenance ledger input is invalid",
+    { details: { field } },
+  );
 }
 
 function postgresCode(error: unknown): string | undefined {
