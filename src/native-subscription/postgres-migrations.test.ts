@@ -9,7 +9,7 @@ import {
   POSTGRES_MIGRATION_V3,
   POSTGRES_REQUIRED_TABLES,
   POSTGRES_SCHEMA_VERSION,
-} from "./postgres-migrations";
+} from "./postgres-migrations.js";
 
 describe("Postgres migration contract", () => {
   test("pins the checked migration bytes", () => {
@@ -31,14 +31,13 @@ describe("Postgres migration contract", () => {
     }
   });
 
-  test("creates a least-privilege runtime role and force-enables RLS", () => {
-    expect(POSTGRES_MIGRATION_V1).toMatch(
-      /CREATE ROLE accounts_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/,
-    );
-    expect(POSTGRES_MIGRATION_V1).toContain("pg_catalog.pg_auth_members");
+  test("keeps stable schema bytes role-agnostic and force-enables RLS", () => {
+    expect(POSTGRES_MIGRATION_V1).not.toContain("accounts_runtime");
+    expect(POSTGRES_MIGRATION_V1).not.toMatch(/CREATE ROLE/i);
     expect(POSTGRES_MIGRATION_V1).toContain("REVOKE ALL ON SCHEMA accounts FROM PUBLIC");
+    expect(POSTGRES_MIGRATION_V1).toContain("FOR SELECT TO PUBLIC");
     expect(POSTGRES_MIGRATION_V1).toContain(
-      "GRANT SELECT ON TABLE accounts.schema_migrations TO accounts_runtime",
+      "REVOKE ALL ON ALL TABLES IN SCHEMA accounts FROM PUBLIC",
     );
     for (const table of POSTGRES_REQUIRED_TABLES.filter(
       (candidate) => candidate !== "schema_migrations",

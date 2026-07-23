@@ -1,5 +1,5 @@
-import { AccountsError } from "./errors";
-import type { Brand } from "./ids";
+import { AccountsError } from "./errors.js";
+import type { Brand } from "./ids.js";
 
 export type Counter = Brand<string, "Counter">;
 

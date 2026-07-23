@@ -1,19 +1,23 @@
 import type { KeyLike } from "node:crypto";
-import type { SQL, TransactionSQL } from "bun";
 
-import { AccountsError } from "./errors";
-import { canonicalSha256 } from "./json";
+import { AccountsError } from "./errors.js";
+import { canonicalSha256 } from "./json.js";
 import {
   issueNativeCapabilityUseReceipt,
   parseNativeCapabilityUseRequest,
   validateNativeCapabilityUseCurrentState,
   type NativeCapabilityUseCurrentState,
-} from "./native-subscription";
+} from "./native-subscription.js";
 import type {
   OnlineGenerationReceiptUseCasRequest,
   OnlineGenerationReceiptUseCasResult,
   OnlineGenerationReceiptUseStore,
-} from "./online-generation-receipt";
+} from "./online-generation-receipt.js";
+import {
+  installPostgresRuntimeContext,
+  type PostgresRuntimeRoleBoundary,
+} from "./postgres-runtime.js";
+import type { PostgresSqlClient, PostgresTransaction } from "./postgres-sql.js";
 
 interface CapabilityUseRow {
   readonly consume_request_id: string;
@@ -24,8 +28,9 @@ interface CapabilityUseRow {
 }
 
 export interface PostgresNativeCapabilityUseStoreOptions {
-  readonly client: SQL;
+  readonly client: PostgresSqlClient;
   readonly principalRef: string;
+  readonly runtimeRole: PostgresRuntimeRoleBoundary;
   readonly issuer: string;
   readonly issuerIncarnation: string;
   readonly keyId: string;
@@ -35,7 +40,7 @@ export interface PostgresNativeCapabilityUseStoreOptions {
   readonly idFactory?: (nowMs: number) => string;
   readonly validateCurrent: (
     request: OnlineGenerationReceiptUseCasRequest,
-    transaction: TransactionSQL,
+    transaction: PostgresTransaction,
   ) => NativeCapabilityUseCurrentState | Promise<NativeCapabilityUseCurrentState>;
 }
 
@@ -70,9 +75,13 @@ export class PostgresNativeCapabilityUseStore
     const requestDigest = canonicalSha256(request);
     return this.serializable(async (transaction) => {
       const lockKeys = [
-        `accounts.capability-use.capability:${request.capability_id}`,
-        `accounts.capability-use.idempotency:${request.idempotency_key_digest}`,
-        `accounts.capability-use.request:${request.consume_request_id}`,
+        capabilityLockKey(this.options.principalRef, "capability", request.capability_id),
+        capabilityLockKey(
+          this.options.principalRef,
+          "idempotency",
+          request.idempotency_key_digest,
+        ),
+        capabilityLockKey(this.options.principalRef, "request", request.consume_request_id),
       ].sort();
       for (const lockKey of lockKeys) {
         await transaction`
@@ -87,8 +96,8 @@ export class PostgresNativeCapabilityUseStore
           consume_request_id::text, request_digest, capability_id::text,
           idempotency_key_digest, receipt_jcs_base64url
         FROM accounts.capability_use_consumptions
-        WHERE consume_request_id = ${request.consume_request_id}::uuid
-        FOR UPDATE
+        WHERE owner_ref = ${this.options.principalRef}
+          AND consume_request_id = ${request.consume_request_id}::uuid
       `;
       if (prior !== undefined) {
         return prior.request_digest === requestDigest
@@ -104,16 +113,16 @@ export class PostgresNativeCapabilityUseStore
           consume_request_id::text, request_digest, capability_id::text,
           idempotency_key_digest, receipt_jcs_base64url
         FROM accounts.capability_use_consumptions
-        WHERE idempotency_key_digest = ${request.idempotency_key_digest}
-        FOR UPDATE
+        WHERE owner_ref = ${this.options.principalRef}
+          AND idempotency_key_digest = ${request.idempotency_key_digest}
       `;
       if (idempotent !== undefined) return { status: "idempotency_conflict" };
 
       const [consumed] = await transaction<Array<{ readonly consume_request_id: string }>>`
         SELECT consume_request_id::text
         FROM accounts.capability_use_consumptions
-        WHERE capability_id = ${request.capability_id}::uuid
-        FOR UPDATE
+        WHERE owner_ref = ${this.options.principalRef}
+          AND capability_id = ${request.capability_id}::uuid
       `;
       if (consumed !== undefined) return { status: "exhausted" };
 
@@ -146,45 +155,22 @@ export class PostgresNativeCapabilityUseStore
         )
       `;
       return { status: "consumed", signedReceipt: Uint8Array.from(signedReceipt) };
-    });
+    }, () => this.recoverUniqueConflict(request, requestDigest));
   }
 
   private async serializable<T>(
-    work: (transaction: TransactionSQL) => Promise<T>,
+    work: (transaction: PostgresTransaction) => Promise<T>,
+    recoverUniqueConflict: () => Promise<T>,
   ): Promise<T> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         return await this.options.client.begin(
           "isolation level serializable read write",
           async (transaction) => {
-            await transaction.unsafe(
-              "SET LOCAL ROLE accounts_runtime; SET LOCAL search_path = pg_catalog, accounts; SET LOCAL row_security = on",
-            ).simple();
-            await transaction`
-              SELECT
-                set_config('accounts.principal', ${this.options.principalRef}, true),
-                set_config('accounts.identity_realm', 'hasna', true)
-            `;
-            const [context] = await transaction<Array<{
-              readonly principal: string | null;
-              readonly realm: string | null;
-              readonly role_name: string;
-            }>>`
-              SELECT
-                accounts.current_principal() AS principal,
-                accounts.current_identity_realm() AS realm,
-                current_user AS role_name
-            `;
-            if (
-              context?.principal !== this.options.principalRef ||
-              context.realm !== "hasna" ||
-              context.role_name !== "accounts_runtime"
-            ) {
-              throw new AccountsError(
-                "FORBIDDEN",
-                "Postgres capability-use context was not installed",
-              );
-            }
+            await installPostgresRuntimeContext(transaction, {
+              principalRef: this.options.principalRef,
+              role: this.options.runtimeRole,
+            });
             return work(transaction);
           },
         );
@@ -192,6 +178,7 @@ export class PostgresNativeCapabilityUseStore
         if (error instanceof AccountsError) throw error;
         const code = postgresCode(error);
         if ((code === "40001" || code === "40P01") && attempt < 2) continue;
+        if (code === "23505") return recoverUniqueConflict();
         throw new AccountsError(
           "DEPENDENCY_UNAVAILABLE",
           "Postgres capability-use transaction failed",
@@ -211,12 +198,59 @@ export class PostgresNativeCapabilityUseStore
       },
     );
   }
+
+  private recoverUniqueConflict(
+    request: OnlineGenerationReceiptUseCasRequest,
+    requestDigest: string,
+  ): Promise<OnlineGenerationReceiptUseCasResult> {
+    return this.options.client.begin("read only", async (transaction) => {
+      await installPostgresRuntimeContext(transaction, {
+        principalRef: this.options.principalRef,
+        role: this.options.runtimeRole,
+      });
+      const [prior] = await transaction<CapabilityUseRow[]>`
+        SELECT
+          consume_request_id::text, request_digest, capability_id::text,
+          idempotency_key_digest, receipt_jcs_base64url
+        FROM accounts.capability_use_consumptions
+        WHERE owner_ref = ${this.options.principalRef}
+          AND consume_request_id = ${request.consume_request_id}::uuid
+      `;
+      if (prior !== undefined) {
+        return prior.request_digest === requestDigest
+          ? {
+              status: "replayed",
+              signedReceipt: decodeCanonicalBase64(prior.receipt_jcs_base64url),
+            }
+          : { status: "idempotency_conflict" };
+      }
+      const [idempotent] = await transaction<CapabilityUseRow[]>`
+        SELECT
+          consume_request_id::text, request_digest, capability_id::text,
+          idempotency_key_digest, receipt_jcs_base64url
+        FROM accounts.capability_use_consumptions
+        WHERE owner_ref = ${this.options.principalRef}
+          AND idempotency_key_digest = ${request.idempotency_key_digest}
+      `;
+      if (idempotent !== undefined) return { status: "idempotency_conflict" };
+      const [consumed] = await transaction<Array<{ readonly consume_request_id: string }>>`
+        SELECT consume_request_id::text
+        FROM accounts.capability_use_consumptions
+        WHERE owner_ref = ${this.options.principalRef}
+          AND capability_id = ${request.capability_id}::uuid
+      `;
+      return consumed === undefined ? { status: "conflict" } : { status: "exhausted" };
+    });
+  }
 }
 
 function postgresCode(error: unknown): string | undefined {
   if (error === null || typeof error !== "object") return undefined;
-  const code = Reflect.get(error, "code");
-  return typeof code === "string" ? code : undefined;
+  for (const field of ["sqlState", "errno", "code"] as const) {
+    const value = Reflect.get(error, field);
+    if (typeof value === "string" && /^[0-9A-Z]{5}$/.test(value)) return value;
+  }
+  return undefined;
 }
 
 function decodeCanonicalBase64(value: string): Uint8Array {
@@ -228,4 +262,12 @@ function decodeCanonicalBase64(value: string): Uint8Array {
     );
   }
   return bytes;
+}
+
+function capabilityLockKey(
+  ownerRef: string,
+  namespace: "capability" | "idempotency" | "request",
+  value: string,
+): string {
+  return `accounts.capability-use.owner:${ownerRef}:${namespace}:${value}`;
 }

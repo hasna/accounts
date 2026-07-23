@@ -6,10 +6,10 @@ import {
   verify as verifyBytes,
 } from "node:crypto";
 
-import { AccountsError } from "./errors";
-import { parseCounter, type Counter } from "./counter";
-import { generateUuidV7, isUuidV7 } from "./ids";
-import { canonicalJson, canonicalSha256, parseClosedJsonBytes } from "./json";
+import { AccountsError } from "./errors.js";
+import { parseCounter, type Counter } from "./counter.js";
+import { generateUuidV7, isUuidV7 } from "./ids.js";
+import { canonicalJson, canonicalSha256, parseClosedJsonBytes } from "./json.js";
 
 export const CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION =
   "accounts.capsule-maintenance/v1" as const;

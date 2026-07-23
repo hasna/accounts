@@ -3,13 +3,13 @@ import {
   type KeyLike,
 } from "node:crypto";
 
-import { AccountsError } from "./errors";
-import { parseCounter, type Counter } from "./counter";
-import { generateUuidV7, isUuidV7 } from "./ids";
+import { AccountsError } from "./errors.js";
+import { parseCounter, type Counter } from "./counter.js";
+import { generateUuidV7, isUuidV7 } from "./ids.js";
 import {
   canonicalJson,
   canonicalSha256,
-} from "./json";
+} from "./json.js";
 import {
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_VERSION,
@@ -18,7 +18,7 @@ import {
   type OnlineGenerationReceiptUseCasRequest,
   type OnlineGenerationReceiptUseCasResult,
   type OnlineGenerationReceiptUseStore,
-} from "./online-generation-receipt";
+} from "./online-generation-receipt.js";
 export const NATIVE_SUBSCRIPTION_PROBE_REQUEST_SCHEMA_VERSION =
   "accounts.native-subscription-probe-request/v1" as const;
 export const NATIVE_SUBSCRIPTION_PROBE_RESULT_SCHEMA_VERSION =

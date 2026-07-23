@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import type { SQL, TransactionSQL } from "bun";
 
 import type {
   CapsuleMaintenanceGrantReservation,
   CapsuleMaintenanceUseCommit,
-} from "./capsule-maintenance";
-import { PostgresCapsuleMaintenanceLedger } from "./postgres-capsule-maintenance";
+} from "./capsule-maintenance.js";
+import { PostgresCapsuleMaintenanceLedger } from "./postgres-capsule-maintenance.js";
+import type { PostgresSqlClient, PostgresTransaction } from "./postgres-sql.js";
 
 const OWNER = "principal:service:hasna:accounts-maintenance";
 const GRANT_ID = "018f0f00-0001-7000-8000-000000000001";
@@ -43,25 +43,38 @@ interface FakeState {
   readonly modes: string[];
 }
 
-function fakeClient(state: FakeState): SQL {
+function fakeClient(state: FakeState): PostgresSqlClient {
   const transaction = (async (
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): Promise<unknown[]> => {
     const query = strings.join("?").replace(/\s+/g, " ").trim();
     if (query.includes("set_config('accounts.principal'")) return [];
+    if (query.includes("pg_advisory_xact_lock")) return [];
     if (query.includes("accounts.current_principal() AS principal")) {
-      return [{ principal: OWNER, realm: "hasna", role_name: "accounts_runtime" }];
+      return [{
+        principal: OWNER,
+        realm: "hasna",
+        role_name: "accounts_runtime",
+        login_role_name: "accounts_runtime",
+      }];
     }
     if (query.startsWith("UPDATE accounts.capsule_maintenance_grants") && query.includes("expires_at <=")) {
       return [];
     }
     if (query.includes("FROM accounts.capsule_maintenance_grants") && query.includes("idempotency_key_digest =")) {
-      return state.grants.filter((row) => row.idempotency_key_digest === values[0]);
+      return state.grants.filter(
+        (row) => row.owner_ref === values[0] && row.idempotency_key_digest === values[1],
+      );
     }
     if (query.includes("FROM accounts.capsule_maintenance_grants") && query.includes("reservation_key_digest =")) {
       return state.grants
-        .filter((row) => row.reservation_key_digest === values[0] && row.state === "live")
+        .filter(
+          (row) =>
+            row.owner_ref === values[0] &&
+            row.reservation_key_digest === values[1] &&
+            row.state === "live",
+        )
         .map((row) => ({ grant_id: row.grant_id }));
     }
     if (query.startsWith("INSERT INTO accounts.capsule_maintenance_grants")) {
@@ -74,13 +87,19 @@ function fakeClient(state: FakeState): SQL {
       return [];
     }
     if (query.includes("FROM accounts.capsule_maintenance_uses") && query.includes("idempotency_key_digest =")) {
-      return state.uses.filter((row) => row.idempotency_key_digest === values[0]);
+      return state.uses.filter(
+        (row) => row.owner_ref === values[0] && row.idempotency_key_digest === values[1],
+      );
     }
     if (query.includes("FROM accounts.capsule_maintenance_grants") && query.includes("grant_id =")) {
-      return state.grants.filter((row) => row.grant_id === values[0]);
+      return state.grants.filter(
+        (row) => row.owner_ref === values[0] && row.grant_id === values[1],
+      );
     }
     if (query.includes("FROM accounts.capsule_maintenance_uses") && query.includes("grant_id =")) {
-      return state.uses.filter((row) => row.grant_id === values[0]).map((row) => ({ grant_id: row.grant_id }));
+      return state.uses
+        .filter((row) => row.owner_ref === values[0] && row.grant_id === values[1])
+        .map((row) => ({ grant_id: row.grant_id }));
     }
     if (query.startsWith("INSERT INTO accounts.capsule_maintenance_uses")) {
       state.uses.push({
@@ -92,19 +111,23 @@ function fakeClient(state: FakeState): SQL {
       return [];
     }
     if (query.startsWith("UPDATE accounts.capsule_maintenance_grants") && query.includes("state = 'consumed'")) {
-      const grant = state.grants.find((row) => row.grant_id === values[1]);
+      const grant = state.grants.find(
+        (row) => row.owner_ref === values[1] && row.grant_id === values[2],
+      );
       if (grant !== undefined) grant.state = "consumed";
       return [];
     }
     throw new Error(`unexpected fake query: ${query}`);
-  }) as unknown as TransactionSQL;
-  transaction.unsafe = (() => ({ simple: async () => [] })) as unknown as TransactionSQL["unsafe"];
+  }) as unknown as PostgresTransaction;
+  transaction.unsafe = (() => ({
+    simple: async () => [],
+  })) as unknown as PostgresTransaction["unsafe"];
   return {
-    begin: async (mode: string, callback: (value: TransactionSQL) => Promise<unknown>) => {
+    begin: async (mode: string, callback: (value: PostgresTransaction) => Promise<unknown>) => {
       state.modes.push(mode);
       return callback(transaction);
     },
-  } as unknown as SQL;
+  } as PostgresSqlClient;
 }
 
 function grant(overrides: Partial<CapsuleMaintenanceGrantReservation> = {}): CapsuleMaintenanceGrantReservation {
@@ -138,8 +161,9 @@ function use(overrides: Partial<CapsuleMaintenanceUseCommit> = {}): CapsuleMaint
 describe("Postgres capsule maintenance ledger", () => {
   test("preserves exact replay across adapter restart and rejects distinct live reservations", async () => {
     const state: FakeState = { grants: [], uses: [], modes: [] };
-    const first = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER);
-    const restarted = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER);
+    const role = { mode: "direct", roleName: "accounts_runtime" } as const;
+    const first = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER, role);
+    const restarted = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER, role);
     expect(await first.reserve(grant())).toEqual({
       status: "reserved",
       grantBytes: grant().grantBytes,
@@ -157,8 +181,9 @@ describe("Postgres capsule maintenance ledger", () => {
 
   test("commits ordinal-one evidence once and returns exact bytes on replay", async () => {
     const state: FakeState = { grants: [], uses: [], modes: [] };
-    const first = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER);
-    const restarted = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER);
+    const role = { mode: "direct", roleName: "accounts_runtime" } as const;
+    const first = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER, role);
+    const restarted = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER, role);
     await first.reserve(grant());
     expect(await first.consume(use())).toEqual({
       status: "consumed",
@@ -173,5 +198,25 @@ describe("Postgres capsule maintenance ledger", () => {
     expect((await restarted.consume(use({ idempotencyKeyDigest: D1 }))).status)
       .toBe("exhausted");
     expect(state.uses).toHaveLength(1);
+  });
+
+  test("rejects credential-shaped arbitrary values before durable persistence", async () => {
+    const state: FakeState = { grants: [], uses: [], modes: [] };
+    const role = { mode: "direct", roleName: "accounts_runtime" } as const;
+    const ledger = new PostgresCapsuleMaintenanceLedger(fakeClient(state), OWNER, role);
+    expect(() => ledger.reserve(grant({
+      grantBytes: Uint8Array.from(Buffer.from(JSON.stringify({
+        grant: "one",
+        note: "sk-" + "A".repeat(24),
+      }))),
+    }))).toThrow(expect.objectContaining({ code: "VALIDATION_FAILED" }));
+    expect(() => ledger.consume(use({
+      consumeReceiptBytes: Uint8Array.from(Buffer.from(JSON.stringify({
+        receipt: "one",
+        metadata: { password: "not-a-real-password" },
+      }))),
+    }))).toThrow(expect.objectContaining({ code: "VALIDATION_FAILED" }));
+    expect(state.grants).toEqual([]);
+    expect(state.uses).toEqual([]);
   });
 });

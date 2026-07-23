@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { AccountsError } from "./errors";
+import { AccountsError } from "./errors.js";
 
 const MAX_JSON_BYTES = 1_048_576;
 const MAX_JSON_DEPTH = 32;
@@ -280,6 +280,7 @@ function serializeCanonical(value: unknown): string {
 }
 
 export function canonicalJson(value: unknown): string {
+  assertNoSensitiveFields(value);
   return serializeCanonical(snapshotJson(value, 0, new Set()));
 }
 

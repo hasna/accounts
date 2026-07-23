@@ -52,7 +52,7 @@
     "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:postgres": "ACCOUNTS_REQUIRE_POSTGRES=1 bun test src/server/postgres.integration.test.ts"
+    "test:postgres": "ACCOUNTS_REQUIRE_POSTGRES=1 bun test src/server/postgres.integration.test.ts src/native-subscription/postgres-native-subscription.integration.test.ts"
   },
   "keywords": [
     "claude",

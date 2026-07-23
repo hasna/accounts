@@ -7,8 +7,8 @@ import {
   type KeyObject,
 } from "node:crypto";
 
-import { AccountsError } from "./errors";
-import { parseCounter } from "./counter";
+import { AccountsError } from "./errors.js";
+import { parseCounter } from "./counter.js";
 import {
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_VERSION,
@@ -26,12 +26,12 @@ import {
   type OnlineGenerationReceiptUseGuard,
   type OnlineGenerationReceiptUseStore,
   type ProviderDestinationPolicy,
-} from "./online-generation-receipt";
+} from "./online-generation-receipt.js";
 import {
   canonicalJson,
   canonicalSha256,
   parseClosedJsonBytes,
-} from "./json";
+} from "./json.js";
 
 const NOW = new Date("2026-07-10T12:00:30.000Z");
 const ISSUED_AT = "2026-07-10T12:00:00.000Z";

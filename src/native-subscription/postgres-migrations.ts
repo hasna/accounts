@@ -25,18 +25,20 @@ export const POSTGRES_REQUIRED_TABLES = Object.freeze([
   "idempotency_records",
 ] as const);
 
-const GLOBAL_REALM_TABLES = Object.freeze([
+export const POSTGRES_GLOBAL_REALM_TABLES = Object.freeze([
   "accounts_installation",
   "recovery_ledger_receipts",
 ] as const);
 
-const OWNER_TABLES = POSTGRES_REQUIRED_TABLES.filter(
+export const POSTGRES_OWNER_TABLES = Object.freeze(POSTGRES_REQUIRED_TABLES.filter(
   (table) =>
     table !== "schema_migrations" &&
-    !GLOBAL_REALM_TABLES.includes(table as (typeof GLOBAL_REALM_TABLES)[number]),
-);
+    !POSTGRES_GLOBAL_REALM_TABLES.includes(
+      table as (typeof POSTGRES_GLOBAL_REALM_TABLES)[number],
+    ),
+));
 
-const MUTABLE_RUNTIME_TABLES = Object.freeze([
+export const POSTGRES_MUTABLE_RUNTIME_TABLES = Object.freeze([
   "accounts_installation",
   "provider_accounts",
   "entitlements",
@@ -49,7 +51,7 @@ const MUTABLE_RUNTIME_TABLES = Object.freeze([
   "outbox",
 ] as const);
 
-const APPEND_ONLY_RUNTIME_TABLES = Object.freeze([
+export const POSTGRES_APPEND_ONLY_RUNTIME_TABLES = Object.freeze([
   "provider_subject_claims",
   "capacity_domain_claims",
   "credential_family_claims",
@@ -60,24 +62,26 @@ const APPEND_ONLY_RUNTIME_TABLES = Object.freeze([
   "idempotency_records",
 ] as const);
 
-const INSERT_ONLY_RUNTIME_TABLES = Object.freeze([
+export const POSTGRES_INSERT_ONLY_RUNTIME_TABLES = Object.freeze([
   "credential_binding_handles",
 ] as const);
 
-const rlsSql = OWNER_TABLES.map(
+const rlsSql = POSTGRES_OWNER_TABLES.map(
   (table) => `
 ALTER TABLE accounts.${table} ENABLE ROW LEVEL SECURITY;
 ALTER TABLE accounts.${table} FORCE ROW LEVEL SECURITY;
 CREATE POLICY ${table}_owner_select ON accounts.${table}
-  FOR SELECT TO accounts_runtime
+  FOR SELECT TO PUBLIC
   USING (accounts.row_owned_by(owner_ref));
 CREATE POLICY ${table}_owner_insert ON accounts.${table}
-  FOR INSERT TO accounts_runtime
+  FOR INSERT TO PUBLIC
   WITH CHECK (accounts.row_owned_by(owner_ref));
 ${
-  MUTABLE_RUNTIME_TABLES.includes(table as (typeof MUTABLE_RUNTIME_TABLES)[number])
+  POSTGRES_MUTABLE_RUNTIME_TABLES.includes(
+    table as (typeof POSTGRES_MUTABLE_RUNTIME_TABLES)[number],
+  )
     ? `CREATE POLICY ${table}_owner_update ON accounts.${table}
-  FOR UPDATE TO accounts_runtime
+  FOR UPDATE TO PUBLIC
   USING (accounts.row_owned_by(owner_ref))
   WITH CHECK (accounts.row_owned_by(owner_ref));`
     : ""
@@ -85,20 +89,22 @@ ${
 `,
 ).join("\n");
 
-const globalRlsSql = GLOBAL_REALM_TABLES.map(
+const globalRlsSql = POSTGRES_GLOBAL_REALM_TABLES.map(
   (table) => `
 ALTER TABLE accounts.${table} ENABLE ROW LEVEL SECURITY;
 ALTER TABLE accounts.${table} FORCE ROW LEVEL SECURITY;
 CREATE POLICY ${table}_realm_select ON accounts.${table}
-  FOR SELECT TO accounts_runtime
+  FOR SELECT TO PUBLIC
   USING (accounts.realm_is_current(identity_realm));
 CREATE POLICY ${table}_realm_insert ON accounts.${table}
-  FOR INSERT TO accounts_runtime
+  FOR INSERT TO PUBLIC
   WITH CHECK (accounts.realm_is_current(identity_realm));
 ${
-  MUTABLE_RUNTIME_TABLES.includes(table as (typeof MUTABLE_RUNTIME_TABLES)[number])
+  POSTGRES_MUTABLE_RUNTIME_TABLES.includes(
+    table as (typeof POSTGRES_MUTABLE_RUNTIME_TABLES)[number],
+  )
     ? `CREATE POLICY ${table}_realm_update ON accounts.${table}
-  FOR UPDATE TO accounts_runtime
+  FOR UPDATE TO PUBLIC
   USING (accounts.realm_is_current(identity_realm))
   WITH CHECK (accounts.realm_is_current(identity_realm));`
     : ""
@@ -106,52 +112,14 @@ ${
 `,
 ).join("\n");
 
-const grantsSql = `
-GRANT SELECT, INSERT, UPDATE ON TABLE
-  ${MUTABLE_RUNTIME_TABLES.map((table) => `accounts.${table}`).join(",\n  ")}
-TO accounts_runtime;
-GRANT SELECT, INSERT ON TABLE
-  ${[...APPEND_ONLY_RUNTIME_TABLES, ...INSERT_ONLY_RUNTIME_TABLES]
-    .map((table) => `accounts.${table}`)
-    .join(",\n  ")}
-TO accounts_runtime;
-`;
-
 export const POSTGRES_MIGRATION_V1 = `
-CREATE SCHEMA IF NOT EXISTS accounts;
-
 CREATE TABLE accounts.schema_migrations (
   version BIGINT PRIMARY KEY CHECK (version > 0),
   checksum TEXT NOT NULL CHECK (checksum ~ '^sha256:[0-9a-f]{64}$'),
   applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
-DO $accounts_role$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'accounts_runtime') THEN
-    CREATE ROLE accounts_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
-  ELSIF EXISTS (
-    SELECT 1 FROM pg_catalog.pg_roles
-    WHERE rolname = 'accounts_runtime'
-      AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls OR rolcanlogin OR rolinherit)
-  ) OR EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_auth_members AS membership
-    JOIN pg_catalog.pg_roles AS role ON role.oid = membership.member
-    WHERE role.rolname = 'accounts_runtime'
-  ) OR EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_auth_members AS membership
-    JOIN pg_catalog.pg_roles AS role ON role.oid = membership.roleid
-    WHERE role.rolname = 'accounts_runtime' AND membership.admin_option
-  ) THEN
-    RAISE EXCEPTION 'accounts_runtime has unsafe role attributes';
-  END IF;
-END
-$accounts_role$;
-
 REVOKE ALL ON SCHEMA accounts FROM PUBLIC;
-GRANT USAGE ON SCHEMA accounts TO accounts_runtime;
 
 CREATE OR REPLACE FUNCTION accounts.current_principal()
 RETURNS TEXT
@@ -198,10 +166,6 @@ REVOKE ALL ON FUNCTION accounts.current_principal() FROM PUBLIC;
 REVOKE ALL ON FUNCTION accounts.current_identity_realm() FROM PUBLIC;
 REVOKE ALL ON FUNCTION accounts.row_owned_by(TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION accounts.realm_is_current(TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION accounts.current_principal() TO accounts_runtime;
-GRANT EXECUTE ON FUNCTION accounts.current_identity_realm() TO accounts_runtime;
-GRANT EXECUTE ON FUNCTION accounts.row_owned_by(TEXT) TO accounts_runtime;
-GRANT EXECUTE ON FUNCTION accounts.realm_is_current(TEXT) TO accounts_runtime;
 
 CREATE TABLE accounts.accounts_installation (
   singleton SMALLINT NOT NULL DEFAULT 1 CHECK (singleton = 1),
@@ -470,7 +434,6 @@ BEGIN
 END
 $function$;
 REVOKE ALL ON FUNCTION accounts.delete_credential_handle_for_revocation(UUID, TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION accounts.delete_credential_handle_for_revocation(UUID, TEXT) TO accounts_runtime;
 
 CREATE OR REPLACE FUNCTION accounts.require_handle_removed_before_revoke()
 RETURNS trigger
@@ -651,7 +614,7 @@ BEGIN
   RAISE EXCEPTION 'append-only Accounts row cannot be changed' USING ERRCODE = '23000';
 END
 $function$;
-${APPEND_ONLY_RUNTIME_TABLES.map(
+${POSTGRES_APPEND_ONLY_RUNTIME_TABLES.map(
   (table) => `CREATE TRIGGER ${table}_immutable
   BEFORE UPDATE OR DELETE ON accounts.${table}
   FOR EACH ROW EXECUTE FUNCTION accounts.reject_append_only_change();`,
@@ -661,11 +624,7 @@ ${rlsSql}
 
 ${globalRlsSql}
 
-${grantsSql}
-
-REVOKE ALL ON TABLE accounts.schema_migrations FROM PUBLIC, accounts_runtime;
-GRANT SELECT ON TABLE accounts.schema_migrations TO accounts_runtime;
-REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA accounts FROM accounts_runtime;
+REVOKE ALL ON ALL TABLES IN SCHEMA accounts FROM PUBLIC;
 `;
 
 export const POSTGRES_MIGRATION_V1_CHECKSUM = `sha256:${createHash("sha256")
@@ -748,25 +707,24 @@ CREATE TRIGGER capsule_maintenance_uses_immutable
 ALTER TABLE accounts.capsule_maintenance_grants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE accounts.capsule_maintenance_grants FORCE ROW LEVEL SECURITY;
 CREATE POLICY capsule_maintenance_grants_owner_select ON accounts.capsule_maintenance_grants
-  FOR SELECT TO accounts_runtime USING (accounts.row_owned_by(owner_ref));
+  FOR SELECT TO PUBLIC USING (accounts.row_owned_by(owner_ref));
 CREATE POLICY capsule_maintenance_grants_owner_insert ON accounts.capsule_maintenance_grants
-  FOR INSERT TO accounts_runtime WITH CHECK (accounts.row_owned_by(owner_ref));
+  FOR INSERT TO PUBLIC WITH CHECK (accounts.row_owned_by(owner_ref));
 CREATE POLICY capsule_maintenance_grants_owner_update ON accounts.capsule_maintenance_grants
-  FOR UPDATE TO accounts_runtime
+  FOR UPDATE TO PUBLIC
   USING (accounts.row_owned_by(owner_ref)) WITH CHECK (accounts.row_owned_by(owner_ref));
 
 ALTER TABLE accounts.capsule_maintenance_uses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE accounts.capsule_maintenance_uses FORCE ROW LEVEL SECURITY;
 CREATE POLICY capsule_maintenance_uses_owner_select ON accounts.capsule_maintenance_uses
-  FOR SELECT TO accounts_runtime USING (accounts.row_owned_by(owner_ref));
+  FOR SELECT TO PUBLIC USING (accounts.row_owned_by(owner_ref));
 CREATE POLICY capsule_maintenance_uses_owner_insert ON accounts.capsule_maintenance_uses
-  FOR INSERT TO accounts_runtime WITH CHECK (accounts.row_owned_by(owner_ref));
+  FOR INSERT TO PUBLIC WITH CHECK (accounts.row_owned_by(owner_ref));
 
-GRANT SELECT, INSERT, UPDATE ON TABLE accounts.capsule_maintenance_grants TO accounts_runtime;
-GRANT SELECT, INSERT ON TABLE accounts.capsule_maintenance_uses TO accounts_runtime;
-REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER
-  ON accounts.capsule_maintenance_grants, accounts.capsule_maintenance_uses
-  FROM accounts_runtime;
+REVOKE ALL ON TABLE
+  accounts.capsule_maintenance_grants,
+  accounts.capsule_maintenance_uses
+  FROM PUBLIC;
 `;
 
 export const POSTGRES_MIGRATION_V2_CHECKSUM = `sha256:${createHash("sha256")
@@ -798,14 +756,12 @@ ALTER TABLE accounts.capability_use_consumptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE accounts.capability_use_consumptions FORCE ROW LEVEL SECURITY;
 CREATE POLICY capability_use_consumptions_owner_select
   ON accounts.capability_use_consumptions
-  FOR SELECT TO accounts_runtime USING (accounts.row_owned_by(owner_ref));
+  FOR SELECT TO PUBLIC USING (accounts.row_owned_by(owner_ref));
 CREATE POLICY capability_use_consumptions_owner_insert
   ON accounts.capability_use_consumptions
-  FOR INSERT TO accounts_runtime WITH CHECK (accounts.row_owned_by(owner_ref));
+  FOR INSERT TO PUBLIC WITH CHECK (accounts.row_owned_by(owner_ref));
 
-GRANT SELECT, INSERT ON TABLE accounts.capability_use_consumptions TO accounts_runtime;
-REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
-  ON accounts.capability_use_consumptions FROM accounts_runtime;
+REVOKE ALL ON TABLE accounts.capability_use_consumptions FROM PUBLIC;
 `;
 
 export const POSTGRES_MIGRATION_V3_CHECKSUM = `sha256:${createHash("sha256")
@@ -813,6 +769,29 @@ export const POSTGRES_MIGRATION_V3_CHECKSUM = `sha256:${createHash("sha256")
   .digest("hex")}`;
 
 export const POSTGRES_MIGRATION_CHECKSUM = POSTGRES_MIGRATION_V3_CHECKSUM;
+
+export const POSTGRES_FINAL_TABLES = Object.freeze([
+  ...POSTGRES_REQUIRED_TABLES,
+  "capsule_maintenance_grants",
+  "capsule_maintenance_uses",
+  "capability_use_consumptions",
+] as const);
+
+export const POSTGRES_RUNTIME_READ_ONLY_TABLES = Object.freeze([
+  "schema_migrations",
+] as const);
+
+export const POSTGRES_RUNTIME_MUTABLE_TABLES = Object.freeze([
+  ...POSTGRES_MUTABLE_RUNTIME_TABLES,
+  "capsule_maintenance_grants",
+] as const);
+
+export const POSTGRES_RUNTIME_INSERT_ONLY_TABLES = Object.freeze([
+  ...POSTGRES_APPEND_ONLY_RUNTIME_TABLES,
+  ...POSTGRES_INSERT_ONLY_RUNTIME_TABLES,
+  "capsule_maintenance_uses",
+  "capability_use_consumptions",
+] as const);
 
 export const POSTGRES_MIGRATIONS = Object.freeze([
   Object.freeze({

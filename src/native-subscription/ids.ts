@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 
-import { AccountsError } from "./errors";
+import { AccountsError } from "./errors.js";
 
 declare const brand: unique symbol;
 export type Brand<T, Name extends string> = T & { readonly [brand]: Name };

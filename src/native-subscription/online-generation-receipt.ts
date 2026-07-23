@@ -3,17 +3,17 @@ import {
   type KeyObject,
 } from "node:crypto";
 
-import { AccountsError } from "./errors";
+import { AccountsError } from "./errors.js";
 import {
   canonicalJson,
   canonicalSha256,
   parseClosedJsonBytes,
-} from "./json";
+} from "./json.js";
 import {
   parseCounter,
   type Counter,
-} from "./counter";
-import { isUuidV7 } from "./ids";
+} from "./counter.js";
+import { isUuidV7 } from "./ids.js";
 
 export const ONLINE_GENERATION_CHECK_RECEIPT_SCHEMA_VERSION =
   "accounts.online-generation-check-receipt.v1" as const;

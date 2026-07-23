@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, sign as signBytes, type KeyLike } from "node:crypto";
 
-import { AccountsError } from "./errors";
-import { parseCounter } from "./counter";
+import { AccountsError } from "./errors.js";
+import { parseCounter } from "./counter.js";
 import {
   CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR,
   CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
@@ -18,20 +18,20 @@ import {
   verifyInfinityMaintenanceHeldReceipt,
   type CapsuleMaintenanceCurrentState,
   type CapsuleMaintenanceTransportBinding,
-} from "./capsule-maintenance";
+} from "./capsule-maintenance.js";
 import {
   InMemoryNativeCapabilityUseStore,
   StaticNativeSubscriptionSnapshotSource,
   evaluateNativeSubscriptionProbe,
   type NativeSubscriptionBindingSnapshot,
   type NativeSubscriptionProbeRequest,
-} from "./native-subscription";
+} from "./native-subscription.js";
 import {
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
   type OnlineGenerationReceiptUseCasRequest,
-} from "./online-generation-receipt";
-import { canonicalJson, canonicalSha256, parseClosedJsonBytes } from "./json";
+} from "./online-generation-receipt.js";
+import { canonicalJson, canonicalSha256, parseClosedJsonBytes } from "./json.js";
 
 const NOW = new Date("2030-07-18T12:00:00.000Z");
 const OWNER = "principal:human:hasna:owner-a";

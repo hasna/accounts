@@ -1,9 +1,9 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import type { SQL, TransactionSQL } from "bun";
 
-import { PostgresNativeCapabilityUseStore } from "./postgres-native-capability-use";
-import type { OnlineGenerationReceiptUseCasRequest } from "./online-generation-receipt";
+import { PostgresNativeCapabilityUseStore } from "./postgres-native-capability-use.js";
+import type { OnlineGenerationReceiptUseCasRequest } from "./online-generation-receipt.js";
+import type { PostgresSqlClient, PostgresTransaction } from "./postgres-sql.js";
 
 const OWNER = "principal:service:hasna:infinity";
 const SUBJECT = "principal:service:hasna:worker";
@@ -43,7 +43,7 @@ interface FakeState {
   locks: string[];
 }
 
-function fakeClient(state: FakeState): SQL {
+function fakeClient(state: FakeState): PostgresSqlClient {
   const transaction = (async (
     strings: TemplateStringsArray,
     ...values: unknown[]
@@ -51,7 +51,12 @@ function fakeClient(state: FakeState): SQL {
     const query = strings.join("?").replace(/\s+/g, " ").trim();
     if (query.includes("set_config('accounts.principal'")) return [];
     if (query.includes("accounts.current_principal() AS principal")) {
-      return [{ principal: OWNER, realm: "hasna", role_name: "accounts_runtime" }];
+      return [{
+        principal: OWNER,
+        realm: "hasna",
+        role_name: "accounts_runtime",
+        login_role_name: "accounts_runtime",
+      }];
     }
     if (query.includes("pg_advisory_xact_lock")) {
       state.locks.push(String(values[0]));
@@ -61,20 +66,24 @@ function fakeClient(state: FakeState): SQL {
       query.includes("FROM accounts.capability_use_consumptions") &&
       query.includes("consume_request_id =")
     ) {
-      return state.rows.filter((row) => row.consume_request_id === values[0]);
+      return state.rows.filter(
+        (row) => row.owner_ref === values[0] && row.consume_request_id === values[1],
+      );
     }
     if (
       query.includes("FROM accounts.capability_use_consumptions") &&
       query.includes("idempotency_key_digest =")
     ) {
-      return state.rows.filter((row) => row.idempotency_key_digest === values[0]);
+      return state.rows.filter(
+        (row) => row.owner_ref === values[0] && row.idempotency_key_digest === values[1],
+      );
     }
     if (
       query.includes("FROM accounts.capability_use_consumptions") &&
       query.includes("capability_id =")
     ) {
       return state.rows
-        .filter((row) => row.capability_id === values[0])
+        .filter((row) => row.owner_ref === values[0] && row.capability_id === values[1])
         .map((row) => ({ consume_request_id: row.consume_request_id }));
     }
     if (query.startsWith("INSERT INTO accounts.capability_use_consumptions")) {
@@ -90,17 +99,19 @@ function fakeClient(state: FakeState): SQL {
       return [];
     }
     throw new Error(`unexpected fake query: ${query}`);
-  }) as unknown as TransactionSQL;
-  transaction.unsafe = (() => ({ simple: async () => [] })) as unknown as TransactionSQL["unsafe"];
+  }) as unknown as PostgresTransaction;
+  transaction.unsafe = (() => ({
+    simple: async () => [],
+  })) as unknown as PostgresTransaction["unsafe"];
   return {
     begin: async (
       mode: string,
-      callback: (value: TransactionSQL) => Promise<unknown>,
+      callback: (value: PostgresTransaction) => Promise<unknown>,
     ) => {
       state.modes.push(mode);
       return callback(transaction);
     },
-  } as unknown as SQL;
+  } as PostgresSqlClient;
 }
 
 function request(
@@ -150,6 +161,7 @@ describe("Postgres native capability-use store", () => {
     const options = {
       client: fakeClient(state),
       principalRef: OWNER,
+      runtimeRole: { mode: "direct", roleName: "accounts_runtime" } as const,
       issuer: "accounts-self-hosted",
       issuerIncarnation: "accounts-incarnation-a",
       keyId: "accounts-capability-use-key-a",
@@ -183,9 +195,15 @@ describe("Postgres native capability-use store", () => {
     expect(currentChecks).toBe(1);
     expect(state.rows).toHaveLength(1);
     expect(state.modes.every((mode) => mode === "isolation level serializable read write")).toBe(true);
-    expect(state.locks).toContain(`accounts.capability-use.capability:${IDS.capability}`);
-    expect(state.locks).toContain(`accounts.capability-use.idempotency:${D3}`);
-    expect(state.locks).toContain(`accounts.capability-use.request:${IDS.consumeRequest}`);
+    expect(state.locks).toContain(
+      `accounts.capability-use.owner:${OWNER}:capability:${IDS.capability}`,
+    );
+    expect(state.locks).toContain(
+      `accounts.capability-use.owner:${OWNER}:idempotency:${D3}`,
+    );
+    expect(state.locks).toContain(
+      `accounts.capability-use.owner:${OWNER}:request:${IDS.consumeRequest}`,
+    );
   });
 
   test("rejects changed idempotent bytes and exhausts a capability under a new request", async () => {
@@ -194,6 +212,7 @@ describe("Postgres native capability-use store", () => {
     const store = new PostgresNativeCapabilityUseStore({
       client: fakeClient(state),
       principalRef: OWNER,
+      runtimeRole: { mode: "direct", roleName: "accounts_runtime" },
       issuer: "accounts-self-hosted",
       issuerIncarnation: "accounts-incarnation-a",
       keyId: "accounts-capability-use-key-a",
@@ -219,5 +238,31 @@ describe("Postgres native capability-use store", () => {
       idempotency_key_digest: D5,
     }))).status).toBe("exhausted");
     expect(state.rows).toHaveLength(1);
+  });
+
+  test("rejects credential-shaped arbitrary DTO values before signing or persistence", async () => {
+    const state: FakeState = { rows: [], modes: [], locks: [] };
+    const keys = generateKeyPairSync("ed25519");
+    const store = new PostgresNativeCapabilityUseStore({
+      client: fakeClient(state),
+      principalRef: OWNER,
+      runtimeRole: { mode: "direct", roleName: "accounts_runtime" },
+      issuer: "accounts-self-hosted",
+      issuerIncarnation: "accounts-incarnation-a",
+      keyId: "accounts-capability-use-key-a",
+      audience: "infinity-self-hosted",
+      privateKey: keys.privateKey,
+      clock: () => NOW,
+      idFactory: () => IDS.consumeReceipt,
+      validateCurrent: () => ({
+        catalogIncarnation: "catalog-a",
+        recoveryFrontierSequence: "1",
+        recoveryFrontierHash: D4,
+      }),
+    });
+    await expect(store.compareAndConsume(request({
+      resource_id: "sk-" + "A".repeat(24),
+    }))).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(state.rows).toEqual([]);
   });
 });

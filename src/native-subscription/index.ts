@@ -20,3 +20,5 @@ export * from "./postgres-capsule-maintenance.js";
 export * from "./postgres-native-capability-use.js";
 export * from "./postgres-migrations.js";
 export * from "./postgres-migrator.js";
+export * from "./postgres-runtime.js";
+export * from "./postgres-sql.js";

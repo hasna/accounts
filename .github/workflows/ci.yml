@@ -109,7 +109,7 @@ jobs:
         env:
           ACCOUNTS_REQUIRE_POSTGRES: "1"
           HASNA_ACCOUNTS_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/accounts_test
-        run: bun test src/server/postgres.integration.test.ts
+        run: bun test src/server/postgres.integration.test.ts src/native-subscription/postgres-native-subscription.integration.test.ts
 
   portable-claude:
     name: portable-claude (${{ matrix.os }})
