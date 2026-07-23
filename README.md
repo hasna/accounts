@@ -4,6 +4,11 @@
 > machine — Claude Code, Takumi, Codex CLI, Codex App, Gemini CLI, opencode,
 > Cursor Agent, Pi Coding Agent, Hermes, Kimi Code, Grok Build, and custom tools.
 
+Infinity's credential-free native-subscription capacity, maintenance-grant,
+and ordinal-one capability-use contracts are available from the explicit
+`@hasna/accounts/native-subscription` subpath. See
+[Native subscription authority](docs/native-subscription.md).
+
 `accounts` is a local-first CLI. Each **profile** is an isolated config directory.
 Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** with
 `accounts apply` (syncs auth to live `~/.claude` paths).

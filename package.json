@@ -23,6 +23,10 @@
     "./sdk": {
       "types": "./dist/sdk/index.d.ts",
       "import": "./dist/sdk/index.js"
+    },
+    "./native-subscription": {
+      "types": "./dist/native-subscription/index.d.ts",
+      "import": "./dist/native-subscription/index.js"
     }
   },
   "files": [
@@ -37,7 +41,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node --external @hasna/contracts && bun build src/mcp.ts --outdir dist --target node --external @hasna/contracts && bun build src/index.ts --outdir dist --target node --external @hasna/contracts && bun build src/storage.ts --outdir dist --target node && bun build src/sdk/index.ts --outdir dist/sdk --target node && bun build src/server/index.ts src/server/migrate.ts --outdir dist/server --target bun --packages external && tsc --emitDeclarationOnly --outDir dist",
+    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node --external @hasna/contracts && bun build src/mcp.ts --outdir dist --target node --external @hasna/contracts && bun build src/index.ts --outdir dist --target node --external @hasna/contracts && bun build src/storage.ts --outdir dist --target node && bun build src/sdk/index.ts --outdir dist/sdk --target node && bun build src/native-subscription/index.ts --outdir dist/native-subscription --target node && bun build src/server/index.ts src/server/migrate.ts --outdir dist/server --target bun --packages external && tsc --emitDeclarationOnly --outDir dist",
     "contracts:conformance": "contracts conformance examples",
     "contracts:no-cloud-scan": "contracts no-cloud-scan --json .",
     "dev": "bun run src/cli.ts",
