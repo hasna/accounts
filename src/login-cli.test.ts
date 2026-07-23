@@ -152,7 +152,12 @@ function recoveryProfileLockPath(profileDir: string): string {
 
 function readRecoveryJournal(id: string): {
   ownerPid: number;
-  finalizationState: { writes: { keychainLockToken?: string } };
+  finalizationState: {
+    writes: {
+      keychainLockToken?: string;
+      applyLockToken?: string;
+    };
+  };
 } {
   return deserialize(
     readFileSync(join(home, "login-finalization-journals", `${id}.bin`)),
@@ -1462,6 +1467,34 @@ test("concurrent recovery publishes lock ownership only after its exclusive prof
   expect(crashed.signal).toBe("SIGKILL");
   const [journalId] = recoveryJournalIds();
   expect(journalId).toBeTruthy();
+  const [leaseId] = recoveryLeaseIds();
+  expect(leaseId).toBeTruthy();
+  const abandonedProfileIntent = readRecoveryLease(leaseId!);
+  const abandonedProfileLock = recoveryProfileLockPath(
+    abandonedProfileIntent.profileDir,
+  );
+  const abandonedJournal = readRecoveryJournal(journalId!);
+  const abandonedKeychainLock = readFileSync(fixture.keychainLock, "utf8");
+  expect(readFileSync(abandonedProfileLock, "utf8"))
+    .toBe(abandonedProfileIntent.profileLockToken);
+  expect(abandonedJournal.finalizationState.writes.keychainLockToken).toBeTruthy();
+  expect(abandonedJournal.finalizationState.writes.applyLockToken).toBeTruthy();
+
+  // This test coordinates two contenders for the dead journal. Resolve the
+  // original crashed login's separate profile-lease intent first so the
+  // contenders cannot race in the startup intent prepass before both reach the
+  // journal-recovery barrier. Keep the journal, its keychain/apply ownership
+  // tokens, and its live keychain lease abandoned so the tested recovery
+  // ownership path remains unchanged.
+  rmSync(abandonedProfileLock);
+  rmSync(
+    join(home, "login-finalization-journals", `${leaseId}.lease`),
+  );
+  expect(recoveryLeaseIds()).toEqual([]);
+  expect(recoveryJournalIds()).toEqual([journalId]);
+  expect(readRecoveryJournal(journalId!)).toEqual(abandonedJournal);
+  expect(readFileSync(fixture.keychainLock, "utf8")).toBe(abandonedKeychainLock);
+
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
   const hookDirectory = join(home, "recovery-hooks-ownership");
   const commonEnv = {

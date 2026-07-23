@@ -156,6 +156,46 @@ test("permission source normalization rejects duplicates and preset/pass-through
   ])).toThrow(/may be supplied only once/);
 });
 
+test("Claude native permission-mode parsing requires exact canonical spellings", () => {
+  const claude = getTool("claude");
+
+  for (const nativeMode of [
+    "bypass",
+    "bypass-permissions",
+    "accept-edits",
+    "dont-ask",
+    "PLAN",
+    " plan",
+    "plan ",
+    "futureMode",
+    "allow-dangerous",
+  ]) {
+    for (const passthroughArgs of [
+      ["--permission-mode", nativeMode],
+      [`--permission-mode=${nativeMode}`],
+    ]) {
+      expect(() => resolvePermissionInputs(claude, { passthroughArgs })).toThrow(
+        /exact canonical/,
+      );
+    }
+  }
+
+  for (const nativeMode of [
+    "bypassPermissions",
+    "auto",
+    "acceptEdits",
+    "dontAsk",
+    "plan",
+  ]) {
+    for (const passthroughArgs of [
+      ["--permission-mode", nativeMode],
+      [`--permission-mode=${nativeMode}`],
+    ]) {
+      expect(resolvePermissionInputs(claude, { passthroughArgs })).toEqual({ args: [] });
+    }
+  }
+});
+
 test("mergeToolArgs prepends permission args without duplicating explicit flags", () => {
   const claude = getTool("claude");
   expect(mergeToolArgs(claude, ["--continue"], { permissions: "dangerous" })).toEqual([

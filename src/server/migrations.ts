@@ -15,7 +15,10 @@ import {
   type Migration,
   type TypedQueryClient,
 } from "../generated/storage-kit/index.js";
+import { LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON } from "../lib/migration.js";
 import { API_KEYS_TABLE } from "./config.js";
+
+export { LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON };
 
 /** Ordered app-schema SQL files, applied before the auth table migrations. */
 export const APP_MIGRATION_FILES = [
@@ -93,14 +96,6 @@ export interface MigrationStatus {
   /** Applied ids whose recorded checksum differs from this build. */
   checksumMismatches: string[];
 }
-
-/**
- * Stable public reason code for the migration 0010 deployment gate.
- *
- * Keep internal task identifiers out of runtime errors and operator docs.
- */
-export const LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON =
-  "login-cleanup-ledger-atomicity" as const;
 
 /**
  * Source merge must not make migration 0010 deployable. Its SQL and ledger

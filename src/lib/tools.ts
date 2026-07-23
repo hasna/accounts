@@ -184,6 +184,15 @@ export interface ToolArgOptions {
 
 export const CLAUDE_DANGEROUS_PERMISSION_ARG = "--dangerously-skip-permissions";
 const CLAUDE_PERMISSION_MODE_ARG = "--permission-mode";
+const CLAUDE_NATIVE_PERMISSION_MODE_PRESETS = new Map(
+  Object.entries(
+    BUILTIN_TOOLS.find((tool) => tool.id === "claude")?.permissionArgs ?? {},
+  ).flatMap(([preset, args]) =>
+    args.length === 2 && args[0] === CLAUDE_PERMISSION_MODE_ARG
+      ? [[args[1]!, preset] as const]
+      : []
+  ),
+);
 
 export interface PermissionInputs {
   permissions?: string;
@@ -215,6 +224,23 @@ const PERMISSION_ALIASES = new Map<string, string>([
 export function normalizePermissionPreset(value: string): string {
   const normalized = value.trim().replace(/^--/, "").replaceAll("_", "-").toLowerCase();
   return PERMISSION_ALIASES.get(normalized) ?? normalized;
+}
+
+function validateClaudeNativePermissionMode(value: string): void {
+  if (CLAUDE_NATIVE_PERMISSION_MODE_PRESETS.has(value)) return;
+
+  const normalizedPreset = normalizePermissionPreset(value);
+  const canonical = [...CLAUDE_NATIVE_PERMISSION_MODE_PRESETS.entries()]
+    .find(([, preset]) => preset === normalizedPreset)?.[0];
+  if (canonical) {
+    throw new AccountsError(
+      `${CLAUDE_PERMISSION_MODE_ARG} requires the exact canonical Claude mode "${canonical}"`,
+    );
+  }
+  throw new AccountsError(
+    `${CLAUDE_PERMISSION_MODE_ARG} requires an exact canonical Claude mode. ` +
+    `Supported modes: ${[...CLAUDE_NATIVE_PERMISSION_MODE_PRESETS.keys()].join(", ")}`,
+  );
 }
 
 /**
@@ -263,9 +289,9 @@ export function validatePermissionInputs(inputs: PermissionInputs): void {
 }
 
 /**
- * Treat native Claude permission modes as a permission source without
- * constraining the value to today's built-in presets. Claude may add modes,
- * but a caller still must not use a native mode to override another source.
+ * Treat exact native Claude permission modes as a permission source. Accounts
+ * presets accept aliases, but raw Claude argv stays fail-closed so aliases,
+ * casing variants, whitespace, and unknown values cannot bypass validation.
  */
 function validateClaudePermissionModeInputs(inputs: PermissionInputs): string | undefined {
   const passthroughArgs = inputs.passthroughArgs ?? [];
@@ -277,6 +303,7 @@ function validateClaudePermissionModeInputs(inputs: PermissionInputs): string | 
       if (!value?.trim() || value.startsWith("-")) {
         throw new AccountsError(`${CLAUDE_PERMISSION_MODE_ARG} requires a value`);
       }
+      validateClaudeNativePermissionMode(value);
       nativeModes.push(value);
       index += 1;
       continue;
@@ -286,6 +313,7 @@ function validateClaudePermissionModeInputs(inputs: PermissionInputs): string | 
       if (!value.trim()) {
         throw new AccountsError(`${CLAUDE_PERMISSION_MODE_ARG} requires a value`);
       }
+      validateClaudeNativePermissionMode(value);
       nativeModes.push(value);
     }
   }
@@ -402,8 +430,7 @@ export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOption
     const hasEquivalentNativeMode =
       claudePermissionMode !== undefined &&
       configuredClaudePermissionMode !== undefined &&
-      normalizePermissionPreset(claudePermissionMode) ===
-        normalizePermissionPreset(configuredClaudePermissionMode);
+      claudePermissionMode === configuredClaudePermissionMode;
     hasConfiguredPermissionArgs ||= hasEquivalentNativeMode;
     if (
       configuredPermissionArgs.length > 0 &&

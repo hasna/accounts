@@ -160,3 +160,4 @@ export {
   validateEventActorRefs,
 } from "./lib/contracts.js";
 export { AccountsEventsClient, createAccountsEventsClient } from "./lib/events.js";
+export { LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON } from "./lib/migration.js";

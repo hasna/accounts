@@ -1,6 +1,24 @@
 import { expect, test } from "bun:test";
 import { AccountsError, getTool, mergeToolArgs } from "./index.js";
 
+const canonicalClaudePermissionModes = [
+  ["bypass", "bypassPermissions"],
+  ["auto", "auto"],
+  ["accept-edits", "acceptEdits"],
+  ["dont-ask", "dontAsk"],
+  ["plan", "plan"],
+] as const;
+
+const invalidClaudePermissionModes = [
+  ["bypass", "bypass"],
+  ["bypass", "bypass-permissions"],
+  ["accept-edits", "accept-edits"],
+  ["dont-ask", "dont-ask"],
+  ["plan", "PLAN"],
+  ["plan", " plan"],
+  ["plan", "plan "],
+] as const;
+
 test("public mergeToolArgs rejects conflicting Claude permission modes", () => {
   const claude = getTool("claude");
 
@@ -11,6 +29,20 @@ test("public mergeToolArgs rejects conflicting Claude permission modes", () => {
     ["bypass", ["--permission-mode=plan"]],
   ] as const) {
     expect(() => mergeToolArgs(claude, [...args], { permissions })).toThrow(AccountsError);
+  }
+});
+
+test("public mergeToolArgs requires exact canonical Claude native permission modes", () => {
+  const claude = getTool("claude");
+
+  for (const [permissions, nativeMode] of invalidClaudePermissionModes) {
+    for (const args of [
+      ["--permission-mode", nativeMode],
+      [`--permission-mode=${nativeMode}`],
+    ]) {
+      expect(() => mergeToolArgs(claude, [...args])).toThrow(/exact canonical/);
+      expect(() => mergeToolArgs(claude, [...args], { permissions })).toThrow(/exact canonical/);
+    }
   }
 });
 
@@ -47,13 +79,30 @@ test("public mergeToolArgs preserves coherent Claude permission sources", () => 
   ]) {
     expect(mergeToolArgs(claude, args)).toEqual(args);
   }
-  for (const [permissions, args] of [
-    ["plan", ["--permission-mode", "plan"]],
-    ["plan", ["--permission-mode=plan"]],
-    ["bypass", ["--permission-mode", "bypassPermissions"]],
-    ["bypass", ["--permission-mode=bypassPermissions"]],
-  ] as const) {
-    expect(mergeToolArgs(claude, [...args], { permissions })).toEqual(args);
+  for (const [permissions, nativeMode] of canonicalClaudePermissionModes) {
+    for (const args of [
+      ["--permission-mode", nativeMode],
+      [`--permission-mode=${nativeMode}`],
+    ]) {
+      expect(mergeToolArgs(claude, [...args])).toEqual(args);
+      expect(mergeToolArgs(claude, [...args], { permissions })).toEqual(args);
+    }
+  }
+});
+
+test("public mergeToolArgs rejects unknown Claude native permission modes", () => {
+  const claude = getTool("claude");
+
+  for (const nativeMode of ["futureMode", "allow-dangerous"]) {
+    for (const args of [
+      ["--permission-mode", nativeMode],
+      [`--permission-mode=${nativeMode}`],
+    ]) {
+      expect(() => mergeToolArgs(claude, [...args])).toThrow(/exact canonical/);
+      expect(() => mergeToolArgs(claude, [...args], { permissions: "plan" })).toThrow(
+        /exact canonical/,
+      );
+    }
   }
 });
 

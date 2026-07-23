@@ -477,7 +477,9 @@ function removeExactAbandonedProcessLock(
   ownerPid: number,
   ownerProcessStartId: string,
 ): boolean {
-  if (!exactToken) return !exactProcessLockHasLiveReclaimClaims(path);
+  // A preparation that never acquired this lock has no cleanup authority and
+  // must neither wait on nor clear another acquisition's reclaim aliases.
+  if (!exactToken) return true;
   const observation = observeExactProcessLock(path, exactToken);
   if (observation) {
     if (ownerIsLive(ownerPid, ownerProcessStartId)) {
@@ -486,7 +488,7 @@ function removeExactAbandonedProcessLock(
     removeObservedExactProcessLock(observation);
   }
   return (
-    !exactProcessLockHasLiveReclaimClaims(path) &&
+    !exactProcessLockHasLiveReclaimClaims(path, exactToken) &&
     !observeExactProcessLock(path, exactToken)
   );
 }
