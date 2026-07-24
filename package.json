@@ -1,6 +1,6 @@
 {
   "name": "@hasna/accounts",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally — isolated config dirs, per-account email, one-command switching.",
   "type": "module",
   "main": "dist/index.js",

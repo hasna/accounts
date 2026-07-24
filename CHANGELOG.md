@@ -6,6 +6,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-24
+
+### Fixed
+
+- Configs prelaunch now performs an explicit empty session render for profiles
+  with no instruction sources. When accounts resolves zero identity exports for a
+  `configs session plan`/`apply`, it appends `--allow-empty-sources` so `configs`
+  writes a valid empty render (`CLAUDE.md` + a `sourceCount: 0` manifest, exit 0)
+  instead of failing closed. This unblocks `accounts launch` / `accounts run` for
+  identity-less profiles (e.g. `accountNNN`), which previously aborted with
+  `configs prelaunch apply failed ... Session render has no instruction sources`.
+  Profiles that resolve one or more instruction sources are unchanged and never
+  receive the flag.
+
 ## [0.2.8] - 2026-07-15
 
 ### Changed

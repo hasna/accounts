@@ -54,6 +54,7 @@ export function configsPrelaunchCommand(
   const mode = opts.mode ?? "apply";
   const configsTool = configsSessionToolFor(tool);
   if (mode === "skip" || !configsTool) return [];
+  const identityExports = opts.identityExports ?? [];
   return [
     opts.configsBin ?? "configs",
     "session",
@@ -66,7 +67,10 @@ export function configsPrelaunchCommand(
     profile.dir,
     "--session-id",
     opts.sessionId ?? `accounts:${tool.id}:${profile.name}`,
-    ...((opts.identityExports ?? []).flatMap((path) => ["--identity-export", path])),
+    ...identityExports.flatMap((path) => ["--identity-export", path]),
+    // No instruction sources: tell configs this is an explicit empty render so it
+    // produces a valid sourceCount:0 manifest instead of failing closed.
+    ...(identityExports.length === 0 ? ["--allow-empty-sources"] : []),
   ];
 }
 

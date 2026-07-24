@@ -117,6 +117,7 @@ describe("configs prelaunch", () => {
       "/tmp/accounts/codex-profile",
       "--session-id",
       "accounts:codex:codex-profile",
+      "--allow-empty-sources",
     ]);
   });
 
@@ -128,6 +129,7 @@ describe("configs prelaunch", () => {
     expect(command.slice(1, 5)).toEqual(["session", "apply", "--tool", "claude"]);
     expect(command).toContain("--target-home");
     expect(command).toContain("/tmp/accounts/claude-profile");
+    expect(command).toContain("--allow-empty-sources");
   });
 
   test("passes OpenIdentities configs exports to the configs session command", () => {
@@ -138,12 +140,30 @@ describe("configs prelaunch", () => {
     });
 
     expect(command).toContain("--identity-export");
+    expect(command).not.toContain("--allow-empty-sources");
     expect(command.slice(-4)).toEqual([
       "--identity-export",
       "/tmp/global-identities.json",
       "--identity-export",
       "/tmp/account-agent.json",
     ]);
+  });
+
+  test("adds --allow-empty-sources only when there are no instruction sources", () => {
+    const p = profile("claude");
+
+    const emptyImplicit = configsPrelaunchCommand(p, getTool("claude"));
+    expect(emptyImplicit).toContain("--allow-empty-sources");
+    expect(emptyImplicit).not.toContain("--identity-export");
+
+    const emptyExplicit = configsPrelaunchCommand(p, getTool("claude"), { identityExports: [] });
+    expect(emptyExplicit).toContain("--allow-empty-sources");
+
+    const withSources = configsPrelaunchCommand(p, getTool("claude"), {
+      identityExports: ["/tmp/one.json"],
+    });
+    expect(withSources).toContain("--identity-export");
+    expect(withSources).not.toContain("--allow-empty-sources");
   });
 
   test("runs configs prelaunch and fails closed unless bypassed", () => {
