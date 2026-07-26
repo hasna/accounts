@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -14,6 +17,7 @@ import {
   CLAUDE_SESSION_METADATA_MAX_BYTES,
   listClaudeSessions,
 } from "./lib/claude-sessions.js";
+import { formatClaudeSessionTable } from "./lib/claude-sessions-cli.js";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
 const UUID_B = "22222222-2222-4222-8222-222222222222";
@@ -53,19 +57,24 @@ function sessionPath(profileDir: string, encodedProject: string, uuid: string): 
   return join(projectDir, `${uuid}.jsonl`);
 }
 
+function canonicalPath(path: string): string {
+  return realpathSync.native(path);
+}
+
 function writeSession(
   profileDir: string,
   encodedProject: string,
   uuid: string,
   cwd: string,
   secret = "PROMPT_MUST_NOT_ESCAPE",
+  sessionId = uuid,
 ): string {
   const path = sessionPath(profileDir, encodedProject, uuid);
   writeFileSync(
     path,
     `${JSON.stringify({
       type: "user",
-      sessionId: uuid,
+      sessionId,
       cwd,
       message: { role: "user", content: secret },
     })}\n`,
@@ -103,9 +112,57 @@ describe("Claude session catalog discovery", () => {
     expect(sessions.find((entry) => entry.ownerProfile === "work")).toMatchObject({
       projectIdentity: repoOne,
       cwd: repoOne,
-      sourcePath: workSource,
+      sourcePath: canonicalPath(workSource),
+      sessionIdCheck: "bounded-match",
+      identity: {
+        ownerProfile: "work",
+        profileIdentity: canonicalPath(work.dir),
+        profilePath: canonicalPath(work.dir),
+        encodedProject: "-repos-one",
+        projectIdentity: repoOne,
+        uuid: UUID_A,
+        sourcePath: canonicalPath(workSource),
+      },
     });
     expect(new Set(sessions.map((entry) => JSON.stringify(entry.identity))).size).toBe(3);
+    expect(new Set(sessions.map((entry) => entry.catalogRef)).size).toBe(3);
+  });
+
+  test("uses source paths in canonical refs and reports bounded sessionId mismatches", () => {
+    const managed = { ...profile("same"), identity: "identity://managed-same" };
+    const representedDefault = {
+      ...profile("same", join(fakeHome, ".claude")),
+      identity: "identity://default-same",
+    };
+    const sharedCwd = join(root, "repos", "same");
+    mkdirSync(sharedCwd, { recursive: true });
+
+    const managedSource = writeSession(managed.dir, "-same-project", UUID_A, sharedCwd, "SECRET_ONE", UUID_B);
+    const defaultSource = writeSession(representedDefault.dir, "-same-project", UUID_A, sharedCwd);
+
+    const sessions = listClaudeSessions([managed, representedDefault], {
+      profilesRoot,
+      defaultDir: representedDefault.dir,
+    });
+
+    expect(sessions).toHaveLength(2);
+    expect(new Set(sessions.map((entry) => entry.catalogRef)).size).toBe(2);
+    const managedEntry = sessions.find(
+      (entry) => entry.sourcePath === canonicalPath(managedSource),
+    )!;
+    expect(managedEntry.catalogRef).toContain(encodeURIComponent(managed.identity));
+    expect(managedEntry.catalogRef).toContain(encodeURIComponent(canonicalPath(managed.dir)));
+    expect(managedEntry.catalogRef).toContain(encodeURIComponent("-same-project"));
+    expect(managedEntry.catalogRef).toContain(UUID_A);
+    expect(managedEntry.catalogRef).toContain(encodeURIComponent(canonicalPath(managedSource)));
+    expect(sessions.map((entry) => entry.identity.sourcePath).sort()).toEqual(
+      [canonicalPath(defaultSource), canonicalPath(managedSource)].sort(),
+    );
+    expect(managedEntry.sessionIdCheck).toBe("bounded-mismatch");
+    expect(
+      sessions.find((entry) => entry.sourcePath === canonicalPath(defaultSource))?.sessionIdCheck,
+    ).toBe("bounded-match");
+    expect(JSON.stringify(sessions)).not.toContain("SECRET_ONE");
   });
 
   test("excludes stale foreign, missing, non-Claude, and unrepresented default directories", () => {
@@ -157,6 +214,36 @@ describe("Claude session catalog discovery", () => {
     });
 
     expect(sessions.map((entry) => entry.uuid)).toEqual([UUID_D]);
+  });
+
+  test("rejects multiply-linked session files and leaves transcript content unchanged", () => {
+    const valid = profile("valid");
+    const original = writeSession(valid.dir, "-hardlinks", UUID_A, "/hardlink");
+    const linked = sessionPath(valid.dir, "-hardlinks", UUID_B);
+    linkSync(original, linked);
+    const retained = writeSession(valid.dir, "-hardlinks", UUID_C, "/retained");
+    const before = readFileSync(retained);
+
+    const sessions = listClaudeSessions([valid], {
+      profilesRoot,
+      defaultDir: join(fakeHome, ".claude"),
+    });
+
+    expect(sessions.map((entry) => entry.uuid)).toEqual([UUID_C]);
+    expect(readFileSync(retained)).toEqual(before);
+  });
+
+  test("normalizes profile-root comparison case on Windows", () => {
+    const work = profile("work");
+    writeSession(work.dir, "-case", UUID_A, join(root, "repo-case"));
+    const caseVariant = { ...work, dir: work.dir.toUpperCase() };
+
+    const sessions = listClaudeSessions([caseVariant], {
+      profilesRoot,
+      defaultDir: join(fakeHome, ".claude"),
+    });
+
+    expect(sessions).toHaveLength(process.platform === "win32" ? 1 : 0);
   });
 
   test("tolerates malformed transcripts and bounds top-level metadata parsing", () => {
@@ -215,10 +302,11 @@ describe("accounts sessions CLI", () => {
     );
   }
 
-  function runCli(...args: string[]) {
-    return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
+  function runCliEntrypoint(entrypointArgs: string[], ...args: string[]) {
+    return spawnSync(process.execPath, [...entrypointArgs, ...args], {
       cwd: process.cwd(),
       encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
       env: {
         ...process.env,
         NODE_ENV: "test",
@@ -227,6 +315,27 @@ describe("accounts sessions CLI", () => {
         NO_COLOR: "1",
       },
     });
+  }
+
+  function runCli(...args: string[]) {
+    return runCliEntrypoint(["run", "src/cli.ts"], ...args);
+  }
+
+  function parseCatalog(result: ReturnType<typeof runCli>): Array<Record<string, unknown>> {
+    if (result.status !== 0) {
+      throw new Error(`session CLI exited ${String(result.status)}: ${result.stderr.slice(0, 500)}`);
+    }
+    try {
+      const value = JSON.parse(result.stdout) as unknown;
+      if (!Array.isArray(value)) throw new Error("catalog JSON was not an array");
+      return value as Array<Record<string, unknown>>;
+    } catch (error) {
+      throw new Error(
+        `session CLI emitted invalid JSON (${result.stdout.length} bytes): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   test("renders a concise table by default and structured filtered JSON for both command forms", () => {
@@ -269,9 +378,15 @@ describe("accounts sessions CLI", () => {
     });
     expect(parsed[0]?.identity).toEqual({
       ownerProfile: "work",
+      profileIdentity: canonicalPath(work.dir),
+      profilePath: canonicalPath(work.dir),
+      encodedProject: "-repo-one",
       projectIdentity: projectOne,
       uuid: UUID_A,
+      sourcePath: canonicalPath(sessionPath(work.dir, "-repo-one", UUID_A)),
     });
+    expect(parsed[0]?.catalogRef).toMatch(/^claude-session:v1:/);
+    expect(parsed[0]?.sessionIdCheck).toBe("bounded-match");
     expect(json.stdout).not.toContain("FIRST_SECRET_PROMPT");
 
     const duplicateUuid = runCli("sessions", "--uuid", UUID_A, "--json");
@@ -283,5 +398,80 @@ describe("accounts sessions CLI", () => {
     const directJson = runCli("sessions", "--profile", "personal", "--json");
     expect(directJson.status).toBe(0);
     expect(JSON.parse(directJson.stdout)).toHaveLength(1);
+  });
+
+  test("flushes valid JSON for at least 2,000 sessions from source and built Bun entrypoints", () => {
+    const work = profile("bulk");
+    const count = 2_000;
+    for (let index = 0; index < count; index++) {
+      const uuid = `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+      writeSession(work.dir, "-bulk", uuid, join(root, "repo-bulk"));
+    }
+    writeStore([work]);
+
+    const source = runCliEntrypoint(["run", "src/cli.ts"], "sessions", "--json");
+    expect(source.status).toBe(0);
+    expect(parseCatalog(source)).toHaveLength(count);
+
+    const buildDir = join(root, "built");
+    const build = spawnSync(
+      process.execPath,
+      [
+        "build",
+        "src/cli.ts",
+        "--outdir",
+        buildDir,
+        "--target",
+        "node",
+        "--external",
+        "@hasna/contracts",
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+      },
+    );
+    expect(build.status).toBe(0);
+    const built = runCliEntrypoint([join(buildDir, "cli.js")], "sessions", "--json");
+    expect(built.status).toBe(0);
+    expect(parseCatalog(built)).toHaveLength(count);
+  }, 30_000);
+
+  test("escapes Unicode controls and truncates tables without splitting code points", () => {
+    const entry = {
+      identity: {
+        ownerProfile: "safe",
+        profileIdentity: "identity://safe",
+        profilePath: "/profiles/safe",
+        encodedProject: "-project",
+        projectIdentity: "/project",
+        uuid: UUID_A,
+        sourcePath: `/profiles/safe/projects/-project/${UUID_A}.jsonl`,
+      },
+      catalogRef: "claude-session:v1:test",
+      ownerProfile: `\u202e\u2066safe`,
+      profileIdentity: "identity://safe",
+      profilePath: "/profiles/safe",
+      encodedProject: `${"漢".repeat(22)}😀`,
+      projectIdentity: "/project",
+      uuid: UUID_A,
+      sourcePath: `/profiles/safe/projects/-project/${UUID_A}.jsonl`,
+      sessionIdCheck: "not-observed" as const,
+      sizeBytes: 1,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    const table = formatClaudeSessionTable([entry]);
+    expect(table).toContain("\\u202e");
+    expect(table).toContain("\\u2066");
+    expect(table).not.toContain("\u202e");
+    expect(table).not.toContain("\u2066");
+    expect(table).toContain(`${"漢".repeat(19)}…`);
+    expect(
+      Array.from(table).some((character) => {
+        const codePoint = character.codePointAt(0)!;
+        return codePoint >= 0xd800 && codePoint <= 0xdfff;
+      }),
+    ).toBe(false);
   });
 });

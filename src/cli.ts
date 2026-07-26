@@ -105,16 +105,14 @@ function formatHttpError(err: { status: number; body?: unknown; message?: string
  * unexpected errors still propagate with their stack to aid debugging.
  */
 function action<A extends unknown[]>(fn: (...args: A) => void | Promise<void>) {
-  return (...args: A) => {
-    void (async () => {
-      try {
-        await fn(...args);
-      } catch (err) {
-        if (err instanceof AccountsError) die(err.message);
-        if (isHttpError(err)) die(formatHttpError(err));
-        throw err;
-      }
-    })();
+  return async (...args: A): Promise<void> => {
+    try {
+      await fn(...args);
+    } catch (err) {
+      if (err instanceof AccountsError) die(err.message);
+      if (isHttpError(err)) die(formatHttpError(err));
+      throw err;
+    }
   };
 }
 
@@ -1444,7 +1442,7 @@ contracts
 
 registerEventsCommands(program, { source: "accounts", createClient: () => createAccountsEventsClient() });
 
-program.parseAsync(process.argv);
+await program.parseAsync(process.argv);
 
 function getVersion(): string {
   // Read the version from the package.json that ships alongside the build.

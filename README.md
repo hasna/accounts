@@ -173,12 +173,20 @@ See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
 `projects/<encoded-project>/<uuid>.jsonl` under verified local Claude profiles.
 The live `~/.claude` directory is included only when an Accounts profile
 explicitly represents it. Foreign or missing profile paths and symlinks are
-ignored.
+ignored. Session files with multiple hard links are also rejected.
 
 The default table shows owner, project, UUID, update time, and size. `--json`
-also returns the encoded project key, canonical cwd/project identity, and exact
-source path needed to distinguish sessions that share a UUID. Metadata reads
-are bounded; prompts, messages, and transcript content are never emitted.
+also returns an opaque `catalogRef`, the source profile identity, canonical
+profile and source paths, the encoded project key, and the bounded
+`sessionIdCheck` result needed to
+distinguish collisions or report a filename/metadata mismatch. The bounded
+metadata scan is discovery only and does not assert that the whole transcript
+is valid; continuation brokers must validate the complete source strictly.
+
+Catalog reads never change transcript content and prompts/messages are never
+emitted. On platforms that support it, Accounts requests `O_NOATIME`; when the
+flag is unavailable or not permitted, the read-only fallback may update
+filesystem access-time metadata.
 
 ## Cloud Runtime Entrypoints
 

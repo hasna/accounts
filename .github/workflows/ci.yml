@@ -134,5 +134,5 @@ jobs:
       - name: Build Node CLI
         run: bun run build
 
-      - name: Portable Claude launch smoke
-        run: bun test src/claude-launch-cli.test.ts
+      - name: Portable Claude launch and session suites
+        run: bun test src/claude-launch-cli.test.ts src/claude-sessions.test.ts
