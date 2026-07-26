@@ -158,6 +158,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts hook uninstall` | Remove hook script. |
 | `accounts hook path` | Print hook script path. |
 | `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). `--background`, `--profile <name>`, `--json`. |
+| `accounts sessions` (`sessions list`) | Read-only catalog of root Claude sessions owned by registered local profiles. `--profile`, `--project`, `--uuid`, `--json`. |
 | `accounts health` (`readiness`) | Print the sanitized account/provider readiness contract. Use `--json` for automation. |
 | `accounts detect <name>` | Re-detect email from config dir. |
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
@@ -165,6 +166,34 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts-migrate` | Check or apply the cloud Postgres schema migrations. Use `--dry-run` to print the pending migration plan without mutating the database. |
 
 See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
+
+### Claude session catalog
+
+`accounts sessions` and `accounts sessions list` scan only
+`projects/<encoded-project>/<uuid>.jsonl` under verified local Claude profiles.
+The live `~/.claude` directory is included only when an Accounts profile
+explicitly represents it. Foreign or missing profile paths and symlinks are
+ignored. Session files with multiple hard links are also rejected.
+
+The default table shows owner, project, UUID, update time, and size. `--json`
+also returns an opaque `catalogRef`, the source profile identity, canonical
+profile and source paths, the encoded project key, and the bounded
+`sessionIdCheck` result needed to
+distinguish collisions or report a filename/metadata mismatch. The bounded
+metadata scan is discovery only and does not assert that the whole transcript
+is valid; continuation brokers must validate the complete source strictly.
+
+Catalog reads never change transcript content and prompts/messages are never
+emitted. On platforms that support it, Accounts requests `O_NOATIME`; when the
+flag is unavailable or not permitted, the read-only fallback may update
+filesystem access-time metadata.
+
+Scanning a machine that is actively writing sessions never truncates the
+catalog silently. A path that keeps changing is retried, and anything still
+unreadable is listed as a `warning:` on stderr, so a consumer can tell "no such
+session" from "not observed on this pass". stdout stays a clean stream: closing
+the pipe early — `accounts sessions --json | head` — exits 0 without a stack
+trace.
 
 ## Cloud Runtime Entrypoints
 

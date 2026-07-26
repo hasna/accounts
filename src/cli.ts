@@ -63,6 +63,7 @@ import {
 import { accountsCapabilityCard, accountsNoCloudEvidencePack, toSupervisorOptionsWorkRun } from "./lib/contracts.js";
 import { createAccountsEventsClient } from "./lib/events.js";
 import { getAccountsReadiness, type AccountsReadiness, type AccountsReadinessStatus } from "./lib/readiness.js";
+import { registerClaudeSessionCommands } from "./lib/claude-sessions-cli.js";
 
 const program = new Command();
 
@@ -104,16 +105,14 @@ function formatHttpError(err: { status: number; body?: unknown; message?: string
  * unexpected errors still propagate with their stack to aid debugging.
  */
 function action<A extends unknown[]>(fn: (...args: A) => void | Promise<void>) {
-  return (...args: A) => {
-    void (async () => {
-      try {
-        await fn(...args);
-      } catch (err) {
-        if (err instanceof AccountsError) die(err.message);
-        if (isHttpError(err)) die(formatHttpError(err));
-        throw err;
-      }
-    })();
+  return async (...args: A): Promise<void> => {
+    try {
+      await fn(...args);
+    } catch (err) {
+      if (err instanceof AccountsError) die(err.message);
+      if (isHttpError(err)) die(formatHttpError(err));
+      throw err;
+    }
   };
 }
 
@@ -1389,6 +1388,8 @@ program
     }),
   );
 
+registerClaudeSessionCommands(program, action);
+
 const contracts = program.command("contracts").description("Emit @hasna/contracts-compatible Accounts JSON");
 
 contracts
@@ -1441,7 +1442,7 @@ contracts
 
 registerEventsCommands(program, { source: "accounts", createClient: () => createAccountsEventsClient() });
 
-program.parseAsync(process.argv);
+await program.parseAsync(process.argv);
 
 function getVersion(): string {
   // Read the version from the package.json that ships alongside the build.
