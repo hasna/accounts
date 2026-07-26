@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
+  chmodSync,
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -16,6 +19,7 @@ import type { Profile } from "./types.js";
 import {
   CLAUDE_SESSION_METADATA_MAX_BYTES,
   listClaudeSessions,
+  type ClaudeSessionScanSkip,
 } from "./lib/claude-sessions.js";
 import { formatClaudeSessionTable } from "./lib/claude-sessions-cli.js";
 
@@ -59,6 +63,18 @@ function sessionPath(profileDir: string, encodedProject: string, uuid: string): 
 
 function canonicalPath(path: string): string {
   return realpathSync.native(path);
+}
+
+function bulkUuid(index: number): string {
+  return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+}
+
+async function waitFor(condition: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 function writeSession(
@@ -284,6 +300,110 @@ describe("Claude session catalog discovery", () => {
       projectIdentity: "encoded:-repo-bounded",
     });
   });
+
+  test("stays complete while project directories and sessions are written underneath it", async () => {
+    const work = profile("churn");
+    const projectCount = 24;
+    const sessionsPerProject = 10;
+    const expected = projectCount * sessionsPerProject;
+    for (let project = 0; project < projectCount; project++) {
+      for (let session = 0; session < sessionsPerProject; session++) {
+        writeSession(
+          work.dir,
+          `-repo-${project}`,
+          bulkUuid(project * sessionsPerProject + session),
+          join(root, `repo-${project}`),
+        );
+      }
+    }
+    const livePath = writeSession(work.dir, "-live", UUID_A, join(root, "repo-live"));
+
+    const projectsDir = join(work.dir, "projects");
+    const readyPath = join(root, "churn-ready");
+    const stopPath = join(root, "churn-stop");
+    const counterPath = join(root, "churn-count");
+    const churnCount = (): number => {
+      try {
+        return Number.parseInt(readFileSync(counterPath, "utf8"), 10) || 0;
+      } catch {
+        return 0;
+      }
+    };
+
+    const churn = spawn(
+      process.execPath,
+      [
+        "run",
+        join("test", "support", "claude-session-churn.ts"),
+        projectsDir,
+        join(projectsDir, "-repo-0"),
+        livePath,
+        readyPath,
+        stopPath,
+        counterPath,
+      ],
+      { cwd: process.cwd(), env: process.env, stdio: ["ignore", "ignore", "ignore"] },
+    );
+    // Subscribe before the scans so an early exit cannot be missed in `finally`.
+    const churnClosed = once(churn, "close");
+    churn.on("error", () => {});
+
+    try {
+      await waitFor(() => existsSync(readyPath), "the churn process to start");
+      const churnedBeforeScans = churnCount();
+      for (let scan = 0; scan < 25; scan++) {
+        const skipped: ClaudeSessionScanSkip[] = [];
+        const sessions = listClaudeSessions([work], {
+          profilesRoot,
+          defaultDir: join(fakeHome, ".claude"),
+          onSkip: (skip) => {
+            skipped.push(skip);
+          },
+        });
+        // Settled sessions are never in the churn path, so every scan must see
+        // all of them: a TOCTOU guard failure may not silently truncate.
+        expect(sessions.filter((entry) => entry.encodedProject !== "-live")).toHaveLength(expected);
+        // The session being appended to may legitimately lose the race, but it
+        // has to be reported rather than silently omitted.
+        expect(
+          sessions.some((entry) => entry.encodedProject === "-live") ||
+            skipped.some((skip) => skip.path === livePath),
+        ).toBe(true);
+      }
+      expect(churnCount()).toBeGreaterThan(churnedBeforeScans);
+    } finally {
+      writeFileSync(stopPath, "");
+      churn.kill();
+      await churnClosed;
+    }
+  }, 60_000);
+
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "reports project directories it cannot observe instead of dropping them",
+    () => {
+      const work = profile("locked");
+      writeSession(work.dir, "-visible", UUID_A, join(root, "repo-visible"));
+      writeSession(work.dir, "-locked", UUID_B, join(root, "repo-locked"));
+      const lockedDir = join(work.dir, "projects", "-locked");
+      const skipped: ClaudeSessionScanSkip[] = [];
+
+      chmodSync(lockedDir, 0o000);
+      try {
+        const sessions = listClaudeSessions([work], {
+          profilesRoot,
+          defaultDir: join(fakeHome, ".claude"),
+          onSkip: (skip) => {
+            skipped.push(skip);
+          },
+        });
+
+        expect(sessions.map((entry) => entry.uuid)).toEqual([UUID_A]);
+        expect(skipped).toEqual([{ path: lockedDir, reason: "unstable-directory" }]);
+      } finally {
+        chmodSync(lockedDir, 0o700);
+      }
+    },
+  );
 });
 
 describe("accounts sessions CLI", () => {
@@ -302,18 +422,22 @@ describe("accounts sessions CLI", () => {
     );
   }
 
+  function cliEnv(): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      NODE_ENV: "test",
+      HOME: fakeHome,
+      ACCOUNTS_HOME: accountsHome,
+      NO_COLOR: "1",
+    };
+  }
+
   function runCliEntrypoint(entrypointArgs: string[], ...args: string[]) {
     return spawnSync(process.execPath, [...entrypointArgs, ...args], {
       cwd: process.cwd(),
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
-      env: {
-        ...process.env,
-        NODE_ENV: "test",
-        HOME: fakeHome,
-        ACCOUNTS_HOME: accountsHome,
-        NO_COLOR: "1",
-      },
+      env: cliEnv(),
     });
   }
 
@@ -436,6 +560,59 @@ describe("accounts sessions CLI", () => {
     expect(built.status).toBe(0);
     expect(parseCatalog(built)).toHaveLength(count);
   }, 30_000);
+
+  // POSIX pipe semantics: a reader that quits early is the case the guard is
+  // for, and the crash it prevents was only ever reachable there.
+  test.skipIf(process.platform === "win32")(
+    "exits cleanly when the reader closes the pipe before the catalog is flushed",
+    async () => {
+      const work = profile("piped");
+      for (let index = 0; index < 400; index++) {
+        writeSession(work.dir, "-piped", bulkUuid(index), join(root, "repo-piped"));
+      }
+      writeStore([work]);
+
+      const child = spawn(process.execPath, ["run", "src/cli.ts", "sessions", "--json"], {
+        cwd: process.cwd(),
+        env: cliEnv(),
+      });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.stdout.on("error", () => {});
+      child.stdout.destroy();
+
+      const [code] = (await once(child, "close")) as [number | null, string | null];
+      expect(stderr).toBe("");
+      expect(code).toBe(0);
+    },
+    30_000,
+  );
+
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "warns on stderr about paths that could not be observed",
+    () => {
+      const work = profile("locked");
+      writeSession(work.dir, "-visible", UUID_A, join(root, "repo-visible"));
+      writeSession(work.dir, "-locked", UUID_B, join(root, "repo-locked"));
+      const lockedDir = join(work.dir, "projects", "-locked");
+      writeStore([work]);
+
+      chmodSync(lockedDir, 0o000);
+      try {
+        const json = runCli("sessions", "--json");
+        expect(json.status).toBe(0);
+        expect(parseCatalog(json).map((entry) => entry.uuid)).toEqual([UUID_A]);
+        expect(json.stderr).toContain("warning:");
+        expect(json.stderr).toContain("unstable-directory");
+        expect(json.stderr).toContain(lockedDir);
+      } finally {
+        chmodSync(lockedDir, 0o700);
+      }
+    },
+  );
 
   test("escapes Unicode controls and truncates tables without splitting code points", () => {
     const entry = {

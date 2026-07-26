@@ -188,6 +188,13 @@ emitted. On platforms that support it, Accounts requests `O_NOATIME`; when the
 flag is unavailable or not permitted, the read-only fallback may update
 filesystem access-time metadata.
 
+Scanning a machine that is actively writing sessions never truncates the
+catalog silently. A path that keeps changing is retried, and anything still
+unreadable is listed as a `warning:` on stderr, so a consumer can tell "no such
+session" from "not observed on this pass". stdout stays a clean stream: closing
+the pipe early — `accounts sessions --json | head` — exits 0 without a stack
+trace.
+
 ## Cloud Runtime Entrypoints
 
 The published package also includes two operator entrypoints for the

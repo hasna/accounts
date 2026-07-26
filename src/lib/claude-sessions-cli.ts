@@ -1,10 +1,11 @@
+import chalk from "chalk";
 import { Argument, type Command } from "commander";
-import { once } from "node:events";
 import { resolveStore } from "./store.js";
 import {
   listClaudeSessions,
   type ClaudeSessionCatalogEntry,
   type ClaudeSessionCatalogOptions,
+  type ClaudeSessionScanSkip,
 } from "./claude-sessions.js";
 
 interface SessionsCliOptions {
@@ -117,18 +118,90 @@ function addOptions(command: Command): Command {
     .option("--json", "output structured JSON");
 }
 
+/** A reader that quits early (`| head`, `| less`) is a normal end of output. */
+function isClosedPipe(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code)
+      : "";
+  return code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
+}
+
+let stdoutPipeGuarded = false;
+
+/** Keep a closed reader from surfacing as an unhandled stdout `error` event. */
+function guardStdoutPipe(): void {
+  if (stdoutPipeGuarded) return;
+  stdoutPipeGuarded = true;
+  process.stdout.on("error", (error: unknown) => {
+    if (!isClosedPipe(error)) {
+      process.nextTick(() => {
+        throw error;
+      });
+    }
+  });
+}
+
+/** Resolves once stdout drains, or once the reader goes away. */
+function waitForDrain(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const settle = (error?: unknown) => {
+      process.stdout.off("drain", onDrain);
+      process.stdout.off("close", onClose);
+      process.stdout.off("error", onError);
+      if (error !== undefined && !isClosedPipe(error)) reject(error);
+      else resolve();
+    };
+    const onDrain = () => settle();
+    const onClose = () => settle();
+    const onError = (error: unknown) => settle(error);
+    process.stdout.on("drain", onDrain);
+    process.stdout.on("close", onClose);
+    process.stdout.on("error", onError);
+  });
+}
+
 async function writeStdout(value: string): Promise<void> {
-  if (!process.stdout.write(`${value}\n`)) await once(process.stdout, "drain");
+  guardStdoutPipe();
+  if (process.stdout.destroyed || process.stdout.writableEnded) return;
+  try {
+    if (!process.stdout.write(`${value}\n`)) await waitForDrain();
+  } catch (error) {
+    if (!isClosedPipe(error)) throw error;
+  }
+}
+
+const MAX_REPORTED_SKIPS = 10;
+
+/** Skips go to stderr so a catalog consumer can tell absent from not observed. */
+function warnSkipped(skipped: readonly ClaudeSessionScanSkip[]): void {
+  if (skipped.length === 0) return;
+  console.error(
+    chalk.yellow(
+      `warning: ${skipped.length} path(s) changed while being scanned and are missing from this catalog`,
+    ),
+  );
+  for (const skip of skipped.slice(0, MAX_REPORTED_SKIPS)) {
+    console.error(chalk.dim(`  ${skip.reason}: ${printable(skip.path)}`));
+  }
+  if (skipped.length > MAX_REPORTED_SKIPS) {
+    console.error(chalk.dim(`  … and ${skipped.length - MAX_REPORTED_SKIPS} more`));
+  }
 }
 
 async function printSessions(options: SessionsCliOptions): Promise<void> {
   const profiles = await resolveStore().listProfiles("claude");
+  const skipped: ClaudeSessionScanSkip[] = [];
   const catalogOptions: ClaudeSessionCatalogOptions = {
     ...(options.profile ? { profile: options.profile } : {}),
     ...(options.project ? { project: options.project } : {}),
     ...(options.uuid ? { uuid: options.uuid } : {}),
+    onSkip: (skip) => {
+      skipped.push(skip);
+    },
   };
   const sessions = listClaudeSessions(profiles, catalogOptions);
+  warnSkipped(skipped);
   if (options.json) {
     await writeStdout(JSON.stringify(sessions, null, 2));
     return;

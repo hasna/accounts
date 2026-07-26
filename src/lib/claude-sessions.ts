@@ -18,6 +18,12 @@ import { getTool } from "./tools.js";
 export const CLAUDE_SESSION_METADATA_MAX_BYTES = 64 * 1024;
 export const CLAUDE_SESSION_METADATA_MAX_LINES = 32;
 
+/**
+ * A live machine writes sessions while the catalog is being read. Retry the
+ * benign races a couple of times before reporting a path as unobserved.
+ */
+const SCAN_ATTEMPTS = 3;
+
 const UUID_JSONL = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 
 export interface ClaudeSessionIdentity {
@@ -51,6 +57,12 @@ export interface ClaudeSessionCatalogEntry {
   updatedAt: string;
 }
 
+/** A listed path the scan refused to report because it kept changing underneath. */
+export interface ClaudeSessionScanSkip {
+  path: string;
+  reason: "unstable-directory" | "unstable-session";
+}
+
 export interface ClaudeSessionCatalogOptions {
   /** Accounts-managed profiles root. Overridable for isolated tests. */
   profilesRoot?: string;
@@ -61,6 +73,12 @@ export interface ClaudeSessionCatalogOptions {
   uuid?: string;
   metadataMaxBytes?: number;
   metadataMaxLines?: number;
+  /**
+   * Receives every path that was listed but could not be observed safely, so
+   * callers can tell "no such session" apart from "not observed on this pass"
+   * instead of reading a silently truncated catalog.
+   */
+  onSkip?: (skip: ClaudeSessionScanSkip) => void;
 }
 
 interface VerifiedProfileRoot {
@@ -83,6 +101,19 @@ interface BoundedMetadata {
   sourcePath: string;
   stat: Stats;
 }
+
+/**
+ * `excluded` means the path is deliberately not a catalog entry (foreign,
+ * multiply linked, gone); `unstable` means a guard could not be satisfied while
+ * the path was being written and the caller must retry or report the skip.
+ */
+type SessionObservation =
+  | { status: "observed"; metadata: BoundedMetadata }
+  | { status: "excluded" }
+  | { status: "unstable" };
+
+const EXCLUDED: SessionObservation = { status: "excluded" };
+const UNSTABLE: SessionObservation = { status: "unstable" };
 
 function safeResolve(path: string): string | undefined {
   if (!path || !isAbsolute(path) || path.includes("\0") || /[\r\n]/.test(path)) return undefined;
@@ -123,6 +154,23 @@ function sameFile(left: Stats, right: Stats): boolean {
   );
 }
 
+/**
+ * Directories are re-verified by identity, never by content-derived stat
+ * fields: writing a session legitimately bumps the parent's mtime, ctime, size,
+ * and — when a project directory appears or disappears — its nlink. Comparing
+ * those made every concurrent write look like a TOCTOU swap and silently
+ * dropped the rest of the subtree. Device, inode, real path, ownership, and
+ * mode still have to match, so a substituted, re-owned, or re-permissioned
+ * directory is still caught.
+ */
+function sameDirectory(left: Stats, right: Stats): boolean {
+  if (!left.isDirectory() || !right.isDirectory()) return false;
+  if (left.dev !== 0 && right.dev !== 0 && left.ino !== 0 && right.ino !== 0) {
+    if (left.dev !== right.dev || left.ino !== right.ino) return false;
+  }
+  return left.mode === right.mode && left.uid === right.uid && left.gid === right.gid;
+}
+
 function snapshotDirectory(path: string): DirectorySnapshot | undefined {
   const stat = lstatNoThrow(path);
   if (!stat?.isDirectory() || stat.isSymbolicLink()) return undefined;
@@ -133,16 +181,17 @@ function snapshotDirectory(path: string): DirectorySnapshot | undefined {
   }
 }
 
+/** Re-snapshots the directory on every call; never trusts a scan-old stat. */
 function unchangedDirectory(snapshot: DirectorySnapshot): boolean {
   const current = snapshotDirectory(snapshot.path);
   return Boolean(
     current &&
       samePath(current.realPath, snapshot.realPath) &&
-      sameFile(current.stat, snapshot.stat),
+      sameDirectory(current.stat, snapshot.stat),
   );
 }
 
-function readVerifiedDirectory(
+function readVerifiedDirectoryOnce(
   path: string,
   expectedParent?: DirectorySnapshot,
 ): { entries: Dirent[]; snapshot: DirectorySnapshot } | undefined {
@@ -164,6 +213,17 @@ function readVerifiedDirectory(
   } catch {
     return undefined;
   }
+}
+
+function readVerifiedDirectory(
+  path: string,
+  expectedParent?: DirectorySnapshot,
+): { entries: Dirent[]; snapshot: DirectorySnapshot } | undefined {
+  for (let attempt = 0; attempt < SCAN_ATTEMPTS; attempt++) {
+    const listing = readVerifiedDirectoryOnce(path, expectedParent);
+    if (listing) return listing;
+  }
+  return undefined;
 }
 
 /**
@@ -358,20 +418,16 @@ function readBoundedMetadata(
   expectedUuid: string,
   maxBytes: number,
   maxLines: number,
-): BoundedMetadata | undefined {
-  if (
-    initialStat.nlink !== 1 ||
-    !unchangedDirectory(projectSnapshot)
-  ) {
-    return undefined;
-  }
+): SessionObservation {
+  if (initialStat.nlink !== 1) return EXCLUDED;
+  if (!unchangedDirectory(projectSnapshot)) return UNSTABLE;
   let sourcePath: string;
   try {
     sourcePath = realpathSync.native(path);
   } catch {
-    return undefined;
+    return EXCLUDED;
   }
-  if (!samePath(sourcePath, join(projectSnapshot.realPath, basename(path)))) return undefined;
+  if (!samePath(sourcePath, join(projectSnapshot.realPath, basename(path)))) return EXCLUDED;
 
   const readLength = maxBytes > 0 ? Math.min(initialStat.size, maxBytes) : 0;
   const buffer = Buffer.allocUnsafe(readLength);
@@ -380,39 +436,30 @@ function readBoundedMetadata(
   let openedStat: Stats | undefined;
   try {
     fd = safeOpenReadOnly(path);
-    if (fd === undefined) return undefined;
+    // Still a regular file but refusing to open (permissions, descriptor
+    // exhaustion) means unobserved; vanished or symlinked means absent.
+    if (fd === undefined) return lstatNoThrow(path)?.isFile() ? UNSTABLE : EXCLUDED;
     openedStat = fstatSync(fd);
-    if (
-      !openedStat.isFile() ||
-      openedStat.nlink !== 1 ||
-      !sameFile(initialStat, openedStat)
-    ) {
-      return undefined;
-    }
+    if (!openedStat.isFile() || openedStat.nlink !== 1) return EXCLUDED;
+    if (!sameFile(initialStat, openedStat)) return UNSTABLE;
     bytesRead = readSync(fd, buffer, 0, readLength, 0);
     const afterRead = fstatSync(fd);
-    if (afterRead.nlink !== 1 || !sameFile(openedStat, afterRead)) return undefined;
+    if (afterRead.nlink !== 1) return EXCLUDED;
+    if (!sameFile(openedStat, afterRead)) return UNSTABLE;
   } catch {
-    return undefined;
+    return UNSTABLE;
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
 
   const finalStat = lstatNoThrow(path);
-  if (
-    !openedStat ||
-    !finalStat?.isFile() ||
-    finalStat.isSymbolicLink() ||
-    finalStat.nlink !== 1 ||
-    !sameFile(openedStat, finalStat) ||
-    !unchangedDirectory(projectSnapshot)
-  ) {
-    return undefined;
-  }
+  if (!openedStat || !finalStat) return EXCLUDED;
+  if (!finalStat.isFile() || finalStat.isSymbolicLink() || finalStat.nlink !== 1) return EXCLUDED;
+  if (!sameFile(openedStat, finalStat) || !unchangedDirectory(projectSnapshot)) return UNSTABLE;
   try {
-    if (!samePath(realpathSync.native(path), sourcePath)) return undefined;
+    if (!samePath(realpathSync.native(path), sourcePath)) return EXCLUDED;
   } catch {
-    return undefined;
+    return EXCLUDED;
   }
 
   const text = buffer.subarray(0, bytesRead).toString("utf8");
@@ -435,15 +482,36 @@ function readBoundedMetadata(
     }
   }
   return {
-    ...(cwd ? { cwd } : {}),
-    sessionIdCheck: mismatchedSessionId
-      ? "bounded-mismatch"
-      : observedSessionId
-        ? "bounded-match"
-        : "not-observed",
-    sourcePath,
-    stat: finalStat,
+    status: "observed",
+    metadata: {
+      ...(cwd ? { cwd } : {}),
+      sessionIdCheck: mismatchedSessionId
+        ? "bounded-mismatch"
+        : observedSessionId
+          ? "bounded-match"
+          : "not-observed",
+      sourcePath,
+      stat: finalStat,
+    },
   };
+}
+
+/** Re-stats and retries the file, so a session being appended to is not lost. */
+function observeSession(
+  path: string,
+  projectSnapshot: DirectorySnapshot,
+  expectedUuid: string,
+  maxBytes: number,
+  maxLines: number,
+): SessionObservation {
+  let observation: SessionObservation = UNSTABLE;
+  for (let attempt = 0; attempt < SCAN_ATTEMPTS; attempt++) {
+    const stat = lstatNoThrow(path);
+    if (!stat?.isFile() || stat.isSymbolicLink()) return EXCLUDED;
+    observation = readBoundedMetadata(path, stat, projectSnapshot, expectedUuid, maxBytes, maxLines);
+    if (observation.status !== "unstable") return observation;
+  }
+  return observation;
 }
 
 function matchesFilters(entry: ClaudeSessionCatalogEntry, options: ClaudeSessionCatalogOptions): boolean {
@@ -487,10 +555,21 @@ function catalogRef(
 }
 
 /**
+ * Report a directory the scan listed but could not read. A directory that is
+ * simply gone is absent rather than unobserved, so it stays silent.
+ */
+function reportSkip(options: ClaudeSessionCatalogOptions, path: string): void {
+  if (!options.onSkip) return;
+  if (lstatNoThrow(path)?.isDirectory()) options.onSkip({ path, reason: "unstable-directory" });
+}
+
+/**
  * Discover root Claude JSONL sessions under Accounts-owned local profiles.
  * This function never mutates transcript content and never follows direct
  * session-store symlinks. It requests O_NOATIME where the platform and
  * permissions support it; fallback reads can still update filesystem atime.
+ * Concurrent writers never truncate the result silently: a path that stays
+ * unreadable after `SCAN_ATTEMPTS` is reported through `options.onSkip`.
  */
 export function listClaudeSessions(
   profiles: readonly Profile[],
@@ -507,14 +586,20 @@ export function listClaudeSessions(
     if (!verified) continue;
     const projectsPath = join(verified.dir, "projects");
     const projects = readVerifiedDirectory(projectsPath, verified.snapshot);
-    if (!projects) continue;
+    if (!projects) {
+      reportSkip(options, projectsPath);
+      continue;
+    }
 
     for (const projectDirent of projects.entries) {
       if (!projectDirent.isDirectory() || projectDirent.isSymbolicLink()) continue;
       const encodedProject = projectDirent.name;
       const projectPath = join(projectsPath, encodedProject);
       const project = readVerifiedDirectory(projectPath, projects.snapshot);
-      if (!project) continue;
+      if (!project) {
+        reportSkip(options, projectPath);
+        continue;
+      }
 
       for (const sessionDirent of project.entries) {
         if (!sessionDirent.isFile() || sessionDirent.isSymbolicLink()) continue;
@@ -522,19 +607,20 @@ export function listClaudeSessions(
         if (!match) continue;
 
         const candidatePath = join(projectPath, sessionDirent.name);
-        const stat = lstatNoThrow(candidatePath);
-        if (!stat?.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) continue;
         const uuid = match[1]!.toLowerCase();
-        const metadata = readBoundedMetadata(
+        const observation = observeSession(
           candidatePath,
-          stat,
           project.snapshot,
           uuid,
           maxBytes,
           maxLines,
         );
-        if (!metadata) continue;
-        const { cwd, sessionIdCheck, sourcePath } = metadata;
+        if (observation.status === "excluded") continue;
+        if (observation.status === "unstable") {
+          options.onSkip?.({ path: candidatePath, reason: "unstable-session" });
+          continue;
+        }
+        const { cwd, sessionIdCheck, sourcePath } = observation.metadata;
         const projectIdentity = cwd ?? `encoded:${encodedProject}`;
         const entry: ClaudeSessionCatalogEntry = {
           identity: {
@@ -562,8 +648,8 @@ export function listClaudeSessions(
           uuid,
           sourcePath,
           sessionIdCheck,
-          sizeBytes: metadata.stat.size,
-          updatedAt: new Date(metadata.stat.mtimeMs).toISOString(),
+          sizeBytes: observation.metadata.stat.size,
+          updatedAt: new Date(observation.metadata.stat.mtimeMs).toISOString(),
         };
         if (matchesFilters(entry, options)) results.push(entry);
       }
