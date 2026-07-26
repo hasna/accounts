@@ -63,6 +63,7 @@ import {
 import { accountsCapabilityCard, accountsNoCloudEvidencePack, toSupervisorOptionsWorkRun } from "./lib/contracts.js";
 import { createAccountsEventsClient } from "./lib/events.js";
 import { getAccountsReadiness, type AccountsReadiness, type AccountsReadinessStatus } from "./lib/readiness.js";
+import { registerClaudeSessionCommands } from "./lib/claude-sessions-cli.js";
 
 const program = new Command();
 
@@ -1388,6 +1389,8 @@ program
       console.log(chalk.green("\nhealthy."));
     }),
   );
+
+registerClaudeSessionCommands(program, action);
 
 const contracts = program.command("contracts").description("Emit @hasna/contracts-compatible Accounts JSON");
 
