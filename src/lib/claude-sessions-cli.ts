@@ -96,10 +96,13 @@ export function formatClaudeSessionTable(entries: readonly ClaudeSessionCatalogE
     SIZE: formatBytes(entry.sizeBytes),
   }));
   const headers = ["OWNER", "PROJECT", "UUID", "UPDATED", "SIZE"] as const;
+  // Folded, never spread: one call argument per row overflows the engine's call
+  // arity ceiling, so a large catalog would exit with a RangeError and an empty
+  // stdout instead of a table.
   const widths = Object.fromEntries(
     headers.map((header) => [
       header,
-      Math.max(displayWidth(header), ...rows.map((row) => displayWidth(row[header]))),
+      rows.reduce((width, row) => Math.max(width, displayWidth(row[header])), displayWidth(header)),
     ]),
   ) as Record<(typeof headers)[number], number>;
 

@@ -20,6 +20,7 @@ import type { Profile } from "./types.js";
 import {
   CLAUDE_SESSION_METADATA_MAX_BYTES,
   listClaudeSessions,
+  type ClaudeSessionCatalogEntry,
   type ClaudeSessionScanSkip,
 } from "./lib/claude-sessions.js";
 import { formatClaudeSessionTable } from "./lib/claude-sessions-cli.js";
@@ -68,6 +69,40 @@ function canonicalPath(path: string): string {
 
 function bulkUuid(index: number): string {
   return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+}
+
+function bulkCatalogEntry(index: number): ClaudeSessionCatalogEntry {
+  const uuid = bulkUuid(index);
+  const sourcePath = `/profiles/bulk/projects/-bulk/${uuid}.jsonl`;
+  return {
+    identity: {
+      ownerProfile: "bulk",
+      profileIdentity: "/profiles/bulk",
+      profilePath: "/profiles/bulk",
+      encodedProject: "-bulk",
+      projectIdentity: "/repo-bulk",
+      uuid,
+      sourcePath,
+    },
+    catalogRef: `claude-session:v1:${index}`,
+    ownerProfile: "bulk",
+    profileIdentity: "/profiles/bulk",
+    profilePath: "/profiles/bulk",
+    encodedProject: "-bulk",
+    projectIdentity: "/repo-bulk",
+    cwd: "/repo-bulk",
+    uuid,
+    sourcePath,
+    sessionIdCheck: "bounded-match",
+    sizeBytes: index,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+/** The published binary runs on node, which `bun test` is not. */
+function resolveNodeBinary(): string | undefined {
+  const probe = spawnSync("node", ["--version"], { encoding: "utf8" });
+  return probe.status === 0 ? "node" : undefined;
 }
 
 async function waitFor(condition: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
@@ -566,6 +601,65 @@ describe("accounts sessions CLI", () => {
     expect(built.status).toBe(0);
     expect(parseCatalog(built)).toHaveLength(count);
   }, 30_000);
+
+  // Default table mode, on the engine the published binary actually runs. Both
+  // entrypoints above are driven by `process.execPath`, which under `bun test`
+  // is Bun — and Bun's call arity ceiling is several times node's, so a catalog
+  // that Bun formats happily is one node can abort on. The harness refuses to
+  // run unless the row count still overflows a spread on the engine under test.
+  const nodeBinary = resolveNodeBinary();
+  test.skipIf(nodeBinary === undefined)(
+    "formats a catalog past node's call arity ceiling instead of aborting the table",
+    () => {
+      const rows = 200_000;
+      const buildDir = join(root, "table-scale");
+      const build = spawnSync(
+        process.execPath,
+        [
+          "build",
+          "./test/support/claude-session-table-scale.ts",
+          "--outdir",
+          buildDir,
+          "--target",
+          "node",
+        ],
+        { cwd: process.cwd(), encoding: "utf8" },
+      );
+      expect(build.status).toBe(0);
+
+      const formatted = spawnSync(
+        nodeBinary!,
+        [join(buildDir, "claude-session-table-scale.js"), String(rows)],
+        { cwd: process.cwd(), encoding: "utf8" },
+      );
+      expect(formatted.stderr).not.toContain("RangeError");
+      expect(formatted.status).toBe(0);
+      // Header, rule, then every row: the catalog is formatted, not truncated.
+      expect(formatted.stdout.trim()).toBe(String(rows + 2));
+    },
+    60_000,
+  );
+
+  // The same invariant stated so it holds on every engine, including one whose
+  // ceiling is too high to reach with a catalog a test can afford to build.
+  test("measures column widths without one call argument per catalog row", () => {
+    const entries = Array.from({ length: 5_000 }, (_, index) => bulkCatalogEntry(index));
+    const nativeMax = Math.max;
+    let widestCall = 0;
+    Math.max = ((...values: number[]) => {
+      widestCall = nativeMax(widestCall, values.length);
+      return nativeMax(...values);
+    }) as typeof Math.max;
+    let table: string;
+    try {
+      table = formatClaudeSessionTable(entries);
+    } finally {
+      Math.max = nativeMax;
+    }
+
+    expect(table.split("\n")).toHaveLength(entries.length + 2);
+    expect(widestCall).toBeLessThanOrEqual(4);
+  });
 
   // POSIX pipe semantics: a reader that quits early is the case the guard is
   // for, and the crash it prevents was only ever reachable there.
