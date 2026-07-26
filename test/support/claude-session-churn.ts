@@ -36,6 +36,8 @@ for (let index = 0; !existsSync(stopPath) && Date.now() < deadline; index++) {
   attempt(() => appendFileSync(livePath, `${JSON.stringify({ type: "system", churn: index })}\n`));
   attempt(() => rmSync(churnDir, { recursive: true, force: true }));
   attempt(() => rmSync(churnFile, { force: true }));
-  attempt(() => writeFileSync(counterPath, String(index + 1)));
+  // One byte per pass. The reader samples the size, so it never observes a
+  // truncated counter no matter when it looks.
+  attempt(() => appendFileSync(counterPath, "."));
   Atomics.wait(sleepBuffer, 0, 0, 1);
 }

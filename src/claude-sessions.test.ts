@@ -10,6 +10,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -322,9 +323,11 @@ describe("Claude session catalog discovery", () => {
     const readyPath = join(root, "churn-ready");
     const stopPath = join(root, "churn-stop");
     const counterPath = join(root, "churn-count");
+    // The churn process appends one byte per pass; sampling the size never
+    // races with a rewrite, and 0 simply means "no reading this time".
     const churnCount = (): number => {
       try {
-        return Number.parseInt(readFileSync(counterPath, "utf8"), 10) || 0;
+        return statSync(counterPath).size;
       } catch {
         return 0;
       }
@@ -351,6 +354,7 @@ describe("Claude session catalog discovery", () => {
     try {
       await waitFor(() => existsSync(readyPath), "the churn process to start");
       const churnedBeforeScans = churnCount();
+      let churnedDuringScans = churnedBeforeScans;
       for (let scan = 0; scan < 25; scan++) {
         const skipped: ClaudeSessionScanSkip[] = [];
         const sessions = listClaudeSessions([work], {
@@ -369,8 +373,10 @@ describe("Claude session catalog discovery", () => {
           sessions.some((entry) => entry.encodedProject === "-live") ||
             skipped.some((skip) => skip.path === livePath),
         ).toBe(true);
+        churnedDuringScans = Math.max(churnedDuringScans, churnCount());
       }
-      expect(churnCount()).toBeGreaterThan(churnedBeforeScans);
+      // Proves the scans really did overlap a mutating tree.
+      expect(churnedDuringScans).toBeGreaterThan(churnedBeforeScans);
     } finally {
       writeFileSync(stopPath, "");
       churn.kill();
