@@ -2,18 +2,30 @@
 
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  copyFileSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, posix, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  posix,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { gunzipSync } from "node:zlib";
 import type { Bundle as SigstoreBundle } from "@sigstore/bundle";
-import { compare, valid } from "semver";
+import { compare, prerelease, valid } from "semver";
 
 export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const PUBLISH_PREDICATE =
@@ -70,6 +82,11 @@ interface PackedArtifact {
   bytes: Buffer;
 }
 
+interface StagedPackSource {
+  root: string;
+  preview: PackResult;
+}
+
 export interface ReleaseCandidate {
   schema: "hasna.accounts.release-candidate/v3";
   name: string;
@@ -104,6 +121,11 @@ export interface ArchiveSummary {
   fileCount: number;
   unpackedBytes: number;
   files: Array<{ path: string; size: number }>;
+}
+
+interface ParsedArchive {
+  summary: ArchiveSummary;
+  packageManifest?: Buffer;
 }
 
 type SigstoreVerifier = (
@@ -309,7 +331,7 @@ function archivePath(header: Buffer): string {
   return path.slice("package/".length);
 }
 
-export function verifyArchive(bytes: Uint8Array): ArchiveSummary {
+function parseArchive(bytes: Uint8Array): ParsedArchive {
   let tar: Buffer;
   try {
     tar = gunzipSync(Buffer.from(bytes), { maxOutputLength: MAX_TAR_STREAM_BYTES });
@@ -321,6 +343,7 @@ export function verifyArchive(bytes: Uint8Array): ArchiveSummary {
   }
   check(tar.length % 512 === 0, "archive tar stream is not block aligned");
   const files: ArchiveSummary["files"] = [];
+  let packageManifest: Buffer | undefined;
   const seen = new Set<string>();
   let unpackedBytes = 0;
   let entries = 0;
@@ -373,15 +396,59 @@ export function verifyArchive(bytes: Uint8Array): ArchiveSummary {
     );
     const padded = Math.ceil(size / 512) * 512;
     check(offset + padded <= tar.length, `archive entry ${path} is truncated`);
+    if (path === "package.json") {
+      packageManifest = Buffer.from(tar.subarray(offset, offset + size));
+    }
     offset += padded;
     files.push({ path, size });
   }
   check(endBlocks === 2, "archive is missing two terminal zero blocks");
   check(files.length > 0, "archive contains no regular files");
-  return { fileCount: files.length, unpackedBytes, files };
+  return {
+    summary: { fileCount: files.length, unpackedBytes, files },
+    packageManifest,
+  };
 }
 
-function verifyArtifactBytes(pack: PackResult, bytes: Buffer): void {
+export function verifyArchive(bytes: Uint8Array): ArchiveSummary {
+  return parseArchive(bytes).summary;
+}
+
+function exactCommit(value: string, label: string): string {
+  check(value.match(/^[0-9a-f]{40}$/), `${label} must be an exact 40-character lowercase git SHA`);
+  return value;
+}
+
+function verifyPackedManifest(
+  archive: ParsedArchive,
+  expected: Pick<ReleaseCandidate, "name" | "version" | "commit">,
+): void {
+  const bytes = archive.packageManifest;
+  check(bytes, "packed archive is missing package.json");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8")) as unknown;
+  } catch (error) {
+    throw new Error(
+      `packed package.json is invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const manifest = record(parsed, "packed package.json");
+  check(
+    manifest.name === expected.name && manifest.version === expected.version,
+    "packed package.json identity disagrees with the release candidate",
+  );
+  check(
+    manifest.gitHead === exactCommit(expected.commit, "expected gitHead"),
+    "packed package.json gitHead disagrees with the release commit",
+  );
+}
+
+function verifyArtifactBytes(
+  pack: PackResult,
+  bytes: Buffer,
+  expectedCommit: string,
+): void {
   check(bytes.length === pack.size, "npm pack size does not match the tarball bytes");
   check(bytes.length <= MAX_TARBALL_BYTES, `tarball exceeds ${MAX_TARBALL_BYTES} bytes`);
   check(
@@ -389,7 +456,8 @@ function verifyArtifactBytes(pack: PackResult, bytes: Buffer): void {
       `sha512-${createHash("sha512").update(bytes).digest("base64")}` === pack.integrity,
     "npm pack metadata does not match the tarball bytes",
   );
-  const summary = verifyArchive(bytes);
+  const archive = parseArchive(bytes);
+  const summary = archive.summary;
   const expectedFiles = pack.files
     .map(({ path, size }) => ({ path, size }))
     .sort((left, right) => left.path.localeCompare(right.path));
@@ -398,6 +466,11 @@ function verifyArtifactBytes(pack: PackResult, bytes: Buffer): void {
     JSON.stringify(archiveFiles) === JSON.stringify(expectedFiles),
     "archive entries disagree with npm pack metadata",
   );
+  verifyPackedManifest(archive, {
+    name: pack.name,
+    version: pack.version,
+    commit: expectedCommit,
+  });
 }
 
 export function assertDeterministicPacks(
@@ -419,25 +492,106 @@ export function assertDeterministicPacks(
   }
 }
 
-function buildAndPack(root: string): PackedArtifact {
+function safePackPath(root: string, path: string): {
+  source: string;
+  relativePath: string;
+} {
+  check(
+    !isAbsolute(path) &&
+      !path.includes("\\") &&
+      !path.match(/(?:^|\/)\.{1,2}(?:\/|$)/) &&
+      posix.normalize(path) === path,
+    `npm pack returned an unsafe file path: ${path}`,
+  );
+  const source = resolve(root, ...path.split("/"));
+  const relativePath = relative(root, source);
+  check(
+    relativePath && relativePath !== ".." && !relativePath.startsWith(`..${sep}`),
+    `npm pack file escapes the package root: ${path}`,
+  );
+  return { source, relativePath };
+}
+
+function stagePackSource(root: string, expectedCommit: string): StagedPackSource {
+  const preview = parsePack(run("npm", [
+    "pack", "--ignore-scripts", "--json", "--dry-run",
+  ], root));
+  const staged = mkdtempSync(join(tmpdir(), "accounts-pack-source-"));
+  for (const file of preview.files) {
+    const { source, relativePath } = safePackPath(root, file.path);
+    const stat = lstatSync(source);
+    check(
+      stat.isFile() && !stat.isSymbolicLink(),
+      `npm pack source must be a regular non-symlink file: ${file.path}`,
+    );
+    const destination = join(staged, relativePath);
+    mkdirSync(dirname(destination), { recursive: true });
+    copyFileSync(source, destination);
+    chmodSync(destination, file.mode);
+  }
+  const manifestPath = join(staged, "package.json");
+  const manifest = record(
+    JSON.parse(readFileSync(manifestPath, "utf8")),
+    "staged package.json",
+  );
+  check(
+    manifest.gitHead === undefined,
+    "source package.json must not contain generated gitHead metadata",
+  );
+  manifest.gitHead = exactCommit(expectedCommit, "release commit");
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+    flag: "w",
+    mode: 0o644,
+  });
+  return { root: staged, preview };
+}
+
+function verifyStagedPackFileSet(preview: PackResult, packed: PackResult): void {
+  check(
+    preview.name === packed.name && preview.version === packed.version,
+    "staged pack identity changed after gitHead injection",
+  );
+  const fileShape = (pack: PackResult) =>
+    pack.files
+      .map(({ path, size, mode }) => ({
+        path,
+        size: path === "package.json" ? "<generated-gitHead>" : size,
+        mode,
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+  check(
+    JSON.stringify(fileShape(preview)) === JSON.stringify(fileShape(packed)),
+    "staged pack file set changed after gitHead injection",
+  );
+}
+
+function buildAndPack(root: string, expectedCommit: string): PackedArtifact {
   run("bun", ["run", "build"], root, { inherit: true, timeoutMs: 300_000 });
+  const staged = stagePackSource(root, expectedCommit);
   const destination = mkdtempSync(join(tmpdir(), "accounts-pack-"));
   try {
     const pack = parsePack(run("npm", [
       "pack", "--ignore-scripts", "--json", "--pack-destination", destination,
-    ], root));
+    ], staged.root));
+    verifyStagedPackFileSet(staged.preview, pack);
     check(basename(pack.filename) === pack.filename, "npm pack returned an unsafe filename");
     const bytes = readFileSync(join(destination, pack.filename));
-    verifyArtifactBytes(pack, bytes);
+    verifyArtifactBytes(pack, bytes, expectedCommit);
     return { result: pack, bytes };
   } finally {
+    rmSync(staged.root, { recursive: true, force: true });
     rmSync(destination, { recursive: true, force: true });
   }
 }
 
-export function verifyDeterministicPack(root: string, artifactPath?: string): PackResult {
-  const first = buildAndPack(root);
-  const second = buildAndPack(root);
+export function verifyDeterministicPack(
+  root: string,
+  artifactPath?: string,
+  expectedCommit = run("git", ["rev-parse", "HEAD"], root).trim(),
+): PackResult {
+  exactCommit(expectedCommit, "release commit");
+  const first = buildAndPack(root, expectedCommit);
+  const second = buildAndPack(root, expectedCommit);
   assertDeterministicPacks(first.result, second.result, first.bytes, second.bytes);
   if (artifactPath) {
     const output = resolve(artifactPath);
@@ -937,12 +1091,16 @@ function verifyCandidateArtifact(value: ReleaseCandidate): Buffer {
       `sha512-${createHash("sha512").update(bytes).digest("base64")}` === value.integrity,
     "candidate artifact bytes changed after verification",
   );
-  const archive = verifyArchive(bytes);
-  check(archive.fileCount === value.fileCount, "candidate archive file count changed after verification");
+  const archive = parseArchive(bytes);
   check(
-    archive.unpackedBytes === value.unpackedBytes,
+    archive.summary.fileCount === value.fileCount,
+    "candidate archive file count changed after verification",
+  );
+  check(
+    archive.summary.unpackedBytes === value.unpackedBytes,
     "candidate archive unpacked bytes changed after verification",
   );
+  verifyPackedManifest(archive, value);
   return bytes;
 }
 
@@ -1180,9 +1338,13 @@ export function verifyDownloadedTarball(value: ReleaseCandidate, bytes: Uint8Arr
       `sha512-${createHash("sha512").update(buffer).digest("base64")}` === value.integrity,
     "downloaded registry tarball differs from the reviewed pack",
   );
-  const archive = verifyArchive(buffer);
-  check(archive.fileCount === value.fileCount, "downloaded archive file count differs");
-  check(archive.unpackedBytes === value.unpackedBytes, "downloaded archive unpacked bytes differ");
+  const archive = parseArchive(buffer);
+  check(archive.summary.fileCount === value.fileCount, "downloaded archive file count differs");
+  check(
+    archive.summary.unpackedBytes === value.unpackedBytes,
+    "downloaded archive unpacked bytes differ",
+  );
+  verifyPackedManifest(archive, value);
 }
 
 export function verifyDistTags(
@@ -1210,6 +1372,10 @@ export function assertPromotionVersion(
   currentLatest: string | undefined,
 ): "advance" | "idempotent" {
   check(valid(candidateVersion) !== null, `candidate ${candidateVersion} is not valid SemVer`);
+  check(
+    prerelease(candidateVersion) === null,
+    `refusing prerelease ${candidateVersion} promotion to latest`,
+  );
   if (currentLatest === undefined) return "advance";
   check(
     valid(currentLatest) !== null,
@@ -1226,6 +1392,17 @@ export function assertPromotionVersion(
     `refusing stale or downgrade promotion of ${candidateVersion} over registry latest ${currentLatest}`,
   );
   return "advance";
+}
+
+export function assertPromotionSnapshotUnchanged(
+  expectedLatest: string | undefined,
+  immediateLatest: string | undefined,
+): void {
+  check(
+    expectedLatest === immediateLatest,
+    "registry latest changed immediately before promotion; expected " +
+      `${expectedLatest ?? "<absent>"}, received ${immediateLatest ?? "<absent>"}`,
+  );
 }
 
 export function assertFinalPromotionVersion(
@@ -1357,9 +1534,16 @@ async function promoteDistTag(
   assertCandidateContext(value, manifest, env);
   verifyCandidateArtifact(value);
   const before = await fetchJson(packageUrl(value.name));
-  const promotion = assertPromotionVersion(value.version, latestDistTag(before));
+  const observedLatest = latestDistTag(before);
+  const promotion = assertPromotionVersion(value.version, observedLatest);
   if (promotion === "advance") {
     verifyDistTags(value, before, "staged");
+    const immediatelyBeforeMutation = await fetchJson(packageUrl(value.name));
+    verifyDistTags(value, immediatelyBeforeMutation, "staged");
+    assertPromotionSnapshotUnchanged(
+      observedLatest,
+      latestDistTag(immediatelyBeforeMutation),
+    );
     run("npm", [
       "dist-tag", "add", `${value.name}@${value.version}`, value.intendedTag,
       "--registry", REGISTRY,
@@ -1397,11 +1581,12 @@ async function main(): Promise<void> {
     assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
     assertGitContext(root, manifest, process.env);
     const artifactPath = resolve(option(args, "--artifact"));
-    const pack = verifyDeterministicPack(root, artifactPath);
+    const commit = text(process.env.GITHUB_SHA, "GITHUB_SHA");
+    const pack = verifyDeterministicPack(root, artifactPath, commit);
     const value = candidateFrom(
       manifest,
       pack,
-      text(process.env.GITHUB_SHA, "GITHUB_SHA"),
+      commit,
       artifactPath,
     );
     const output = resolve(option(args, "--out"));

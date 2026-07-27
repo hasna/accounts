@@ -18,6 +18,7 @@ import {
   assertExactCliVersion,
   assertFinalPromotionVersion,
   assertGitEvidence,
+  assertPromotionSnapshotUnchanged,
   assertPromotionVersion,
   assertTrustedPublishEnvironment,
   expectedSigstoreIdentity,
@@ -499,8 +500,11 @@ test("allows only advancing or exact-idempotent semantic promotion", () => {
   expect(assertPromotionVersion("1.2.3", "1.2.3")).toBe("idempotent");
   expect(assertPromotionVersion("1.2.3", "1.2.2")).toBe("advance");
   expect(() => assertPromotionVersion("1.2.3", "1.2.4")).toThrow("stale or downgrade");
-  expect(() => assertPromotionVersion("1.2.3-beta.1", "1.2.3-alpha.9")).not.toThrow();
-  expect(() => assertPromotionVersion("1.2.3-alpha.9", "1.2.3-beta.1")).toThrow("stale or downgrade");
+  expect(() => assertPromotionVersion("1.2.3-beta.1", "1.2.3-alpha.9"))
+    .toThrow("prerelease");
+  expect(() => assertPromotionVersion("2.0.0-rc.1", "1.9.9")).toThrow("prerelease");
+  expect(() => assertPromotionVersion("2.0.0-rc.1", undefined)).toThrow("prerelease");
+  expect(() => assertPromotionVersion("1.2.3-alpha.9", "1.2.3-beta.1")).toThrow("prerelease");
   expect(() => assertPromotionVersion("1.2.3+two", "1.2.3+one"))
     .toThrow("does not advance semantic precedence");
   expect(() => assertPromotionVersion("not-semver", "1.2.3")).toThrow("valid SemVer");
@@ -512,6 +516,17 @@ test("allows only advancing or exact-idempotent semantic promotion", () => {
     .toThrow("registry latest changed during promotion");
   expect(() => assertFinalPromotionVersion("1.2.3", undefined))
     .toThrow("registry latest changed during promotion");
+});
+
+test("fails closed when registry latest changes immediately before mutation", () => {
+  expect(() => assertPromotionSnapshotUnchanged(undefined, undefined)).not.toThrow();
+  expect(() => assertPromotionSnapshotUnchanged("1.2.2", "1.2.2")).not.toThrow();
+  expect(() => assertPromotionSnapshotUnchanged(undefined, "1.2.2"))
+    .toThrow("changed immediately before promotion");
+  expect(() => assertPromotionSnapshotUnchanged("1.2.2", "1.2.3"))
+    .toThrow("changed immediately before promotion");
+  expect(() => assertPromotionSnapshotUnchanged("1.2.2", undefined))
+    .toThrow("changed immediately before promotion");
 });
 
 test("pins the exact Fulcio workflow SAN and OIDC issuer for cryptographic verification", async () => {
@@ -694,19 +709,70 @@ test("binds audited attestations to exact subject, workflow, repository, tag, an
   )).toThrow("publish attestation");
 });
 
-test("rejects changed registry downloads using size and both package digests", () => {
+test("requires exact gitHead in the preserved and downloaded tarball manifest", () => {
+  const manifestBytes = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
   const bytes = archive([
     tarEntry("package/exact.txt", 5, "0", Buffer.from("exact")),
+    tarEntry("package/package.json", manifestBytes.length, "0", manifestBytes),
   ]);
   const exactCandidate = {
     ...candidate,
     size: bytes.length,
-    fileCount: 1,
-    unpackedBytes: 5,
+    fileCount: 2,
+    unpackedBytes: 5 + manifestBytes.length,
     shasum: createHash("sha1").update(bytes).digest("hex"),
     integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
   };
   expect(() => verifyDownloadedTarball(exactCandidate, bytes)).not.toThrow();
+
+  const missingManifestBytes = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+  }));
+  const missingGitHead = archive([
+    tarEntry("package/exact.txt", 5, "0", Buffer.from("exact")),
+    tarEntry(
+      "package/package.json",
+      missingManifestBytes.length,
+      "0",
+      missingManifestBytes,
+    ),
+  ]);
+  const missingGitHeadCandidate = {
+    ...candidate,
+    size: missingGitHead.length,
+    fileCount: 2,
+    unpackedBytes: 5 + missingManifestBytes.length,
+    shasum: createHash("sha1").update(missingGitHead).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(missingGitHead).digest("base64")}`,
+  };
+  expect(() => verifyDownloadedTarball(missingGitHeadCandidate, missingGitHead))
+    .toThrow("gitHead");
+
+  const wrongManifestBytes = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: "f".repeat(40),
+  }));
+  const wrongGitHead = archive([
+    tarEntry("package/exact.txt", 5, "0", Buffer.from("exact")),
+    tarEntry("package/package.json", wrongManifestBytes.length, "0", wrongManifestBytes),
+  ]);
+  const wrongGitHeadCandidate = {
+    ...candidate,
+    size: wrongGitHead.length,
+    fileCount: 2,
+    unpackedBytes: 5 + wrongManifestBytes.length,
+    shasum: createHash("sha1").update(wrongGitHead).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(wrongGitHead).digest("base64")}`,
+  };
+  expect(() => verifyDownloadedTarball(wrongGitHeadCandidate, wrongGitHead))
+    .toThrow("gitHead");
+
   expect(() => verifyDownloadedTarball(exactCandidate, Buffer.from("the altered registry tarball")))
     .toThrow("size differs");
   const sameSizeChanged = Buffer.from(bytes);
@@ -784,6 +850,14 @@ test("caps retry, response, and tarball resource use", async () => {
 
 test("release workflow publishes one preserved tarball under staging before promotion", () => {
   const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+  const implementation = readFileSync(
+    new URL("./release-provenance.ts", import.meta.url),
+    "utf8",
+  );
+  const promotionImplementation = implementation.slice(
+    implementation.indexOf("async function promoteDistTag("),
+    implementation.indexOf("function option("),
+  );
   expect(workflow).toContain('tags:\n      - "npm/accounts/v*"');
   expect(workflow).toContain("group: hasna-accounts-npm-release");
   expect(workflow).not.toContain("group: release-${{ github.ref }}");
@@ -808,6 +882,10 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(workflow).not.toMatch(/uses:\s+\S+@v\d/);
   expect(workflow).not.toContain("bun-version: latest");
   expect(workflow).not.toContain('node-version: "24.x"');
+  expect(
+    promotionImplementation.match(/await fetchJson\(packageUrl\(value\.name\)\)/g),
+  ).toHaveLength(3);
+  expect(promotionImplementation).toContain("assertPromotionSnapshotUnchanged(");
 });
 
 test("package lifecycle rejects direct publication outside the preserved-artifact wrapper", () => {

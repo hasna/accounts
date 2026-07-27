@@ -174,10 +174,13 @@ group. Later tags queue behind earlier tags rather than running concurrently.
 The promotion gate still reads npm live: a candidate may advance `latest` only
 when its SemVer precedence is greater than the current target, or may continue
 as an exact idempotent retry when the version strings are identical. Downgrades,
-stale reordered candidates, invalid versions, and versions that differ only in
-build metadata fail closed. The final verification repeats the comparison and
-requires exact equality, so a registry change observed after the precheck
-invalidates the run.
+stale reordered candidates, prereleases, invalid versions, and versions that
+differ only in build metadata fail closed. Immediately before any `dist-tag`
+mutation, the promotion command reads the package metadata a second time and
+requires the exact `latest` snapshot it previously evaluated. This closes
+intervening external-publisher changes that are outside the repository workflow
+concurrency lock. The final verification repeats the comparison and requires
+exact equality, so a later registry change also invalidates the run.
 
 Before publication, the workflow requires:
 
@@ -193,16 +196,23 @@ Before publication, the workflow requires:
 - two clean build-and-pack runs with identical file lists, metadata, hashes,
   size, tarball bytes, and bounded archive contents.
 
-The second verified tarball is preserved in the runner temporary directory.
-The workflow publishes that exact file under
+Each pack run copies only npm's reviewed package file set to an isolated
+temporary package root, injects the exact 40-character release commit as
+`gitHead` into that internal `package/package.json`, and packs the isolated
+root. The source checkout and its `package.json` are never modified. CI and the
+release workflow both pin npm `11.16.0`, and the deterministic-pack verifier
+opens each produced tarball and requires that exact embedded `gitHead`.
+
+The second byte-identical verified tarball is preserved in the runner temporary
+directory. The workflow publishes that exact file under
 `release-candidate-X.Y.Z`; it never asks npm to pack the checkout again.
 
 ## Registry and provenance verification
 
 Before the intended dist-tag moves, the workflow requires:
 
-- registry `gitHead`, size, SHA-1, SHA-512 integrity, and downloaded bytes equal
-  the preserved candidate;
+- registry `gitHead`, packed-manifest `gitHead`, size, SHA-1, SHA-512 integrity,
+  and downloaded bytes equal the preserved candidate and exact release commit;
 - registry and archive file counts and unpacked sizes agree; the archive has at
   most 512 entries, each regular file is at most 16 MiB, total unpacked regular
   files are at most 64 MiB, and all paths remain beneath `package/`;
