@@ -1,13 +1,19 @@
 const SECRET_PATTERN =
   /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[oprsu]_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b/g;
 const CREDENTIAL_FIELD_PATTERN =
-  /(^|[^A-Za-z0-9_-])(["']?)([A-Za-z][A-Za-z0-9_-]*)\2[ \t]*[:=][ \t]*/gim;
+  /(^|[^A-Za-z0-9_. -])(["']?)([A-Za-z][A-Za-z0-9_. -]{0,63}?)\2[ \t]*[:=][ \t]*/gim;
 const SERIALIZED_FIELD_PATTERN =
-  /(^|[,{])([ \t]*)("(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*")[ \t]*:[ \t]*/gm;
+  /(^|[,{])([ \t]*)(("(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*")|('(?:\\(?:['"\\/bfnrt]|u[0-9A-Fa-f]{4})|[^'\\\r\n])*'))[ \t]*:[ \t]*/gm;
 const HEADER_LINE_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:/;
 const EXPLICIT_DIAGNOSTIC_RECORD_PATTERN =
   /^(?:status|message|stack|detail)[ \t]*=[ \t]*\S/i;
-const SENSITIVE_TERMINAL_TOKENS = new Set(["credential", "password", "secret", "token"]);
+const SENSITIVE_TERMINAL_TOKENS = new Set([
+  "credential",
+  "passphrase",
+  "password",
+  "secret",
+  "token",
+]);
 const SENSITIVE_KEY_QUALIFIERS = new Set([
   "api",
   "private",
@@ -17,6 +23,9 @@ const SENSITIVE_KEY_QUALIFIERS = new Set([
   "authorization",
   "access",
   "consumer",
+  "bearer",
+  "oauth",
+  "session",
   "x",
   "goog",
   "amz",
@@ -45,6 +54,7 @@ const SENSITIVE_EXACT_KEYS = new Set([
   "xamzsecuritytoken",
   "credential",
   "password",
+  "passphrase",
   "secret",
   "token",
 ]);
@@ -295,12 +305,7 @@ function redactEscapedSerializedFields(value: string): string {
     const encodedKey = match[3]!;
     if (!encodedKey.includes("\\")) continue;
 
-    let key: unknown;
-    try {
-      key = JSON.parse(encodedKey);
-    } catch {
-      continue;
-    }
+    const key = decodeSerializedKey(encodedKey);
     if (typeof key !== "string" || !isSensitiveCredentialKey(key)) continue;
 
     const valueStart = SERIALIZED_FIELD_PATTERN.lastIndex;
@@ -312,6 +317,51 @@ function redactEscapedSerializedFields(value: string): string {
   }
 
   return cursor === 0 ? value : output + value.slice(cursor);
+}
+
+function decodeSerializedKey(encoded: string): string | undefined {
+  if (encoded[0] === '"') {
+    try {
+      const value = JSON.parse(encoded);
+      return typeof value === "string" ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (encoded[0] !== "'" || encoded.at(-1) !== "'") return undefined;
+
+  let output = "";
+  for (let index = 1; index < encoded.length - 1; index++) {
+    const char = encoded[index]!;
+    if (char !== "\\") {
+      output += char;
+      continue;
+    }
+    const escaped = encoded[++index];
+    if (!escaped) return undefined;
+    if (escaped === "u") {
+      const hex = encoded.slice(index + 1, index + 5);
+      if (!/^[0-9A-Fa-f]{4}$/.test(hex)) return undefined;
+      output += String.fromCharCode(Number.parseInt(hex, 16));
+      index += 4;
+      continue;
+    }
+    const escapes: Record<string, string> = {
+      "'": "'",
+      '"': '"',
+      "\\": "\\",
+      "/": "/",
+      b: "\b",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+    };
+    const decoded = escapes[escaped];
+    if (decoded === undefined) return undefined;
+    output += decoded;
+  }
+  return output;
 }
 
 function redactPlainText(value: string): string {
@@ -365,9 +415,19 @@ export function redactArgv(argv: string[]): string[] {
       continue;
     }
 
-    const equals = arg.indexOf("=");
-    if (equals > 0 && isSensitiveCredentialKey(arg.slice(0, equals))) {
-      redacted.push(`${arg.slice(0, equals + 1)}[REDACTED]`);
+    if (arg === "-k") {
+      redacted.push(arg);
+      redactNext = true;
+      continue;
+    }
+    if (/^-k.+/.test(arg)) {
+      redacted.push("-k[REDACTED]");
+      continue;
+    }
+
+    const separator = arg.search(/[=:]/);
+    if (separator > 0 && isSensitiveCredentialKey(arg.slice(0, separator))) {
+      redacted.push(`${arg.slice(0, separator + 1)}[REDACTED]`);
       continue;
     }
 
@@ -375,6 +435,31 @@ export function redactArgv(argv: string[]): string[] {
     if (isSensitiveCredentialKey(arg)) redactNext = true;
   }
   return redacted;
+}
+
+/** Redact credential-bearing keys and nested string diagnostics in public data. */
+export function redactPublicValue(value: unknown): unknown {
+  if (typeof value === "string") return redactText(value);
+  if (Array.isArray(value)) return value.map((entry) => redactPublicValue(entry));
+  if (!value || typeof value !== "object") return value;
+
+  const result: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value)) {
+    result[key] = isSensitiveCredentialKey(key)
+      ? "[REDACTED]"
+      : redactPublicValue(nested);
+  }
+  return result;
+}
+
+/** Redact environment values by both semantic key and embedded diagnostic form. */
+export function redactEnvironment(env: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).map(([key, value]) => [
+      key,
+      isSensitiveCredentialKey(key) ? "[REDACTED]" : redactText(value),
+    ]),
+  );
 }
 
 /** Redact common credential values and credential-bearing request headers. */

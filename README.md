@@ -150,13 +150,25 @@ stdout are separated as distinct records before bounded redaction, preventing a
 missing trailing newline from fusing a diagnostic prefix with a
 credential-bearing header.
 Credential keys are classified through one separator/camel-case-aware policy,
-so forms such as `oauth_token`, `consumerSecret`, and `webhookCredential`
+so dot-, space-, separator-, and camel-case forms such as `oauth.key`,
+`oauth key`, `oauth_token`, `consumerSecret`, `sessionKey`, and
+`webhookCredential`
 receive the same treatment without matching benign names such as
 `tokenBucket` or `passwordless`. Valid JSON is redacted recursively after
 decoding escaped keys, while malformed serialized fragments remain
 fail-closed. Supervisor child arguments stay raw only for the immediate spawn;
 persisted state, restart responses, legacy state reads, and text/JSON status
-surfaces store or return argument-aware redacted command arrays.
+surfaces store or return argument-aware redacted command arrays. Long options
+using `=`, `:`, or a following value and the supported short `-k` forms share
+that policy.
+
+Switch output is an explicit `hasna.accounts.switch-output/v1` DTO. It exposes
+only bounded profile/tool identifiers, status booleans, a redacted command and
+handoff line, and the user-facing message; internal profile metadata, tool
+configuration, environment maps, and export scripts do not cross that output
+boundary. Raw arguments and environment values remain available only to the
+immediate provider spawn. Unix supervisor directories, state files, and sockets
+are owner-only (`0700`, `0600`, and `0600`).
 
 Printed POSIX handoffs validate every environment-variable name, single-quote
 every value and command word without expansion, and place an explicit `env --`

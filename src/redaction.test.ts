@@ -59,7 +59,13 @@ test("request-header redaction leaves unrelated prose and fields unchanged", () 
 test("semantic credential-key normalization covers separator and camel-case variants without near misses", () => {
   const sensitive = [
     "oauth_token",
+    "oauth.key",
+    "oauth key",
+    "oauthKey",
+    "bearerKey",
+    "sessionKey",
     "bearer-token",
+    "passphrase",
     "signing_secret",
     "consumerSecret",
     "database_password",
@@ -166,6 +172,12 @@ test("argument redaction uses the same semantic credential-key classifier", () =
     "provider",
     "--oauth_token",
     "argv-oauth-secret",
+    "--passphrase",
+    "argv-passphrase-secret",
+    "--api-key:argv-colon-secret",
+    "-k",
+    "argv-short-secret",
+    "-kargv-joined-secret",
     "--consumerSecret=argv-consumer-secret",
     "--tokenBucket",
     "keep-token-bucket",
@@ -177,12 +189,48 @@ test("argument redaction uses the same semantic credential-key classifier", () =
     "provider",
     "--oauth_token",
     "[REDACTED]",
+    "--passphrase",
+    "[REDACTED]",
+    "--api-key:[REDACTED]",
+    "-k",
+    "[REDACTED]",
+    "-k[REDACTED]",
     "--consumerSecret=[REDACTED]",
     "--tokenBucket",
     "keep-token-bucket",
     "--webhookCredential",
     "[REDACTED]",
   ]);
+});
+
+test("dot, space, escaped, and single-quoted credential keys fail closed", () => {
+  const samples = [
+    "oauth.key=dot-key-secret",
+    "oauth key = space-key-secret",
+    "passphrase: passphrase-secret",
+    '{"oauth.key":"json-dot-secret","status":401}',
+    String.raw`{"oauth\u002ekey":"escaped-dot-secret","status":401}`,
+    String.raw`{"oauth\u002ekey":"malformed-escaped-secret","status" 401}`,
+    "{'session key':'single-quoted-secret','status':401}",
+    "{'bearerKey':'single-camel-secret';'status':401}",
+    String.raw`{'oauth\u002ekey':'single-escaped-secret','status' 401}`,
+  ];
+
+  const redacted = redactText(samples.join("\n"));
+  for (const secret of [
+    "dot-key-secret",
+    "space-key-secret",
+    "passphrase-secret",
+    "json-dot-secret",
+    "escaped-dot-secret",
+    "malformed-escaped-secret",
+    "single-quoted-secret",
+    "single-camel-secret",
+    "single-escaped-secret",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted).toContain("[REDACTED]");
 });
 
 test("credential records nested inside non-sensitive wrapper values are still redacted", () => {

@@ -9,7 +9,11 @@ import { appliedProfile } from "./apply.js";
 import { providerLaunchEnv } from "./env.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool } from "./tools.js";
-import { switchProfile, type SwitchResult } from "./switch.js";
+import {
+  publicSwitchResult,
+  switchProfile,
+  type PublicSwitchResult,
+} from "./switch.js";
 
 export interface CodexAppMenuProfile {
   name: string;
@@ -42,7 +46,7 @@ export interface CodexAppRelaunchOptions {
 }
 
 export interface CodexAppMenuSwitchResult {
-  switch: SwitchResult;
+  switch: PublicSwitchResult;
   quitAttempted: boolean;
   launchStarted: boolean;
   launchCommand: string[];
@@ -138,11 +142,12 @@ export async function switchCodexAppFromMenu(
     child.unref?.();
   }
 
+  const publicResult = publicSwitchResult(result);
   return {
-    switch: result,
+    switch: publicResult,
     quitAttempted: shouldQuit,
     launchStarted: shouldLaunch,
-    launchCommand: result.command,
+    launchCommand: publicResult.command,
   };
 }
 

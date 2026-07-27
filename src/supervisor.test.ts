@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -357,6 +357,9 @@ test("legacy supervisor state is redacted defensively when read", () => {
       pid: 123,
       socketPath: supervisorSocketPath("codewith"),
       command: ["codewith", "--webhookCredential", "legacy-supervisor-secret"],
+      args: ["--passphrase", "legacy-unknown-args-secret"],
+      lastError: "oauth.key=legacy-last-error-secret",
+      custom: { "session key": "legacy-custom-secret" },
       startedAt: "2026-07-27T00:00:00.000Z",
       updatedAt: "2026-07-27T00:00:00.000Z",
     }),
@@ -364,7 +367,97 @@ test("legacy supervisor state is redacted defensively when read", () => {
 
   const state = readSupervisorState("codewith");
   expect(state?.command).toEqual(["codewith", "--webhookCredential", "[REDACTED]"]);
-  expect(JSON.stringify(state)).not.toContain("legacy-supervisor-secret");
+  expect(state).not.toHaveProperty("args");
+  expect(state).not.toHaveProperty("lastError");
+  expect(state).not.toHaveProperty("custom");
+  for (const secret of [
+    "legacy-supervisor-secret",
+    "legacy-unknown-args-secret",
+    "legacy-last-error-secret",
+    "legacy-custom-secret",
+  ]) {
+    expect(JSON.stringify(state)).not.toContain(secret);
+  }
+});
+
+test("supervisor public switch response is a strict safe DTO and filesystem is owner-only", async () => {
+  const logPath = join(home, "safe-dto.log");
+  const scriptPath = join(home, "safe-dto.mjs");
+  writeFileSync(
+    scriptPath,
+    [
+      'import { appendFileSync } from "node:fs";',
+      'appendFileSync(process.env.FAKE_LOG, JSON.stringify({ args: process.argv.slice(2), secret: process.env.SERVICE_API_KEY }) + "\\n");',
+      'process.on("SIGTERM", () => process.exit(0));',
+      "setInterval(() => undefined, 1000);",
+    ].join("\n"),
+  );
+
+  const envSecret = "supervisor-extra-env-secret";
+  const argSecret = "supervisor-short-arg-secret";
+  addCustomTool({
+    id: "safedto",
+    label: "Safe DTO",
+    envVar: "SAFE_DTO_HOME",
+    extraEnv: { SERVICE_API_KEY: envSecret },
+    defaultDir: join(home, "safe-dto-default"),
+    bin: process.execPath,
+    resumeArgs: [scriptPath],
+  });
+  const one = addProfile({ name: "one", tool: "safedto" });
+  const two = addProfile({ name: "two", tool: "safedto" });
+  const previousFakeLog = process.env.FAKE_LOG;
+  process.env.FAKE_LOG = logPath;
+  if (process.platform !== "win32") {
+    mkdirSync(dirname(supervisorSocketPath("safedto")), { recursive: true, mode: 0o777 });
+    chmodSync(dirname(supervisorSocketPath("safedto")), 0o777);
+  }
+  const running = runSupervisedTool(one, getTool("safedto"), [scriptPath], {
+    stdio: "ignore",
+    restartDelayMs: 25,
+  });
+
+  try {
+    await waitFor(() => (existsSync(supervisorSocketPath("safedto")) ? true : undefined));
+    if (process.platform !== "win32") {
+      expect(statSync(dirname(supervisorSocketPath("safedto"))).mode & 0o777).toBe(0o700);
+      expect(statSync(supervisorSocketPath("safedto")).mode & 0o777).toBe(0o600);
+      await waitFor(() => (existsSync(supervisorStatePath("safedto")) ? true : undefined));
+      expect(statSync(supervisorStatePath("safedto")).mode & 0o777).toBe(0o600);
+    }
+
+    const response = await sendSupervisorRequest("safedto", {
+      type: "switch_profile",
+      name: two.name,
+      resume: false,
+      args: [scriptPath, "-k", argSecret],
+    });
+    const publicJson = JSON.stringify(response);
+    expect(publicJson).not.toContain(argSecret);
+    expect(publicJson).not.toContain(envSecret);
+    const publicResult = response?.ok && "queued" in response ? response.result : undefined;
+    expect(publicResult).toEqual({
+      schema: "hasna.accounts.switch-output/v1",
+      profile: { name: "two", tool: "safedto" },
+      tool: { id: "safedto", label: "Safe DTO" },
+      applied: false,
+      active: true,
+      command: [process.execPath, scriptPath, "-k", "[REDACTED]"],
+      commandLine: publicResult?.commandLine,
+      restartRequired: false,
+      message: "two is now the active Safe DTO profile",
+    });
+    expect(publicResult?.commandLine).toContain("'-k' '[REDACTED]'");
+    expect(response?.ok && "queued" in response ? response.result : undefined).not.toHaveProperty("env");
+    expect(response?.ok && "queued" in response ? response.result : undefined).not.toHaveProperty("exports");
+    await waitFor(() => readLog(logPath).find((entry) => entry.args.includes(argSecret)));
+
+    await sendSupervisorRequest("safedto", { type: "stop" });
+    expect(await running).toBe(0);
+  } finally {
+    process.env.FAKE_LOG = previousFakeLog;
+    await sendSupervisorRequest("safedto", { type: "stop" }, { allowMissing: true }).catch(() => undefined);
+  }
 });
 
 test("supervisor switch preflights configs before queueing or stopping the current child", async () => {
@@ -466,6 +559,7 @@ test("supervisor switch preflights configs before queueing or stopping the curre
 test("switch --supervisor sends configs prelaunch flags to the supervisor", async () => {
   addProfile({ name: "two", tool: "codewith" });
 
+  const responseSecret = "malicious-response-extra-env-secret";
   let request: unknown;
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
@@ -475,9 +569,33 @@ test("switch --supervisor sends configs prelaunch flags to the supervisor", asyn
         JSON.stringify({
           ok: true,
           queued: true,
-          result: { profile: { name: "two" }, command: ["codewith"], commandLine: "codewith" },
-          state: { version: 1, tool: "codewith", profile: "one", pid: process.pid, socketPath: supervisorSocketPath("codewith"), command: ["codewith"], startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+          result: {
+            schema: "hasna.accounts.switch-output/v1",
+            profile: { name: "two", tool: "codewith" },
+            tool: { id: "codewith", label: "Codewith" },
+            applied: false,
+            active: true,
+            command: ["codewith"],
+            commandLine: "codewith",
+            restartRequired: true,
+            message: "two is now the active Codewith profile",
+            env: { SERVICE_API_KEY: responseSecret },
+            exports: `export SERVICE_API_KEY=${responseSecret}`,
+          },
+          state: {
+            version: 1,
+            tool: "codewith",
+            profile: "one",
+            pid: process.pid,
+            socketPath: supervisorSocketPath("codewith"),
+            command: ["codewith"],
+            args: ["--api-key", responseSecret],
+            lastError: `oauth.key=${responseSecret}`,
+            startedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
           restartDelayMs: 1,
+          extra: { passphrase: responseSecret },
         }) + "\n",
       );
     });
@@ -517,6 +635,15 @@ test("switch --supervisor sends configs prelaunch flags to the supervisor", asyn
     ]);
 
     expect({ exitCode, stdout, stderr }).toMatchObject({ exitCode: 0 });
+    expect(`${stdout}${stderr}`).not.toContain(responseSecret);
+    const publicResponse = JSON.parse(stdout) as {
+      result: Record<string, unknown>;
+      state: Record<string, unknown>;
+    };
+    expect(publicResponse.result).not.toHaveProperty("env");
+    expect(publicResponse.result).not.toHaveProperty("exports");
+    expect(publicResponse.state).not.toHaveProperty("args");
+    expect(publicResponse.state).not.toHaveProperty("lastError");
     expect(request).toMatchObject({
       type: "switch_profile",
       name: "two",

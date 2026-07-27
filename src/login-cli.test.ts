@@ -503,6 +503,80 @@ test("non-launch switch handoff command unsets request debugging before provider
   expectSafeProviderObservation();
 });
 
+test("switch human, JSON, and launch output use the safe DTO while launch keeps raw args transient", () => {
+  writeFakeTool("safe-output-tool", "SAFE_OUTPUT_HOME", "safe-output");
+  addFakeLoginTool("safe-output", "Safe Output", "SAFE_OUTPUT_HOME", "safe-output-tool");
+  expect(runCli("add", "acct", "--tool", "safe-output").status).toBe(0);
+
+  const envSecret = "switch-extra-env-secret";
+  const argvSecret = "switch-api-arg-secret";
+  const storePath = join(home, "accounts.json");
+  const store = JSON.parse(readFileSync(storePath, "utf8")) as {
+    tools: Array<{ id: string; extraEnv?: Record<string, string> }>;
+  };
+  store.tools.find((tool) => tool.id === "safe-output")!.extraEnv = {
+    SERVICE_API_KEY: envSecret,
+  };
+  writeFileSync(storePath, JSON.stringify(store));
+
+  const human = runCliWith([
+    "switch",
+    "acct",
+    "--tool",
+    "safe-output",
+    "--mode",
+    "active",
+    "--",
+    "--api-key",
+    argvSecret,
+  ]);
+  expect(human.status, human.stderr).toBe(0);
+  expect(`${human.stdout}${human.stderr}`).not.toContain(argvSecret);
+  expect(`${human.stdout}${human.stderr}`).not.toContain(envSecret);
+  expect(human.stdout).toContain("--api-key");
+  expect(human.stdout).toContain("[REDACTED]");
+
+  const json = runCliWith([
+    "switch",
+    "acct",
+    "--tool",
+    "safe-output",
+    "--mode",
+    "active",
+    "--json",
+    "--",
+    "--api-key",
+    argvSecret,
+  ]);
+  expect(json.status, json.stderr).toBe(0);
+  expect(`${json.stdout}${json.stderr}`).not.toContain(argvSecret);
+  expect(`${json.stdout}${json.stderr}`).not.toContain(envSecret);
+  const output = JSON.parse(json.stdout) as Record<string, unknown>;
+  expect(output["schema"]).toBe("hasna.accounts.switch-output/v1");
+  expect(output).not.toHaveProperty("env");
+  expect(output).not.toHaveProperty("exports");
+  expect(output["tool"]).toEqual({ id: "safe-output", label: "Safe Output" });
+  expect(output["profile"]).toEqual({ name: "acct", tool: "safe-output" });
+
+  rmSync(logPath, { force: true });
+  const launched = runCliWith([
+    "switch",
+    "acct",
+    "--tool",
+    "safe-output",
+    "--mode",
+    "active",
+    "--launch",
+    "--",
+    "--api-key",
+    argvSecret,
+  ]);
+  expect(launched.status, launched.stderr).toBe(0);
+  expect(`${launched.stdout}${launched.stderr}`).not.toContain(argvSecret);
+  expect(`${launched.stdout}${launched.stderr}`).not.toContain(envSecret);
+  expect(readLogEntries().at(-1)?.args).toContain(`--api-key ${argvSecret}`);
+});
+
 test("accounts shell removes request debugging while preserving same-binding environment", () => {
   writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
   addFakeLoginTool();

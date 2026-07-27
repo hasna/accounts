@@ -91,12 +91,29 @@ stdout are separated by a record boundary before line bounding and redaction.
 This keeps provably independent records visible without repeated suffix scans,
 fusing process streams, or exposing malformed folds.
 Credential-key classification is centralized and normalizes separators and
-camel case before applying terminal semantic tokens. Valid JSON documents are
-walked recursively after JSON key escape decoding; escaped keys in malformed
-serialized fragments use the same fail-closed record boundary. Supervisor
-arguments remain raw only in memory long enough to spawn the provider child.
-State files, legacy-state reads, switch responses, and live/stale status output
-all use the same argument-aware redaction before data leaves that boundary.
+camel case, including dot and space boundaries, before applying terminal
+semantic tokens. Valid JSON documents are walked recursively after JSON key
+escape decoding; escaped and single-quoted keys in malformed serialized
+fragments use the same fail-closed record boundary. Argument redaction handles
+credential-bearing long options separated by `=`, `:`, or the next argv item,
+plus the supported `-k value` and `-kvalue` forms.
+
+`src/lib/switch.ts` separates the internal `SwitchResult`, which may contain
+raw launch material, from the explicit public
+`hasna.accounts.switch-output/v1` projection. CLI, MCP, and supervisor switch
+surfaces emit only that DTO: bounded profile/tool identity, status, redacted
+command/handoff data, and message. Environment maps, export scripts, complete
+profiles, and complete tool definitions remain internal. The supervisor client
+also projects socket responses rather than trusting unknown fields, and legacy
+state parsing constructs the current schema field by field instead of spreading
+persisted data.
+
+Supervisor arguments remain raw only in memory long enough to spawn the
+provider child. State files, legacy-state reads, switch responses, and
+live/stale status output all use argument-aware redaction before data leaves
+that boundary. On Unix, the supervisor directory is forced to `0700` and its
+state file and control socket to `0600`, including when `ACCOUNTS_HOME` points
+at a pre-existing permissive directory.
 
 ## Apply safety
 

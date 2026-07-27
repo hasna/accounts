@@ -70,8 +70,8 @@ export type {
   PrepareLoginOptions,
   ToolAvailability,
 } from "./lib/login.js";
-export { switchProfile } from "./lib/switch.js";
-export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
+export { publicSwitchResult, switchProfile } from "./lib/switch.js";
+export type { PublicSwitchResult, SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
 export {
   codexAppBinaryExists,
   codexAppMenuState,

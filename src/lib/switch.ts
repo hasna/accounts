@@ -12,6 +12,7 @@ import {
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
+import { redactArgv, redactEnvironment } from "./redaction.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
 
@@ -37,8 +38,50 @@ export interface SwitchResult {
   message: string;
 }
 
+export interface PublicSwitchResult {
+  schema: "hasna.accounts.switch-output/v1";
+  profile: {
+    name: string;
+    tool: string;
+  };
+  tool: {
+    id: string;
+    label: string;
+  };
+  applied: boolean;
+  active: boolean;
+  command: string[];
+  commandLine: string;
+  permissions?: string;
+  restartRequired: boolean;
+  message: string;
+}
+
 function commandLine(env: Record<string, string>, command: string[]): string {
   return `${formatEnvAssignments(env)} ${command.map(quotePosixShellWord).join(" ")}`.trim();
+}
+
+/** Project an internal launch result to the only shape allowed on public output. */
+export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
+  const command = redactArgv(result.command);
+  return {
+    schema: "hasna.accounts.switch-output/v1",
+    profile: {
+      name: result.profile.name,
+      tool: result.profile.tool,
+    },
+    tool: {
+      id: result.tool.id,
+      label: result.tool.label,
+    },
+    applied: result.applied,
+    active: result.active,
+    command,
+    commandLine: commandLine(redactEnvironment(result.env), command),
+    ...(result.permissions ? { permissions: result.permissions } : {}),
+    restartRequired: result.restartRequired,
+    message: result.message,
+  };
 }
 
 function commandFor(profile: Profile, tool: ToolDef, opts: SwitchOptions): string[] {

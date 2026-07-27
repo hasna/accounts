@@ -40,7 +40,7 @@ import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.
 import { formatEnvAssignments, formatExportLines, profileEnv, providerLaunchEnv } from "./lib/env.js";
 import { redactText } from "./lib/redaction.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
-import { switchProfile, type SwitchMode } from "./lib/switch.js";
+import { publicSwitchResult, switchProfile, type SwitchMode } from "./lib/switch.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -730,12 +730,13 @@ addConfigsOptions(program
           args,
           permissions: opts.permissions,
         }, store);
+        const output = publicSwitchResult(result);
         if (opts.json) {
-          console.log(JSON.stringify(result, null, 2));
+          console.log(JSON.stringify(output, null, 2));
         } else {
-          console.log(chalk.green(`✓ ${result.message}`));
+          console.log(chalk.green(`✓ ${output.message}`));
           if (result.applied) console.log(chalk.dim("  live/default auth updated"));
-          console.log(chalk.dim(`  restart command: ${result.commandLine}`));
+          console.log(chalk.dim(`  restart command: ${output.commandLine}`));
           if (!opts.launch) {
             console.log(chalk.yellow("  Exit the current agent session, then run the restart command above."));
           }

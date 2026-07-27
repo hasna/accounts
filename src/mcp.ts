@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { resolveStore } from "./lib/store.js";
 import { appliedProfile } from "./lib/apply.js";
-import { switchProfile, type SwitchMode } from "./lib/switch.js";
+import { publicSwitchResult, switchProfile, type SwitchMode } from "./lib/switch.js";
 import { AccountsError } from "./types.js";
 import { listSupervisorStates, sendSupervisorRequest } from "./lib/supervisor.js";
 
@@ -122,9 +122,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           args: switchArgs,
           permissions,
         }, store);
+        const output = publicSwitchResult(result);
         return ok({
           supervised: false,
-          ...result,
+          ...output,
           instruction: result.restartRequired
             ? "Exit the current agent session and run commandLine to resume under the selected profile."
             : "Profile switched.",

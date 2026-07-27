@@ -1,16 +1,22 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, join } from "node:path";
 import { accountsHome, loadAppliedMap } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
-import { formatEnvAssignments, profileEnv, providerLaunchEnv, quotePosixShellWord } from "./env.js";
-import { redactArgv, redactText } from "./redaction.js";
+import { profileEnv, providerLaunchEnv } from "./env.js";
+import { redactArgv, redactPublicValue, redactText } from "./redaction.js";
 import { resolveStore, type AccountsStore } from "./store.js";
-import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
+import {
+  publicSwitchResult,
+  switchProfile,
+  type PublicSwitchResult,
+  type SwitchMode,
+  type SwitchResult,
+} from "./switch.js";
 import { getTool } from "./tools.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchOptions, type ConfigsPrelaunchResult } from "./configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./configs-prelaunch-status.js";
@@ -44,7 +50,7 @@ export type SupervisorRequest =
 
 export type SupervisorResponse =
   | { ok: true; state: SupervisorState }
-  | { ok: true; queued: true; result: SwitchResult; state: SupervisorState; restartDelayMs: number }
+  | { ok: true; queued: true; result: PublicSwitchResult; state: SupervisorState; restartDelayMs: number }
   | { ok: true; stopping: true; state: SupervisorState }
   | { ok: false; error: string };
 
@@ -88,22 +94,118 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function parseState(raw: string): SupervisorState | undefined {
-  const data = JSON.parse(raw) as Partial<SupervisorState>;
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function projectState(value: unknown): SupervisorState | undefined {
+  const data = objectValue(value);
+  if (!data) return undefined;
   if (
-    data.version !== 1 ||
-    typeof data.tool !== "string" ||
-    typeof data.profile !== "string" ||
-    typeof data.pid !== "number" ||
-    typeof data.socketPath !== "string" ||
-    !Array.isArray(data.command)
+    data["version"] !== 1 ||
+    typeof data["tool"] !== "string" ||
+    typeof data["profile"] !== "string" ||
+    typeof data["pid"] !== "number" ||
+    typeof data["socketPath"] !== "string" ||
+    !Array.isArray(data["command"]) ||
+    !data["command"].every((entry) => typeof entry === "string")
+  ) {
+    return undefined;
+  }
+  const state: SupervisorState = {
+    version: 1,
+    tool: redactText(data["tool"]),
+    profile: redactText(data["profile"]),
+    pid: data["pid"],
+    ...(typeof data["childPid"] === "number" ? { childPid: data["childPid"] } : {}),
+    socketPath: redactText(data["socketPath"]),
+    command: redactArgv(data["command"] as string[]),
+    startedAt: typeof data["startedAt"] === "string" ? redactText(data["startedAt"]) : "",
+    updatedAt: typeof data["updatedAt"] === "string" ? redactText(data["updatedAt"]) : "",
+  };
+  if (data["prelaunch"] && typeof data["prelaunch"] === "object") {
+    state.prelaunch = redactPublicValue(data["prelaunch"]) as ConfigsPrelaunchSummary;
+  }
+  return state;
+}
+
+function parseState(raw: string): SupervisorState | undefined {
+  return projectState(JSON.parse(raw));
+}
+
+function projectSwitchResult(value: unknown): PublicSwitchResult | undefined {
+  const data = objectValue(value);
+  const profile = objectValue(data?.["profile"]);
+  const tool = objectValue(data?.["tool"]);
+  if (
+    data?.["schema"] !== "hasna.accounts.switch-output/v1" ||
+    typeof profile?.["name"] !== "string" ||
+    typeof profile["tool"] !== "string" ||
+    typeof tool?.["id"] !== "string" ||
+    typeof tool["label"] !== "string" ||
+    typeof data["applied"] !== "boolean" ||
+    typeof data["active"] !== "boolean" ||
+    !Array.isArray(data["command"]) ||
+    !data["command"].every((entry) => typeof entry === "string") ||
+    typeof data["commandLine"] !== "string" ||
+    typeof data["restartRequired"] !== "boolean" ||
+    typeof data["message"] !== "string"
   ) {
     return undefined;
   }
   return {
-    ...(data as SupervisorState),
-    command: redactArgv(data.command as string[]),
+    schema: "hasna.accounts.switch-output/v1",
+    profile: {
+      name: redactText(profile["name"]),
+      tool: redactText(profile["tool"]),
+    },
+    tool: {
+      id: redactText(tool["id"]),
+      label: redactText(tool["label"]),
+    },
+    applied: data["applied"],
+    active: data["active"],
+    command: redactArgv(data["command"] as string[]),
+    commandLine: redactText(data["commandLine"]),
+    ...(typeof data["permissions"] === "string"
+      ? { permissions: redactText(data["permissions"]) }
+      : {}),
+    restartRequired: data["restartRequired"],
+    message: redactText(data["message"]),
   };
+}
+
+function projectResponse(value: unknown): SupervisorResponse {
+  const data = objectValue(value);
+  if (!data || typeof data["ok"] !== "boolean") {
+    throw new AccountsError("accounts supervisor returned an invalid response");
+  }
+  if (data["ok"] === false) {
+    if (typeof data["error"] !== "string") {
+      throw new AccountsError("accounts supervisor returned an invalid error response");
+    }
+    return { ok: false, error: redactText(data["error"]) };
+  }
+
+  const state = projectState(data["state"]);
+  if (!state) throw new AccountsError("accounts supervisor returned an invalid state");
+  if (data["queued"] === true) {
+    const result = projectSwitchResult(data["result"]);
+    if (!result || typeof data["restartDelayMs"] !== "number") {
+      throw new AccountsError("accounts supervisor returned an invalid switch response");
+    }
+    return {
+      ok: true,
+      queued: true,
+      result,
+      state,
+      restartDelayMs: data["restartDelayMs"],
+    };
+  }
+  if (data["stopping"] === true) return { ok: true, stopping: true, state };
+  return { ok: true, state };
 }
 
 export function readSupervisorState(toolId: string): SupervisorState | undefined {
@@ -127,12 +229,14 @@ export function listSupervisorStates(): SupervisorState[] {
 }
 
 function writeSupervisorState(state: SupervisorState): void {
-  mkdirSync(supervisorDir(), { recursive: true });
+  mkdirSync(supervisorDir(), { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") chmodSync(supervisorDir(), 0o700);
   writeFileSync(
     supervisorStatePath(state.tool),
     JSON.stringify({ ...state, command: redactArgv(state.command) }, null, 2) + "\n",
     { mode: 0o600 },
   );
+  if (process.platform !== "win32") chmodSync(supervisorStatePath(state.tool), 0o600);
 }
 
 function removeSupervisorFiles(toolId: string): void {
@@ -223,15 +327,6 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function publicSwitchResult(result: SwitchResult): SwitchResult {
-  const command = redactArgv(result.command);
-  return {
-    ...result,
-    command,
-    commandLine: `${formatEnvAssignments(result.env)} ${command.map(quotePosixShellWord).join(" ")}`.trim(),
-  };
-}
-
 async function listen(server: Server, socketPath: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error) => {
@@ -240,11 +335,21 @@ async function listen(server: Server, socketPath: string): Promise<void> {
     };
     const onListening = () => {
       server.off("error", onError);
+      if (process.platform !== "win32") chmodSync(socketPath, 0o600);
       resolve();
     };
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(socketPath);
+    if (process.platform === "win32") {
+      server.listen(socketPath);
+      return;
+    }
+    const previousUmask = process.umask(0o177);
+    try {
+      server.listen(socketPath);
+    } finally {
+      process.umask(previousUmask);
+    }
   });
 }
 
@@ -295,7 +400,7 @@ export async function sendSupervisorRequest(
       const newline = buffer.indexOf("\n");
       if (newline === -1) return;
       try {
-        finish(JSON.parse(buffer.slice(0, newline)) as SupervisorResponse);
+        finish(projectResponse(JSON.parse(buffer.slice(0, newline))));
       } catch (err) {
         fail(err as Error);
       }
@@ -318,7 +423,8 @@ export async function runSupervisedTool(
     throw new AccountsError(`an accounts supervisor for ${tool.label} is already running (pid ${existing.pid})`);
   }
   removeSupervisorFiles(tool.id);
-  mkdirSync(supervisorDir(), { recursive: true });
+  mkdirSync(supervisorDir(), { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") chmodSync(supervisorDir(), 0o700);
 
   const startedAt = nowIso();
   const restartDelayMs = opts.restartDelayMs ?? 350;
@@ -494,7 +600,7 @@ export async function runSupervisedTool(
       setTimeout(() => void restartWith(result, preflightedConfigs), 0);
       return { ok: true, queued: true, result: publicSwitchResult(result), state: state(), restartDelayMs };
     } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      return { ok: false, error: redactText(err instanceof Error ? err.message : String(err)) };
     }
   };
 
