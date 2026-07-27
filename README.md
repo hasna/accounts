@@ -241,8 +241,11 @@ stack trace.
   its stat identity and digest, and executes the inherited Linux descriptor
   (`/proc/self/fd/3`) across the exact-version probe and launch. It deletes the
   Claude/Anthropic, AWS, Google/Vertex, Azure/Foundry, custom-header, token/FD,
-  provider-routing, and loader-injection caller environment surfaces, then
-  binds both Claude config and secure storage to the selected profile.
+  provider-routing — including the unprefixed proxy and TLS-trust variables
+  (`HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`,
+  `NODE_TLS_REJECT_UNAUTHORIZED`, `SSL_CERT_FILE`/`SSL_CERT_DIR`) — and
+  loader-injection caller environment surfaces, then binds both Claude config
+  and secure storage to the selected profile.
 - The source is byte-snapshotted into a private `0700` transaction directory;
   artifacts and journal files are `0600`, and files plus containing directories
   are fsynced. Candidate promotion is serialized by canonical target storage

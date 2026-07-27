@@ -146,6 +146,7 @@ export {
   sanitizeClaudeOAuthProfileSettings,
   sanitizeLiveClaudeOAuthSettings,
   CLAUDE_API_AUTH_ENV_KEYS,
+  CLAUDE_NETWORK_ROUTING_ENV_KEYS,
 } from "./lib/claude-auth.js";
 export type { ClaudeProfileAuthHealth, ClaudeProfileAuthStatus } from "./lib/claude-auth.js";
 export { withApplyLock } from "./lib/apply-lock.js";

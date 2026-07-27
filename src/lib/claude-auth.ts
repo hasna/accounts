@@ -264,6 +264,34 @@ export const CLAUDE_API_AUTH_ENV_KEYS = [
   "google_cloud_project",
 ] as const;
 
+/**
+ * Generic proxy and TLS-trust variables Claude Code honors without a vendor
+ * prefix. A caller that keeps these can point the launched session at its own
+ * endpoint and disable transport verification, which leaks the profile bearer
+ * token just as directly as an injected credential would.
+ *
+ * These stay out of CLAUDE_API_AUTH_ENV_KEYS on purpose: `accounts env`,
+ * `accounts run`, and `accounts use` must leave a caller's network
+ * configuration alone, while the cross-account continuation broker fails
+ * closed on it.
+ */
+export const CLAUDE_NETWORK_ROUTING_ENV_KEYS = [
+  "ALL_PROXY",
+  "CURL_CA_BUNDLE",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "NODE_EXTRA_CA_CERTS",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+  "NO_PROXY",
+  "REQUESTS_CA_BUNDLE",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  "all_proxy",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
+
 function readJsonFile(path: string): JsonRecord | undefined {
   if (!existsSync(path)) return undefined;
   try {

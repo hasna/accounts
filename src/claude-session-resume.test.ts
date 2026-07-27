@@ -19,7 +19,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { CLAUDE_API_AUTH_ENV_KEYS } from "./lib/claude-auth.js";
+import {
+  CLAUDE_API_AUTH_ENV_KEYS,
+  CLAUDE_NETWORK_ROUTING_ENV_KEYS,
+} from "./lib/claude-auth.js";
 import type { Profile } from "./types.js";
 
 const SOURCE_UUID = "11111111-1111-4111-8111-111111111111";
@@ -40,6 +43,28 @@ const CLAUDE_220_SETTINGS_OVERRIDE_ENV_KEYS = [
   "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
   "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
 ] as const;
+// Unprefixed proxy and TLS-trust variables redirect and un-verify the launched
+// session even though no vendor prefix names them.
+const CLAUDE_220_GENERIC_ROUTING_ENV_KEYS = [
+  "ALL_PROXY",
+  "CURL_CA_BUNDLE",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "NODE_EXTRA_CA_CERTS",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+  "NO_PROXY",
+  "REQUESTS_CA_BUNDLE",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  "all_proxy",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
+
+function callerRoutingOverride(key: string): string {
+  return /proxy/i.test(key) ? "http://127.0.0.1:1" : "caller-override";
+}
 
 function findNodeBinary(): string | undefined {
   const extensions =
@@ -176,11 +201,12 @@ import { join } from "node:path";
 
 const args = process.argv.slice(2);
 const log = process.env.FAKE_CLAUDE_LOG;
+// Bun predefines HTTP_PROXY, HTTPS_PROXY, NO_PROXY, and
+// NODE_TLS_REJECT_UNAUTHORIZED as own properties of process.env even when the
+// process was started without them, so presence has to be read from the value.
 const poisonedEnvKeys = (process.env.FAKE_CLAUDE_POISON_KEYS || "")
   .split(",")
-  .filter((key) =>
-    key && Object.prototype.hasOwnProperty.call(process.env, key)
-  );
+  .filter((key) => key && process.env[key] !== undefined);
 if (args.length === 1 && args[0] === "--version") {
   if (log) {
     appendFileSync(log, JSON.stringify({
@@ -452,6 +478,9 @@ describe.skipIf(process.platform !== "linux")("accounts sessions resume", () => 
         ...CLAUDE_220_SETTINGS_OVERRIDE_ENV_KEYS,
       ]),
     );
+    expect(CLAUDE_NETWORK_ROUTING_ENV_KEYS).toEqual(
+      expect.arrayContaining([...CLAUDE_220_GENERIC_ROUTING_ENV_KEYS]),
+    );
 
     const result = runCli(
       [
@@ -466,6 +495,12 @@ describe.skipIf(process.platform !== "linux")("accounts sessions resume", () => 
         ...Object.fromEntries(
           CLAUDE_API_AUTH_ENV_KEYS.map((key) => [key, "caller-override"]),
         ),
+        ...Object.fromEntries(
+          CLAUDE_NETWORK_ROUTING_ENV_KEYS.map((key) => [
+            key,
+            callerRoutingOverride(key),
+          ]),
+        ),
         CLAUDE_CODE_HOST_AUTH_ENV_VAR: "CALLER_DYNAMIC_TOKEN",
         CALLER_DYNAMIC_TOKEN: "caller-override",
         AWS_BEARER_TOKEN_CUSTOM: "caller-override",
@@ -477,6 +512,7 @@ describe.skipIf(process.platform !== "linux")("accounts sessions resume", () => 
           ...CLAUDE_API_AUTH_ENV_KEYS.filter(
             (key) => key !== "AWS_EC2_METADATA_DISABLED",
           ),
+          ...CLAUDE_NETWORK_ROUTING_ENV_KEYS,
           "CALLER_DYNAMIC_TOKEN",
           "AWS_BEARER_TOKEN_CUSTOM",
           "AWS_ENDPOINT_URL_BEDROCK",
@@ -944,6 +980,34 @@ describe.skipIf(process.platform !== "linux")("accounts sessions resume", () => 
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("provider auth hook");
+    expect(launchEvents()).toEqual([]);
+    },
+  );
+
+  test.each(["HTTPS_PROXY", "NODE_TLS_REJECT_UNAUTHORIZED"])(
+    "cross owner rejects effective settings env override %s before version probing",
+    (key) => {
+    const source = profile("source");
+    const target = profile("target");
+    writeStore([source, target]);
+    writeSession(source);
+    writeFileSync(
+      join(target.dir, "settings.json"),
+      `${JSON.stringify({ env: { [key]: callerRoutingOverride(key) } })}\n`,
+      { mode: 0o600 },
+    );
+
+    const result = runCli([
+      "sessions",
+      "resume",
+      SOURCE_UUID,
+      "--account",
+      target.name,
+      "--dry-run",
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`provider override "${key}"`);
     expect(launchEvents()).toEqual([]);
     },
   );

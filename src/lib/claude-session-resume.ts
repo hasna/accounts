@@ -37,7 +37,10 @@ import {
 } from "node:path";
 import { accountsHome, profilesDir } from "../storage.js";
 import { AccountsError, type Profile, type ToolDef } from "../types.js";
-import { CLAUDE_API_AUTH_ENV_KEYS } from "./claude-auth.js";
+import {
+  CLAUDE_API_AUTH_ENV_KEYS,
+  CLAUDE_NETWORK_ROUTING_ENV_KEYS,
+} from "./claude-auth.js";
 import { resolveExecutable, runClaudeLaunch } from "./claude-launch.js";
 import {
   isClaudeSessionUuid,
@@ -429,6 +432,9 @@ function claudeSessionEnv(profile: Profile): NodeJS.ProcessEnv {
   };
   const dynamicHostAuthKey = env.CLAUDE_CODE_HOST_AUTH_ENV_VAR;
   for (const key of CLAUDE_API_AUTH_ENV_KEYS) delete env[key];
+  // Generic proxy and TLS-trust variables are provider routing without a vendor
+  // prefix: keeping them would let the caller MITM the profile bearer token.
+  for (const key of CLAUDE_NETWORK_ROUTING_ENV_KEYS) delete env[key];
   for (const key of [
     "BUN_OPTIONS",
     "DYLD_INSERT_LIBRARIES",
@@ -480,6 +486,7 @@ function inspectProviderAuthSettings(profileDir: string, cwd: string): string {
   ]);
   const forbiddenEnv = new Set<string>([
     ...CLAUDE_API_AUTH_ENV_KEYS,
+    ...CLAUDE_NETWORK_ROUTING_ENV_KEYS,
     "BUN_OPTIONS",
     "DYLD_INSERT_LIBRARIES",
     "DYLD_LIBRARY_PATH",

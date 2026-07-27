@@ -17,6 +17,35 @@ import { controlledTestsRoot, executableFilename } from "./support/isolation-pat
 
 const nestedProbe = process.env.ACCOUNTS_TEST_NESTED_PROBE === "1";
 
+// The side-effect probe re-runs the entire suite in a child process, so a fixed
+// budget silently turns into a flake as soon as the suite grows. Scale it with
+// the number of spec files the child will execute, and let a slow machine raise
+// it explicitly with ACCOUNTS_TEST_NESTED_PROBE_TIMEOUT_MS.
+const NESTED_PROBE_BUDGET_PER_TEST_FILE_MS = 15_000;
+const NESTED_PROBE_MINIMUM_BUDGET_MS = 180_000;
+
+function countTestFiles(root: string): number {
+  let total = 0;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    if (entry.isDirectory()) {
+      total += countTestFiles(join(root, entry.name));
+    } else if (entry.name.endsWith(".test.ts")) {
+      total += 1;
+    }
+  }
+  return total;
+}
+
+function nestedProbeBudgetMs(): number {
+  const requested = Number(process.env.ACCOUNTS_TEST_NESTED_PROBE_TIMEOUT_MS);
+  if (Number.isFinite(requested) && requested > 0) return requested;
+  return Math.max(
+    NESTED_PROBE_MINIMUM_BUDGET_MS,
+    countTestFiles(process.cwd()) * NESTED_PROBE_BUDGET_PER_TEST_FILE_MS,
+  );
+}
+
 const inheritedToolHomeKeys = [
   "CLAUDE_CONFIG_DIR",
   "CODEX_HOME",
@@ -259,7 +288,7 @@ test("bare Bun tests make zero inherited network, database, keychain, or tool si
     postgresServer.stop(true);
     rmSync(sentinelRoot, { recursive: true, force: true });
   }
-}, 120_000);
+}, nestedProbeBudgetMs());
 
 test("PostgreSQL variables survive only the exact integration target plus explicit opt-in", async () => {
   if (nestedProbe) {
