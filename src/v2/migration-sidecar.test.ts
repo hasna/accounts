@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   statSync,
@@ -12,7 +13,7 @@ import {
 } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { inspect } from "node:util";
 import { AccountsError } from "../types.js";
 import {
@@ -1796,6 +1797,205 @@ describe("scoped transactional backfill hooks", () => {
     expect(port.committed).toBe(false);
     expect(port.rolledBack).toBe(true);
   });
+
+  test("rejects a valid substituted result when the transaction skips the callback", async () => {
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+    const error = await applyScopedBackfill(sidecar, {
+      async transaction() {
+        return {
+          runtimes: { created: 1, adopted: 0 },
+          accounts: { created: 2, adopted: 0 },
+          crosswalks: { created: 2, adopted: 0 },
+          epoch: "created" as const,
+        };
+      },
+    }).then(
+      () => {
+        throw new Error("expected skipped transaction callback to reject");
+      },
+      (caught) => caught as Error & { code?: string },
+    );
+
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_backfill_failed");
+    expect(sidecar.state).toBe("partial_ready");
+    expect(sidecar.backfillReceipts).toEqual([]);
+  });
+
+  test("rejects a valid substituted result after the callback performs its writes", async () => {
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+    const transaction = new RecordingBackfillTransaction();
+    const error = await applyScopedBackfill(sidecar, {
+      async transaction(_scope, operation) {
+        const captured = await operation(transaction);
+        return {
+          ...captured,
+          runtimes: {
+            created: captured.runtimes.created - 1,
+            adopted: captured.runtimes.adopted + 1,
+          },
+        };
+      },
+    }).then(
+      () => {
+        throw new Error("expected substituted transaction result to reject");
+      },
+      (caught) => caught as Error & { code?: string },
+    );
+
+    expect(transaction.events.length).toBeGreaterThan(0);
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_backfill_failed");
+    expect(sidecar.state).toBe("partial_ready");
+    expect(sidecar.backfillReceipts).toEqual([]);
+  });
+
+  test("rejects a caught second callback invocation before it can call the port again", async () => {
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+    const transaction = new RecordingBackfillTransaction();
+    let eventsAfterFirstInvocation = 0;
+    let eventsAfterSecondInvocation = 0;
+    const error = await applyScopedBackfill(sidecar, {
+      async transaction(_scope, operation) {
+        const captured = await operation(transaction);
+        eventsAfterFirstInvocation = transaction.events.length;
+        try {
+          await operation(transaction);
+        } catch {
+          // A hostile port may swallow the second-invocation failure.
+        }
+        eventsAfterSecondInvocation = transaction.events.length;
+        return captured;
+      },
+    }).then(
+      () => {
+        throw new Error("expected repeated transaction callback to reject");
+      },
+      (caught) => caught as Error & { code?: string },
+    );
+
+    expect(eventsAfterFirstInvocation).toBeGreaterThan(0);
+    expect(eventsAfterSecondInvocation).toBe(eventsAfterFirstInvocation);
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_backfill_failed");
+    expect(sidecar.state).toBe("partial_ready");
+    expect(sidecar.backfillReceipts).toEqual([]);
+  });
+
+  test("rejects an unawaited callback before it can mint a receipt", async () => {
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+    let releaseRuntime!: () => void;
+    const runtimeGate = new Promise<void>((resolve) => {
+      releaseRuntime = resolve;
+    });
+    let callbackPromise: Promise<unknown> | undefined;
+    const transaction: MigrationBackfillTransaction = {
+      async ensureRuntime() {
+        await runtimeGate;
+        return "created";
+      },
+      async ensureAccount() {
+        return "created";
+      },
+      async ensureCrosswalk() {
+        return "created";
+      },
+      async recordEpoch() {
+        return "created";
+      },
+    };
+
+    const outcome = await applyScopedBackfill(sidecar, {
+      async transaction(_scope, operation) {
+        callbackPromise = operation(transaction);
+        return {
+          runtimes: { created: 1, adopted: 0 },
+          accounts: { created: 2, adopted: 0 },
+          crosswalks: { created: 2, adopted: 0 },
+          epoch: "created" as const,
+        };
+      },
+    }).then(
+      () => new Error("expected unawaited transaction callback to reject"),
+      (caught) => caught as Error & { code?: string },
+    );
+    releaseRuntime();
+    await callbackPromise;
+
+    expect(outcome).toBeInstanceOf(MigrationConflictError);
+    expect((outcome as Error & { code?: string }).code).toBe(
+      "migration_backfill_failed",
+    );
+    expect(sidecar.state).toBe("partial_ready");
+    expect(sidecar.backfillReceipts).toEqual([]);
+  });
+
+  test("rejects mutation of the captured callback result after it returns", async () => {
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+    const transaction = new RecordingBackfillTransaction();
+    const error = await applyScopedBackfill(sidecar, {
+      async transaction(_scope, operation) {
+        const captured = await operation(transaction);
+        captured.runtimes.created = 999;
+        return captured;
+      },
+    }).then(
+      () => {
+        throw new Error("expected captured result mutation to reject");
+      },
+      (caught) => caught as Error & { code?: string },
+    );
+
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_backfill_failed");
+    expect(sidecar.state).toBe("partial_ready");
+    expect(sidecar.backfillReceipts).toEqual([]);
+  });
+
+  test.each(["runtime", "account", "crosswalk", "epoch"] as const)(
+    "rejects invalid %s callback output before transaction commit",
+    async (point) => {
+      const port = new RecordingBackfillPort();
+      port.transactionImpl.invalidResultAt = point;
+      const plan = buildPlan();
+      const sidecar = transitionMigrationSidecar(
+        createMigrationSidecar(plan),
+        "partial_ready",
+        { gateEvidence: passingEvidence(plan) },
+      );
+
+      await expect(applyScopedBackfill(sidecar, port)).rejects.toThrow();
+      expect(port.committed).toBe(false);
+      expect(port.rolledBack).toBe(true);
+      expect(sidecar.state).toBe("partial_ready");
+      expect(sidecar.backfillReceipts).toEqual([]);
+    },
+  );
 });
 
 describe("durable sidecar WAL and repair", () => {
@@ -1984,6 +2184,173 @@ describe("durable sidecar WAL and repair", () => {
     expect(JSON.stringify(error)).not.toContain(sidecarPath);
     expect(JSON.stringify(error)).not.toContain(legacy);
   });
+
+  test.each([
+    ["sidecar", (sidecarPath: string) => sidecarPath],
+    ["sidecar staging", (sidecarPath: string) => `${sidecarPath}.tmp`],
+    ["WAL", (sidecarPath: string) => `${sidecarPath}.wal`],
+    ["WAL staging", (sidecarPath: string) => `${sidecarPath}.wal.tmp`],
+    ["writer lock", (sidecarPath: string) => `${sidecarPath}.lock`],
+  ] as const)(
+    "refuses every exact and physical v1 alias at the %s path without changing v1",
+    (_label, companionPath) => {
+      for (const aliasMode of [
+        "exact",
+        "parent-normalized",
+        "symlink",
+        "hard-link",
+      ] as const) {
+        const root = tempRoot();
+        const sidecarPath = join(root, "migration-v2.json");
+        const candidate = companionPath(sidecarPath);
+        const actualLegacyPath =
+          aliasMode === "exact" || aliasMode === "parent-normalized"
+            ? candidate
+            : join(root, `accounts-${aliasMode}.json`);
+        const configuredLegacyPath =
+          aliasMode === "parent-normalized"
+            ? join(
+                dirname(candidate),
+                "normalization-segment",
+                "..",
+                basename(candidate),
+              )
+            : actualLegacyPath;
+        const sentinel = `{"version":1,"aliasMode":"${aliasMode}"}\n`;
+        writeFileSync(actualLegacyPath, sentinel, { mode: 0o600 });
+        if (aliasMode === "symlink") {
+          symlinkSync(actualLegacyPath, candidate);
+        } else if (aliasMode === "hard-link") {
+          linkSync(actualLegacyPath, candidate);
+        }
+
+        const allCompanions = [
+          sidecarPath,
+          `${sidecarPath}.tmp`,
+          `${sidecarPath}.wal`,
+          `${sidecarPath}.wal.tmp`,
+          `${sidecarPath}.lock`,
+        ];
+        const companionSnapshots = new Map(
+          allCompanions.map((path) => {
+            if (!existsSync(path)) return [path, null] as const;
+            const stat = lstatSync(path);
+            return [
+              path,
+              {
+                device: stat.dev,
+                inode: stat.ino,
+                mode: stat.mode,
+                symbolicLink: stat.isSymbolicLink(),
+              },
+            ] as const;
+          }),
+        );
+        const before = statSync(actualLegacyPath);
+        const error = captureError(() => {
+          const store = new MigrationSidecarStore({
+            sidecarPath,
+            legacyStorePath: configuredLegacyPath,
+          });
+          store.install(createMigrationSidecar(buildPlan()));
+        });
+        const after = statSync(actualLegacyPath);
+
+        expect(error.code).toBe("migration_store_path_rejected");
+        expect(readFileSync(actualLegacyPath, "utf8")).toBe(sentinel);
+        expect(after.mode & 0o777).toBe(0o600);
+        expect(after.dev).toBe(before.dev);
+        expect(after.ino).toBe(before.ino);
+        for (const path of allCompanions) {
+          const snapshot = companionSnapshots.get(path);
+          if (snapshot === null) {
+            expect(existsSync(path)).toBe(false);
+            continue;
+          }
+          const current = lstatSync(path);
+          expect({
+            device: current.dev,
+            inode: current.ino,
+            mode: current.mode,
+            symbolicLink: current.isSymbolicLink(),
+          }).toEqual(snapshot);
+        }
+      }
+    },
+  );
+
+  test("refuses to use the v1 registry file as the sidecar directory", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(legacy, "migration-v2.json");
+    const sentinel = '{"version":1,"directoryCollision":true}\n';
+    writeFileSync(legacy, sentinel, { mode: 0o600 });
+    const before = statSync(legacy);
+
+    const error = captureError(
+      () =>
+        new MigrationSidecarStore({
+          sidecarPath,
+          legacyStorePath: legacy,
+        }),
+    );
+    const after = statSync(legacy);
+
+    expect(error.code).toBe("migration_store_path_rejected");
+    expect(readFileSync(legacy, "utf8")).toBe(sentinel);
+    expect(after.mode & 0o777).toBe(0o600);
+    expect(after.dev).toBe(before.dev);
+    expect(after.ino).toBe(before.ino);
+    expect(existsSync(sidecarPath)).toBe(false);
+  });
+
+  test.each([
+    ["sidecar", (sidecarPath: string) => sidecarPath],
+    ["sidecar staging", (sidecarPath: string) => `${sidecarPath}.tmp`],
+    ["WAL", (sidecarPath: string) => `${sidecarPath}.wal`],
+    ["WAL staging", (sidecarPath: string) => `${sidecarPath}.wal.tmp`],
+    ["writer lock", (sidecarPath: string) => `${sidecarPath}.lock`],
+  ] as const)(
+    "revalidates a post-construction v1 alias at the %s path before mutation",
+    (_label, companionPath) => {
+      for (const aliasMode of ["symlink", "hard-link"] as const) {
+        const root = tempRoot();
+        const legacy = join(root, `accounts-${aliasMode}.json`);
+        const sidecarPath = join(root, "migration-v2.json");
+        const candidate = companionPath(sidecarPath);
+        const sentinel = `{"version":1,"lateAlias":"${aliasMode}"}\n`;
+        writeFileSync(legacy, sentinel, { mode: 0o600 });
+        const store = new MigrationSidecarStore({
+          sidecarPath,
+          legacyStorePath: legacy,
+        });
+        if (aliasMode === "symlink") {
+          symlinkSync(legacy, candidate);
+        } else {
+          linkSync(legacy, candidate);
+        }
+        const before = statSync(legacy);
+        const candidateBefore = lstatSync(candidate);
+
+        const error = captureError(() =>
+          store.install(createMigrationSidecar(buildPlan())),
+        );
+        const after = statSync(legacy);
+        const candidateAfter = lstatSync(candidate);
+
+        expect(error.code).toBe("migration_store_path_rejected");
+        expect(readFileSync(legacy, "utf8")).toBe(sentinel);
+        expect(after.mode & 0o777).toBe(0o600);
+        expect(after.dev).toBe(before.dev);
+        expect(after.ino).toBe(before.ino);
+        expect(candidateAfter.dev).toBe(candidateBefore.dev);
+        expect(candidateAfter.ino).toBe(candidateBefore.ino);
+        expect(candidateAfter.isSymbolicLink()).toBe(
+          candidateBefore.isSymbolicLink(),
+        );
+      }
+    },
+  );
 
   test("refuses symlink ancestors before creating sidecar directories", () => {
     const root = tempRoot();

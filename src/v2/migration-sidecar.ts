@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   openSync,
@@ -12,8 +13,9 @@ import {
   rmSync,
   unlinkSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import { assertSafeWritePath } from "../lib/safe-path.js";
 import { AccountsError } from "../types.js";
@@ -35,6 +37,16 @@ const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const SAFE_TEXT_PATTERN = /^[^\0\r\n]+$/;
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const SIDECAR_MODE = 0o600;
+const NOFOLLOW_FLAG =
+  typeof fsConstants.O_NOFOLLOW === "number"
+    ? fsConstants.O_NOFOLLOW
+    : 0;
+const EXCLUSIVE_NOFOLLOW_WRITE_FLAGS =
+  fsConstants.O_CREAT |
+  fsConstants.O_EXCL |
+  fsConstants.O_WRONLY |
+  NOFOLLOW_FLAG;
+const NOFOLLOW_READ_FLAGS = fsConstants.O_RDONLY | NOFOLLOW_FLAG;
 
 const migrationOpaqueIdSchema = z
   .string()
@@ -2281,9 +2293,18 @@ async function applyScopedBackfillInternal(
 
   let result: MigrationBackfillCounts;
   try {
+    let callbackInvocationCount = 0;
+    let callbackCompleted = false;
+    let capturedResult: MigrationBackfillCounts | undefined;
     const transactionResult = await port.transaction(
       sidecar.plan.scope,
       async (transaction) => {
+        callbackInvocationCount += 1;
+        if (callbackInvocationCount !== 1) {
+          throw new MigrationConflictError(
+            "migration backfill transaction callback must run exactly once",
+          );
+        }
         const counts: MigrationBackfillCounts = {
           runtimes: { created: 0, adopted: 0 },
           accounts: { created: 0, adopted: 0 },
@@ -2341,10 +2362,24 @@ async function applyScopedBackfillInternal(
             cutoverEpoch: sidecar.plan.cutoverEpoch,
           }),
         );
-        return deepFreeze(migrationBackfillCountsSchema.parse(counts));
+        capturedResult = deepFreeze(
+          migrationBackfillCountsSchema.parse(counts),
+        );
+        callbackCompleted = true;
+        return capturedResult;
       },
     );
-    result = migrationBackfillCountsSchema.parse(transactionResult);
+    if (
+      callbackInvocationCount !== 1 ||
+      !callbackCompleted ||
+      capturedResult === undefined ||
+      transactionResult !== capturedResult
+    ) {
+      throw new MigrationConflictError(
+        "migration backfill transaction callback contract was violated",
+      );
+    }
+    result = capturedResult;
   } catch {
     throw new MigrationConflictError(
       "migration backfill port operation was rejected",
@@ -2575,13 +2610,48 @@ const migrationSidecarInstallOptionsSchema = z
   })
   .strict();
 
+interface MigrationSidecarStorePaths {
+  readonly directory: string;
+  readonly sidecar: string;
+  readonly sidecarStaging: string;
+  readonly wal: string;
+  readonly walStaging: string;
+  readonly lock: string;
+  readonly guarded: readonly string[];
+  readonly mutableEntries: readonly string[];
+}
+
+function deriveMigrationSidecarStorePaths(
+  sidecarPathInput: string,
+): MigrationSidecarStorePaths {
+  const sidecar = resolve(sidecarPathInput);
+  const directory = dirname(sidecar);
+  const sidecarStaging = `${sidecar}.tmp`;
+  const wal = `${sidecar}.wal`;
+  const walStaging = `${wal}.tmp`;
+  const lock = `${sidecar}.lock`;
+  const mutableEntries = Object.freeze([
+    sidecar,
+    sidecarStaging,
+    wal,
+    walStaging,
+    lock,
+  ]);
+  return Object.freeze({
+    directory,
+    sidecar,
+    sidecarStaging,
+    wal,
+    walStaging,
+    lock,
+    mutableEntries,
+    guarded: Object.freeze([directory, ...mutableEntries]),
+  });
+}
+
 export class MigrationSidecarStore {
-  readonly #sidecarPath: string;
+  readonly #paths: MigrationSidecarStorePaths;
   readonly #legacyStorePath: string;
-  readonly #directory: string;
-  readonly #walPath: string;
-  readonly #walTempPath: string;
-  readonly #lockPath: string;
   readonly #injectFailure?: (point: MigrationSidecarFailurePoint) => void;
   readonly #onDurabilityEvent?: (event: MigrationDurabilityEvent) => void;
 
@@ -2591,16 +2661,14 @@ export class MigrationSidecarStore {
       options,
       "migration_invalid_store_options",
     );
-    this.#sidecarPath = resolve(parsedOptions.sidecarPath);
+    this.#paths = deriveMigrationSidecarStorePaths(
+      parsedOptions.sidecarPath,
+    );
     this.#legacyStorePath = resolve(parsedOptions.legacyStorePath);
-    this.#directory = dirname(this.#sidecarPath);
-    this.#walPath = `${this.#sidecarPath}.wal`;
-    this.#walTempPath = `${this.#walPath}.tmp`;
-    this.#lockPath = `${this.#sidecarPath}.lock`;
     this.#injectFailure = parsedOptions.injectFailure;
     this.#onDurabilityEvent = parsedOptions.onDurabilityEvent;
     this.#storeBoundary("migration_store_initialization_failed", () =>
-      this.#assertDistinctLegacyStore(),
+      this.#assertGuardedPathsDistinctFromLegacy(),
     );
   }
 
@@ -2616,12 +2684,18 @@ export class MigrationSidecarStore {
 
   load(): MigrationSidecar | null {
     return this.#storeBoundary("migration_store_read_failed", () => {
-      if (!existsSync(this.#sidecarPath)) return null;
-      assertPrivateRegularFile(this.#sidecarPath, "migration sidecar");
+      this.#assertGuardedPathsDistinctFromLegacy();
+      if (!existsSync(this.#paths.sidecar)) return null;
+      assertPrivateRegularFile(
+        this.#paths.sidecar,
+        "migration sidecar",
+      );
+      const contents = readPrivateRegularFileNoFollow(
+        this.#paths.sidecar,
+        "migration sidecar",
+      ).contents;
       try {
-        return parseSidecar(
-          JSON.parse(readFileSync(this.#sidecarPath, "utf8")),
-        );
+        return parseSidecar(JSON.parse(contents));
       } catch (error) {
         if (error instanceof MigrationDriftError) throw error;
         throw new MigrationDriftError("could not parse migration sidecar", {
@@ -2649,8 +2723,11 @@ export class MigrationSidecarStore {
       const sidecar = parseSidecar(parsedSidecarInput);
       const expectedPreviousDigest = parsedOptions.expectedPreviousDigest;
       return this.#withLock(() => {
-        this.#assertDistinctLegacyStore();
-        if (existsSync(this.#walPath) || existsSync(this.#walTempPath)) {
+        this.#assertGuardedPathsDistinctFromLegacy();
+        if (
+          existsSync(this.#paths.wal) ||
+          existsSync(this.#paths.walStaging)
+        ) {
           throw new MigrationConflictError(
             "pending migration WAL must be repaired before another install",
           );
@@ -2712,21 +2789,24 @@ export class MigrationSidecarStore {
     return this.#storeBoundary("migration_store_repair_failed", () =>
       this.#withLock(() => {
         this.#prepareDirectory();
-        if (!existsSync(this.#walPath) && existsSync(this.#walTempPath)) {
+        if (
+          !existsSync(this.#paths.wal) &&
+          existsSync(this.#paths.walStaging)
+        ) {
           assertPrivateRegularFile(
-            this.#walTempPath,
+            this.#paths.walStaging,
             "migration WAL staging file",
           );
-          this.#readWal(this.#walTempPath);
-          renameSync(this.#walTempPath, this.#walPath);
-          chmodSync(this.#walPath, SIDECAR_MODE);
+          this.#readWal(this.#paths.walStaging);
+          this.#assertGuardedPathsDistinctFromLegacy();
+          renameSync(this.#paths.walStaging, this.#paths.wal);
           this.#emitDurabilityEvent("wal_rename");
-          fsyncDirectory(this.#directory);
+          fsyncDirectory(this.#paths.directory);
           this.#emitDurabilityEvent("wal_directory_fsync");
         }
-        if (!existsSync(this.#walPath)) return this.load();
+        if (!existsSync(this.#paths.wal)) return this.load();
 
-        const wal = this.#readWal(this.#walPath);
+        const wal = this.#readWal(this.#paths.wal);
         if (wal.previousDigest === null) {
           assertCanonicalPlannedGenesis(wal.nextSidecar);
         }
@@ -2772,28 +2852,34 @@ export class MigrationSidecarStore {
   }
 
   #prepareDirectory(): void {
-    this.#assertDistinctLegacyStore();
-    assertSafeWritePath(this.#sidecarPath, {
-      mustStayUnder: this.#directory,
+    this.#assertGuardedPathsDistinctFromLegacy();
+    assertSafeWritePath(this.#paths.sidecar, {
+      mustStayUnder: this.#paths.directory,
     });
-    assertSafeWritePath(this.#walPath, { mustStayUnder: this.#directory });
-    assertSafeWritePath(this.#walTempPath, {
-      mustStayUnder: this.#directory,
+    assertSafeWritePath(this.#paths.sidecarStaging, {
+      mustStayUnder: this.#paths.directory,
     });
-    assertSafeWritePath(this.#lockPath, { mustStayUnder: this.#directory });
+    assertSafeWritePath(this.#paths.wal, {
+      mustStayUnder: this.#paths.directory,
+    });
+    assertSafeWritePath(this.#paths.walStaging, {
+      mustStayUnder: this.#paths.directory,
+    });
+    assertSafeWritePath(this.#paths.lock, {
+      mustStayUnder: this.#paths.directory,
+    });
+    this.#assertGuardedPathsDistinctFromLegacy();
   }
 
-  #assertDistinctLegacyStore(): void {
-    if (
-      this.#sidecarPath === this.#legacyStorePath ||
-      pathsReferToSameFile(this.#sidecarPath, this.#legacyStorePath)
-    ) {
+  #assertGuardedPathsDistinctFromLegacy(): void {
+    for (const candidate of this.#paths.guarded) {
+      if (!pathsReferToSameFile(candidate, this.#legacyStorePath)) continue;
       throw new MigrationConflictError(
-        "migration sidecar path must not be accounts.json or the configured v1 registry path",
+        "migration sidecar storage must not alias the configured v1 registry path",
         {
           code: "migration_store_path_rejected",
           references: [
-            diagnosticReference("root.path", this.#sidecarPath),
+            diagnosticReference("root.path", candidate),
           ],
         },
       );
@@ -2802,10 +2888,10 @@ export class MigrationSidecarStore {
 
   #writeWal(wal: MigrationWal): void {
     this.#writeDurableFile(
-      this.#walPath,
+      this.#paths.wal,
       JSON.stringify(wal, null, 2) + "\n",
       "wal",
-      this.#walTempPath,
+      this.#paths.walStaging,
       true,
     );
   }
@@ -2815,10 +2901,10 @@ export class MigrationSidecarStore {
     options: { allowFailureInjection?: boolean } = {},
   ): void {
     this.#writeDurableFile(
-      this.#sidecarPath,
+      this.#paths.sidecar,
       JSON.stringify(sidecar, null, 2) + "\n",
       "sidecar",
-      `${this.#sidecarPath}.tmp`,
+      this.#paths.sidecarStaging,
       options.allowFailureInjection ?? true,
     );
   }
@@ -2830,11 +2916,17 @@ export class MigrationSidecarStore {
     temp: string,
     allowFailureInjection: boolean,
   ): void {
+    this.#assertGuardedPathsDistinctFromLegacy();
     rmSync(temp, { force: true });
+    this.#assertGuardedPathsDistinctFromLegacy();
     let descriptor: number | undefined;
     let completed = false;
     try {
-      descriptor = openSync(temp, "wx", SIDECAR_MODE);
+      descriptor = openSync(
+        temp,
+        EXCLUSIVE_NOFOLLOW_WRITE_FLAGS,
+        SIDECAR_MODE,
+      );
       writeFileSync(descriptor, contents, { encoding: "utf8" });
       fsyncSync(descriptor);
       this.#emitDurabilityEvent(`${kind}_file_fsync`);
@@ -2843,13 +2935,13 @@ export class MigrationSidecarStore {
       }
       closeSync(descriptor);
       descriptor = undefined;
+      this.#assertGuardedPathsDistinctFromLegacy();
       renameSync(temp, target);
-      chmodSync(target, SIDECAR_MODE);
       this.#emitDurabilityEvent(`${kind}_rename`);
       if (allowFailureInjection) {
         this.#injectFailurePoint(`after_${kind}_rename`);
       }
-      fsyncDirectory(this.#directory);
+      fsyncDirectory(this.#paths.directory);
       this.#emitDurabilityEvent(`${kind}_directory_fsync`);
       if (allowFailureInjection) {
         this.#injectFailurePoint(`after_${kind}_directory_fsync`);
@@ -2857,18 +2949,23 @@ export class MigrationSidecarStore {
       completed = true;
     } finally {
       if (descriptor !== undefined) closeSync(descriptor);
-      if (completed) rmSync(temp, { force: true });
+      if (completed) {
+        this.#assertGuardedPathsDistinctFromLegacy();
+        rmSync(temp, { force: true });
+      }
     }
   }
 
   #finishWal(options: { allowFailureInjection?: boolean } = {}): void {
     const allowFailureInjection = options.allowFailureInjection ?? true;
     if (allowFailureInjection) this.#injectFailurePoint("before_wal_remove");
-    if (existsSync(this.#walPath)) unlinkSync(this.#walPath);
-    rmSync(this.#walTempPath, { force: true });
+    this.#assertGuardedPathsDistinctFromLegacy();
+    if (existsSync(this.#paths.wal)) unlinkSync(this.#paths.wal);
+    this.#assertGuardedPathsDistinctFromLegacy();
+    rmSync(this.#paths.walStaging, { force: true });
     this.#emitDurabilityEvent("wal_remove");
     if (allowFailureInjection) this.#injectFailurePoint("after_wal_remove");
-    fsyncDirectory(this.#directory);
+    fsyncDirectory(this.#paths.directory);
     this.#emitDurabilityEvent("cleanup_directory_fsync");
   }
 
@@ -2895,9 +2992,16 @@ export class MigrationSidecarStore {
   }
 
   #readWal(path: string): MigrationWal {
+    this.#assertGuardedPathsDistinctFromLegacy();
     assertPrivateRegularFile(path, "migration WAL");
+    const contents = readPrivateRegularFileNoFollow(
+      path,
+      "migration WAL",
+    ).contents;
     try {
-      const wal = migrationWalSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+      const wal = migrationWalSchema.parse(
+        JSON.parse(contents),
+      );
       const sidecar = parseSidecar(wal.nextSidecar);
       if (
         sidecar.plan.id !== wal.planId ||
@@ -2922,9 +3026,7 @@ export class MigrationSidecarStore {
     try {
       return operation();
     } finally {
-      closeSync(descriptor);
-      unlinkSync(this.#lockPath);
-      fsyncDirectory(this.#directory);
+      this.#releaseLock(descriptor);
     }
   }
 
@@ -2932,15 +3034,18 @@ export class MigrationSidecarStore {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       let descriptor: number | undefined;
       try {
-        descriptor = openSync(this.#lockPath, "wx", SIDECAR_MODE);
+        this.#assertGuardedPathsDistinctFromLegacy();
+        descriptor = openSync(
+          this.#paths.lock,
+          EXCLUSIVE_NOFOLLOW_WRITE_FLAGS,
+          SIDECAR_MODE,
+        );
         writeFileSync(descriptor, `${process.pid}\n`, { encoding: "utf8" });
         fsyncSync(descriptor);
         return descriptor;
       } catch (error) {
         if (descriptor !== undefined) {
-          closeSync(descriptor);
-          rmSync(this.#lockPath, { force: true });
-          fsyncDirectory(this.#directory);
+          this.#releaseLock(descriptor);
         }
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         if (attempt === 0 && this.#removeDeadWriterLock()) continue;
@@ -2952,19 +3057,48 @@ export class MigrationSidecarStore {
     throw new MigrationConflictError("could not acquire the v2 migration writer lock");
   }
 
+  #releaseLock(descriptor: number): void {
+    const openedStat = fstatSync(descriptor);
+    closeSync(descriptor);
+    this.#assertGuardedPathsDistinctFromLegacy();
+    const currentStat = lstatIfExists(this.#paths.lock);
+    if (
+      !currentStat ||
+      currentStat.dev !== openedStat.dev ||
+      currentStat.ino !== openedStat.ino
+    ) {
+      throw new MigrationConflictError(
+        "migration writer lock identity changed before release",
+      );
+    }
+    unlinkSync(this.#paths.lock);
+    fsyncDirectory(this.#paths.directory);
+  }
+
   #removeDeadWriterLock(): boolean {
-    assertPrivateRegularFile(this.#lockPath, "migration writer lock");
-    const observedStat = lstatSync(this.#lockPath);
-    const rawPid = readFileSync(this.#lockPath, "utf8").trim();
+    this.#assertGuardedPathsDistinctFromLegacy();
+    assertPrivateRegularFile(
+      this.#paths.lock,
+      "migration writer lock",
+    );
+    const observed = readPrivateRegularFileNoFollow(
+      this.#paths.lock,
+      "migration writer lock",
+    );
+    const rawPid = observed.contents.trim();
     if (!/^[1-9][0-9]*$/.test(rawPid)) return false;
     const pid = Number(rawPid);
     if (!Number.isSafeInteger(pid) || processIsAlive(pid)) return false;
-    const currentStat = lstatSync(this.#lockPath);
-    if (observedStat.dev !== currentStat.dev || observedStat.ino !== currentStat.ino) {
+    this.#assertGuardedPathsDistinctFromLegacy();
+    const currentStat = lstatSync(this.#paths.lock);
+    if (
+      observed.stat.dev !== currentStat.dev ||
+      observed.stat.ino !== currentStat.ino
+    ) {
       return false;
     }
-    unlinkSync(this.#lockPath);
-    fsyncDirectory(this.#directory);
+    unlinkSync(this.#paths.lock);
+    fsyncDirectory(this.#paths.directory);
     return true;
   }
 
@@ -2986,7 +3120,7 @@ export class MigrationSidecarStore {
         {
           code: pathRejected ? "migration_store_path_rejected" : code,
           references: [
-            diagnosticReference("root.path", this.#sidecarPath),
+            diagnosticReference("root.path", this.#paths.sidecar),
           ],
         },
       );
@@ -3117,11 +3251,56 @@ function assertReceiptPrefix(
 }
 
 function pathsReferToSameFile(left: string, right: string): boolean {
-  if (!existsSync(left) || !existsSync(right)) return false;
-  const leftStat = lstatSync(left);
-  const rightStat = lstatSync(right);
-  if (leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino) return true;
-  return realpathSync(left) === realpathSync(right);
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  if (normalizedLeft === normalizedRight) return true;
+
+  const leftStat = lstatIfExists(normalizedLeft);
+  const rightStat = lstatIfExists(normalizedRight);
+  if (
+    leftStat &&
+    rightStat &&
+    leftStat.dev === rightStat.dev &&
+    leftStat.ino === rightStat.ino
+  ) {
+    return true;
+  }
+
+  const physicalLeft = resolvePhysicalPath(normalizedLeft);
+  const physicalRight = resolvePhysicalPath(normalizedRight);
+  return (
+    physicalLeft !== undefined &&
+    physicalRight !== undefined &&
+    physicalLeft === physicalRight
+  );
+}
+
+function lstatIfExists(path: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function resolvePhysicalPath(path: string): string | undefined {
+  let cursor = resolve(path);
+  const missingSegments: string[] = [];
+  for (;;) {
+    const stat = lstatIfExists(cursor);
+    if (stat) {
+      try {
+        return resolve(realpathSync(cursor), ...missingSegments);
+      } catch {
+        return undefined;
+      }
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) return undefined;
+    missingSegments.unshift(basename(cursor));
+    cursor = parent;
+  }
 }
 
 function processIsAlive(pid: number): boolean {
@@ -3135,11 +3314,38 @@ function processIsAlive(pid: number): boolean {
 
 function assertPrivateRegularFile(path: string, label: string): void {
   const stat = lstatSync(path);
+  assertPrivateRegularStat(stat, label);
+}
+
+function assertPrivateRegularStat(
+  stat: Stats,
+  label: string,
+): void {
   if (!stat.isFile() || stat.isSymbolicLink()) {
     throw new AccountsError(`${label} must be a regular non-symlink file`);
   }
   if ((stat.mode & 0o777) !== SIDECAR_MODE) {
     throw new AccountsError(`${label} must be mode 0600`);
+  }
+}
+
+function readPrivateRegularFileNoFollow(
+  path: string,
+  label: string,
+): Readonly<{
+  contents: string;
+  stat: Stats;
+}> {
+  const descriptor = openSync(path, NOFOLLOW_READ_FLAGS);
+  try {
+    const stat = fstatSync(descriptor);
+    assertPrivateRegularStat(stat, label);
+    return {
+      contents: readFileSync(descriptor, "utf8"),
+      stat,
+    };
+  } finally {
+    closeSync(descriptor);
   }
 }
 

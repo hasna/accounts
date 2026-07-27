@@ -129,15 +129,31 @@ transaction does the function return the receipt required for the matching
 `*_applied` transition. No PostgreSQL schema, migration file, or HTTP route is
 added by this sidecar.
 
+The port must invoke the callback exactly once, await it as part of the
+transaction, and return that exact callback result. Skipping or repeating the
+callback, swallowing a second-call failure, resolving the transaction before
+the callback completes, or substituting even a schema-valid result fails
+closed. The callback result is validated and deeply frozen before it leaves the
+callback; the receipt is derived only from that captured value, never from a
+port-supplied replacement.
+
 Runtime definitions must be identical for every record sharing a runtime ID.
 The crosswalk retains source authority, authority ID, legacy tool/name, and the
 frozen account, runtime, and binding IDs.
 
 ## Durable file contract and repair
 
-`MigrationSidecarStore` must use a path distinct from the v1 registry, including
-hard-link or symlink aliases. Existing sidecar and WAL files must be regular,
-non-symlink files with mode `0600`.
+`MigrationSidecarStore` derives one immutable path set: the sidecar, sidecar
+staging file, WAL, WAL staging file, writer lock, and their containing
+directory. Every path in that set must be distinct from the configured v1
+registry by normalized absolute path and, when the paths exist, resolved path
+plus device/inode identity. Exact, parent-normalized, hard-link, symlink, and
+post-construction aliases fail closed before store mutation. The checks are
+repeated at write, rename, cleanup, repair, and lock boundaries, and file opens
+use no-follow flags where the platform supports them. Existing sidecar and WAL
+files must be regular, non-symlink files with mode `0600`. The store does not
+use a separate mutable backup path; backup and restore artifacts remain
+evidence-only inputs to the preflight plan.
 
 All configured store paths and callbacks are ECMAScript-private runtime state,
 not enumerable properties. Stringification returns only the schema version and
