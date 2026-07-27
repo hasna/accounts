@@ -185,12 +185,21 @@ entries, and unsafe object shapes cannot cross that output boundary. Provider
 records are limited to known agent kinds, malformed PIDs are discarded before
 process accounting, process scans are bound to the requested tool, and human
 rendering reads only validated scalar fields without coercing provider values.
-Configured absolute executable paths are normalized to their basename only at
-the process-matching seam, including direct and Node/Bun-wrapped processes.
+Configured and observed executable paths must match in full whenever both are
+available; neither direct nor Node/Bun-wrapped processes can borrow the identity
+of a different or unresolved same-named executable. Versioned native builds
+require an exact `<tool>/versions/<semver>` path suffix, and exact helper
+options plus leading daemon/agents subcommands are excluded without substring
+matching. Interpreter wrappers use separate Node and Bun option schemas,
+recognize only documented option arities, and fail closed on unknown or
+execution-mode options before accepting a later executable-shaped argument.
 Provider projection is iterative and bounded by explicit depth, object, and
 entry limits; truncated branches use a deterministic `[TRUNCATED]` marker.
-Pseudo-TTY JSON extraction scans input once, bounds nesting, candidate size,
-and fallback attempts, and never retries from every opening bracket.
+Pseudo-TTY JSON extraction removes CSI/OSC terminal controls before a bounded
+single-pass candidate scan. It preserves the earliest possible root while
+rolling a fixed number of fallback candidates, recovers a later agent-record
+array after malformed or unterminated wrapper noise, enforces the candidate
+limit in UTF-8 bytes, and never retries from every opening bracket.
 
 Supervisor arguments remain raw only in memory long enough to spawn the
 provider child. State files, legacy-state reads, switch responses, and

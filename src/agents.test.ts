@@ -37,6 +37,42 @@ test("extractJsonArray strips pty and ANSI noise around the array", () => {
   expect(extractJsonArray(raw)).toEqual([{ pid: 42, name: "a [b] c" }, { kind: "background" }]);
 });
 
+test("extractJsonArray ignores bracketed ANSI OSC payloads before agent data", () => {
+  const raw = '\u001b]0;status [1]\u0007\r\n[{"pid":42,"kind":"background"}]\r\n';
+  expect(extractJsonArray(raw)).toEqual([{ pid: 42, kind: "background" }]);
+});
+
+test("extractJsonArray recovers agent data after an unterminated OSC line", () => {
+  const raw = '\u001b]0;broken [1]\n[{"pid":42,"kind":"background"}]\n';
+  expect(extractJsonArray(raw)).toEqual([{ pid: 42, kind: "background" }]);
+});
+
+test("extractJsonArray resumes after CAN or SUB cancels a terminal control", () => {
+  for (const cancel of ["\u0018", "\u001a"]) {
+    expect(
+      extractJsonArray(`\u001b[31${cancel}[{"pid":42,"kind":"background"}]`),
+      `CSI ${cancel.charCodeAt(0)}`,
+    ).toEqual([{ pid: 42, kind: "background" }]);
+    expect(
+      extractJsonArray(`\u001b]0;broken${cancel}[{"pid":42,"kind":"background"}]`),
+      `OSC ${cancel.charCodeAt(0)}`,
+    ).toEqual([{ pid: 42, kind: "background" }]);
+  }
+});
+
+test("extractJsonArray keeps BEL-delimited bracket data inside DCS-family controls", () => {
+  const controls = ["\u001bP", "\u001bX", "\u001b^", "\u001b_", "\u0090", "\u0098", "\u009e", "\u009f"];
+  for (const control of controls) {
+    const terminator = control.startsWith("\u001b") ? "\u001b\\" : "\u009c";
+    const raw =
+      `${control}ignored\u0007[{"pid":1,"kind":"background"}]${terminator}\n` +
+      '[{"pid":42,"kind":"background"}]\n';
+    expect(extractJsonArray(raw), JSON.stringify(control)).toEqual([
+      { pid: 42, kind: "background" },
+    ]);
+  }
+});
+
 test("extractJsonArray handles brackets inside strings and escapes", () => {
   const raw = 'noise [ {"name": "x\\"]y", "cwd": "/a[b"} ] trailing';
   expect(extractJsonArray(raw)).toEqual([{ name: 'x"]y', cwd: "/a[b" }]);
@@ -50,6 +86,46 @@ test("extractJsonArray recovers a bounded inner candidate from malformed wrapper
   expect(
     extractJsonArray('noise [broken wrapper [{"pid":7,"kind":"background"}] tail'),
   ).toEqual([{ pid: 7, kind: "background" }]);
+});
+
+test("extractJsonArray skips non-record arrays before agent data", () => {
+  expect(
+    extractJsonArray('progress [1]\n[{"pid":7,"kind":"background"}]'),
+  ).toEqual([{ pid: 7, kind: "background" }]);
+});
+
+test("extractJsonArray prefers later agent records over an empty noise array", () => {
+  expect(
+    extractJsonArray('progress []\n[{"pid":7,"kind":"background"}]'),
+  ).toEqual([{ pid: 7, kind: "background" }]);
+  expect(extractJsonArray("[]")).toEqual([]);
+});
+
+test("extractJsonArray recovers after an unterminated string in malformed wrapper noise", () => {
+  expect(
+    extractJsonArray('noise [broken "unterminated [{"pid":7,"kind":"background"}] tail'),
+  ).toEqual([{ pid: 7, kind: "background" }]);
+});
+
+test("extractJsonArray reserves a rolling candidate slot for later agent data", () => {
+  const agents = '[{"pid":7,"kind":"background"}]';
+  expect(extractJsonArray(`${"[".repeat(32)}broken ${agents}`)).toEqual([
+    { pid: 7, kind: "background" },
+  ]);
+});
+
+test("extractJsonArray preserves a valid root across more than 32 nested arrays", () => {
+  let nested: unknown = "leaf";
+  for (let depth = 0; depth < 40; depth++) nested = [nested];
+  const payload = [{ pid: 7, kind: "background", nested }];
+  expect(extractJsonArray(JSON.stringify(payload))).toEqual(payload);
+});
+
+test("extractJsonArray enforces its candidate limit in UTF-8 bytes", () => {
+  const oversized = `[{"kind":"background","name":"${"😀".repeat(300_000)}"}]`;
+  expect(oversized.length).toBeLessThan(1024 * 1024);
+  expect(Buffer.byteLength(oversized, "utf8")).toBeGreaterThan(1024 * 1024);
+  expect(extractJsonArray(oversized) === undefined).toBe(true);
 });
 
 test("extractJsonArray stays linear on dense malformed bracket noise", () => {
@@ -284,10 +360,25 @@ test("isToolSessionCommand matches real session processes and rejects helpers", 
     ["/home/u/.local/bin/claude --resume abc --allow-dangerously-skip-permissions", true],
     ["node /home/u/.local/bin/claude --dangerously-skip-permissions", true],
     ["/home/u/.local/share/claude/versions/2.1.170 --session-id abc", true],
+    ["/tmp/not-claude/claude/versions/helper --session-id abc", false],
     ["/home/u/.local/share/claude/versions/2.1.170 --bg-pty-host /tmp/x.sock 79 74", false],
     ["/home/u/.local/share/claude/versions/2.1.170 --bg-spare /tmp/y.sock", false],
     ["/home/u/.local/bin/claude daemon run --origin transient", false],
+    ["/home/u/.local/bin/claude --debug daemon run --origin transient", false],
     ["claude agents --json", false],
+    ["claude --config /tmp agents --json", false],
+    ["claude --debug-file /dev/null agents --json", false],
+    ["claude --debug-file /dev/null daemon run", false],
+    ["claude --debug api daemon run", false],
+    ["claude -r abc agents --json", false],
+    ["claude --effort high agents --json", false],
+    ['claude --json-schema "{}" agents --json', false],
+    ["claude --max-budget-usd 1 agents --json", false],
+    ["claude -p explain--bg-pty-host-behavior", true],
+    ["claude --bg-sparely user-data", true],
+    ["claude -- --bg-spare", true],
+    ["claude --system-prompt --bg-spare --resume abc", true],
+    ["claude --debug --bg-spare /tmp/y.sock", false],
     ["node /home/u/.local/bin/accounts login acct1 --tool claude", false],
     ["/bin/bash -c source /home/u/profiles/claude/acct1/shell-snapshots/snap.sh", false],
     ["script -qefc claude agents --json /dev/null", false],
@@ -303,12 +394,88 @@ test("isToolSessionCommand matches absolute tool bins and interpreter wrappers",
     `${customBin} --resume abc`,
     `node ${customBin} --resume abc`,
     `bun ${customBin} --resume abc`,
+    `node --no-warnings ${customBin} --resume abc`,
+    `node --experimental-loader /dev/null ${customBin} --resume abc`,
+    `node --require=/dev/null ${customBin} --resume abc`,
+    `node -C custom ${customBin} --resume abc`,
+    `node --conditions=custom ${customBin} --resume abc`,
+    `node --env-file-if-exists /tmp/nope ${customBin} --resume abc`,
+    `node --debug-port 9230 ${customBin} --resume abc`,
+    `node --inspect ${customBin} --resume abc`,
+    `node --inspect=9230 ${customBin} --resume abc`,
+    `nodejs ${customBin} --resume abc`,
+    `bun --preload /dev/null ${customBin} --resume abc`,
+    `bun -r./src/lib/tools.ts ${customBin} --resume abc`,
+    `bun --cwd /tmp ${customBin} --resume abc`,
+    `bun -c=/dev/null ${customBin} --resume abc`,
+    `bun --cpu-prof-name p.cpuprofile ${customBin} --resume abc`,
   ]) {
     expect(isToolSessionCommand(command, customBin), command).toBe(true);
   }
+  for (const command of [
+    "/tmp/other/custom-agent --resume abc",
+    "node /tmp/other/custom-agent --resume abc",
+    "bun /tmp/other/custom-agent --resume abc",
+    `node --require ${customBin} /tmp/other-entrypoint.js`,
+    `node --inspect /dev/null ${customBin}`,
+    `node --inspect-brk /dev/null ${customBin}`,
+    `node --inspect-wait /dev/null ${customBin}`,
+    `node -e "setTimeout(() => {}, 10)" ${customBin}`,
+    `node --eval="" ${customBin}`,
+    `bun -e "setTimeout(() => {}, 10)" ${customBin}`,
+    `bun --eval="" ${customBin}`,
+    `node --run=no-such-script ${customBin}`,
+    `node --future-option=value ${customBin}`,
+    `node -r./mod.cjs ${customBin}`,
+    `node -r=./mod.cjs ${customBin}`,
+    `node -C/tmp ${customBin}`,
+    `node -C=custom ${customBin}`,
+    `node -random ${customBin}`,
+    `node --cwd /tmp ${customBin}`,
+    `node --smol ${customBin}`,
+    `node --preload /dev/null ${customBin}`,
+    `node --input-type module ${customBin}`,
+    `node --experimental-sea-config /dev/null ${customBin}`,
+    `node --build-snapshot-config /dev/null ${customBin}`,
+    `bun -C custom ${customBin}`,
+    `bun --experimental-loader /dev/null ${customBin}`,
+    `bun --filter no-match ${customBin}`,
+    `bun --workspaces ${customBin}`,
+    `bun --parallel ${customBin}`,
+    `bun --sequential ${customBin}`,
+    `bun --shell bun ${customBin}`,
+    "node --env-file-if-exists /dev/null /tmp/other-entrypoint.js",
+    "bun --cpu-prof-name /dev/null /tmp/other-entrypoint.js",
+  ]) {
+    expect(isToolSessionCommand(command, customBin), command).toBe(false);
+  }
+  expect(
+    isToolSessionCommand(
+      "node --env-file-if-exists /dev/null /tmp/other-entrypoint.js",
+      "/dev/null",
+    ),
+  ).toBe(false);
+  expect(
+    isToolSessionCommand(
+      "bun --cpu-prof-name /dev/null /tmp/other-entrypoint.js",
+      "/dev/null",
+    ),
+  ).toBe(false);
+  expect(isToolSessionCommand("custom-agent --resume abc", customBin)).toBe(false);
+  expect(isToolSessionCommand("node custom-agent --resume abc", customBin)).toBe(false);
 
   const codexAppBin = "/Applications/Codex.app/Contents/MacOS/Codex";
   expect(isToolSessionCommand(`${codexAppBin} --user-data-dir=/safe`, codexAppBin)).toBe(true);
+
+  const spacedBin = "/Applications/Custom Agent.app/Contents/MacOS/custom-agent";
+  for (const command of [
+    `${spacedBin} --resume abc`,
+    `"${spacedBin}" --resume abc`,
+    `node ${spacedBin} --resume abc`,
+    `bun "${spacedBin}" --resume abc`,
+  ]) {
+    expect(isToolSessionCommand(command, spacedBin), command).toBe(true);
+  }
 });
 
 test("backgroundOnly does not leak interactive sessions into (untracked)", () => {

@@ -33,6 +33,18 @@ let keychainState: string;
 let keychainLock: string;
 let securityBin: string;
 
+const WINDOWS_CLEANUP_RETRIES = 20;
+const WINDOWS_CLEANUP_RETRY_DELAY_MS = 100;
+
+function removeTestDirectory(path: string): void {
+  rmSync(path, {
+    recursive: true,
+    force: true,
+    maxRetries: WINDOWS_CLEANUP_RETRIES,
+    retryDelay: WINDOWS_CLEANUP_RETRY_DELAY_MS,
+  });
+}
+
 beforeAll(() => {
   binDir = mkdtempSync(join(tmpdir(), "accounts-claude-bin-"));
   securityBin = writeExecutable("security", fakeSecuritySource());
@@ -49,12 +61,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(home, { recursive: true, force: true });
-  rmSync(launchCwd, { recursive: true, force: true });
+  removeTestDirectory(home);
+  removeTestDirectory(launchCwd);
 });
 
 afterAll(() => {
-  rmSync(binDir, { recursive: true, force: true });
+  removeTestDirectory(binDir);
 });
 
 function writeExecutable(name: string, source: string): string {
@@ -458,7 +470,7 @@ process.exit(29);
     expect(entries(batchLog)).toHaveLength(1);
     expect(existsSync(injectionMarker)).toBe(false);
   } finally {
-    rmSync(batchBin, { recursive: true, force: true });
+    removeTestDirectory(batchBin);
   }
 });
 
@@ -621,7 +633,7 @@ test("immediate crash and missing executable are returned as nonzero diagnostics
     expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });
     expect(existsSync(keychainLock)).toBe(false);
   } finally {
-    rmSync(emptyPath, { recursive: true, force: true });
+    removeTestDirectory(emptyPath);
   }
 });
 

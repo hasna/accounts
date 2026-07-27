@@ -97,15 +97,126 @@ const MAX_AGENT_JSON_NESTING = 32_768;
 const MAX_AGENT_JSON_FALLBACK_CANDIDATES = 32;
 const MAX_AGENT_JSON_CANDIDATE_BYTES = 1024 * 1024;
 
+interface AgentJsonCandidate {
+  start: number;
+  depth: number;
+  inString: boolean;
+  escaped: boolean;
+}
+
+function stripTerminalControlSequences(raw: string): string {
+  const chunks: string[] = [];
+  let plainStart = 0;
+  let index = 0;
+
+  const appendPlain = (end: number): void => {
+    if (end > plainStart) chunks.push(raw.slice(plainStart, end));
+  };
+
+  const consumeStringControl = (
+    start: number,
+    options: { allowBell: boolean; recoverAtNewline: boolean },
+  ): number => {
+    let cursor = start;
+    while (cursor < raw.length) {
+      if (raw[cursor] === "\u0018" || raw[cursor] === "\u001a") return cursor + 1;
+      if (options.allowBell && raw[cursor] === "\u0007") return cursor + 1;
+      if (raw[cursor] === "\u009c") return cursor + 1;
+      if (raw[cursor] === "\u001b" && raw[cursor + 1] === "\\") return cursor + 2;
+      if (options.recoverAtNewline && (raw[cursor] === "\n" || raw[cursor] === "\r")) {
+        return cursor;
+      }
+      cursor++;
+    }
+    return raw.length;
+  };
+
+  const consumeCsi = (start: number): number => {
+    let cursor = start;
+    while (cursor < raw.length) {
+      const code = raw.charCodeAt(cursor);
+      cursor++;
+      if (code === 0x18 || code === 0x1a) break;
+      if (code >= 0x40 && code <= 0x7e) break;
+    }
+    return cursor;
+  };
+
+  while (index < raw.length) {
+    const char = raw[index]!;
+    if (
+      char !== "\u001b" &&
+      char !== "\u0090" &&
+      char !== "\u0098" &&
+      char !== "\u009b" &&
+      char !== "\u009d" &&
+      char !== "\u009e" &&
+      char !== "\u009f"
+    ) {
+      index++;
+      continue;
+    }
+
+    appendPlain(index);
+    if (char === "\u009b") {
+      index = consumeCsi(index + 1);
+    } else if (char === "\u009d") {
+      index = consumeStringControl(index + 1, {
+        allowBell: true,
+        recoverAtNewline: true,
+      });
+    } else if (
+      char === "\u0090" ||
+      char === "\u0098" ||
+      char === "\u009e" ||
+      char === "\u009f"
+    ) {
+      index = consumeStringControl(index + 1, {
+        allowBell: false,
+        recoverAtNewline: false,
+      });
+    } else {
+      const command = raw[index + 1];
+      if (command === "[") index = consumeCsi(index + 2);
+      else if (command === "]") {
+        index = consumeStringControl(index + 2, {
+          allowBell: true,
+          recoverAtNewline: true,
+        });
+      } else if (command === "P" || command === "X" || command === "^" || command === "_") {
+        index = consumeStringControl(index + 2, {
+          allowBell: false,
+          recoverAtNewline: false,
+        });
+      } else {
+        index = Math.min(index + 2, raw.length);
+      }
+    }
+    plainStart = index;
+  }
+
+  appendPlain(raw.length);
+  return chunks.join("").replaceAll("\r", "");
+}
+
 function parseAgentArrayCandidate(
   text: string,
   start: number,
   end: number,
 ): unknown[] | undefined {
-  if (end - start > MAX_AGENT_JSON_CANDIDATE_BYTES) return undefined;
+  const candidate = text.slice(start, end);
+  if (Buffer.byteLength(candidate, "utf8") > MAX_AGENT_JSON_CANDIDATE_BYTES) {
+    return undefined;
+  }
   try {
-    const parsed = JSON.parse(text.slice(start, end)) as unknown;
-    return Array.isArray(parsed) ? parsed : undefined;
+    const parsed = JSON.parse(candidate) as unknown;
+    if (
+      !Array.isArray(parsed) ||
+      !parsed.every((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry))
+    ) {
+      return undefined;
+    }
+    return parsed;
   } catch {
     return undefined;
   }
@@ -117,59 +228,63 @@ function parseAgentArrayCandidate(
  * under `script` and the JSON arrives surrounded by control sequences).
  */
 export function extractJsonArray(raw: string): unknown[] | undefined {
-  const text = raw.replace(/\r/g, "");
-  const starts: number[] = [];
-  let fallbacks: Array<[number, number]> = [];
-  let inString = false;
-  let escaped = false;
-
-  const parseFallbacks = (): unknown[] | undefined => {
-    fallbacks.sort((left, right) => left[0] - right[0]);
-    for (const [start, end] of fallbacks) {
-      const parsed = parseAgentArrayCandidate(text, start, end);
-      if (parsed) return parsed;
-    }
-    return undefined;
-  };
+  const text = stripTerminalControlSequences(raw);
+  const active: AgentJsonCandidate[] = [];
+  let completed: { start: number; parsed: unknown[] } | undefined;
+  let emptyCompleted: { start: number; parsed: unknown[] } | undefined;
 
   for (let index = 0; index < text.length; index++) {
     const char = text[index]!;
-    if (starts.length > 0 && inString) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === '"') inString = false;
-      continue;
-    }
-    if (starts.length > 0 && char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === "[") {
-      if (text[index - 1] === "\u001b") continue;
-      if (starts.length >= MAX_AGENT_JSON_NESTING) {
-        starts.length = 0;
-        fallbacks = [];
-        inString = false;
-        escaped = false;
+    for (let candidateIndex = active.length - 1; candidateIndex >= 0; candidateIndex--) {
+      const candidate = active[candidateIndex]!;
+      if (index - candidate.start > MAX_AGENT_JSON_CANDIDATE_BYTES) {
+        active.splice(candidateIndex, 1);
+        continue;
       }
-      starts.push(index);
-      continue;
-    }
-    if (char !== "]" || starts.length === 0) continue;
 
-    const start = starts.pop()!;
-    if (starts.length === 0) {
-      const parsed = parseAgentArrayCandidate(text, start, index + 1);
-      if (parsed) return parsed;
-      const fallback = parseFallbacks();
-      if (fallback) return fallback;
-      fallbacks = [];
-    } else if (fallbacks.length < MAX_AGENT_JSON_FALLBACK_CANDIDATES) {
-      fallbacks.push([start, index + 1]);
+      if (candidate.inString) {
+        if (candidate.escaped) candidate.escaped = false;
+        else if (char === "\\") candidate.escaped = true;
+        else if (char === '"') candidate.inString = false;
+        else if (char === "\n") active.splice(candidateIndex, 1);
+        continue;
+      }
+      if (char === '"') {
+        candidate.inString = true;
+      } else if (char === "[") {
+        candidate.depth++;
+        if (candidate.depth > MAX_AGENT_JSON_NESTING) active.splice(candidateIndex, 1);
+      } else if (char === "]") {
+        candidate.depth--;
+        if (candidate.depth === 0) {
+          active.splice(candidateIndex, 1);
+          const parsed = parseAgentArrayCandidate(text, candidate.start, index + 1);
+          if (parsed?.length === 0) {
+            if (!emptyCompleted || candidate.start < emptyCompleted.start) {
+              emptyCompleted = { start: candidate.start, parsed };
+            }
+          } else if (parsed && (!completed || candidate.start < completed.start)) {
+            completed = { start: candidate.start, parsed };
+          }
+        }
+      }
+    }
+
+    if (char === "[") {
+      if (active.length >= MAX_AGENT_JSON_FALLBACK_CANDIDATES) {
+        active.splice(1, 1);
+      }
+      active.push({ start: index, depth: 1, inString: false, escaped: false });
+    }
+
+    if (completed) {
+      if (!active.some((candidate) => candidate.start < completed!.start)) {
+        return completed.parsed;
+      }
     }
   }
 
-  return parseFallbacks();
+  return completed?.parsed ?? emptyCompleted?.parsed;
 }
 
 /**
@@ -215,28 +330,507 @@ export function runClaudeAgentsJson(profile: ProfileLike, timeoutMs = 20_000): A
  * the tool — not a daemon, pty host, pre-warmed spare, shell snapshot, our
  * own `agents` listing invocation, or an `accounts` wrapper.
  */
-export function isToolSessionCommand(command: string, bin: string): boolean {
-  const argv = command.trim().split(/\s+/);
-  if (argv.length === 0) return false;
-  const base = (p: string) => p.replaceAll("\\", "/").split("/").pop() ?? p;
-  const binName = base(bin);
+interface CommandToken {
+  value: string;
+  start: number;
+  end: number;
+}
 
-  let head = argv[0] ?? "";
-  let rest = argv.slice(1);
-  // unwrap interpreter wrappers: `node /path/to/bin/claude ...`
-  if ((base(head) === "node" || base(head) === "bun") && rest[0]) {
-    head = rest[0]!;
-    rest = rest.slice(1);
+interface InterpreterOptionSchema {
+  optionsWithValues: ReadonlySet<string>;
+  detachedOnlyValueOptions: ReadonlySet<string>;
+  optionsWithOptionalAttachedValues: ReadonlySet<string>;
+  optionsWithoutValues: ReadonlySet<string>;
+  executionModeOptions: ReadonlySet<string>;
+  attachedShortValueOptions: readonly string[];
+}
+
+const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
+  optionsWithValues: new Set([
+    "-r",
+    "-C",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--conditions",
+    "--inspect-port",
+    "--title",
+    "--icu-data-dir",
+    "--openssl-config",
+    "--redirect-warnings",
+    "--diagnostic-dir",
+    "--cpu-prof-dir",
+    "--heap-prof-dir",
+    "--snapshot-blob",
+    "--env-file",
+    "--env-file-if-exists",
+    "--debug-port",
+    "--cpu-prof-name",
+    "--cpu-prof-interval",
+    "--heap-prof-name",
+    "--heap-prof-interval",
+    "--experimental-config-file",
+    "--experimental-default-type",
+    "--experimental-test-isolation",
+    "--disable-proto",
+    "--disable-warning",
+    "--heapsnapshot-near-heap-limit",
+    "--heapsnapshot-signal",
+    "--inspect-publish-uid",
+    "--localstorage-file",
+    "--max-old-space-size-percentage",
+    "--network-family-autoselection-attempt-timeout",
+    "--watch-path",
+    "--watch-kill-signal",
+    "--test-concurrency",
+    "--test-name-pattern",
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-shard",
+    "--test-timeout",
+    "--tls-cipher-list",
+    "--tls-keylog",
+    "--trace-event-categories",
+    "--trace-event-file-pattern",
+    "--use-largepages",
+    "--v8-pool-size",
+    "--max-http-header-size",
+    "--dns-result-order",
+    "--unhandled-rejections",
+  ]),
+  detachedOnlyValueOptions: new Set(["-r", "-C"]),
+  optionsWithOptionalAttachedValues: new Set([
+    "--inspect",
+    "--inspect-brk",
+    "--inspect-wait",
+  ]),
+  optionsWithoutValues: new Set([
+    "--cpu-prof",
+    "--enable-source-maps",
+    "--expose-gc",
+    "--heap-prof",
+    "--no-addons",
+    "--no-deprecation",
+    "--no-warnings",
+    "--preserve-symlinks",
+    "--preserve-symlinks-main",
+    "--throw-deprecation",
+    "--use-bundled-ca",
+    "--use-openssl-ca",
+    "--use-system-ca",
+    "--watch",
+    "--watch-preserve-output",
+    "--zero-fill-buffers",
+  ]),
+  executionModeOptions: new Set([
+    "-",
+    "-c",
+    "--check",
+    "--completion-bash",
+    "--build-snapshot-config",
+    "-e",
+    "--eval",
+    "--experimental-sea-config",
+    "-h",
+    "--help",
+    "-i",
+    "--interactive",
+    "--input-type",
+    "-p",
+    "--print",
+    "--prof-process",
+    "--run",
+    "--test",
+    "-v",
+    "--version",
+    "--v8-options",
+  ]),
+  attachedShortValueOptions: [],
+};
+
+const BUN_OPTION_SCHEMA: InterpreterOptionSchema = {
+  optionsWithValues: new Set([
+    "-r",
+    "-c",
+    "--preload",
+    "--require",
+    "--import",
+    "--loader",
+    "--cpu-prof-name",
+    "--cpu-prof-dir",
+    "--cpu-prof-interval",
+    "--heap-prof-name",
+    "--heap-prof-dir",
+    "--install",
+    "--port",
+    "--conditions",
+    "--fetch-preconnect",
+    "--max-http-header-size",
+    "--dns-result-order",
+    "--title",
+    "--unhandled-rejections",
+    "--console-depth",
+    "--user-agent",
+    "--cron-title",
+    "--cron-period",
+    "--elide-lines",
+    "--env-file",
+    "--cwd",
+    "--config",
+  ]),
+  detachedOnlyValueOptions: new Set(),
+  optionsWithOptionalAttachedValues: new Set([
+    "--inspect",
+    "--inspect-brk",
+    "--inspect-wait",
+  ]),
+  optionsWithoutValues: new Set([
+    "-b",
+    "-i",
+    "--bun",
+    "--cpu-prof",
+    "--cpu-prof-md",
+    "--experimental-http2-fetch",
+    "--experimental-http3-fetch",
+    "--expose-gc",
+    "--heap-prof",
+    "--heap-prof-md",
+    "--hot",
+    "--if-present",
+    "--no-addons",
+    "--no-clear-screen",
+    "--no-deprecation",
+    "--no-env-file",
+    "--no-exit-on-error",
+    "--no-install",
+    "--no-orphans",
+    "--prefer-latest",
+    "--prefer-offline",
+    "--preserve-symlinks",
+    "--preserve-symlinks-main",
+    "--redis-preconnect",
+    "--silent",
+    "--smol",
+    "--sql-preconnect",
+    "--throw-deprecation",
+    "--use-bundled-ca",
+    "--use-openssl-ca",
+    "--use-system-ca",
+    "--watch",
+    "--zero-fill-buffers",
+  ]),
+  executionModeOptions: new Set([
+    "-e",
+    "--eval",
+    "-h",
+    "--help",
+    "-p",
+    "--print",
+    "--revision",
+    "-F",
+    "--filter",
+    "--parallel",
+    "--sequential",
+    "--shell",
+    "-v",
+    "--version",
+    "--workspaces",
+  ]),
+  attachedShortValueOptions: ["-r", "-c", "-F"],
+};
+
+const TOOL_OPTIONS_WITH_VALUES = new Set([
+  "--config",
+  "--config-dir",
+  "--allowedTools",
+  "--allowed-tools",
+  "--betas",
+  "-d",
+  "--debug",
+  "--debug-file",
+  "--disallowedTools",
+  "--disallowed-tools",
+  "--effort",
+  "--file",
+  "--from-pr",
+  "--settings",
+  "--model",
+  "--permission-mode",
+  "--session-id",
+  "-r",
+  "--resume",
+  "--name",
+  "-n",
+  "--output-format",
+  "--input-format",
+  "--system-prompt",
+  "--append-system-prompt",
+  "--fallback-model",
+  "--json-schema",
+  "--max-budget-usd",
+  "--mcp-config",
+  "--agent",
+  "--agents",
+  "--add-dir",
+  "--plugin-dir",
+  "--plugin-url",
+  "--prompt-suggestions",
+  "--remote-control",
+  "--remote-control-session-name-prefix",
+  "--setting-sources",
+  "--tools",
+  "--max-turns",
+  "--budget-usd",
+  "--worktree",
+  "-w",
+]);
+
+const TOOL_OPTIONS_WITH_OPTIONAL_VALUES = new Set([
+  "-d",
+  "--debug",
+  "--from-pr",
+  "--prompt-suggestions",
+  "--remote-control",
+  "-r",
+  "--resume",
+  "-w",
+  "--worktree",
+]);
+
+function commandBasename(value: string): string {
+  return value.replaceAll("\\", "/").split("/").pop() ?? value;
+}
+
+function hasPathComponent(value: string): boolean {
+  return value.includes("/") || value.includes("\\");
+}
+
+function normalizeExecutablePath(value: string): string {
+  const normalized = value.replaceAll("\\", "/");
+  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+function readCommandToken(command: string, offset: number): CommandToken | undefined {
+  let start = offset;
+  while (start < command.length && /\s/.test(command[start]!)) start++;
+  if (start >= command.length) return undefined;
+
+  const quote = command[start] === '"' || command[start] === "'" ? command[start]! : undefined;
+  if (!quote) {
+    let end = start;
+    while (end < command.length && !/\s/.test(command[end]!)) end++;
+    return { value: command.slice(start, end), start, end };
   }
-  // versioned native builds live under .../<bin>/versions/<semver>
-  const normalizedHead = head.replaceAll("\\", "/");
-  const isVersionedBuild = normalizedHead.includes(`/${binName}/versions/`);
-  if (base(head) !== binName && !isVersionedBuild) return false;
 
-  if (rest[0] === "agents") return false; // our own listing call
-  const joined = rest.join(" ");
-  if (/--bg-pty-host|--bg-spare/.test(joined)) return false; // daemon helpers
-  if (rest[0] === "daemon") return false;
+  let value = "";
+  let end = start + 1;
+  while (end < command.length) {
+    const char = command[end]!;
+    if (char === quote) return { value, start, end: end + 1 };
+    if (
+      char === "\\" &&
+      end + 1 < command.length &&
+      (command[end + 1] === quote || command[end + 1] === "\\")
+    ) {
+      value += command[end + 1]!;
+      end += 2;
+      continue;
+    }
+    value += char;
+    end++;
+  }
+  return { value, start, end };
+}
+
+function executableTokenMatches(
+  observed: string,
+  configured: string,
+): boolean {
+  const configuredHasPath = hasPathComponent(configured);
+  const observedHasPath = hasPathComponent(observed);
+  if (configuredHasPath && observedHasPath) {
+    return normalizeExecutablePath(observed) === normalizeExecutablePath(configured);
+  }
+  if (configuredHasPath) return false;
+  return commandBasename(observed) === commandBasename(configured);
+}
+
+function isVersionedToolBuild(observed: string, configured: string): boolean {
+  if (hasPathComponent(configured)) return false;
+  const components = observed.replaceAll("\\", "/").split("/").filter(Boolean);
+  if (components.length < 3) return false;
+  const [tool, versions, version] = components.slice(-3);
+  return (
+    tool === commandBasename(configured) &&
+    versions === "versions" &&
+    /^\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/.test(version ?? "")
+  );
+}
+
+function matchExecutableAt(
+  command: string,
+  offset: number,
+  configured: string,
+): { end: number } | undefined {
+  let start = offset;
+  while (start < command.length && /\s/.test(command[start]!)) start++;
+
+  if (hasPathComponent(configured)) {
+    const rawObserved = command.slice(start, start + configured.length);
+    const boundary = command[start + configured.length];
+    if (
+      executableTokenMatches(rawObserved, configured) &&
+      (boundary === undefined || /\s/.test(boundary))
+    ) {
+      return { end: start + configured.length };
+    }
+  }
+
+  const token = readCommandToken(command, start);
+  if (!token) return undefined;
+  if (
+    executableTokenMatches(token.value, configured) ||
+    isVersionedToolBuild(token.value, configured)
+  ) {
+    return { end: token.end };
+  }
+  return undefined;
+}
+
+function optionName(value: string): string {
+  const equals = value.indexOf("=");
+  return equals === -1 ? value : value.slice(0, equals);
+}
+
+function resolveInterpreterOption(
+  value: string,
+  schema: InterpreterOptionSchema,
+): { name: string; hasAttachedValue: boolean } {
+  const name = optionName(value);
+  const hasAttachedValue = name !== value;
+  if (hasAttachedValue) return { name, hasAttachedValue };
+
+  for (const shortName of schema.attachedShortValueOptions) {
+    if (value.startsWith(shortName) && value.length > shortName.length) {
+      return { name: shortName, hasAttachedValue: true };
+    }
+  }
+  return { name, hasAttachedValue: false };
+}
+
+function interpreterChildOffset(
+  command: string,
+  offset: number,
+  configured: string,
+  schema: InterpreterOptionSchema,
+): number | undefined {
+  let cursor = offset;
+  while (true) {
+    const executable = matchExecutableAt(command, cursor, configured);
+    if (executable) {
+      let start = cursor;
+      while (start < command.length && /\s/.test(command[start]!)) start++;
+      return start;
+    }
+
+    const token = readCommandToken(command, cursor);
+    if (!token) return undefined;
+    if (token.value === "--") {
+      const child = readCommandToken(command, token.end);
+      return child && matchExecutableAt(command, child.start, configured)
+        ? child.start
+        : undefined;
+    }
+    if (!token.value.startsWith("-") || token.value === "-") return undefined;
+
+    cursor = token.end;
+    const { name, hasAttachedValue } = resolveInterpreterOption(token.value, schema);
+    if (schema.executionModeOptions.has(name)) return undefined;
+    if (schema.optionsWithValues.has(name)) {
+      if (hasAttachedValue) {
+        if (schema.detachedOnlyValueOptions.has(name)) return undefined;
+        continue;
+      }
+      const value = readCommandToken(command, cursor);
+      if (!value) return undefined;
+      cursor = value.end;
+      continue;
+    }
+    if (schema.optionsWithOptionalAttachedValues.has(name)) {
+      continue;
+    }
+    if (schema.optionsWithoutValues.has(name)) {
+      if (hasAttachedValue) return undefined;
+      continue;
+    }
+    return undefined;
+  }
+}
+
+function commandArguments(command: string, offset: number): string[] {
+  const args: string[] = [];
+  let cursor = offset;
+  while (true) {
+    const token = readCommandToken(command, cursor);
+    if (!token) return args;
+    args.push(token.value);
+    cursor = token.end;
+  }
+}
+
+function classifyToolArguments(args: string[]): {
+  helper: boolean;
+  mode?: string;
+} {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--") return { helper: false };
+    if (!arg.startsWith("-") || arg === "-") return { helper: false, mode: arg };
+    const name = optionName(arg);
+    if (name === "--bg-pty-host" || name === "--bg-spare") return { helper: true };
+    if (TOOL_OPTIONS_WITH_VALUES.has(name) && !arg.includes("=")) {
+      const next = args[index + 1];
+      if (
+        !TOOL_OPTIONS_WITH_OPTIONAL_VALUES.has(name) ||
+        (
+          next !== undefined &&
+          !next.startsWith("-") &&
+          next !== "agents" &&
+          next !== "daemon"
+        )
+      ) {
+        index++;
+      }
+    }
+  }
+  return { helper: false };
+}
+
+export function isToolSessionCommand(command: string, bin: string): boolean {
+  const first = readCommandToken(command, 0);
+  if (!first) return false;
+
+  let executableOffset = first.start;
+  const interpreter = commandBasename(first.value).toLowerCase().replace(/\.exe$/, "");
+  if (interpreter === "node" || interpreter === "nodejs" || interpreter === "bun") {
+    const childOffset = interpreterChildOffset(
+      command,
+      first.end,
+      bin,
+      interpreter === "bun" ? BUN_OPTION_SCHEMA : NODE_OPTION_SCHEMA,
+    );
+    if (childOffset === undefined) return false;
+    executableOffset = childOffset;
+  }
+
+  const executable = matchExecutableAt(command, executableOffset, bin);
+  if (!executable) return false;
+
+  const args = commandArguments(command, executable.end);
+  const classification = classifyToolArguments(args);
+  if (classification.helper) return false;
+  if (classification.mode === "agents" || classification.mode === "daemon") return false;
   return true;
 }
 
