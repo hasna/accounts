@@ -175,13 +175,21 @@ The live `~/.claude` directory is included only when an Accounts profile
 explicitly represents it. Foreign or missing profile paths and symlinks are
 ignored. Session files with multiple hard links are also rejected.
 
-The default table shows owner, project, UUID, update time, and size. `--json`
-also returns an opaque `catalogRef`, the source profile identity, canonical
-profile and source paths, the encoded project key, and the bounded
-`sessionIdCheck` result needed to
-distinguish collisions or report a filename/metadata mismatch. The bounded
-metadata scan is discovery only and does not assert that the whole transcript
-is valid; continuation brokers must validate the complete source strictly.
+The default table shows owner, project, UUID, update time, size, and a bounded
+session-ID check. `BOUNDED-MISMATCH` and `NOT-OBSERVED` remain visible instead
+of looking like healthy entries. `--json` also returns an opaque `catalogRef`,
+the source profile identity, canonical profile and source paths, the encoded
+project key, and the bounded `sessionIdCheck` result needed to distinguish
+collisions or report a filename/metadata mismatch. The v2 reference includes the
+owner representation as well as canonical profile-source coordinates, so two
+profiles representing the same default root remain unambiguous. Exact duplicate
+source representations are emitted once. The bounded metadata scan is discovery
+only and does not assert that the whole transcript is valid; continuation
+brokers must validate the complete source strictly.
+
+`--uuid` requires canonical hexadecimal `8-4-4-4-12` UUID syntax. A valid UUID
+with no match returns an empty result successfully; malformed syntax exits
+nonzero with a validation error.
 
 Catalog reads never change transcript content and prompts/messages are never
 emitted. On platforms that support it, Accounts requests `O_NOATIME`; when the
@@ -191,9 +199,11 @@ filesystem access-time metadata.
 Scanning a machine that is actively writing sessions never truncates the
 catalog silently. A path that keeps changing is retried, and anything still
 unreadable is listed as a `warning:` on stderr, so a consumer can tell "no such
-session" from "not observed on this pass". stdout stays a clean stream: closing
-the pipe early — `accounts sessions --json | head` — exits 0 without a stack
-trace.
+session" from "not observed on this pass". A represented profile with malformed
+UTF-16 identity metadata is skipped and reported by reason and canonical source
+path only; the identity text is not emitted. stdout stays a clean stream:
+closing the pipe early — `accounts sessions --json | head` — exits 0 without a
+stack trace.
 
 ## Cloud Runtime Entrypoints
 

@@ -202,6 +202,8 @@ describe("Claude session catalog discovery", () => {
     const managedEntry = sessions.find(
       (entry) => entry.sourcePath === canonicalPath(managedSource),
     )!;
+    expect(managedEntry.catalogRef).toMatch(/^claude-session:v2:/);
+    expect(managedEntry.catalogRef).toContain(encodeURIComponent(managed.name));
     expect(managedEntry.catalogRef).toContain(encodeURIComponent(managed.identity));
     expect(managedEntry.catalogRef).toContain(encodeURIComponent(canonicalPath(managed.dir)));
     expect(managedEntry.catalogRef).toContain(encodeURIComponent("-same-project"));
@@ -215,6 +217,80 @@ describe("Claude session catalog discovery", () => {
       sessions.find((entry) => entry.sourcePath === canonicalPath(defaultSource))?.sessionIdCheck,
     ).toBe("bounded-match");
     expect(JSON.stringify(sessions)).not.toContain("SECRET_ONE");
+  });
+
+  test("keeps owner representations distinct when two profiles share the default root", () => {
+    const sharedDir = join(fakeHome, ".claude");
+    const primary = profile("primary", sharedDir);
+    const secondary = profile("secondary", sharedDir);
+    writeSession(sharedDir, "-shared-default", UUID_A, join(root, "repo-shared"));
+
+    const first = listClaudeSessions([primary, secondary], {
+      profilesRoot,
+      defaultDir: sharedDir,
+    });
+    const reordered = listClaudeSessions([secondary, primary], {
+      profilesRoot,
+      defaultDir: sharedDir,
+    });
+
+    expect(first.map((entry) => entry.ownerProfile)).toEqual(["primary", "secondary"]);
+    expect(new Set(first.map((entry) => entry.catalogRef)).size).toBe(2);
+    expect(first.map((entry) => [entry.ownerProfile, entry.catalogRef])).toEqual(
+      reordered.map((entry) => [entry.ownerProfile, entry.catalogRef]),
+    );
+  });
+
+  test("deduplicates exact duplicate profile source records", () => {
+    const representedDefault = {
+      ...profile("main", join(fakeHome, ".claude")),
+      identity: "identity://represented-default",
+    };
+    writeSession(
+      representedDefault.dir,
+      "-represented-default",
+      UUID_A,
+      join(root, "repo-default"),
+    );
+
+    const sessions = listClaudeSessions(
+      [representedDefault, { ...representedDefault }],
+      {
+        profilesRoot,
+        defaultDir: representedDefault.dir,
+      },
+    );
+
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.ownerProfile).toBe("main");
+  });
+
+  test("skips one malformed profile identity without aborting the catalog or exposing it", () => {
+    const valid = profile("valid");
+    const malformed = {
+      ...profile("malformed"),
+      identity: "SENSITIVE_IDENTITY_PREFIX\uD800",
+    };
+    writeSession(valid.dir, "-valid", UUID_A, join(root, "repo-valid"));
+    writeSession(malformed.dir, "-malformed", UUID_B, join(root, "repo-malformed"));
+    const skipped: ClaudeSessionScanSkip[] = [];
+
+    const sessions = listClaudeSessions([malformed, valid], {
+      profilesRoot,
+      defaultDir: join(fakeHome, ".claude"),
+      onSkip: (skip) => {
+        skipped.push(skip);
+      },
+    });
+
+    expect(sessions.map((entry) => entry.ownerProfile)).toEqual(["valid"]);
+    expect(skipped).toEqual([
+      {
+        path: canonicalPath(malformed.dir),
+        reason: "invalid-profile-identity",
+      },
+    ]);
+    expect(JSON.stringify({ sessions, skipped })).not.toContain("SENSITIVE_IDENTITY_PREFIX");
   });
 
   test("excludes stale foreign, missing, non-Claude, and unrepresented default directories", () => {
@@ -550,7 +626,7 @@ describe("accounts sessions CLI", () => {
       uuid: UUID_A,
       sourcePath: canonicalPath(sessionPath(work.dir, "-repo-one", UUID_A)),
     });
-    expect(parsed[0]?.catalogRef).toMatch(/^claude-session:v1:/);
+    expect(parsed[0]?.catalogRef).toMatch(/^claude-session:v2:/);
     expect(parsed[0]?.sessionIdCheck).toBe("bounded-match");
     expect(json.stdout).not.toContain("FIRST_SECRET_PROMPT");
 
@@ -563,6 +639,57 @@ describe("accounts sessions CLI", () => {
     const directJson = runCli("sessions", "--profile", "personal", "--json");
     expect(directJson.status).toBe(0);
     expect(JSON.parse(directJson.stdout)).toHaveLength(1);
+  });
+
+  test("rejects invalid UUID filter syntax while a valid no-match remains successful", () => {
+    writeStore([]);
+
+    const invalid = runCli("sessions", "--uuid", "not-a-uuid", "--json");
+    expect(invalid.status).not.toBe(0);
+    expect(invalid.stdout).toBe("");
+    expect(invalid.stderr).toContain("--uuid must be a valid UUID");
+
+    const noMatch = runCli("sessions", "--uuid", UUID_D, "--json");
+    expect(noMatch.status).toBe(0);
+    expect(JSON.parse(noMatch.stdout)).toEqual([]);
+    expect(noMatch.stderr).toBe("");
+  });
+
+  test("isolates malformed UTF-16 identity from a real CLI catalog pass", () => {
+    const valid = profile("valid");
+    const malformed = {
+      ...profile("malformed"),
+      identity: "CLI_IDENTITY_MUST_NOT_ESCAPE\uD800",
+    };
+    writeSession(valid.dir, "-valid", UUID_A, join(root, "repo-valid"));
+    writeSession(malformed.dir, "-malformed", UUID_B, join(root, "repo-malformed"));
+    writeStore([malformed, valid]);
+
+    const result = runCli("sessions", "--json");
+    expect(result.status).toBe(0);
+    expect(parseCatalog(result).map((entry) => entry.ownerProfile)).toEqual(["valid"]);
+    expect(result.stderr).toContain("invalid-profile-identity");
+    expect(result.stdout).not.toContain("CLI_IDENTITY_MUST_NOT_ESCAPE");
+    expect(result.stderr).not.toContain("CLI_IDENTITY_MUST_NOT_ESCAPE");
+    expect(result.stderr).not.toContain("URIError");
+  });
+
+  test("shows bounded metadata integrity states in the human table", () => {
+    const match = bulkCatalogEntry(1);
+    const mismatch = {
+      ...bulkCatalogEntry(2),
+      sessionIdCheck: "bounded-mismatch" as const,
+    };
+    const notObserved = {
+      ...bulkCatalogEntry(3),
+      sessionIdCheck: "not-observed" as const,
+    };
+
+    const table = formatClaudeSessionTable([match, mismatch, notObserved]);
+    expect(table).toContain("ID CHECK");
+    expect(table).toContain("bounded-match");
+    expect(table).toContain("BOUNDED-MISMATCH");
+    expect(table).toContain("NOT-OBSERVED");
   });
 
   test("flushes valid JSON for at least 2,000 sessions from source and built Bun entrypoints", () => {

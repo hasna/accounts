@@ -24,7 +24,13 @@ export const CLAUDE_SESSION_METADATA_MAX_LINES = 32;
  */
 const SCAN_ATTEMPTS = 3;
 
-const UUID_JSONL = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const UUID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const UUID = new RegExp(`^${UUID_SOURCE}$`, "i");
+const UUID_JSONL = new RegExp(`^(${UUID_SOURCE})\\.jsonl$`, "i");
+
+export function isClaudeSessionUuid(value: string): boolean {
+  return UUID.test(value);
+}
 
 export interface ClaudeSessionIdentity {
   ownerProfile: string;
@@ -57,10 +63,14 @@ export interface ClaudeSessionCatalogEntry {
   updatedAt: string;
 }
 
-/** A listed path the scan refused to report because it kept changing underneath. */
+/** A source path omitted from this pass, with a content-free reason. */
 export interface ClaudeSessionScanSkip {
   path: string;
-  reason: "unstable-directory" | "unstable-session";
+  reason:
+    | "unstable-directory"
+    | "unstable-session"
+    | "invalid-profile-identity"
+    | "invalid-source-identity";
 }
 
 export interface ClaudeSessionCatalogOptions {
@@ -138,6 +148,22 @@ function comparablePath(path: string): string {
 
 function samePath(left: string, right: string): boolean {
   return comparablePath(left) === comparablePath(right);
+}
+
+/** encodeURIComponent rejects lone surrogates, so reject them at the record boundary. */
+function isWellFormedUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= value.length) return false;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      index++;
+      continue;
+    }
+    if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) return false;
+  }
+  return true;
 }
 
 function sameFile(left: Stats, right: Stats): boolean {
@@ -236,6 +262,7 @@ function verifyProfileRoot(
   profile: Profile,
   managedRoot: string,
   defaultRoot: string,
+  onSkip?: ClaudeSessionCatalogOptions["onSkip"],
 ): VerifiedProfileRoot | undefined {
   if (profile.tool !== "claude") return undefined;
   const dir = safeResolve(profile.dir);
@@ -265,9 +292,14 @@ function verifyProfileRoot(
   ) {
     return undefined;
   }
+  const profileIdentity = profile.identity ?? snapshot.realPath;
+  if (!isWellFormedUtf16(profileIdentity)) {
+    onSkip?.({ path: snapshot.realPath, reason: "invalid-profile-identity" });
+    return undefined;
+  }
   return {
     ownerProfile: profile.name,
-    profileIdentity: profile.identity ?? snapshot.realPath,
+    profileIdentity,
     dir,
     profilePath: snapshot.realPath,
     snapshot,
@@ -538,20 +570,37 @@ function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function encodeCatalogParts(parts: readonly string[]): string | undefined {
+  if (!parts.every(isWellFormedUtf16)) return undefined;
+  return parts.map((part) => encodeURIComponent(part)).join(":");
+}
+
 function catalogRef(
+  ownerProfile: string,
   profileIdentity: string,
   profilePath: string,
   encodedProject: string,
   uuid: string,
   sourcePath: string,
-): string {
-  return `claude-session:v1:${[
+): string | undefined {
+  const encoded = encodeCatalogParts([
+    ownerProfile,
     profileIdentity,
     profilePath,
     encodedProject,
     uuid,
     sourcePath,
-  ].map((part) => encodeURIComponent(part)).join(":")}`;
+  ]);
+  return encoded === undefined ? undefined : `claude-session:v2:${encoded}`;
+}
+
+/** Stable identity of one registry representation of a canonical profile root. */
+function representedProfileRef(profile: VerifiedProfileRoot): string | undefined {
+  return encodeCatalogParts([
+    profile.ownerProfile,
+    profile.profileIdentity,
+    profile.profilePath,
+  ]);
 }
 
 /**
@@ -580,10 +629,18 @@ export function listClaudeSessions(
   const maxBytes = options.metadataMaxBytes ?? CLAUDE_SESSION_METADATA_MAX_BYTES;
   const maxLines = options.metadataMaxLines ?? CLAUDE_SESSION_METADATA_MAX_LINES;
   const results: ClaudeSessionCatalogEntry[] = [];
+  const representedProfiles = new Set<string>();
 
   for (const profile of profiles) {
-    const verified = verifyProfileRoot(profile, managedRoot, defaultRoot);
+    const verified = verifyProfileRoot(profile, managedRoot, defaultRoot, options.onSkip);
     if (!verified) continue;
+    const profileRef = representedProfileRef(verified);
+    if (!profileRef) {
+      options.onSkip?.({ path: verified.profilePath, reason: "invalid-source-identity" });
+      continue;
+    }
+    if (representedProfiles.has(profileRef)) continue;
+    representedProfiles.add(profileRef);
     const projectsPath = join(verified.dir, "projects");
     const projects = readVerifiedDirectory(projectsPath, verified.snapshot);
     if (!projects) {
@@ -622,6 +679,18 @@ export function listClaudeSessions(
         }
         const { cwd, sessionIdCheck, sourcePath } = observation.metadata;
         const projectIdentity = cwd ?? `encoded:${encodedProject}`;
+        const reference = catalogRef(
+          verified.ownerProfile,
+          verified.profileIdentity,
+          verified.profilePath,
+          encodedProject,
+          uuid,
+          sourcePath,
+        );
+        if (!reference) {
+          options.onSkip?.({ path: candidatePath, reason: "invalid-source-identity" });
+          continue;
+        }
         const entry: ClaudeSessionCatalogEntry = {
           identity: {
             ownerProfile: verified.ownerProfile,
@@ -632,13 +701,7 @@ export function listClaudeSessions(
             uuid,
             sourcePath,
           },
-          catalogRef: catalogRef(
-            verified.profileIdentity,
-            verified.profilePath,
-            encodedProject,
-            uuid,
-            sourcePath,
-          ),
+          catalogRef: reference,
           ownerProfile: verified.ownerProfile,
           profileIdentity: verified.profileIdentity,
           profilePath: verified.profilePath,
