@@ -47,6 +47,42 @@ export const migrationDigestSchema = z
 
 export type MigrationDigest = z.infer<typeof migrationDigestSchema>;
 
+const migrationRedactionDomainSchema = z.enum([
+  "machine",
+  "source.key",
+  "source.authority-id",
+  "source.tool",
+  "source.name",
+  "runtime.label",
+  "root.path",
+  "root.real-path",
+  "root.device",
+  "root.inode",
+  "root.unsafe-reason",
+  "alias",
+  "alias.session",
+  "diagnostic.plan",
+  "diagnostic.source-key",
+  "diagnostic.source-tool",
+  "diagnostic.alias",
+  "diagnostic.runtime-id",
+]);
+
+export type MigrationRedactionDomain = z.infer<
+  typeof migrationRedactionDomainSchema
+>;
+
+export interface MigrationDiagnosticReference {
+  domain: MigrationRedactionDomain;
+  digest: MigrationDigest;
+}
+
+interface MigrationDiagnosticOptions {
+  code?: string;
+  count?: number;
+  references?: readonly MigrationDiagnosticReference[];
+}
+
 const sourceAuthoritySchema = z.enum(["local-v1", "api-v1"]);
 const legacyKeySchema = z
   .string()
@@ -594,16 +630,30 @@ export interface BuildMigrationPlanOptions {
 }
 
 export class MigrationConflictError extends Error {
-  constructor(message: string) {
+  readonly code: string;
+  readonly count?: number;
+  readonly references: readonly MigrationDiagnosticReference[];
+
+  constructor(message: string, options: MigrationDiagnosticOptions = {}) {
     super(message);
     this.name = "MigrationConflictError";
+    this.code = options.code ?? stableDiagnosticCode(message);
+    this.count = options.count;
+    this.references = deepFreeze([...(options.references ?? [])]);
   }
 }
 
 export class MigrationDriftError extends Error {
-  constructor(message: string) {
+  readonly code: string;
+  readonly count?: number;
+  readonly references: readonly MigrationDiagnosticReference[];
+
+  constructor(message: string, options: MigrationDiagnosticOptions = {}) {
     super(message);
     this.name = "MigrationDriftError";
+    this.code = options.code ?? stableDiagnosticCode(message);
+    this.count = options.count;
+    this.references = deepFreeze([...(options.references ?? [])]);
   }
 }
 
@@ -646,7 +696,13 @@ export function buildMigrationPlan(
     const existing = migrationPlanSchema.parse(options.existingPlan);
     if (existing.inputDigest !== inputDigest) {
       throw new MigrationDriftError(
-        `migration input digest changed for frozen plan "${existing.id}"`,
+        "migration input digest changed for frozen plan",
+        {
+          code: "migration_frozen_input_digest_changed",
+          references: [
+            diagnosticReference("diagnostic.plan", existing.id),
+          ],
+        },
       );
     }
     const existingInput = normalizeMigrationPlanInput(
@@ -657,7 +713,13 @@ export function buildMigrationPlan(
       JSON.stringify(canonicalize(input))
     ) {
       throw new MigrationDriftError(
-        `migration canonical frozen input changed for plan "${existing.id}"`,
+        "migration canonical frozen input changed for plan",
+        {
+          code: "migration_frozen_input_changed",
+          references: [
+            diagnosticReference("diagnostic.plan", existing.id),
+          ],
+        },
       );
     }
     return deepFreeze(structuredClone(existing));
@@ -676,13 +738,29 @@ export function buildMigrationPlan(
   for (const observation of observations) {
     const key = sourceKey(observation);
     if (sourceKeys.has(key)) {
-      throw new MigrationConflictError(`duplicate legacy source key "${key}"`);
+      throw new MigrationConflictError("duplicate legacy source key", {
+        code: "migration_duplicate_legacy_source_key",
+        count: 2,
+        references: [
+          diagnosticReference("diagnostic.source-key", key),
+        ],
+      });
     }
     sourceKeys.add(key);
     const existingRuntimeLabel = runtimeLabelByTool.get(observation.source.tool);
     if (existingRuntimeLabel && existingRuntimeLabel !== observation.runtimeLabel) {
       throw new MigrationConflictError(
-        `legacy tool "${observation.source.tool}" has conflicting runtime labels`,
+        "legacy tool has conflicting runtime labels",
+        {
+          code: "migration_conflicting_runtime_labels",
+          count: 2,
+          references: [
+            diagnosticReference(
+              "diagnostic.source-tool",
+              observation.source.tool,
+            ),
+          ],
+        },
       );
     }
     runtimeLabelByTool.set(observation.source.tool, observation.runtimeLabel);
@@ -903,8 +981,8 @@ export interface RedactedMigrationRecord {
         state: "verified";
         pathDigest: MigrationDigest;
         realPathDigest: MigrationDigest;
-        device: string;
-        inode: string;
+        deviceDigest: MigrationDigest;
+        inodeDigest: MigrationDigest;
         entryCount: number;
         byteCount: number;
         digest: MigrationDigest;
@@ -926,6 +1004,7 @@ export interface RedactedMigrationRecord {
 
 export interface RedactedMigrationPlan {
   schemaVersion: 1;
+  redactionVersion: 1;
   id: string;
   idempotencyKey: MigrationDigest;
   inputDigest: MigrationDigest;
@@ -943,35 +1022,54 @@ export function redactMigrationPlan(planInput: MigrationPlan): RedactedMigration
   const plan = migrationPlanSchema.parse(planInput);
   return deepFreeze({
     schemaVersion: 1 as const,
+    redactionVersion: 1 as const,
     id: plan.id,
     idempotencyKey: plan.idempotencyKey,
     inputDigest: plan.inputDigest,
     planDigest: plan.planDigest,
     scope: plan.scope,
-    machineIdDigest: hashText(plan.machineId),
+    machineIdDigest: migrationRedactionDigest("machine", plan.machineId),
     createdAt: plan.createdAt,
     cutoverEpoch: plan.cutoverEpoch,
     sourceDigests: plan.sourceDigests,
     backup: plan.backup,
     records: plan.records.map((record) => ({
-      sourceKeyDigest: hashText(record.sourceKey),
+      sourceKeyDigest: migrationRedactionDigest("source.key", record.sourceKey),
       source: {
         authority: record.source.authority,
-        authorityIdDigest: hashText(record.source.authorityId),
-        toolDigest: hashText(record.source.tool),
-        nameDigest: hashText(record.source.name),
+        authorityIdDigest: migrationRedactionDigest(
+          "source.authority-id",
+          record.source.authorityId,
+        ),
+        toolDigest: migrationRedactionDigest("source.tool", record.source.tool),
+        nameDigest: migrationRedactionDigest("source.name", record.source.name),
       },
-      runtimeLabelDigest: hashText(record.runtimeLabel),
+      runtimeLabelDigest: migrationRedactionDigest(
+        "runtime.label",
+        record.runtimeLabel,
+      ),
       inputDigest: record.inputDigest,
       target: record.target,
       root:
         record.root.state === "verified"
           ? {
               state: "verified" as const,
-              pathDigest: hashText(record.root.path),
-              realPathDigest: hashText(record.root.realPath),
-              device: record.root.device,
-              inode: record.root.inode,
+              pathDigest: migrationRedactionDigest(
+                "root.path",
+                record.root.path,
+              ),
+              realPathDigest: migrationRedactionDigest(
+                "root.real-path",
+                record.root.realPath,
+              ),
+              deviceDigest: migrationRedactionDigest(
+                "root.device",
+                record.root.device,
+              ),
+              inodeDigest: migrationRedactionDigest(
+                "root.inode",
+                record.root.inode,
+              ),
               entryCount: record.root.entryCount,
               byteCount: record.root.byteCount,
               digest: record.root.digest,
@@ -980,14 +1078,21 @@ export function redactMigrationPlan(planInput: MigrationPlan): RedactedMigration
               state: record.root.state,
               code: record.root.code,
               pathDigest: record.root.pathDigest,
-              reasonDigest: hashText(record.root.reason),
+              reasonDigest: migrationRedactionDigest(
+                "root.unsafe-reason",
+                record.root.reason,
+              ),
             },
       authentication: record.authentication,
       pointers: record.pointers,
       sessionReferenceDigests: record.sessionReferenceDigests,
       catalogSkipDigests: record.catalogSkipDigests,
-      historicalAliasDigests: record.historicalAliases.map(hashText),
-      historicalSessionAliasDigests: record.historicalSessionAliases.map(hashText),
+      historicalAliasDigests: record.historicalAliases.map((alias) =>
+        migrationRedactionDigest("alias", alias),
+      ),
+      historicalSessionAliasDigests: record.historicalSessionAliases.map(
+        (alias) => migrationRedactionDigest("alias.session", alias),
+      ),
       disposition: record.disposition,
     })),
   });
@@ -1334,14 +1439,28 @@ function appendAliasToJournal(
   );
   if (!record) {
     throw new MigrationConflictError(
-      `migration alias source "${alias.sourceKey}" is not in the frozen plan`,
+      "migration alias source is not in the frozen plan",
+      {
+        code: "migration_alias_source_not_in_plan",
+        references: [
+          diagnosticReference("diagnostic.source-key", alias.sourceKey),
+          diagnosticReference("diagnostic.alias", alias.alias),
+        ],
+      },
     );
   }
   const expectedTarget =
     alias.kind === "legacy_account" ? record.target.accountId : record.target.bindingId;
   if (alias.targetId !== expectedTarget) {
     throw new MigrationConflictError(
-      `migration alias "${alias.alias}" does not target its frozen immutable identity`,
+      "migration alias does not target its frozen immutable identity",
+      {
+        code: "migration_alias_target_mismatch",
+        references: [
+          diagnosticReference("diagnostic.source-key", alias.sourceKey),
+          diagnosticReference("diagnostic.alias", alias.alias),
+        ],
+      },
     );
   }
   const existing = entries.find(
@@ -1352,7 +1471,14 @@ function appendAliasToJournal(
       return entries;
     }
     throw new MigrationConflictError(
-      `migration alias "${alias.alias}" already targets a different immutable identity`,
+      "migration alias already targets a different immutable identity",
+      {
+        code: "migration_alias_identity_conflict",
+        count: 2,
+        references: [
+          diagnosticReference("diagnostic.alias", alias.alias),
+        ],
+      },
     );
   }
   const previousDigest = entries.at(-1)?.digest ?? null;
@@ -1850,7 +1976,14 @@ export async function applyScopedBackfill(
     const existing = runtimes.get(runtime.id);
     if (existing && hashCanonical(existing) !== hashCanonical(runtime)) {
       throw new MigrationConflictError(
-        `runtime id "${runtime.id}" maps to conflicting migration definitions`,
+        "runtime id maps to conflicting migration definitions",
+        {
+          code: "migration_runtime_definition_conflict",
+          count: 2,
+          references: [
+            diagnosticReference("diagnostic.runtime-id", runtime.id),
+          ],
+        },
       );
     }
     runtimes.set(runtime.id, runtime);
@@ -2108,7 +2241,8 @@ export class MigrationSidecarStore {
     } catch (error) {
       if (error instanceof MigrationDriftError) throw error;
       throw new MigrationDriftError(
-        `could not parse migration sidecar: ${(error as Error).message}`,
+        "could not parse migration sidecar",
+        { code: "migration_sidecar_parse_failed" },
       );
     }
   }
@@ -2199,7 +2333,8 @@ export class MigrationSidecarStore {
         current = this.load();
       } catch (error) {
         throw new MigrationDriftError(
-          `migration sidecar drift is ambiguous; preserving WAL: ${(error as Error).message}`,
+          "migration sidecar drift is ambiguous; preserving WAL",
+          { code: "migration_sidecar_drift_ambiguous" },
         );
       }
       if (current?.integrityDigest === wal.nextDigest) {
@@ -2331,7 +2466,10 @@ export class MigrationSidecarStore {
       return wal;
     } catch (error) {
       if (error instanceof MigrationDriftError) throw error;
-      throw new MigrationDriftError(`could not parse migration WAL: ${(error as Error).message}`);
+      throw new MigrationDriftError(
+        "could not parse migration WAL",
+        { code: "migration_wal_parse_failed" },
+      );
     }
   }
 
@@ -2544,6 +2682,52 @@ function fsyncDirectory(path: string): void {
   } finally {
     closeSync(descriptor);
   }
+}
+
+export function migrationRedactionDigest(
+  domainInput: MigrationRedactionDomain,
+  value: string,
+): MigrationDigest {
+  const domainResult = migrationRedactionDomainSchema.safeParse(domainInput);
+  if (!domainResult.success) {
+    throw new MigrationConflictError(
+      "migration redaction domain is not schema-owned",
+      { code: "migration_invalid_redaction_domain" },
+    );
+  }
+  const domain = domainResult.data;
+  const frame = (part: string): Buffer => {
+    const payload = Buffer.from(part, "utf8");
+    const length = Buffer.allocUnsafe(4);
+    length.writeUInt32BE(payload.length);
+    return Buffer.concat([length, payload]);
+  };
+  return `sha256:${createHash("sha256")
+    .update(frame("hasna.accounts.v2.migration.redaction"))
+    .update(frame("1"))
+    .update(frame(domain))
+    .update(frame(value))
+    .digest("hex")}`;
+}
+
+function diagnosticReference(
+  domain: MigrationRedactionDomain,
+  value: string,
+): MigrationDiagnosticReference {
+  return deepFreeze({
+    domain,
+    digest: migrationRedactionDigest(domain, value),
+  });
+}
+
+function stableDiagnosticCode(message: string): string {
+  const normalized = message
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized.startsWith("migration_")
+    ? normalized
+    : `migration_${normalized}`;
 }
 
 function hashText(value: string): MigrationDigest {

@@ -25,6 +25,7 @@ import {
   evaluateMigrationGates,
   migrationCompatibilityFixtureSchema,
   migrationPlanSchema,
+  migrationRedactionDigest,
   migrationSidecarSchema,
   redactMigrationPlan,
   transitionMigrationSidecar,
@@ -81,6 +82,38 @@ function canonicalize(value: unknown): unknown {
 
 function canonicalDigest(value: unknown): `sha256:${string}` {
   return digest(JSON.stringify(canonicalize(value)));
+}
+
+function redactionDigest(domain: string, value: string): `sha256:${string}` {
+  const frame = (part: string): Buffer => {
+    const payload = Buffer.from(part, "utf8");
+    const length = Buffer.allocUnsafe(4);
+    length.writeUInt32BE(payload.length);
+    return Buffer.concat([length, payload]);
+  };
+  return `sha256:${createHash("sha256")
+    .update(frame("hasna.accounts.v2.migration.redaction"))
+    .update(frame("1"))
+    .update(frame(domain))
+    .update(frame(value))
+    .digest("hex")}`;
+}
+
+function captureError(operation: () => unknown): Error & {
+  code?: string;
+  count?: number;
+  references?: readonly unknown[];
+} {
+  try {
+    operation();
+  } catch (error) {
+    return error as Error & {
+      code?: string;
+      count?: number;
+      references?: readonly unknown[];
+    };
+  }
+  throw new Error("expected operation to throw");
 }
 
 function backupPlan() {
@@ -795,9 +828,11 @@ describe("v2 migration plan", () => {
     ]);
     const redacted = redactMigrationPlan(plan);
     const encoded = JSON.stringify(redacted);
+    const sensitivePlanRecord = plan.records.find(
+      (record) => record.source.tool === "credential-token-runtime",
+    )!;
     const sensitiveRecord = redacted.records.find(
-      (record) =>
-        record.source.toolDigest === digest("credential-token-runtime"),
+      (record) => record.target.accountId === sensitivePlanRecord.target.accountId,
     );
     const unsafeRecord = redacted.records.find(
       (record) => record.root.state === "unsafe",
@@ -820,23 +855,197 @@ describe("v2 migration plan", () => {
     expect(sensitiveRecord?.source).not.toHaveProperty("tool");
     expect(sensitiveRecord).not.toHaveProperty("runtimeLabel");
     expect(sensitiveRecord?.source.toolDigest).toBe(
-      digest("credential-token-runtime"),
+      redactionDigest("source.tool", "credential-token-runtime"),
     );
     expect(sensitiveRecord?.runtimeLabelDigest).toBe(
-      digest("Bearer synthetic credential marker"),
+      redactionDigest("runtime.label", "Bearer synthetic credential marker"),
     );
     expect(sensitiveRecord?.root?.byteCount).toBe(2048);
     expect(sensitiveRecord?.root?.digest).toBe(
       digest("root-credential-token-runtime-alice"),
     );
+    expect(redacted.redactionVersion).toBe(1);
+    expect(sensitiveRecord?.root).not.toHaveProperty("device");
+    expect(sensitiveRecord?.root).not.toHaveProperty("inode");
+    expect(sensitiveRecord?.root).toMatchObject({
+      deviceDigest: redactionDigest("root.device", "1"),
+      inodeDigest: redactionDigest(
+        "root.inode",
+        sensitivePlanRecord.root.state === "verified"
+          ? sensitivePlanRecord.root.inode
+          : "",
+      ),
+    });
+    if (sensitiveRecord?.root?.state === "verified") {
+      expect(sensitiveRecord.root.pathDigest).not.toBe(
+        sensitiveRecord.root.realPathDigest,
+      );
+    }
     expect(sensitiveRecord?.historicalAliasDigests).toHaveLength(1);
     expect(sensitiveRecord?.historicalSessionAliasDigests).toHaveLength(1);
     expect(unsafeRecord?.root).toMatchObject({
       state: "unsafe",
       code: "missing",
       pathDigest: digest("missing-path"),
-      reasonDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      reasonDigest: redactionDigest(
+        "root.unsafe-reason",
+        "private root /secret/missing was absent",
+      ),
     });
+  });
+
+  test("domain-separates and length-frames every caller-origin redacted value", () => {
+    const shared = "shared-redaction-marker";
+    const device = "98765432101234567890";
+    const inode = device;
+    const plan = buildPlan([
+      safeObservation(shared, shared, {
+        runtimeLabel: shared,
+        root: {
+          ...safeObservation(shared, shared).root,
+          device,
+          inode,
+        },
+        historicalAliases: [shared, ".sessionframing-marker"],
+        historicalSessionAliases: [shared, "framing-marker"],
+      }),
+    ]);
+    const redacted = redactMigrationPlan(plan);
+    const encoded = JSON.stringify(redacted);
+    const record = redacted.records[0]!;
+
+    const sameValueDigests = [
+      record.source.toolDigest,
+      record.source.nameDigest,
+      record.runtimeLabelDigest,
+      record.historicalAliasDigests[0],
+      record.historicalSessionAliasDigests[0],
+    ];
+    expect(new Set(sameValueDigests).size).toBe(sameValueDigests.length);
+    expect(record.historicalAliasDigests[0]).not.toBe(
+      record.historicalSessionAliasDigests[0],
+    );
+    expect(record.historicalAliasDigests[0]).toBe(
+      redactionDigest("alias", ".sessionframing-marker"),
+    );
+    expect(record.historicalSessionAliasDigests[0]).toBe(
+      redactionDigest("alias.session", "framing-marker"),
+    );
+    expect(migrationRedactionDigest("alias", ".sessionframing-marker")).toBe(
+      redactionDigest("alias", ".sessionframing-marker"),
+    );
+    expect(encoded).not.toContain(shared);
+    expect(encoded).not.toContain(device);
+    expect(encoded).not.toContain(inode);
+    expect(record.root).not.toHaveProperty("device");
+    expect(record.root).not.toHaveProperty("inode");
+    expect(record.root).toMatchObject({
+      deviceDigest: redactionDigest("root.device", device),
+      inodeDigest: redactionDigest("root.inode", inode),
+    });
+    if (record.root.state === "verified") {
+      expect(record.root.deviceDigest).not.toBe(record.root.inodeDigest);
+    }
+  });
+
+  test("returns stable diagnostic codes and opaque references without caller text", () => {
+    const marker = "bearer-secret-diagnostic-marker";
+    const duplicate = safeObservation(marker, marker);
+    const duplicateError = captureError(() => buildPlan([duplicate, duplicate]));
+    const runtimeError = captureError(() =>
+      buildPlan([
+        safeObservation("alice", marker, { runtimeLabel: `${marker}-one` }),
+        safeObservation("bob", marker, { runtimeLabel: `${marker}-two` }),
+      ]),
+    );
+    const markerPlan = buildMigrationPlan(planInput(), {
+      idFactory: (kind, seed) =>
+        kind === "plan"
+          ? `plan-${marker}`
+          : stableId(kind, seed),
+    });
+    const frozenPlanError = captureError(() =>
+      buildMigrationPlan(
+        planInput([
+          safeObservation("alice", "claude", { inputDigest: digest("changed") }),
+          safeObservation("bob", "codex"),
+        ]),
+        { existingPlan: markerPlan },
+      ),
+    );
+    const initial = createMigrationSidecar(buildPlan());
+    const unknownSourceError = captureError(() =>
+      appendMigrationAlias(initial, {
+        kind: "legacy_account",
+        alias: marker,
+        sourceKey: marker,
+        targetId: initial.plan.records[0]!.target.accountId,
+      }),
+    );
+    const wrongTargetError = captureError(() =>
+      appendMigrationAlias(initial, {
+        kind: "legacy_account",
+        alias: marker,
+        sourceKey: initial.plan.records[0]!.sourceKey,
+        targetId: initial.plan.records[1]!.target.accountId,
+      }),
+    );
+    const aliasOwner = appendMigrationAlias(initial, {
+      kind: "legacy_account",
+      alias: marker,
+      sourceKey: initial.plan.records[0]!.sourceKey,
+      targetId: initial.plan.records[0]!.target.accountId,
+    });
+    const aliasConflictError = captureError(() =>
+      appendMigrationAlias(aliasOwner, {
+        kind: "legacy_account",
+        alias: marker,
+        sourceKey: initial.plan.records[1]!.sourceKey,
+        targetId: initial.plan.records[1]!.target.accountId,
+      }),
+    );
+
+    for (const error of [
+      duplicateError,
+      runtimeError,
+      frozenPlanError,
+      unknownSourceError,
+      wrongTargetError,
+      aliasConflictError,
+    ]) {
+      const exported = JSON.stringify({
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        count: error.count,
+        references: error.references,
+      });
+      expect(exported).not.toContain(marker);
+      expect(error.code).toMatch(/^migration_[a-z0-9_]+$/);
+      expect(error.references?.length).toBeGreaterThan(0);
+      expect(exported).toMatch(/sha256:[a-f0-9]{64}/);
+    }
+
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    writeFileSync(
+      sidecarPath,
+      `${JSON.stringify({ ...initial, state: marker })}\n`,
+      { mode: 0o600 },
+    );
+    const loadError = captureError(() =>
+      new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy }).load(),
+    );
+    expect(loadError.message).not.toContain(marker);
+    expect(loadError.code).toBe("migration_sidecar_parse_failed");
+
+    const domainError = captureError(() =>
+      migrationRedactionDigest(marker as never, marker),
+    );
+    expect(domainError.message).not.toContain(marker);
+    expect(domainError.code).toBe("migration_invalid_redaction_domain");
   });
 
   test("strict schemas reject credential and transcript tunnels", () => {

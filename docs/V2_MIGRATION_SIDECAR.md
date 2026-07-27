@@ -30,11 +30,22 @@ is namespaced by tenant and scope so identical legacy coordinates in different
 scopes cannot collide. Legacy records are not grouped, renamed, or physically
 relocated.
 
-The redacted census view hashes machine IDs, authority IDs, runtime tool keys,
-runtime labels, profile names, paths, unsafe-root reasons, source keys, and
-aliases while retaining only schema-owned enums, counts, filesystem identity,
-input digests, allocated opaque IDs, and quarantine evidence. Arbitrary census
-text is never emitted verbatim by the redacted view.
+The redacted census view uses redaction scheme version 1: SHA-256 over a
+versioned, length-framed context, one schema-owned semantic domain, and the
+UTF-8 value. Machine IDs, authority IDs, runtime tool keys, runtime labels,
+profile names, paths, unsafe-root reasons, source keys, account aliases,
+session aliases, device IDs, and inode IDs each use distinct domains. Equal
+caller text in different fields therefore cannot produce a shared digest, and
+delimiter-like text cannot cross a frame boundary. The view retains only
+schema-owned enums, counts, content/input digests, allocated opaque IDs, and
+quarantine evidence; raw filesystem identity and arbitrary census text are
+never emitted.
+
+Public migration conflict and drift errors expose a stable
+`migration_*` code, optional numeric counts, and only domain-hashed opaque
+references. They do not interpolate plan IDs, source keys, tool keys, aliases,
+runtime IDs, nested parser messages, or other caller-controlled text into the
+message.
 
 ## Conflict quarantine and aliases
 
