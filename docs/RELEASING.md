@@ -49,14 +49,21 @@ an active semantic match for only this tag pattern, all three protections, and
 `GITHUB_REF_PROTECTED=true`.
 
 GitHub omits `bypass_actors` from a ruleset response unless the API caller can
-administer that ruleset. The normal workflow token is intentionally read-only,
-so the preflight validates the organization-administrator bypass whenever
-GitHub exposes it but does not require that privileged field to be present. The
-creation restriction proves that a successfully created protected tag used a
-configured bypass authority; the release environment then independently
-requires the exact live triggering user as its sole reviewer and confirms,
-through GitHub's metadata read API, that the user has repository administrator
-permission.
+administer that ruleset. The preflight therefore fails closed when the field is
+missing. Store a fine-grained token named `RELEASE_GITHUB_ADMIN_TOKEN` in the
+protected environment with only repository Metadata read and Administration
+read access for `hasna/accounts`. Do not grant Contents write, Actions write, or
+any organization-wide mutation permission. The token must belong to the same
+user who triggered the release. The preflight uses it only to read the live
+ruleset, requires the visible bypass list to contain exactly one
+`OrganizationAdmin` entry in `always` mode, and verifies that its owner and the
+release actor are the same live repository administrator.
+
+The normal workflow token remains read-only and is used for the environment,
+deployment-policy, and triggering-actor reads. The administration-read token is
+not passed to build, test, pack, npm publication, registry verification, or npm
+promotion commands. The workflow exposes only a boolean presence signal outside
+the preflight calls; a missing secret fails before packing or publication.
 
 ### GitHub release environment
 
@@ -65,7 +72,8 @@ Create a protected `npm-release` environment:
 - allow deployments only from tags matching `npm/accounts/v*`;
 - require exactly one user reviewer matching the release actor;
 - allow that reviewer to approve their own deployment;
-- store only the `NPM_DIST_TAG_TOKEN` secret described below.
+- store only `RELEASE_GITHUB_ADMIN_TOKEN` and the `NPM_DIST_TAG_TOKEN` described
+  below.
 
 The npm trusted publisher must include the same environment name. A mismatch
 causes npm OIDC publication to fail. This repository currently has one
@@ -127,10 +135,25 @@ The release and CI workflows pin:
 - Node `24.18.0`;
 - npm `11.16.0`;
 - Bun `1.3.14`;
+- `semver` `7.7.2` for npm-compatible version precedence;
+- `@sigstore/bundle` `4.0.0`, `@sigstore/protobuf-specs` `0.5.1`, and
+  `@sigstore/verify` `3.1.1` for standard Fulcio, CT-log, and Rekor bundle
+  verification;
+- the reviewed Sigstore public-good trusted root at
+  `scripts/sigstore-trusted-root.json`, pinned by SHA-256
+  `6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66`;
 - the frozen Bun lockfile and seven-day minimum release age.
 
 The release preflight checks the observed tool versions exactly. Updating any
 pin requires a reviewed PR and refreshed compatibility evidence.
+
+Normal CI and the release job also run a network-bounded cryptographic smoke
+test against the immutable provenance bundles for exact
+`sigstore@4.1.1` and `semver@7.8.5` fixtures. It proves both valid identities,
+then proves that another valid Fulcio identity, another issuer, and a changed
+DSSE signature are rejected by the pinned verifier. The verification path is
+offline after the bundle is obtained: it reads only the checksummed reviewed
+root, so a release cannot silently accept a changed live trust document.
 
 ## Release procedure
 
@@ -146,6 +169,16 @@ pin requires a reviewed PR and refreshed compatibility evidence.
 3. The protected tag starts the release workflow. Do not run `npm publish`
    locally and do not move any dist-tag manually while it is running.
 
+All release tags share the single `hasna-accounts-npm-release` concurrency
+group. Later tags queue behind earlier tags rather than running concurrently.
+The promotion gate still reads npm live: a candidate may advance `latest` only
+when its SemVer precedence is greater than the current target, or may continue
+as an exact idempotent retry when the version strings are identical. Downgrades,
+stale reordered candidates, invalid versions, and versions that differ only in
+build metadata fail closed. The final verification repeats the comparison and
+requires exact equality, so a registry change observed after the precheck
+invalidates the run.
+
 Before publication, the workflow requires:
 
 - exact repository, workflow, protected tag, annotated tag, and commit
@@ -158,7 +191,7 @@ Before publication, the workflow requires:
 - audit, type, compatibility, test, build, contract, conformance, and PostgreSQL
   gates;
 - two clean build-and-pack runs with identical file lists, metadata, hashes,
-  size, and tarball bytes.
+  size, tarball bytes, and bounded archive contents.
 
 The second verified tarball is preserved in the runner temporary directory.
 The workflow publishes that exact file under
@@ -170,6 +203,12 @@ Before the intended dist-tag moves, the workflow requires:
 
 - registry `gitHead`, size, SHA-1, SHA-512 integrity, and downloaded bytes equal
   the preserved candidate;
+- registry and archive file counts and unpacked sizes agree; the archive has at
+  most 512 entries, each regular file is at most 16 MiB, total unpacked regular
+  files are at most 64 MiB, and all paths remain beneath `package/`;
+- only regular files and empty directories are accepted; symlinks, hard links,
+  devices, FIFOs, duplicate paths, traversal, absolute paths, malformed
+  headers, and gzip/tar expansion beyond the caps fail before installation;
 - the version-specific quarantine dist-tag points to the candidate while the
   intended dist-tag does not;
 - an exact-version consumer install with install scripts disabled;
@@ -178,12 +217,20 @@ Before the intended dist-tag moves, the workflow requires:
   invalid or missing signatures and returns the exact package's verified
   bundles;
 - only after npm's standard Sigstore verification succeeds, the exact verified
-  DSSE statements are parsed and required to bind the package purl and digest,
-  npm registry publish claim, `hasna/accounts`, `release.yml`, release tag, and
+  provenance bundle is independently verified by the pinned Sigstore library
+  against the checksummed TUF-published trust root, with CT-log and Rekor
+  thresholds of one, exact Fulcio URI SAN
+  `https://github.com/hasna/accounts/.github/workflows/release.yml@refs/tags/npm/accounts/vX.Y.Z`,
+  and exact OIDC issuer `https://token.actions.githubusercontent.com`;
+- only after that cryptographic identity check succeeds are the exact DSSE
+  statements parsed and required to bind the package purl and digest, npm
+  registry publish claim, `hasna/accounts`, `release.yml`, release tag, and
   commit.
 
-Network responses, command runtimes, retry budgets, decoded JSON, and tarball
-sizes are capped. Unsigned bundles, missing transparency-log evidence, wrong
+Network responses, command runtimes, retry budgets, decoded JSON, compressed
+tarball size, individual archive entries, total unpacked bytes, and archive
+entry count are capped. Unsigned bundles, another valid Fulcio identity or
+issuer, missing or non-positive Rekor `logIndex`/`integratedTime`, wrong
 subjects, or any semantic disagreement fail closed.
 
 After those checks, the promotion step moves the intended dist-tag (normally

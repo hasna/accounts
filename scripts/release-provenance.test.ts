@@ -1,7 +1,11 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { gzipSync } from "node:zlib";
 import {
+  MAX_ARCHIVE_ENTRIES,
+  MAX_ARCHIVE_ENTRY_BYTES,
+  MAX_ARCHIVE_UNPACKED_BYTES,
   MAX_JSON_BYTES,
   MAX_TARBALL_BYTES,
   PUBLISH_PREDICATE,
@@ -12,8 +16,11 @@ import {
   RELEASE_WORKFLOW,
   assertDeterministicPacks,
   assertExactCliVersion,
+  assertFinalPromotionVersion,
   assertGitEvidence,
+  assertPromotionVersion,
   assertTrustedPublishEnvironment,
+  expectedSigstoreIdentity,
   extractVerifiedAttestations,
   packagePurl,
   parseRetryOptions,
@@ -21,12 +28,14 @@ import {
   releaseTag,
   repositorySlug,
   stagingDistTag,
+  verifyArchive,
   verifyAttestations,
   verifyDistTags,
   verifyDownloadedTarball,
   verifyReleaseEnvironment,
   verifyRegistryMetadata,
   verifyReleaseRulesets,
+  verifySigstoreBundle,
   type PackResult,
   type ReleaseCandidate,
 } from "./release-provenance";
@@ -39,7 +48,7 @@ const manifest = {
 };
 const digest = Buffer.alloc(64, 0xab);
 const candidate: ReleaseCandidate = {
-  schema: "hasna.accounts.release-candidate/v2",
+  schema: "hasna.accounts.release-candidate/v3",
   name: manifest.name,
   version: manifest.version,
   tag: "npm/accounts/v0.3.0",
@@ -51,6 +60,7 @@ const candidate: ReleaseCandidate = {
   filename: "hasna-accounts-0.3.0.tgz",
   size: 300,
   fileCount: 2,
+  unpackedBytes: 300,
   artifactPath: "/tmp/release-candidate.tgz",
   stagingTag: "release-candidate-0.3.0",
   intendedTag: "latest",
@@ -74,7 +84,10 @@ function attestation(
     predicateType,
     bundle: {
       mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
-      verificationMaterial: { tlogEntries: [{}] },
+      verificationMaterial: {
+        certificate: { rawBytes: "synthetic-fixture" },
+        tlogEntries: [{ logIndex: "1", integratedTime: "2" }],
+      },
       dsseEnvelope: {
         payload: Buffer.from(JSON.stringify(payload)).toString("base64"),
         payloadType: "application/vnd.in-toto+json",
@@ -163,6 +176,41 @@ function ruleset(ruleTypes = ["creation", "update", "deletion"]) {
   };
 }
 
+function tarEntry(
+  path: string,
+  size: number,
+  type = "0",
+  content = Buffer.alloc(size),
+): Buffer {
+  const header = Buffer.alloc(512);
+  const writeText = (value: string, offset: number, length: number) => {
+    header.write(value, offset, Math.min(Buffer.byteLength(value), length), "utf8");
+  };
+  const writeOctal = (value: number, offset: number, length: number) => {
+    const encoded = value.toString(8).padStart(length - 1, "0");
+    writeText(`${encoded}\0`, offset, length);
+  };
+  writeText(path, 0, 100);
+  writeOctal(0o644, 100, 8);
+  writeOctal(0, 108, 8);
+  writeOctal(0, 116, 8);
+  writeOctal(size, 124, 12);
+  writeOctal(0, 136, 12);
+  header.fill(0x20, 148, 156);
+  writeText(type, 156, 1);
+  writeText("ustar\0", 257, 6);
+  writeText("00", 263, 2);
+  writeText(`${header.reduce((sum, byte) => sum + byte, 0).toString(8).padStart(6, "0")}\0 `, 148, 8);
+  const body = type === "0"
+    ? Buffer.concat([content, Buffer.alloc((512 - (content.length % 512)) % 512)])
+    : Buffer.alloc(0);
+  return Buffer.concat([header, body]);
+}
+
+function archive(entries: Array<ReturnType<typeof tarEntry>>): Buffer {
+  return gzipSync(Buffer.concat([...entries, Buffer.alloc(1024)]));
+}
+
 test("derives package-owned repository, release tag, staging tag, and purl", () => {
   expect(repositorySlug(manifest)).toBe("hasna/accounts");
   expect(releaseTag(manifest)).toBe(candidate.tag);
@@ -183,6 +231,7 @@ test("accepts only the exact tokenless protected GitHub OIDC workflow and pinned
     GITHUB_WORKFLOW_REF: `${candidate.repository}/${RELEASE_WORKFLOW}@refs/tags/${candidate.tag}`,
     GITHUB_SHA: candidate.commit,
     NPM_DIST_TAG_TOKEN_CONFIGURED: "true",
+    RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: "true",
     ACTIONS_ID_TOKEN_REQUEST_URL: "https://example.invalid/oidc",
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "present",
   };
@@ -208,6 +257,10 @@ test("accepts only the exact tokenless protected GitHub OIDC workflow and pinned
     ...env,
     NPM_DIST_TAG_TOKEN_CONFIGURED: "false",
   }, tools)).toThrow("NPM_DIST_TAG_TOKEN is not configured");
+  expect(() => assertTrustedPublishEnvironment(manifest, {
+    ...env,
+    RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: "false",
+  }, tools)).toThrow("RELEASE_GITHUB_ADMIN_TOKEN is not configured");
   expect(() => assertTrustedPublishEnvironment(manifest, {
     ...env,
     "NPM_CONFIG_//REGISTRY.NPMJS.ORG/:_AUTHTOKEN": "forbidden",
@@ -278,10 +331,7 @@ test("requires a live active release-tag ruleset with immutable restricted autho
     name: "protect-npm-accounts-release-tags",
   });
   const { bypass_actors: _hiddenByGitHub, ...readOnlyRuleset } = ruleset();
-  expect(verifyReleaseRulesets([readOnlyRuleset])).toEqual({
-    id: 19_812_295,
-    name: "protect-npm-accounts-release-tags",
-  });
+  expect(() => verifyReleaseRulesets([readOnlyRuleset])).toThrow("bypass actors are unavailable");
   expect(() => verifyReleaseRulesets([{ ...ruleset(), enforcement: "evaluate" }]))
     .toThrow("no active tag ruleset");
   expect(() => verifyReleaseRulesets([{
@@ -307,13 +357,13 @@ test("requires a live active release-tag ruleset with immutable restricted autho
     },
   }])).toThrow("no active tag ruleset");
   expect(() => verifyReleaseRulesets([ruleset(["update", "deletion"])]))
-    .toThrow("no active tag ruleset");
+    .toThrow("exactly creation, update, and deletion");
   expect(() => verifyReleaseRulesets([ruleset(["creation", "deletion"])]))
-    .toThrow("no active tag ruleset");
+    .toThrow("exactly creation, update, and deletion");
   expect(() => verifyReleaseRulesets([ruleset(["creation", "update"])]))
-    .toThrow("no active tag ruleset");
+    .toThrow("exactly creation, update, and deletion");
   expect(() => verifyReleaseRulesets([{ ...ruleset(), bypass_actors: [] }]))
-    .toThrow("restrict authority");
+    .toThrow("exactly one organization-admin");
   expect(() => verifyReleaseRulesets([{
     ...ruleset(),
     bypass_actors: [{
@@ -321,7 +371,22 @@ test("requires a live active release-tag ruleset with immutable restricted autho
       actor_type: "Team",
       bypass_mode: "always",
     }],
-  }])).toThrow("organization-admin authority");
+  }])).toThrow("exactly one organization-admin");
+  expect(() => verifyReleaseRulesets([{
+    ...ruleset(),
+    bypass_actors: [
+      ...ruleset().bypass_actors,
+      {
+        actor_id: 123,
+        actor_type: "Team",
+        bypass_mode: "always",
+      },
+    ],
+  }])).toThrow("exactly one organization-admin");
+  expect(() => verifyReleaseRulesets([{
+    ...ruleset(),
+    rules: [...ruleset().rules, { type: "required_signatures" }],
+  }])).toThrow("exactly creation, update, and deletion");
 });
 
 test("requires protected release-environment reviewers and an exact tag deployment policy", () => {
@@ -349,11 +414,22 @@ test("requires protected release-environment reviewers and an exact tag deployme
     role_name: "admin",
     user: { id: 123, login: "release-owner" },
   };
-  expect(() => verifyReleaseEnvironment(environment, policies, actor)).not.toThrow();
+  const administrationCredential = {
+    identity: { id: 123, login: "release-owner" },
+    permission: actor,
+  };
+  expect(() => verifyReleaseEnvironment(
+    environment,
+    policies,
+    actor,
+    administrationCredential.identity,
+    administrationCredential.permission,
+  )).not.toThrow();
   expect(() => verifyReleaseEnvironment({
     ...environment,
     protection_rules: [{ type: "branch_policy" }],
-  }, policies, actor)).toThrow("require reviewers");
+  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+    .toThrow("require reviewers");
   expect(() => verifyReleaseEnvironment({
     ...environment,
     protection_rules: [
@@ -364,7 +440,8 @@ test("requires protected release-environment reviewers and an exact tag deployme
       },
       { type: "branch_policy" },
     ],
-  }, policies, actor)).toThrow("allow the authorized reviewer");
+  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+    .toThrow("allow the authorized reviewer");
   expect(() => verifyReleaseEnvironment({
     ...environment,
     protection_rules: [
@@ -375,19 +452,23 @@ test("requires protected release-environment reviewers and an exact tag deployme
       },
       { type: "branch_policy" },
     ],
-  }, policies, actor)).toThrow("exactly match the live release actor");
+  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+    .toThrow("exactly match the live release actor");
   expect(() => verifyReleaseEnvironment(environment, policies, {
     ...actor,
     permission: "write",
-  })).toThrow("repository admin permission");
+  }, administrationCredential.identity, administrationCredential.permission))
+    .toThrow("repository admin permission");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
     branch_policies: [{ id: 456, name: "npm/accounts/v*", type: "branch" }],
-  }, actor)).toThrow("exact npm/accounts/v* tag policy");
+  }, actor, administrationCredential.identity, administrationCredential.permission))
+    .toThrow("exact npm/accounts/v* tag policy");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
     branch_policies: [{ id: 456, name: "npm/accounts/*", type: "tag" }],
-  }, actor)).toThrow("exact npm/accounts/v* tag policy");
+  }, actor, administrationCredential.identity, administrationCredential.permission))
+    .toThrow("exact npm/accounts/v* tag policy");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
     total_count: 2,
@@ -395,7 +476,97 @@ test("requires protected release-environment reviewers and an exact tag deployme
       { id: 456, name: "npm/accounts/v*", type: "tag" },
       { id: 789, name: "main", type: "branch" },
     ],
-  }, actor)).toThrow("exactly one deployment tag policy");
+  }, actor, administrationCredential.identity, administrationCredential.permission))
+    .toThrow("exactly one deployment tag policy");
+  expect(() => verifyReleaseEnvironment(
+    environment,
+    policies,
+    actor,
+    { id: 999, login: "other-admin" },
+    { permission: "admin", user: { id: 999, login: "other-admin" } },
+  )).toThrow("administration credential must belong to the release actor");
+  expect(() => verifyReleaseEnvironment(
+    environment,
+    policies,
+    actor,
+    administrationCredential.identity,
+    { ...administrationCredential.permission, permission: "write" },
+  )).toThrow("administration credential needs repository admin read authority");
+});
+
+test("allows only advancing or exact-idempotent semantic promotion", () => {
+  expect(assertPromotionVersion("1.2.3", undefined)).toBe("advance");
+  expect(assertPromotionVersion("1.2.3", "1.2.3")).toBe("idempotent");
+  expect(assertPromotionVersion("1.2.3", "1.2.2")).toBe("advance");
+  expect(() => assertPromotionVersion("1.2.3", "1.2.4")).toThrow("stale or downgrade");
+  expect(() => assertPromotionVersion("1.2.3-beta.1", "1.2.3-alpha.9")).not.toThrow();
+  expect(() => assertPromotionVersion("1.2.3-alpha.9", "1.2.3-beta.1")).toThrow("stale or downgrade");
+  expect(() => assertPromotionVersion("1.2.3+two", "1.2.3+one"))
+    .toThrow("does not advance semantic precedence");
+  expect(() => assertPromotionVersion("not-semver", "1.2.3")).toThrow("valid SemVer");
+  expect(() => assertPromotionVersion("1.2.3", "not-semver")).toThrow("registry latest");
+  expect(() => assertFinalPromotionVersion("1.2.3", "1.2.3")).not.toThrow();
+  expect(() => assertFinalPromotionVersion("1.2.3", "1.2.4"))
+    .toThrow("stale or downgrade");
+  expect(() => assertFinalPromotionVersion("1.2.3", "1.2.2"))
+    .toThrow("registry latest changed during promotion");
+  expect(() => assertFinalPromotionVersion("1.2.3", undefined))
+    .toThrow("registry latest changed during promotion");
+});
+
+test("pins the exact Fulcio workflow SAN and OIDC issuer for cryptographic verification", async () => {
+  const policy = expectedSigstoreIdentity(candidate);
+  expect(policy).toEqual({
+    certificateIdentityURI:
+      "^https://github\\.com/hasna/accounts/\\.github/workflows/release\\.yml@refs/tags/npm/accounts/v0\\.3\\.0$",
+    certificateIssuer: "https://token.actions.githubusercontent.com",
+  });
+  const otherRepository = expectedSigstoreIdentity({
+    ...candidate,
+    repository: "attacker/accounts",
+  });
+  expect(otherRepository.certificateIdentityURI).not.toBe(policy.certificateIdentityURI);
+  const otherTag = expectedSigstoreIdentity({
+    ...candidate,
+    tag: "npm/accounts/v9.9.9",
+  });
+  expect(otherTag.certificateIdentityURI).not.toBe(policy.certificateIdentityURI);
+  const bundle = {
+    mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+    verificationMaterial: {
+      certificate: { rawBytes: "verified-fixture" },
+      tlogEntries: [{
+        logIndex: "1",
+        integratedTime: "2",
+      }],
+    },
+    dsseEnvelope: {
+      payload: "e30=",
+      payloadType: "application/vnd.in-toto+json",
+      signatures: [{ sig: "cryptographic-fixture" }],
+    },
+  };
+  let calls = 0;
+  await verifySigstoreBundle(candidate, bundle, async (received, options) => {
+    calls++;
+    expect(received).toBe(bundle);
+    expect(options).toEqual({
+      ...policy,
+      ctLogThreshold: 1,
+      tlogThreshold: 1,
+    });
+  });
+  expect(calls).toBe(1);
+  await expect(verifySigstoreBundle(candidate, {
+    ...bundle,
+    verificationMaterial: { tlogEntries: [] },
+  }, async () => {})).rejects.toThrow("Fulcio certificate");
+  await expect(verifySigstoreBundle(candidate, bundle, async (_received, options) => {
+    if (options?.certificateIdentityURI !== policy.certificateIdentityURI) {
+      throw new Error("other valid Fulcio identity rejected");
+    }
+    throw new Error("other valid signature rejected");
+  })).rejects.toThrow("other valid signature rejected");
 });
 
 test("requires registry source, integrity, and advertised provenance agreement", () => {
@@ -406,6 +577,8 @@ test("requires registry source, integrity, and advertised provenance agreement",
     dist: {
       integrity: candidate.integrity,
       shasum: candidate.shasum,
+      fileCount: candidate.fileCount,
+      unpackedSize: candidate.unpackedBytes,
       tarball: "https://registry.npmjs.org/@hasna/accounts/-/accounts-0.3.0.tgz",
       attestations: {
         url: "https://registry.npmjs.org/-/npm/v1/attestations/@hasna%2faccounts@0.3.0",
@@ -420,6 +593,14 @@ test("requires registry source, integrity, and advertised provenance agreement",
     ...metadata,
     dist: { ...metadata.dist, integrity: "sha512-wrong" },
   })).toThrow("integrity");
+  expect(() => verifyRegistryMetadata(candidate, {
+    ...metadata,
+    dist: { ...metadata.dist, fileCount: 99 },
+  })).toThrow("fileCount");
+  expect(() => verifyRegistryMetadata(candidate, {
+    ...metadata,
+    dist: { ...metadata.dist, unpackedSize: 999 },
+  })).toThrow("unpackedSize");
   expect(() => verifyRegistryMetadata(candidate, {
     ...metadata,
     dist: { ...metadata.dist, attestations: undefined },
@@ -514,10 +695,14 @@ test("binds audited attestations to exact subject, workflow, repository, tag, an
 });
 
 test("rejects changed registry downloads using size and both package digests", () => {
-  const bytes = Buffer.from("the exact reviewed tarball");
+  const bytes = archive([
+    tarEntry("package/exact.txt", 5, "0", Buffer.from("exact")),
+  ]);
   const exactCandidate = {
     ...candidate,
     size: bytes.length,
+    fileCount: 1,
+    unpackedBytes: 5,
     shasum: createHash("sha1").update(bytes).digest("hex"),
     integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
   };
@@ -528,6 +713,45 @@ test("rejects changed registry downloads using size and both package digests", (
   sameSizeChanged[0] ^= 0xff;
   expect(() => verifyDownloadedTarball(exactCandidate, sameSizeChanged))
     .toThrow("differs from the reviewed pack");
+});
+
+test("bounds archive entries, individual bytes, total bytes, paths, and entry types", () => {
+  const exact = archive([
+    tarEntry("package/dist/cli.js", 3, "0", Buffer.from("cli")),
+    tarEntry("package/package.json", 2, "0", Buffer.from("{}")),
+  ]);
+  expect(verifyArchive(exact)).toEqual({
+    fileCount: 2,
+    unpackedBytes: 5,
+    files: [
+      { path: "dist/cli.js", size: 3 },
+      { path: "package.json", size: 2 },
+    ],
+  });
+  expect(() => verifyArchive(archive([
+    tarEntry("package/../escape", 1, "0", Buffer.from("x")),
+  ]))).toThrow("unsafe archive path");
+  expect(() => verifyArchive(archive([
+    tarEntry("/absolute", 1, "0", Buffer.from("x")),
+  ]))).toThrow("unsafe archive path");
+  expect(() => verifyArchive(archive([
+    tarEntry("package/link", 0, "2"),
+  ]))).toThrow("unsupported archive entry type");
+  expect(() => verifyArchive(archive([
+    tarEntry("package/huge", MAX_ARCHIVE_ENTRY_BYTES + 1),
+  ]))).toThrow("individual entry");
+  expect(() => verifyArchive(archive([
+    tarEntry("package/one", MAX_ARCHIVE_ENTRY_BYTES),
+    tarEntry("package/two", MAX_ARCHIVE_ENTRY_BYTES),
+    tarEntry("package/three", MAX_ARCHIVE_ENTRY_BYTES),
+    tarEntry("package/four", MAX_ARCHIVE_ENTRY_BYTES),
+    tarEntry("package/five", 1),
+  ]))).toThrow("total unpacked");
+  expect(() => verifyArchive(archive(
+    Array.from({ length: MAX_ARCHIVE_ENTRIES + 1 }, (_, index) =>
+      tarEntry(`package/f${index}`, 0)
+    ),
+  ))).toThrow("entry count");
 });
 
 test("requires the exact installed CLI version", () => {
@@ -543,6 +767,9 @@ test("caps retry, response, and tarball resource use", async () => {
   expect(() => parseRetryOptions("6", "20000")).toThrow();
   expect(MAX_JSON_BYTES).toBe(8 * 1024 * 1024);
   expect(MAX_TARBALL_BYTES).toBe(32 * 1024 * 1024);
+  expect(MAX_ARCHIVE_ENTRIES).toBe(512);
+  expect(MAX_ARCHIVE_ENTRY_BYTES).toBe(16 * 1024 * 1024);
+  expect(MAX_ARCHIVE_UNPACKED_BYTES).toBe(64 * 1024 * 1024);
   expect(await readLimited(new Response("1234"), 4)).toEqual(Buffer.from("1234"));
   await expect(readLimited(new Response("12345"), 4)).rejects.toThrow("exceeds 4 bytes");
   const stream = new ReadableStream({
@@ -558,7 +785,15 @@ test("caps retry, response, and tarball resource use", async () => {
 test("release workflow publishes one preserved tarball under staging before promotion", () => {
   const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
   expect(workflow).toContain('tags:\n      - "npm/accounts/v*"');
+  expect(workflow).toContain("group: hasna-accounts-npm-release");
+  expect(workflow).not.toContain("group: release-${{ github.ref }}");
   expect(workflow).toContain("id-token: write");
+  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED");
+  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}");
+  expect(
+    workflow.match(/RELEASE_GITHUB_ADMIN_TOKEN: \$\{\{ secrets\.RELEASE_GITHUB_ADMIN_TOKEN \}\}/g),
+  ).toHaveLength(3);
+  expect(workflow).toContain("bun run test:provenance-crypto");
   expect(workflow).toContain(`node-version: "${RELEASE_NODE_VERSION}"`);
   expect(workflow).toContain(`bun-version: "${RELEASE_BUN_VERSION}"`);
   expect(workflow).toContain(`npm_version="$(npm --version)"`);
@@ -580,5 +815,12 @@ test("package lifecycle rejects direct publication outside the preserved-artifac
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { scripts: Record<string, string> };
   expect(packageJson.scripts.prepublishOnly).toContain("reject-direct-publish");
+  expect(packageJson.scripts["test:provenance-crypto"])
+    .toBe("node scripts/verify-sigstore-smoke.mjs");
   expect(packageJson.scripts["verify:pack"]).toContain("release-provenance.ts pack");
+  expect(packageJson.devDependencies.semver).toBe("7.7.2");
+  expect(packageJson.devDependencies["@sigstore/bundle"]).toBe("4.0.0");
+  expect(packageJson.devDependencies["@sigstore/protobuf-specs"]).toBe("0.5.1");
+  expect(packageJson.devDependencies["@sigstore/verify"]).toBe("3.1.1");
+  expect(packageJson.devDependencies.sigstore).toBeUndefined();
 });

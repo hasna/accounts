@@ -102,6 +102,9 @@ jobs:
       - name: Run tests
         run: bun test
 
+      - name: Verify pinned Sigstore identity policy
+        run: bun run test:provenance-crypto
+
       - name: Build
         run: bun run build
 

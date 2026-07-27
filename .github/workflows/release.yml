@@ -6,7 +6,7 @@ on:
       - "npm/accounts/v*"
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: hasna-accounts-npm-release
   cancel-in-progress: false
 
 permissions:
@@ -19,6 +19,7 @@ jobs:
     environment: npm-release
     env:
       NPM_DIST_TAG_TOKEN_CONFIGURED: ${{ secrets.NPM_DIST_TAG_TOKEN != '' }}
+      RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN != '' }}
     timeout-minutes: 30
     permissions:
       actions: read
@@ -73,6 +74,7 @@ jobs:
       - name: Verify protected release identity and live tag ruleset
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
         run: bun run scripts/release-provenance.ts preflight
 
       - name: Verify release
@@ -81,6 +83,7 @@ jobs:
           bun run typecheck
           bun run test:compat
           bun test
+          bun run test:provenance-crypto
           bun run build
           bun run contracts:no-cloud-scan
           bun test src/sdk.test.ts src/contracts.test.ts
@@ -92,8 +95,6 @@ jobs:
             bun run test:postgres
 
       - name: Bind tag, commit, and deterministic package
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           bun run scripts/release-provenance.ts candidate
           --out "$RUNNER_TEMP/release-candidate.json"
@@ -104,9 +105,13 @@ jobs:
           bun run scripts/release-provenance.ts ensure-unpublished
           --candidate "$RUNNER_TEMP/release-candidate.json"
 
-      - name: Publish preserved candidate under version quarantine
+      - name: Reverify live controls immediately before publication
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Publish preserved candidate under version quarantine
         run: >-
           bun run scripts/release-provenance.ts publish-staged
           --candidate "$RUNNER_TEMP/release-candidate.json"
@@ -117,9 +122,14 @@ jobs:
           --candidate "$RUNNER_TEMP/release-candidate.json"
           --phase staged
 
-      - name: Promote the verified version to its intended dist-tag
+      - name: Reverify live controls immediately before promotion
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Promote the verified version to its intended dist-tag
+        env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
         run: >-
           bun run scripts/release-provenance.ts promote

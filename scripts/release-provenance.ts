@@ -9,8 +9,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, posix, resolve } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
+import { gunzipSync } from "node:zlib";
+import type { Bundle as SigstoreBundle } from "@sigstore/bundle";
+import { compare, valid } from "semver";
 
 export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const PUBLISH_PREDICATE =
@@ -21,6 +24,9 @@ export const RELEASE_NPM_VERSION = "11.16.0";
 export const RELEASE_BUN_VERSION = "1.3.14";
 export const MAX_JSON_BYTES = 8 * 1024 * 1024;
 export const MAX_TARBALL_BYTES = 32 * 1024 * 1024;
+export const MAX_ARCHIVE_ENTRIES = 512;
+export const MAX_ARCHIVE_ENTRY_BYTES = 16 * 1024 * 1024;
+export const MAX_ARCHIVE_UNPACKED_BYTES = 64 * 1024 * 1024;
 export const FETCH_TIMEOUT_MS = 15_000;
 export const COMMAND_TIMEOUT_MS = 180_000;
 
@@ -31,6 +37,16 @@ const RELEASE_TAG_PATTERN = "refs/tags/npm/accounts/v*";
 const RELEASE_ENVIRONMENT = "npm-release";
 const RELEASE_ENVIRONMENT_TAG_PATTERN = "npm/accounts/v*";
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
+const MAX_TAR_STREAM_BYTES =
+  MAX_ARCHIVE_UNPACKED_BYTES + MAX_ARCHIVE_ENTRIES * 1024 + 1024 * 1024;
+const SIGSTORE_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
+
+interface SigstoreVerifyOptions {
+  certificateIdentityURI: string;
+  certificateIssuer: string;
+  ctLogThreshold?: number;
+  tlogThreshold?: number;
+}
 
 interface Manifest {
   name: string;
@@ -55,7 +71,7 @@ interface PackedArtifact {
 }
 
 export interface ReleaseCandidate {
-  schema: "hasna.accounts.release-candidate/v2";
+  schema: "hasna.accounts.release-candidate/v3";
   name: string;
   version: string;
   tag: string;
@@ -67,6 +83,7 @@ export interface ReleaseCandidate {
   filename: string;
   size: number;
   fileCount: number;
+  unpackedBytes: number;
   artifactPath: string;
   stagingTag: string;
   intendedTag: string;
@@ -83,6 +100,17 @@ export interface GitEvidence {
 export type RegistryPhase = "staged" | "promoted";
 type RecordValue = Record<string, unknown>;
 
+export interface ArchiveSummary {
+  fileCount: number;
+  unpackedBytes: number;
+  files: Array<{ path: string; size: number }>;
+}
+
+type SigstoreVerifier = (
+  bundle: SigstoreBundle,
+  options?: SigstoreVerifyOptions,
+) => Promise<void>;
+
 interface ToolchainVersions {
   node: string;
   npm: string;
@@ -93,6 +121,7 @@ interface RunOptions {
   inherit?: boolean;
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  input?: string;
 }
 
 function check(condition: unknown, message: string): asserts condition {
@@ -133,6 +162,7 @@ function runResult(
       NPM_CONFIG_AUDIT: "false",
       NPM_CONFIG_FUND: "false",
     },
+    input: options.input,
   };
   return spawnSync(executable, args, spawnOptions);
 }
@@ -202,7 +232,9 @@ export function stagingDistTag(version: string): string {
 }
 
 function intendedDistTag(manifest: Manifest): string {
-  return assertDistTag(manifest.publishConfig?.tag ?? "latest", "intended tag");
+  const tag = assertDistTag(manifest.publishConfig?.tag ?? "latest", "intended tag");
+  check(tag === "latest", "Accounts releases must promote only the latest dist-tag");
+  return tag;
 }
 
 export function packagePurl(name: string, version: string): string {
@@ -237,6 +269,118 @@ function parsePack(stdout: string): PackResult {
   };
 }
 
+function tarText(header: Buffer, offset: number, length: number, label: string): string {
+  const field = header.subarray(offset, offset + length);
+  const nul = field.indexOf(0);
+  const value = field.subarray(0, nul === -1 ? field.length : nul).toString("utf8");
+  check(!value.match(/[\u0000-\u001f\u007f]/), `${label} contains control characters`);
+  return value;
+}
+
+function tarOctal(header: Buffer, offset: number, length: number, label: string): number {
+  const raw = header.subarray(offset, offset + length).toString("ascii").replace(/\0.*$/, "").trim();
+  check(raw.match(/^[0-7]+$/), `${label} is not canonical octal`);
+  const value = Number.parseInt(raw, 8);
+  check(Number.isSafeInteger(value) && value >= 0, `${label} exceeds safe integer range`);
+  return value;
+}
+
+function assertTarChecksum(header: Buffer): void {
+  const expected = tarOctal(header, 148, 8, "archive header checksum");
+  let actual = 0;
+  for (let index = 0; index < header.length; index++) {
+    actual += index >= 148 && index < 156 ? 0x20 : header[index]!;
+  }
+  check(actual === expected, "archive header checksum disagrees");
+}
+
+function archivePath(header: Buffer): string {
+  const name = tarText(header, 0, 100, "archive entry name");
+  const prefix = tarText(header, 345, 155, "archive entry prefix");
+  const path = prefix ? `${prefix}/${name}` : name;
+  check(
+    path.startsWith("package/") &&
+      !path.startsWith("/") &&
+      !path.includes("\\") &&
+      !path.match(/(?:^|\/)\.{1,2}(?:\/|$)/) &&
+      posix.normalize(path) === path,
+    `unsafe archive path: ${path || "<empty>"}`,
+  );
+  return path.slice("package/".length);
+}
+
+export function verifyArchive(bytes: Uint8Array): ArchiveSummary {
+  let tar: Buffer;
+  try {
+    tar = gunzipSync(Buffer.from(bytes), { maxOutputLength: MAX_TAR_STREAM_BYTES });
+  } catch (error) {
+    throw new Error(
+      `archive gzip stream is invalid or exceeds ${MAX_TAR_STREAM_BYTES} bytes: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  check(tar.length % 512 === 0, "archive tar stream is not block aligned");
+  const files: ArchiveSummary["files"] = [];
+  const seen = new Set<string>();
+  let unpackedBytes = 0;
+  let entries = 0;
+  let offset = 0;
+  let endBlocks = 0;
+  while (offset < tar.length) {
+    const header = tar.subarray(offset, offset + 512);
+    check(header.length === 512, "archive header is truncated");
+    offset += 512;
+    if (header.every((byte) => byte === 0)) {
+      endBlocks++;
+      if (endBlocks === 2) {
+        check(
+          tar.subarray(offset).every((byte) => byte === 0),
+          "archive contains data after its terminal blocks",
+        );
+        break;
+      }
+      continue;
+    }
+    check(endBlocks === 0, "archive contains a single zero block before data");
+    assertTarChecksum(header);
+    check(
+      tarText(header, 257, 6, "archive format") === "ustar",
+      "archive must use the ustar format",
+    );
+    entries++;
+    check(entries <= MAX_ARCHIVE_ENTRIES, `archive entry count exceeds ${MAX_ARCHIVE_ENTRIES}`);
+    const type = String.fromCharCode(header[156] ?? 0);
+    check(
+      type === "\0" || type === "0" || type === "5",
+      `unsupported archive entry type ${JSON.stringify(type)}`,
+    );
+    const path = archivePath(header);
+    check(!seen.has(path), `archive contains duplicate path: ${path}`);
+    seen.add(path);
+    const size = tarOctal(header, 124, 12, "archive entry size");
+    if (type === "5") {
+      check(size === 0, "archive directory entry must be empty");
+      continue;
+    }
+    check(
+      size <= MAX_ARCHIVE_ENTRY_BYTES,
+      `archive individual entry exceeds ${MAX_ARCHIVE_ENTRY_BYTES} bytes`,
+    );
+    unpackedBytes += size;
+    check(
+      unpackedBytes <= MAX_ARCHIVE_UNPACKED_BYTES,
+      `archive total unpacked bytes exceed ${MAX_ARCHIVE_UNPACKED_BYTES}`,
+    );
+    const padded = Math.ceil(size / 512) * 512;
+    check(offset + padded <= tar.length, `archive entry ${path} is truncated`);
+    offset += padded;
+    files.push({ path, size });
+  }
+  check(endBlocks === 2, "archive is missing two terminal zero blocks");
+  check(files.length > 0, "archive contains no regular files");
+  return { fileCount: files.length, unpackedBytes, files };
+}
+
 function verifyArtifactBytes(pack: PackResult, bytes: Buffer): void {
   check(bytes.length === pack.size, "npm pack size does not match the tarball bytes");
   check(bytes.length <= MAX_TARBALL_BYTES, `tarball exceeds ${MAX_TARBALL_BYTES} bytes`);
@@ -244,6 +388,15 @@ function verifyArtifactBytes(pack: PackResult, bytes: Buffer): void {
     createHash("sha1").update(bytes).digest("hex") === pack.shasum &&
       `sha512-${createHash("sha512").update(bytes).digest("base64")}` === pack.integrity,
     "npm pack metadata does not match the tarball bytes",
+  );
+  const summary = verifyArchive(bytes);
+  const expectedFiles = pack.files
+    .map(({ path, size }) => ({ path, size }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const archiveFiles = [...summary.files].sort((left, right) => left.path.localeCompare(right.path));
+  check(
+    JSON.stringify(archiveFiles) === JSON.stringify(expectedFiles),
+    "archive entries disagree with npm pack metadata",
   );
 }
 
@@ -322,6 +475,10 @@ function workflowIdentity(
   check(
     env.NPM_DIST_TAG_TOKEN_CONFIGURED === "true",
     "NPM_DIST_TAG_TOKEN is not configured in the protected release environment",
+  );
+  check(
+    env.RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED === "true",
+    "RELEASE_GITHUB_ADMIN_TOKEN is not configured in the protected release environment",
   );
   check(manifest.publishConfig?.registry === REGISTRY, `publish registry must be ${REGISTRY}`);
   check(manifest.publishConfig?.access === "public", "publish access must be public");
@@ -435,26 +592,31 @@ export function verifyReleaseRulesets(input: unknown): { id: number; name: strin
       !refConditionIncludesReleaseTag(ruleset.conditions)
     ) continue;
     check(Array.isArray(ruleset.rules), "ruleset rules must be an array");
-    const types = new Set(ruleset.rules.map((rule, index) =>
+    const types = ruleset.rules.map((rule, index) =>
       text(record(rule, `ruleset rule ${index}`).type, `ruleset rule ${index} type`)
-    ));
-    if (!["creation", "update", "deletion"].every((type) => types.has(type))) continue;
-    if (ruleset.bypass_actors !== undefined) {
-      check(Array.isArray(ruleset.bypass_actors), "ruleset bypass actors must be an array");
-      check(ruleset.bypass_actors.length > 0, "release tag ruleset must restrict authority to bypass actors");
-      let organizationAdminAuthority = false;
-      for (const [index, actorInput] of ruleset.bypass_actors.entries()) {
-        const actor = record(actorInput, `ruleset bypass actor ${index}`);
-        check(actor.bypass_mode === "always", "release tag bypass actors must use always mode");
-        const actorType = text(actor.actor_type, `ruleset bypass actor ${index} type`);
-        check(
-          ["OrganizationAdmin", "Team", "Integration", "EnterpriseOwner"].includes(actorType),
-          "release tag bypass actor type is not an accountable release authority",
-        );
-        organizationAdminAuthority ||= actorType === "OrganizationAdmin";
-      }
-      check(organizationAdminAuthority, "release tag creation must require organization-admin authority");
-    }
+    );
+    check(
+      types.length === 3 &&
+        new Set(types).size === 3 &&
+        ["creation", "update", "deletion"].every((type) => types.includes(type)),
+      "release tag rules must be exactly creation, update, and deletion",
+    );
+    check(
+      ruleset.bypass_actors !== undefined,
+      "release tag ruleset bypass actors are unavailable; administration-read authority is required",
+    );
+    check(Array.isArray(ruleset.bypass_actors), "ruleset bypass actors must be an array");
+    check(
+      ruleset.bypass_actors.length === 1,
+      "release tag ruleset must have exactly one organization-admin always bypass",
+    );
+    const actor = record(ruleset.bypass_actors[0], "ruleset bypass actor");
+    check(
+      actor.actor_id === null &&
+        actor.actor_type === "OrganizationAdmin" &&
+        actor.bypass_mode === "always",
+      "release tag ruleset must have exactly one organization-admin always bypass",
+    );
     return {
       id: integer(ruleset.id, "ruleset id"),
       name: text(ruleset.name, "ruleset name"),
@@ -469,11 +631,36 @@ export function verifyReleaseEnvironment(
   environmentInput: unknown,
   policiesInput: unknown,
   actorPermissionInput: unknown,
+  administrationIdentityInput: unknown,
+  administrationPermissionInput: unknown,
 ): void {
   const environment = record(environmentInput, "GitHub release environment");
   const actorPermission = record(actorPermissionInput, "GitHub release actor permission");
   const actor = record(actorPermission.user, "GitHub release actor");
+  const administrationIdentity = record(
+    administrationIdentityInput,
+    "GitHub administration credential identity",
+  );
+  const administrationPermission = record(
+    administrationPermissionInput,
+    "GitHub administration credential permission",
+  );
+  const administrationUser = record(
+    administrationPermission.user,
+    "GitHub administration credential permission user",
+  );
   check(actorPermission.permission === "admin", "release actor must have repository admin permission");
+  check(
+    administrationPermission.permission === "admin",
+    "administration credential needs repository admin read authority",
+  );
+  check(
+    administrationIdentity.id === actor.id &&
+      administrationIdentity.login === actor.login &&
+      administrationUser.id === actor.id &&
+      administrationUser.login === actor.login,
+    "administration credential must belong to the release actor",
+  );
   check(environment.name === RELEASE_ENVIRONMENT, `release environment must be ${RELEASE_ENVIRONMENT}`);
   check(Array.isArray(environment.protection_rules), "release environment protection rules must be an array");
   const rules = environment.protection_rules.map((entry, index) =>
@@ -576,17 +763,31 @@ async function assertLiveReleaseControls(
   const repository = repositorySlug(manifest);
   check(env.GITHUB_REPOSITORY === repository, "ruleset repository disagrees with package metadata");
   const token = text(env.GITHUB_TOKEN, "GITHUB_TOKEN");
+  const administrationToken = text(
+    env.RELEASE_GITHUB_ADMIN_TOKEN,
+    "RELEASE_GITHUB_ADMIN_TOKEN",
+  );
   const headers = {
     accept: "application/vnd.github+json",
     authorization: `Bearer ${token}`,
     "x-github-api-version": GITHUB_API_VERSION,
   };
+  const administrationHeaders = {
+    ...headers,
+    authorization: `Bearer ${administrationToken}`,
+  };
   const actorName = encodeURIComponent(text(env.GITHUB_ACTOR, "GITHUB_ACTOR"));
-  const [summaries, environment, policies, actorPermission] = await Promise.all([
+  const [
+    summaries,
+    environment,
+    policies,
+    actorPermission,
+    administrationIdentity,
+  ] = await Promise.all([
     fetchJson(
       githubUrl(`/repos/${repository}/rulesets?includes_parents=true&targets=tag&per_page=100`),
       MAX_JSON_BYTES,
-      headers,
+      administrationHeaders,
     ),
     fetchJson(
       githubUrl(`/repos/${repository}/environments/${RELEASE_ENVIRONMENT}`),
@@ -605,15 +806,35 @@ async function assertLiveReleaseControls(
       MAX_JSON_BYTES,
       headers,
     ),
+    fetchJson(githubUrl("/user"), MAX_JSON_BYTES, administrationHeaders),
   ]);
   check(Array.isArray(summaries), "GitHub rulesets response must be an array");
   const details = await Promise.all(summaries.map(async (entry, index) => {
     const summary = record(entry, `ruleset summary ${index}`);
     const id = integer(summary.id, `ruleset summary ${index} id`);
-    return fetchJson(githubUrl(`/repos/${repository}/rulesets/${id}`), MAX_JSON_BYTES, headers);
+    return fetchJson(
+      githubUrl(`/repos/${repository}/rulesets/${id}`),
+      MAX_JSON_BYTES,
+      administrationHeaders,
+    );
   }));
+  const administration = record(administrationIdentity, "GitHub administration credential identity");
+  const administrationName = encodeURIComponent(
+    text(administration.login, "GitHub administration credential login"),
+  );
+  const administrationPermission = await fetchJson(
+    githubUrl(`/repos/${repository}/collaborators/${administrationName}/permission`),
+    MAX_JSON_BYTES,
+    administrationHeaders,
+  );
   const ruleset = verifyReleaseRulesets(details);
-  verifyReleaseEnvironment(environment, policies, actorPermission);
+  verifyReleaseEnvironment(
+    environment,
+    policies,
+    actorPermission,
+    administrationIdentity,
+    administrationPermission,
+  );
   console.log(`verified active release tag ruleset ${ruleset.name} (${ruleset.id})`);
   console.log(`verified protected ${RELEASE_ENVIRONMENT} environment and tag policy`);
 }
@@ -625,8 +846,13 @@ function candidateFrom(
   artifactPath: string,
 ): ReleaseCandidate {
   check(pack.name === manifest.name && pack.version === manifest.version, "pack metadata disagrees with package.json");
+  const unpackedBytes = pack.files.reduce((sum, file) => sum + file.size, 0);
+  check(
+    Number.isSafeInteger(unpackedBytes) && unpackedBytes <= MAX_ARCHIVE_UNPACKED_BYTES,
+    "pack unpacked size exceeds the release limit",
+  );
   return {
-    schema: "hasna.accounts.release-candidate/v2",
+    schema: "hasna.accounts.release-candidate/v3",
     name: manifest.name,
     version: manifest.version,
     tag: releaseTag(manifest),
@@ -638,6 +864,7 @@ function candidateFrom(
     filename: pack.filename,
     size: pack.size,
     fileCount: pack.files.length,
+    unpackedBytes,
     artifactPath,
     stagingTag: stagingDistTag(manifest.version),
     intendedTag: intendedDistTag(manifest),
@@ -646,11 +873,11 @@ function candidateFrom(
 
 function loadCandidate(path: string): ReleaseCandidate {
   const value = record(JSON.parse(readFileSync(path, "utf8")), "release candidate");
-  check(value.schema === "hasna.accounts.release-candidate/v2", "unsupported candidate schema");
+  check(value.schema === "hasna.accounts.release-candidate/v3", "unsupported candidate schema");
   const artifactPath = text(value.artifactPath, "candidate artifact path");
   check(isAbsolute(artifactPath), "candidate artifact path must be absolute");
   const result: ReleaseCandidate = {
-    schema: "hasna.accounts.release-candidate/v2",
+    schema: "hasna.accounts.release-candidate/v3",
     name: text(value.name, "candidate name"),
     version: text(value.version, "candidate version"),
     tag: text(value.tag, "candidate tag"),
@@ -662,12 +889,20 @@ function loadCandidate(path: string): ReleaseCandidate {
     filename: text(value.filename, "candidate filename"),
     size: integer(value.size, "candidate size"),
     fileCount: integer(value.fileCount, "candidate file count"),
+    unpackedBytes: integer(value.unpackedBytes, "candidate unpacked bytes"),
     artifactPath,
     stagingTag: assertDistTag(text(value.stagingTag, "candidate staging tag"), "candidate staging tag"),
     intendedTag: assertDistTag(text(value.intendedTag, "candidate intended tag"), "candidate intended tag"),
   };
   check(result.commit.match(/^[0-9a-f]{40}$/), "candidate commit must be a full SHA");
-  check(result.size > 0 && result.fileCount > 0, "candidate artifact metadata must be nonempty");
+  check(
+    result.size > 0 &&
+      result.fileCount > 0 &&
+      result.fileCount <= MAX_ARCHIVE_ENTRIES &&
+      result.unpackedBytes > 0 &&
+      result.unpackedBytes <= MAX_ARCHIVE_UNPACKED_BYTES,
+    "candidate artifact metadata must be nonempty and within archive limits",
+  );
   return result;
 }
 
@@ -701,6 +936,12 @@ function verifyCandidateArtifact(value: ReleaseCandidate): Buffer {
     createHash("sha1").update(bytes).digest("hex") === value.shasum &&
       `sha512-${createHash("sha512").update(bytes).digest("base64")}` === value.integrity,
     "candidate artifact bytes changed after verification",
+  );
+  const archive = verifyArchive(bytes);
+  check(archive.fileCount === value.fileCount, "candidate archive file count changed after verification");
+  check(
+    archive.unpackedBytes === value.unpackedBytes,
+    "candidate archive unpacked bytes changed after verification",
   );
   return bytes;
 }
@@ -743,6 +984,14 @@ export function verifyRegistryMetadata(
   check(metadata.gitHead === value.commit, "registry gitHead disagrees");
   const dist = record(metadata.dist, "registry dist");
   check(dist.integrity === value.integrity && dist.shasum === value.shasum, "registry integrity disagrees");
+  check(
+    integer(dist.fileCount, "registry fileCount") === value.fileCount,
+    "registry fileCount disagrees",
+  );
+  check(
+    integer(dist.unpackedSize, "registry unpackedSize") === value.unpackedBytes,
+    "registry unpackedSize disagrees",
+  );
   const attestations = record(dist.attestations, "registry attestations");
   check(
     record(attestations.provenance, "registry provenance").predicateType === PROVENANCE_PREDICATE,
@@ -782,6 +1031,78 @@ function integrityHex(integrity: string): string {
   return decodeBase64(match[1], "candidate integrity").toString("hex");
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function expectedSigstoreIdentity(
+  value: Pick<ReleaseCandidate, "repository" | "workflow" | "tag">,
+): Pick<SigstoreVerifyOptions, "certificateIdentityURI" | "certificateIssuer"> {
+  const identity =
+    `https://github.com/${value.repository}/${value.workflow}@refs/tags/${value.tag}`;
+  return {
+    certificateIdentityURI: `^${escapeRegex(identity)}$`,
+    certificateIssuer: SIGSTORE_OIDC_ISSUER,
+  };
+}
+
+async function verifySigstoreWithPinnedNode(
+  bundle: SigstoreBundle,
+  options?: SigstoreVerifyOptions,
+): Promise<void> {
+  const root = resolve(process.cwd());
+  run("node", [join(root, "scripts", "verify-sigstore.mjs")], root, {
+    timeoutMs: 60_000,
+    input: JSON.stringify({ bundle, options }),
+  });
+}
+
+export async function verifySigstoreBundle(
+  value: ReleaseCandidate,
+  input: unknown,
+  verifier: SigstoreVerifier = verifySigstoreWithPinnedNode,
+): Promise<void> {
+  const bundle = record(input, "Sigstore provenance bundle");
+  check(
+    bundle.mediaType === "application/vnd.dev.sigstore.bundle.v0.3+json",
+    "provenance must use a Sigstore v0.3 bundle",
+  );
+  const material = record(bundle.verificationMaterial, "Sigstore verification material");
+  check(material.certificate, "Sigstore provenance bundle must contain a Fulcio certificate");
+  await verifier(bundle as unknown as SigstoreBundle, {
+    ...expectedSigstoreIdentity(value),
+    ctLogThreshold: 1,
+    tlogThreshold: 1,
+  });
+}
+
+export async function verifyProvenanceBundleCryptographically(
+  value: ReleaseCandidate,
+  input: unknown,
+  verifier: SigstoreVerifier = verifySigstoreWithPinnedNode,
+): Promise<void> {
+  check(Array.isArray(input), "npm audit did not return attestation bundles");
+  const provenance = input.filter((entry) =>
+    record(entry, "cryptographically verified attestation").predicateType ===
+      PROVENANCE_PREDICATE
+  );
+  check(provenance.length === 1, "exactly one SLSA provenance bundle is required");
+  await verifySigstoreBundle(
+    value,
+    record(provenance[0], "SLSA provenance attestation").bundle,
+    verifier,
+  );
+}
+
+function positiveIntegerStringOrNumber(value: unknown, label: string): bigint {
+  const encoded = typeof value === "number" ? String(value) : value;
+  check(
+    typeof encoded === "string" && encoded.match(/^[1-9]\d*$/),
+    `${label} must be a positive integer`,
+  );
+  return BigInt(encoded);
+}
+
 function auditedStatement(item: unknown, value: ReleaseCandidate): RecordValue {
   const attestation = record(item, "cryptographically verified attestation");
   const predicateType = text(attestation.predicateType, "predicate type");
@@ -790,9 +1111,12 @@ function auditedStatement(item: unknown, value: ReleaseCandidate): RecordValue {
   check(Array.isArray(envelope.signatures) && envelope.signatures.length > 0, "unsigned DSSE bundle is forbidden");
   const material = record(bundle.verificationMaterial, "Sigstore verification material");
   check(
-    Array.isArray(material.tlogEntries) && material.tlogEntries.length > 0,
-    "Sigstore transparency-log evidence is required",
+    Array.isArray(material.tlogEntries) && material.tlogEntries.length === 1,
+    "exactly one Sigstore transparency-log entry is required",
   );
+  const tlog = record(material.tlogEntries[0], "Sigstore transparency-log entry");
+  positiveIntegerStringOrNumber(tlog.logIndex, "Sigstore logIndex");
+  positiveIntegerStringOrNumber(tlog.integratedTime, "Sigstore integratedTime");
   const decoded = record(
     JSON.parse(decodeBase64(envelope.payload, "DSSE payload").toString("utf8")),
     "in-toto statement",
@@ -856,6 +1180,9 @@ export function verifyDownloadedTarball(value: ReleaseCandidate, bytes: Uint8Arr
       `sha512-${createHash("sha512").update(buffer).digest("base64")}` === value.integrity,
     "downloaded registry tarball differs from the reviewed pack",
   );
+  const archive = verifyArchive(buffer);
+  check(archive.fileCount === value.fileCount, "downloaded archive file count differs");
+  check(archive.unpackedBytes === value.unpackedBytes, "downloaded archive unpacked bytes differ");
 }
 
 export function verifyDistTags(
@@ -876,6 +1203,47 @@ export function verifyDistTags(
       `${value.intendedTag} does not agree with ${value.stagingTag}`,
     );
   }
+}
+
+export function assertPromotionVersion(
+  candidateVersion: string,
+  currentLatest: string | undefined,
+): "advance" | "idempotent" {
+  check(valid(candidateVersion) !== null, `candidate ${candidateVersion} is not valid SemVer`);
+  if (currentLatest === undefined) return "advance";
+  check(
+    valid(currentLatest) !== null,
+    `registry latest ${currentLatest} is not valid SemVer`,
+  );
+  if (candidateVersion === currentLatest) return "idempotent";
+  const precedence = compare(candidateVersion, currentLatest);
+  check(
+    precedence !== 0,
+    `${candidateVersion} does not advance semantic precedence over registry latest ${currentLatest}`,
+  );
+  check(
+    precedence > 0,
+    `refusing stale or downgrade promotion of ${candidateVersion} over registry latest ${currentLatest}`,
+  );
+  return "advance";
+}
+
+export function assertFinalPromotionVersion(
+  candidateVersion: string,
+  currentLatest: string | undefined,
+): void {
+  check(
+    assertPromotionVersion(candidateVersion, currentLatest) === "idempotent",
+    `registry latest changed during promotion; expected ${candidateVersion}, received ` +
+      `${currentLatest ?? "<absent>"}`,
+  );
+}
+
+function latestDistTag(input: unknown): string | undefined {
+  const tags = record(record(input, "registry package metadata")["dist-tags"], "registry dist-tags");
+  const latest = tags.latest;
+  check(latest === undefined || typeof latest === "string", "registry latest must be a string");
+  return latest;
 }
 
 export function extractVerifiedAttestations(
@@ -956,9 +1324,14 @@ async function verifyRegistryRelease(
     try {
       const versionMetadata = await fetchJson(packageUrl(value.name, value.version));
       const urls = verifyRegistryMetadata(value, versionMetadata);
-      verifyDistTags(value, await fetchJson(packageUrl(value.name)), phase);
+      const packageMetadata = await fetchJson(packageUrl(value.name));
+      verifyDistTags(value, packageMetadata, phase);
+      if (phase === "promoted") {
+        assertFinalPromotionVersion(value.version, latestDistTag(packageMetadata));
+      }
       verifyDownloadedTarball(value, await fetchLimited(urls.tarballUrl, MAX_TARBALL_BYTES));
       const auditedBundles = verifyExactInstallAndAttestations(value);
+      await verifyProvenanceBundleCryptographically(value, auditedBundles);
       verifyAttestations(value, auditedBundles);
       console.log(
         `verified ${value.name}@${value.version}: registry bytes, gitHead, ` +
@@ -983,13 +1356,18 @@ async function promoteDistTag(
   assertGitContext(root, manifest, env);
   assertCandidateContext(value, manifest, env);
   verifyCandidateArtifact(value);
-  await assertLiveReleaseControls(manifest, env);
-  verifyDistTags(value, await fetchJson(packageUrl(value.name)), "staged");
-  run("npm", [
-    "dist-tag", "add", `${value.name}@${value.version}`, value.intendedTag,
-    "--registry", REGISTRY,
-  ], root);
-  verifyDistTags(value, await fetchJson(packageUrl(value.name)), "promoted");
+  const before = await fetchJson(packageUrl(value.name));
+  const promotion = assertPromotionVersion(value.version, latestDistTag(before));
+  if (promotion === "advance") {
+    verifyDistTags(value, before, "staged");
+    run("npm", [
+      "dist-tag", "add", `${value.name}@${value.version}`, value.intendedTag,
+      "--registry", REGISTRY,
+    ], root);
+  }
+  const after = await fetchJson(packageUrl(value.name));
+  verifyDistTags(value, after, "promoted");
+  assertFinalPromotionVersion(value.version, latestDistTag(after));
   console.log(`promoted ${value.name}@${value.version} to ${value.intendedTag}`);
 }
 
@@ -1018,7 +1396,6 @@ async function main(): Promise<void> {
   } else if (subcommand === "candidate") {
     assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
     assertGitContext(root, manifest, process.env);
-    await assertLiveReleaseControls(manifest, process.env);
     const artifactPath = resolve(option(args, "--artifact"));
     const pack = verifyDeterministicPack(root, artifactPath);
     const value = candidateFrom(
@@ -1037,7 +1414,6 @@ async function main(): Promise<void> {
   } else if (subcommand === "publish-staged") {
     assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
     assertGitContext(root, manifest, process.env);
-    await assertLiveReleaseControls(manifest, process.env);
     const value = loadCandidate(resolve(option(args, "--candidate")));
     assertCandidateContext(value, manifest, process.env);
     verifyCandidateArtifact(value);
