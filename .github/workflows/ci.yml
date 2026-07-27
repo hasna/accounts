@@ -76,7 +76,10 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile --minimum-release-age 259200
+        run: bun install --frozen-lockfile --minimum-release-age 604800
+
+      - name: Reject high-severity dependency advisories
+        run: bun audit --audit-level high
 
       - name: Type check
         run: bun run typecheck
@@ -126,7 +129,7 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile --minimum-release-age 259200
+        run: bun install --frozen-lockfile --minimum-release-age 604800
 
       - name: Claude launch type check
         run: bun run typecheck
