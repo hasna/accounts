@@ -132,6 +132,15 @@ export interface PromotionRegistry {
   setLatest: (version: string) => Promise<void>;
 }
 
+export interface RegistryReleaseAttemptOperations {
+  readVersionMetadata: () => Promise<unknown>;
+  readPackageMetadata: () => Promise<unknown>;
+  readTarball: (url: URL) => Promise<Uint8Array>;
+  verifyConsumer: () => unknown[];
+  verifyCryptographically: (bundles: unknown[]) => Promise<void>;
+  verifySemantically: (bundles: unknown[]) => void;
+}
+
 export interface ArchiveSummary {
   fileCount: number;
   unpackedBytes: number;
@@ -1765,6 +1774,38 @@ export function parseRetryOptions(attemptsInput: string, delayInput: string): {
   return { attempts, delayMs };
 }
 
+function verifyRegistryPackageState(
+  value: ReleaseCandidate,
+  phase: RegistryPhase,
+  input: unknown,
+): void {
+  const metadata = record(input, "registry package metadata");
+  check(metadata.name === value.name, `registry package identity must be ${value.name}`);
+  verifyDistTags(value, metadata, phase);
+  if (phase === "promoted") {
+    assertFinalMonotonicPromotion(value, metadata);
+  }
+}
+
+export async function verifyRegistryReleaseAttempt(
+  value: ReleaseCandidate,
+  phase: RegistryPhase,
+  operations: RegistryReleaseAttemptOperations,
+): Promise<void> {
+  const versionMetadata = await operations.readVersionMetadata();
+  const urls = verifyRegistryMetadata(value, versionMetadata);
+  verifyRegistryPackageState(value, phase, await operations.readPackageMetadata());
+  verifyDownloadedTarball(value, await operations.readTarball(urls.tarballUrl));
+  const auditedBundles = operations.verifyConsumer();
+  await operations.verifyCryptographically(auditedBundles);
+  operations.verifySemantically(auditedBundles);
+
+  // Consumer installation, npm signature audit, and Sigstore verification are
+  // intentionally slow network and process gates. Their success must not rely
+  // on the package snapshot observed before they began.
+  verifyRegistryPackageState(value, phase, await operations.readPackageMetadata());
+}
+
 async function verifyRegistryRelease(
   value: ReleaseCandidate,
   phase: RegistryPhase,
@@ -1774,17 +1815,15 @@ async function verifyRegistryRelease(
   let failure: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const versionMetadata = await fetchJson(packageUrl(value.name, value.version));
-      const urls = verifyRegistryMetadata(value, versionMetadata);
-      const packageMetadata = await fetchJson(packageUrl(value.name));
-      verifyDistTags(value, packageMetadata, phase);
-      if (phase === "promoted") {
-        assertFinalMonotonicPromotion(value, packageMetadata);
-      }
-      verifyDownloadedTarball(value, await fetchLimited(urls.tarballUrl, MAX_TARBALL_BYTES));
-      const auditedBundles = verifyExactInstallAndAttestations(value);
-      await verifyProvenanceBundleCryptographically(value, auditedBundles);
-      verifyAttestations(value, auditedBundles);
+      await verifyRegistryReleaseAttempt(value, phase, {
+        readVersionMetadata: () => fetchJson(packageUrl(value.name, value.version)),
+        readPackageMetadata: () => fetchJson(packageUrl(value.name)),
+        readTarball: (url) => fetchLimited(url, MAX_TARBALL_BYTES),
+        verifyConsumer: () => verifyExactInstallAndAttestations(value),
+        verifyCryptographically: (bundles) =>
+          verifyProvenanceBundleCryptographically(value, bundles),
+        verifySemantically: (bundles) => verifyAttestations(value, bundles),
+      });
       console.log(
         `verified ${value.name}@${value.version}: registry bytes, gitHead, ` +
           `cryptographic attestations, provenance semantics, ${value.stagingTag}, exact install, and CLI agree`,

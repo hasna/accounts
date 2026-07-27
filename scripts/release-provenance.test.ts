@@ -39,6 +39,7 @@ import {
   verifyDownloadedTarball,
   verifyReleaseEnvironment,
   verifyRegistryMetadata,
+  verifyRegistryReleaseAttempt,
   verifyReleaseRulesets,
   verifySigstoreBundle,
   type PackResult,
@@ -157,6 +158,26 @@ function registryPackage(
       ...(latest === undefined ? {} : { latest }),
     },
     versions: Object.fromEntries(versions.map((version) => [version, { version }])),
+  };
+}
+
+function registryVersionMetadata(value: ReleaseCandidate): Record<string, unknown> {
+  return {
+    name: value.name,
+    version: value.version,
+    gitHead: value.commit,
+    dist: {
+      integrity: value.integrity,
+      shasum: value.shasum,
+      fileCount: value.fileCount,
+      unpackedSize: value.unpackedBytes,
+      tarball: `https://registry.npmjs.org/@hasna/accounts/-/accounts-${value.version}.tgz`,
+      attestations: {
+        url:
+          `https://registry.npmjs.org/-/npm/v1/attestations/@hasna%2faccounts@${value.version}`,
+        provenance: { predicateType: PROVENANCE_PREDICATE },
+      },
+    },
   };
 }
 
@@ -991,6 +1012,111 @@ test("keeps staging and intended dist-tags separated until promotion and equal a
   expect(() => verifyDistTags(candidate, {
     "dist-tags": { [candidate.intendedTag]: candidate.version },
   }, "promoted")).toThrow(candidate.stagingTag);
+});
+
+test("rejects a staged dist-tag mutation during install and audit before reporting success", async () => {
+  const packageJson = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
+  const tarball = archive([
+    tarEntry("package/package.json", packageJson.length, "0", packageJson),
+    tarEntry("package/dist/cli.js", 3, "0", Buffer.from("cli")),
+  ]);
+  const value: ReleaseCandidate = {
+    ...candidate,
+    size: tarball.length,
+    shasum: createHash("sha1").update(tarball).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+    fileCount: 2,
+    unpackedBytes: packageJson.length + 3,
+  };
+  let packageMetadata = registryPackage(
+    "0.2.12",
+    ["0.2.12", value.version],
+    value,
+  );
+  let packageReads = 0;
+
+  await expect(verifyRegistryReleaseAttempt(value, "staged", {
+    readVersionMetadata: async () => registryVersionMetadata(value),
+    readPackageMetadata: async () => {
+      packageReads++;
+      return packageMetadata;
+    },
+    readTarball: async () => tarball,
+    verifyConsumer: () => {
+      packageMetadata = registryPackage(
+        value.version,
+        ["0.2.12", value.version],
+        value,
+      );
+      return attestations();
+    },
+    verifyCryptographically: async () => {},
+    verifySemantically: () => {},
+  })).rejects.toThrow("latest was promoted before registry verification completed");
+  expect(packageReads).toBe(2);
+});
+
+test("rejects promoted monotonic drift at every slow verification gate before reporting success", async () => {
+  const packageJson = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
+  const tarball = archive([
+    tarEntry("package/package.json", packageJson.length, "0", packageJson),
+    tarEntry("package/dist/cli.js", 3, "0", Buffer.from("cli")),
+  ]);
+  const value: ReleaseCandidate = {
+    ...candidate,
+    size: tarball.length,
+    shasum: createHash("sha1").update(tarball).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+    fileCount: 2,
+    unpackedBytes: packageJson.length + 3,
+  };
+  const mutationGates = ["tarball", "consumer", "cryptographic", "semantic"] as const;
+  for (const mutationGate of mutationGates) {
+    let packageMetadata = registryPackage(
+      value.version,
+      ["0.2.12", value.version],
+      value,
+    );
+    let packageReads = 0;
+    const mutatePackage = () => {
+      packageMetadata = registryPackage(
+        value.version,
+        ["0.2.12", value.version, "0.4.0"],
+        value,
+      );
+    };
+
+    await expect(verifyRegistryReleaseAttempt(value, "promoted", {
+      readVersionMetadata: async () => registryVersionMetadata(value),
+      readPackageMetadata: async () => {
+        packageReads++;
+        return packageMetadata;
+      },
+      readTarball: async () => {
+        if (mutationGate === "tarball") mutatePackage();
+        return tarball;
+      },
+      verifyConsumer: () => {
+        if (mutationGate === "consumer") mutatePackage();
+        return attestations();
+      },
+      verifyCryptographically: async () => {
+        if (mutationGate === "cryptographic") mutatePackage();
+      },
+      verifySemantically: () => {
+        if (mutationGate === "semantic") mutatePackage();
+      },
+    })).rejects.toThrow("highest stable is 0.4.0");
+    expect(packageReads).toBe(2);
+  }
 });
 
 test("trusts only the exact package bundles returned by successful npm signature audit", () => {

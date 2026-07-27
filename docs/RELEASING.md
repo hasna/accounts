@@ -3,8 +3,11 @@
 `@hasna/accounts` is released only by `.github/workflows/release.yml`. The
 workflow publishes one preserved, deterministic tarball to a version-specific
 quarantine dist-tag, verifies that exact registry artifact, and only then moves
-the intended dist-tag. A failed candidate remains installable only by exact
-version or its quarantine tag; it is never promoted by the failed run.
+the intended dist-tag. A failure before the promotion command leaves the
+candidate installable only by exact version or its quarantine tag. A failure
+after promotion may occur during the final verification pass; in that case the
+intended dist-tag may already have moved and must be inspected and repaired
+rather than assumed unchanged.
 
 ## Required external controls
 
@@ -191,8 +194,12 @@ candidate run as superseded. An external overwrite back to an older tag is
 retried. Mutation and compensation attempts are bounded; a non-converging
 publisher race or failed compensation fails loudly with the last observed
 target and error state and requires operator recovery. No script can prevent a
-new external mutation after its final successful read, so release operators
-must not publish or move this package's dist-tags concurrently.
+new external mutation after its final successful read. The staged and promoted
+verification passes therefore reread the complete package metadata after the
+slow tarball download, exact install, signature audit, cryptographic check, and
+semantic check, then immediately revalidate the dist-tags and, for the promoted
+phase, the final monotonic state. Release operators must still not publish or
+move this package's dist-tags concurrently.
 
 Before publication, the workflow requires:
 
@@ -262,7 +269,20 @@ After those checks, the promotion step moves the intended dist-tag (normally
 tag and remains the unique highest stable registry version. A newer stable
 version discovered after mutation is restored as `latest` and the older
 candidate run fails as superseded. The final job repeats the registry,
-provenance, signature, install, CLI, and dist-tag checks in the promoted state.
+provenance, signature, install, CLI, and dist-tag checks in the promoted state,
+then performs a fresh terminal package-metadata read after all slow checks.
+That last read must still show exact quarantine and intended-tag agreement and
+the candidate as the unique highest stable version before the workflow reports
+success.
+
+The promotion command can forward-compensate a newer stable version that it
+observes in its immediate post-mutation reads because that command has the
+scoped dist-tag credential. The later verification command deliberately does
+not have that credential. If its terminal read discovers drift, the workflow
+fails after promotion without claiming that the earlier mutation was rolled
+back. Inspect the complete registry version and dist-tag state, then use a
+separate reviewed recovery change either to move `latest` forward to the newest
+verified stable version or to restore the previously verified exact version.
 
 ## Install and rollback
 
@@ -280,7 +300,11 @@ bun add --exact @hasna/accounts@X.Y.Z --minimum-release-age 604800
 ```
 
 If verification fails before promotion, leave the immutable version under its
-`release-candidate-X.Y.Z` tag and investigate; do not unpublish it. If a
-post-promotion runtime regression is discovered, move the intended dist-tag
-back to the last verified exact version through a separate reviewed recovery
-change, then reinstall that exact version in consumers.
+`release-candidate-X.Y.Z` tag and investigate; do not unpublish it. If terminal
+verification fails after promotion, first read the complete live version and
+dist-tag state: the candidate may already be `latest`, or an external publisher
+may have moved it again. Repair that state through a separate reviewed change,
+moving forward to the newest verified stable version when appropriate or
+restoring the previously verified exact version. For a post-promotion runtime
+regression, restore the last verified exact version and reinstall that exact
+version in consumers.
