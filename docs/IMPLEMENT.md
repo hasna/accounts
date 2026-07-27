@@ -51,7 +51,9 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 case-insensitively after all provider env overlays. Generated export handoffs
 explicitly `unset` them, and generated command handoffs use `env -u`, so an
 inherited value cannot survive merely because the caller executes printed
-output instead of using an Accounts-owned spawn.
+output instead of using an Accounts-owned spawn. The optional bash/zsh
+`claude()` hook uses the same child-only `env -u` boundary: it preserves the
+parent shell and every other inherited environment variable.
 
 Do not broaden that list without evidence that another control dumps provider
 requests. `PATH`, proxy/TLS configuration, Bedrock/Vertex selection, and

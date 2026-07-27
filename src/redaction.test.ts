@@ -63,3 +63,81 @@ test("an unterminated quoted header value does not consume later diagnostic line
   expect(redacted).not.toContain("unterminated-secret");
   expect(redacted).toContain("status=502 message=upstream failed");
 });
+
+test("folded sensitive request headers redact every syntactic continuation", () => {
+  const input = [
+    "request attempt=1",
+    "Authorization: AWS4-HMAC-SHA256 Credential=folded-access/20260727/us-east-1/bedrock/aws4_request,\r",
+    "\tSignedHeaders=content-type;host;x-amz-date,\r",
+    " Signature=folded-signature\r",
+    "status=403 request-id=independent-diagnostic",
+    "pRoXy-AuThOrIzAtIoN: Digest username=\"folded-proxy-user\",\r",
+    "\tnonce=\"folded-proxy-nonce\", response=\"folded-proxy-response\"\r",
+    "proxy-status=407 proxy-request-id=independent-proxy-diagnostic",
+    "Cookie: session=folded-session;",
+    ' theme="night,blue";',
+    "\tcsrf=folded-csrf",
+    "retryable=false",
+    "Set-Cookie: first=folded-first;",
+    "\tPath=/; HttpOnly,",
+    " second=folded-second; SameSite=Lax",
+    "completed=false",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "folded-access",
+    "SignedHeaders",
+    "folded-signature",
+    "folded-proxy-user",
+    "folded-proxy-nonce",
+    "folded-proxy-response",
+    "folded-session",
+    "night,blue",
+    "folded-csrf",
+    "folded-first",
+    "Path=/",
+    "folded-second",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const diagnostic of [
+    "request attempt=1",
+    "status=403 request-id=independent-diagnostic",
+    "proxy-status=407 proxy-request-id=independent-proxy-diagnostic",
+    "retryable=false",
+    "completed=false",
+  ]) {
+    expect(redacted).toContain(diagnostic);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
+
+test("an empty sensitive header never consumes the next diagnostic line", () => {
+  const input = [
+    "Authorization:   ",
+    "status=401 message=empty authorization header",
+    "Proxy-Authorization=\t",
+    "proxy-status=407 message=empty proxy authorization header",
+  ].join("\n");
+
+  expect(redactText(input)).toBe(input);
+});
+
+test("sensitive header matching handles safe delimiters without broad prose redaction", () => {
+  const input = [
+    "pRoXy-AuThOrIzAtIoN='Digest username=\"quoted-user\", nonce=\"quoted-nonce\"'",
+    'COOKIE = "session=quoted-session; theme=blue"',
+    "authorization-mode = public-capability-name",
+    "Set-Cookie documentation: independent prose",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of ["quoted-user", "quoted-nonce", "quoted-session"]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted).toContain("authorization-mode = public-capability-name");
+  expect(redacted).toContain("Set-Cookie documentation: independent prose");
+});

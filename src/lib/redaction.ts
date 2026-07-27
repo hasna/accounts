@@ -1,13 +1,27 @@
 const SECRET_PATTERN = /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[oprsu]_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b/g;
 const SECRET_FIELD_PATTERN =
-  /(\b(?:x-api-key|x-goog-api-key|x-amz-security-token|api[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?token|(?:access|refresh|id|session)[-_]?token|credential|password|secret|token)\b["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|(?:Bearer|Basic)\s+[^\s,;}\]]+|[^\s,;}\]]+)/gi;
+  /(\b(?:x-api-key|x-goog-api-key|x-amz-security-token|api[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?token|(?:access|refresh|id|session)[-_]?token|credential|password|secret|token)\b["']?[ \t]*[:=][ \t]*)(?:"[^"\r\n]*"|'[^'\r\n]*'|(?:Bearer|Basic)[ \t]+[^\s,;}\]]+|[^\s,;}\]]+)/gi;
 const SENSITIVE_REQUEST_HEADER_PATTERN =
-  /(^|[^A-Za-z0-9_-])(["']?)(?:authorization|proxy-authorization|cookie|set-cookie)\2\s*[:=]\s*/gim;
-const SERIALIZED_FIELD_BOUNDARY = /^,\s*["']?[A-Za-z][A-Za-z0-9_-]*["']?\s*:/;
+  /(^|[^A-Za-z0-9_-])(["']?)(?:authorization|proxy-authorization|cookie|set-cookie)\2[ \t]*[:=][ \t]*/gim;
+const SERIALIZED_FIELD_BOUNDARY = /^,[ \t]*["']?[A-Za-z][A-Za-z0-9_-]*["']?[ \t]*:/;
+
+function lineBreakEnd(value: string, start: number): number {
+  return value[start] === "\r" && value[start + 1] === "\n" ? start + 2 : start + 1;
+}
+
+function continuationStart(value: string, lineBreakStart: number): number | undefined {
+  const nextLine = lineBreakEnd(value, lineBreakStart);
+  return value[nextLine] === " " || value[nextLine] === "\t" ? nextLine : undefined;
+}
 
 function quotedValueEnd(value: string, start: number, quote: string): number {
   for (let index = start + 1; index < value.length; index++) {
-    if (value[index] === "\r" || value[index] === "\n") return index;
+    if (value[index] === "\r" || value[index] === "\n") {
+      const continuation = continuationStart(value, index);
+      if (continuation === undefined) return index;
+      index = continuation - 1;
+      continue;
+    }
     if (value[index] === "\\") {
       index++;
       continue;
@@ -21,7 +35,12 @@ function unquotedHeaderValueEnd(value: string, start: number): number {
   let quote: string | undefined;
   for (let index = start; index < value.length; index++) {
     const char = value[index]!;
-    if (char === "\r" || char === "\n") return index;
+    if (char === "\r" || char === "\n") {
+      const continuation = continuationStart(value, index);
+      if (continuation === undefined) return index;
+      index = continuation - 1;
+      continue;
+    }
     if (quote) {
       if (char === "\\") {
         index++;

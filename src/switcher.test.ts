@@ -340,6 +340,96 @@ test("hook install writes script with name validation", async () => {
   expect(hookScript()).toContain("=~ ^[a-z0-9][a-z0-9-]*$");
 });
 
+test("hook scrubs request debugging only for the provider child", () => {
+  const binDir = mkdtempSync(join(tmpdir(), "accounts hook 'bin-"));
+  const generatedHook = join(home, "generated hook 'script.sh");
+  const observationPath = join(home, "hook-observation.txt");
+  const fakeAccounts = join(binDir, "accounts");
+  const fakeClaude = join(binDir, "claude");
+  const args = ["space arg", "single'quote", '"double quote"', "$literal", "*"];
+
+  writeFileSync(
+    fakeAccounts,
+    [
+      "#!/bin/sh",
+      'case "${1:-}" in',
+      "  active|applied) exit 0 ;;",
+      "  apply) exit 99 ;;",
+      "esac",
+      "exit 0",
+    ].join("\n"),
+  );
+  writeFileSync(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "{",
+      '  printf "debug=%s,%s,%s\\n" "${BUN_CONFIG_VERBOSE_FETCH+x}" "${NODE_DEBUG+x}" "${NODE_DEBUG_NATIVE+x}"',
+      '  printf "path=%s\\n" "$PATH"',
+      '  printf "https_proxy=%s\\n" "${HTTPS_PROXY:-}"',
+      '  printf "tls=%s\\n" "${NODE_EXTRA_CA_CERTS:-}"',
+      '  printf "bedrock=%s\\n" "${CLAUDE_CODE_USE_BEDROCK:-}"',
+      '  printf "vertex=%s\\n" "${CLAUDE_CODE_USE_VERTEX:-}"',
+      '  printf "aws=%s\\n" "${AWS_PROFILE:-}"',
+      '  printf "google=%s\\n" "${GOOGLE_APPLICATION_CREDENTIALS:-}"',
+      '  for arg in "$@"; do printf "arg=%s\\n" "$arg"; done',
+      '} > "$HOOK_OBSERVATION"',
+    ].join("\n"),
+  );
+  chmodSync(fakeAccounts, 0o755);
+  chmodSync(fakeClaude, 0o755);
+  writeFileSync(generatedHook, hookScript(), { mode: 0o755 });
+
+  const result = spawnSync(
+    "/bin/bash",
+    [
+      "--noprofile",
+      "--norc",
+      "-c",
+      [
+        'source "$1"',
+        "shift",
+        'claude "$@"',
+        'printf "parent-debug=%s,%s,%s\\n" "${BUN_CONFIG_VERBOSE_FETCH+x}" "${NODE_DEBUG+x}" "${NODE_DEBUG_NATIVE+x}"',
+      ].join("\n"),
+      "accounts-hook-test",
+      generatedHook,
+      ...args,
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        HOOK_OBSERVATION: observationPath,
+        BUN_CONFIG_VERBOSE_FETCH: "1",
+        NODE_DEBUG: "http,http2",
+        NODE_DEBUG_NATIVE: "http",
+        HTTPS_PROXY: "http://proxy.example.test:8443",
+        NODE_EXTRA_CA_CERTS: "/profiles/work/ca.pem",
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        CLAUDE_CODE_USE_VERTEX: "1",
+        AWS_PROFILE: "work",
+        GOOGLE_APPLICATION_CREDENTIALS: "/profiles/work/google.json",
+      },
+    },
+  );
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toContain("parent-debug=x,x,x");
+  const observation = readFileSync(observationPath, "utf8");
+  expect(observation).toContain("debug=,,");
+  expect(observation).toContain(`path=${binDir}:`);
+  expect(observation).toContain("https_proxy=http://proxy.example.test:8443");
+  expect(observation).toContain("tls=/profiles/work/ca.pem");
+  expect(observation).toContain("bedrock=1");
+  expect(observation).toContain("vertex=1");
+  expect(observation).toContain("aws=work");
+  expect(observation).toContain("google=/profiles/work/google.json");
+  expect(observation.match(/^arg=.*$/gm)?.map((line) => line.slice(4))).toEqual(args);
+  rmSync(binDir, { recursive: true, force: true });
+});
+
 test("resolvePickMode maps Commander --no-act to none", async () => {
   expect(resolvePickMode({ act: false })).toBe("none");
   expect(resolvePickMode({ env: true })).toBe("env");

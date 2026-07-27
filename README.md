@@ -127,8 +127,10 @@ Credential-bearing launches, probes, subshells, and generated handoffs
 intentionally remove exactly three request-dump controls:
 `BUN_CONFIG_VERBOSE_FETCH`, `NODE_DEBUG`, and `NODE_DEBUG_NATIVE`.
 `accounts env` and `accounts pick --env` print an `unset` before their exports;
-non-launch `accounts switch` commands use `env -u` for the same keys. This also
-prevents a custom tool's profile environment from restoring those controls.
+non-launch `accounts switch` commands and the optional `claude()` shell hook
+use `env -u` for the same keys. The hook changes only the provider child, not
+the parent shell. This also prevents a custom tool's profile environment from
+restoring those controls.
 
 Accounts otherwise preserves the caller's same-binding environment, including
 `PATH`, proxy and TLS settings, Bedrock/Vertex selection, and AWS/Google SDK
