@@ -67,6 +67,22 @@ function stableId(kind: string, seed: string): string {
   return `${kind}_${createHash("sha256").update(seed).digest("hex").slice(0, 24)}`;
 }
 
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalize((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+function canonicalDigest(value: unknown): `sha256:${string}` {
+  return digest(JSON.stringify(canonicalize(value)));
+}
+
 function backupPlan() {
   return {
     archiveId: "backup_000000000000001",
@@ -180,6 +196,28 @@ function passingEvidence(plan: MigrationPlan): MigrationGateEvidence {
 }
 
 describe("v2 migration plan", () => {
+  test("uses deterministic default identities and idempotency keys for identical input", () => {
+    const first = buildMigrationPlan(planInput());
+    const second = buildMigrationPlan(planInput());
+    const otherScope = buildMigrationPlan({
+      ...planInput(),
+      scope: {
+        tenantId: "tenant_0000000000000002",
+        scopeId: "scope_00000000000000002",
+      },
+    });
+
+    expect(second).toEqual(first);
+    expect(first.id).toMatch(/^plan_[a-f0-9]{32}$/);
+    expect(first.idempotencyKey).toBe(second.idempotencyKey);
+    expect(otherScope.records[0]!.target.accountId).not.toBe(
+      first.records[0]!.target.accountId,
+    );
+    expect(otherScope.records[0]!.target.runtimeId).not.toBe(
+      first.records[0]!.target.runtimeId,
+    );
+  });
+
   test("allocates stable immutable targets without rewriting or grouping legacy records", () => {
     const plan = buildPlan();
 
@@ -244,6 +282,23 @@ describe("v2 migration plan", () => {
     expect(plan.records.every((record) => record.binding === undefined)).toBe(true);
   });
 
+  test("quarantines distinct legacy names that resolve to the same verified root identity", () => {
+    const sharedRoot = safeObservation("alice").root;
+    const plan = buildPlan([
+      safeObservation("alice"),
+      safeObservation("bob", "claude", {
+        root: sharedRoot,
+        inputDigest: digest("same-root-bob"),
+      }),
+    ]);
+
+    expect(plan.records.map((record) => record.disposition)).toEqual([
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+    ]);
+    expect(plan.records.every((record) => record.binding === undefined)).toBe(true);
+  });
+
   test("fails duplicate source observations rather than silently overwriting", () => {
     expect(() => buildPlan([safeObservation("alice"), safeObservation("alice")])).toThrow(
       "duplicate legacy source key",
@@ -292,6 +347,104 @@ describe("v2 migration plan", () => {
         sourceDigests: { ...plan.sourceDigests, untrackedSource: digest("unknown") },
       }).success,
     ).toBe(false);
+
+    expect(
+      migrationPlanSchema.safeParse({
+        ...plan,
+        records: [
+          {
+            ...plan.records[0],
+            binding: {
+              ...plan.records[0]!.binding!,
+              credentialRef: "vault://must-not-enter-sidecar",
+            },
+          },
+          plan.records[1],
+        ],
+      }).success,
+    ).toBe(false);
+
+    expect(
+      migrationPlanSchema.safeParse({
+        ...plan,
+        records: [
+          {
+            ...plan.records[0],
+            disposition: {
+              state: "quarantined",
+              reasons: ["catalog_skip"],
+            },
+            binding: undefined,
+          },
+          plan.records[1],
+        ],
+      }).success,
+    ).toBe(false);
+
+    expect(
+      migrationPlanSchema.safeParse({
+        ...plan,
+        records: [
+          {
+            ...plan.records[0],
+            sourceKey: "local-v1:machine_000000000000001:claude:forged",
+          },
+          plan.records[1],
+        ],
+      }).success,
+    ).toBe(false);
+
+    expect(
+      migrationPlanSchema.safeParse({
+        ...plan,
+        records: [
+          {
+            ...plan.records[0],
+            binding: {
+              ...plan.records[0]!.binding!,
+              accountId: plan.records[1]!.target.accountId,
+            },
+          },
+          plan.records[1],
+        ],
+      }).success,
+    ).toBe(false);
+
+    const forgedAccountId = "account_forged0000000000001";
+    expect(
+      migrationPlanSchema.safeParse({
+        ...plan,
+        records: [
+          {
+            ...plan.records[0],
+            target: {
+              ...plan.records[0]!.target,
+              accountId: forgedAccountId,
+            },
+            binding: {
+              ...plan.records[0]!.binding!,
+              accountId: forgedAccountId,
+            },
+          },
+          plan.records[1],
+        ],
+      }).success,
+    ).toBe(false);
+
+    expect(() =>
+      buildMigrationPlan(planInput(), {
+        existingPlan: {
+          ...plan,
+          records: [
+            {
+              ...plan.records[0],
+              runtimeLabel: "Forged but schema-valid label",
+            },
+            plan.records[1],
+          ],
+        },
+      }),
+    ).toThrow("input digest");
   });
 
   test("redacts paths and aliases while retaining counts, digests, and conflict evidence", () => {
@@ -476,7 +629,7 @@ describe("backup, gates, aliases, and cutover states", () => {
     ).toThrow("does not target its frozen immutable identity");
   });
 
-  test("enforces explicit monotonic partial and final cutover states", () => {
+  test("enforces durable gate and scope-bound backfill receipts across cutover states", async () => {
     const plan = buildPlan();
     const initial = createMigrationSidecar(plan);
     expect(() => transitionMigrationSidecar(initial, "partial_ready")).toThrow(
@@ -485,13 +638,58 @@ describe("backup, gates, aliases, and cutover states", () => {
     const partialReady = transitionMigrationSidecar(initial, "partial_ready", {
       gateEvidence: passingEvidence(plan),
     });
-    const partialApplied = transitionMigrationSidecar(partialReady, "partial_applied");
+    expect(partialReady.gateReceipts).toHaveLength(1);
+    expect(partialReady.gateReceipts[0]).toMatchObject({
+      intent: "partial",
+      targetState: "partial_ready",
+      sourceIntegrityDigest: initial.integrityDigest,
+    });
+    expect(() => transitionMigrationSidecar(partialReady, "partial_applied")).toThrow(
+      "requires a committed scope-bound backfill receipt",
+    );
+    const partialBackfill = await applyScopedBackfill(partialReady, new RecordingBackfillPort());
+    const { digest: _receiptDigest, ...partialReceiptCore } =
+      partialBackfill.receipt;
+    const wrongScopeCore = {
+      ...partialReceiptCore,
+      scope: {
+        tenantId: "tenant_0000000000000002",
+        scopeId: "scope_00000000000000002",
+      },
+    };
+    expect(() =>
+      transitionMigrationSidecar(partialReady, "partial_applied", {
+        backfillReceipt: {
+          ...wrongScopeCore,
+          digest: canonicalDigest(wrongScopeCore),
+        },
+      }),
+    ).toThrow("not bound to the frozen plan and scope");
+    const aliasAdvanced = appendMigrationAlias(partialReady, {
+      kind: "legacy_account",
+      alias: "legacy:claude:alice-after-backfill",
+      sourceKey: partialReady.plan.records[0]!.sourceKey,
+      targetId: partialReady.plan.records[0]!.target.accountId,
+    });
+    expect(() =>
+      transitionMigrationSidecar(aliasAdvanced, "partial_applied", {
+        backfillReceipt: partialBackfill.receipt,
+      }),
+    ).toThrow("does not bind the exact partial_ready predecessor");
+    const partialApplied = transitionMigrationSidecar(partialReady, "partial_applied", {
+      backfillReceipt: partialBackfill.receipt,
+    });
     const finalReady = transitionMigrationSidecar(partialApplied, "final_ready", {
       gateEvidence: passingEvidence(plan),
     });
-    const finalApplied = transitionMigrationSidecar(finalReady, "final_applied");
+    const finalBackfill = await applyScopedBackfill(finalReady, new RecordingBackfillPort());
+    const finalApplied = transitionMigrationSidecar(finalReady, "final_applied", {
+      backfillReceipt: finalBackfill.receipt,
+    });
 
     expect(finalApplied.state).toBe("final_applied");
+    expect(finalApplied.gateReceipts).toHaveLength(2);
+    expect(finalApplied.backfillReceipts).toHaveLength(2);
     expect(() => transitionMigrationSidecar(finalApplied, "partial_applied")).toThrow(
       "cannot move migration state backwards",
     );
@@ -519,23 +717,24 @@ describe("backup, gates, aliases, and cutover states", () => {
 class RecordingBackfillTransaction implements MigrationBackfillTransaction {
   readonly events: string[] = [];
   failAt?: string;
+  invalidResultAt?: string;
 
   async ensureRuntime(runtime: ScopedBackfillRuntime): Promise<"created" | "adopted"> {
     this.events.push(`runtime:${runtime.id}`);
     this.maybeFail("runtime");
-    return "created";
+    return this.result("runtime");
   }
 
   async ensureAccount(account: ScopedBackfillAccount): Promise<"created" | "adopted"> {
     this.events.push(`account:${account.id}`);
     this.maybeFail("account");
-    return "created";
+    return this.result("account");
   }
 
   async ensureCrosswalk(crosswalk: ScopedBackfillCrosswalk): Promise<"created" | "adopted"> {
     this.events.push(`crosswalk:${crosswalk.sourceKey}`);
     this.maybeFail("crosswalk");
-    return "created";
+    return this.result("crosswalk");
   }
 
   async recordEpoch(input: {
@@ -545,11 +744,17 @@ class RecordingBackfillTransaction implements MigrationBackfillTransaction {
   }): Promise<"created" | "adopted"> {
     this.events.push(`epoch:${input.planId}`);
     this.maybeFail("epoch");
-    return "created";
+    return this.result("epoch");
   }
 
   private maybeFail(point: string): void {
     if (this.failAt === point) throw new Error(`forced ${point} failure`);
+  }
+
+  private result(point: string): "created" | "adopted" {
+    return this.invalidResultAt === point
+      ? ("invalid" as "created")
+      : "created";
   }
 }
 
@@ -604,6 +809,12 @@ describe("scoped transactional backfill hooks", () => {
       accounts: { created: 1, adopted: 0 },
       crosswalks: { created: 1, adopted: 0 },
       epoch: "created",
+      receipt: expect.objectContaining({
+        planId: plan.id,
+        idempotencyKey: plan.idempotencyKey,
+        scope: plan.scope,
+        readyState: "partial_ready",
+      }),
     });
     expect(port.transactionImpl.events.filter((event) => event.startsWith("account:"))).toHaveLength(
       1,
@@ -627,6 +838,21 @@ describe("scoped transactional backfill hooks", () => {
     expect(port.committed).toBe(false);
     expect(port.rolledBack).toBe(true);
     expect(sidecar.state).toBe("partial_ready");
+  });
+
+  test("validates port outcomes inside the transaction before a receipt can be issued", async () => {
+    const port = new RecordingBackfillPort();
+    port.transactionImpl.invalidResultAt = "account";
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+
+    await expect(applyScopedBackfill(sidecar, port)).rejects.toThrow();
+    expect(port.committed).toBe(false);
+    expect(port.rolledBack).toBe(true);
   });
 });
 
@@ -784,6 +1010,62 @@ describe("durable sidecar WAL and repair", () => {
     expect(store.load()).toEqual(updated);
   });
 
+  test("refuses to overwrite a valid pending WAL before repair preserves its first intent", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    const first = createMigrationSidecar(buildPlan());
+    const crashing = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+      injectFailure: (point) => {
+        if (point === "after_wal_directory_fsync") throw new Error("crash");
+      },
+    });
+    expect(() => crashing.install(first)).toThrow("crash");
+    const walBefore = readFileSync(`${sidecarPath}.wal`, "utf8");
+
+    const second = createMigrationSidecar(
+      buildPlan([safeObservation("charlie")]),
+    );
+    const competing = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    expect(() => competing.install(second)).toThrow("pending migration WAL");
+    expect(readFileSync(`${sidecarPath}.wal`, "utf8")).toBe(walBefore);
+    expect(competing.repair()).toEqual(first);
+  });
+
+  test("rejects a valid-integrity readiness successor with no durable gate receipt", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const initial = createMigrationSidecar(buildPlan());
+    store.install(initial);
+
+    const legitimate = transitionMigrationSidecar(initial, "final_ready", {
+      gateEvidence: passingEvidence(initial.plan),
+    });
+    const {
+      integrityDigest: _integrityDigest,
+      gateReceipts: _gateReceipts,
+      ...withoutReceipt
+    } = legitimate;
+    const forgedCore = { ...withoutReceipt, gateReceipts: [] };
+    const forged = {
+      ...forgedCore,
+      integrityDigest: canonicalDigest(forgedCore),
+    } as MigrationSidecar;
+
+    expect(() =>
+      store.install(forged, {
+        expectedPreviousDigest: initial.integrityDigest,
+      }),
+    ).toThrow("durable gate receipt");
+    expect(store.load()).toEqual(initial);
+  });
+
   test("preserves active writer locks and removes only dead-writer locks", () => {
     const root = tempRoot();
     const legacy = join(root, "accounts.json");
@@ -842,6 +1124,12 @@ describe("old and new client-server compatibility fixtures", () => {
         writes: "v1_only",
       },
       {
+        client: "old",
+        server: "new",
+        result: "upgrade_required",
+        writes: "none",
+      },
+      {
         client: "transition",
         server: "old",
         result: "preflight_only",
@@ -852,6 +1140,12 @@ describe("old and new client-server compatibility fixtures", () => {
         server: "transition",
         result: "sidecar_backfill",
         writes: "journaled_v2",
+      },
+      {
+        client: "transition",
+        server: "new",
+        result: "v2",
+        writes: "v2_only",
       },
       {
         client: "new",
@@ -872,5 +1166,18 @@ describe("old and new client-server compatibility fixtures", () => {
         writes: "v2_only",
       },
     ]);
+
+    expect(
+      migrationCompatibilityFixtureSchema.safeParse({
+        ...fixture,
+        cases: fixture.cases.slice(0, 8),
+      }).success,
+    ).toBe(false);
+    expect(
+      migrationCompatibilityFixtureSchema.safeParse({
+        ...fixture,
+        cases: [...fixture.cases.slice(0, 8), fixture.cases[0]],
+      }).success,
+    ).toBe(false);
   });
 });

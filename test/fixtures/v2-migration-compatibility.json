@@ -14,6 +14,12 @@
       "writes": "v1_only"
     },
     {
+      "client": "old",
+      "server": "new",
+      "result": "upgrade_required",
+      "writes": "none"
+    },
+    {
       "client": "transition",
       "server": "old",
       "result": "preflight_only",
@@ -24,6 +30,12 @@
       "server": "transition",
       "result": "sidecar_backfill",
       "writes": "journaled_v2"
+    },
+    {
+      "client": "transition",
+      "server": "new",
+      "result": "v2",
+      "writes": "v2_only"
     },
     {
       "client": "new",

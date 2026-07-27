@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -223,6 +223,7 @@ export type MigrationPlanInput = Readonly<z.infer<typeof migrationPlanInputSchem
 const quarantineReasonSchema = z.enum([
   "same_name_cross_runtime",
   "duplicate_legacy_identity",
+  "duplicate_verified_root",
   "root_missing",
   "root_foreign",
   "root_nested",
@@ -273,6 +274,13 @@ const migrationRecordSchema = z
   })
   .strict()
   .superRefine((record, context) => {
+    if (record.sourceKey !== sourceKeyFromSource(record.source)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["sourceKey"],
+        message: "migration sourceKey must match its structured source identity",
+      });
+    }
     if (record.disposition.state === "ready" && !record.binding) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -285,6 +293,53 @@ const migrationRecordSchema = z
         code: z.ZodIssueCode.custom,
         path: ["binding"],
         message: "quarantined migration record may not install a machine binding",
+      });
+    }
+    if (
+      record.binding &&
+      (record.binding.id !== record.target.bindingId ||
+        record.binding.accountId !== record.target.accountId ||
+        record.binding.runtimeId !== record.target.runtimeId)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["binding"],
+        message: "migration binding identity must match its frozen target",
+      });
+    }
+    if (
+      record.binding &&
+      record.root.state === "verified" &&
+      record.binding.rootPath !== record.root.realPath
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["binding", "rootPath"],
+        message: "migration binding root must match its verified canonical root",
+      });
+    }
+    if (
+      record.binding &&
+      record.binding.authentication !== record.authentication
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["binding", "authentication"],
+        message: "migration binding authentication must match the frozen observation",
+      });
+    }
+    if (record.binding && record.binding.generation !== 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["binding", "generation"],
+        message: "migration binding must begin at generation zero",
+      });
+    }
+    if (record.binding && record.binding.credentialRef !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["binding", "credentialRef"],
+        message: "migration sidecar may not carry credential references",
       });
     }
   });
@@ -304,6 +359,7 @@ export const migrationPlanSchema = z
     sourceDigests: migrationSourceDigestsSchema,
     backup: backupRestorePlanSchema,
     records: z.array(migrationRecordSchema),
+    planDigest: migrationDigestSchema,
   })
   .strict()
   .superRefine((plan, context) => {
@@ -312,6 +368,16 @@ export const migrationPlanSchema = z
     const bindingIds = new Set<string>();
     const runtimeTools = new Map<string, string>();
     for (const [index, record] of plan.records.entries()) {
+      if (
+        index > 0 &&
+        plan.records[index - 1]!.sourceKey.localeCompare(record.sourceKey) >= 0
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["records", index, "sourceKey"],
+          message: "migration plan records must use canonical source-key order",
+        });
+      }
       for (const [value, values, label] of [
         [record.sourceKey, sourceKeys, "source key"],
         [record.target.accountId, accountIds, "account id"],
@@ -335,6 +401,80 @@ export const migrationPlanSchema = z
         });
       }
       runtimeTools.set(record.target.runtimeId, record.source.tool);
+      if (
+        record.binding &&
+        (record.binding.tenantId !== plan.scope.tenantId ||
+          record.binding.scopeId !== plan.scope.scopeId ||
+          record.binding.machineId !== plan.machineId)
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["records", index, "binding"],
+          message: "migration binding must remain inside the frozen plan scope and machine",
+        });
+      }
+    }
+    const reconstructedInputResult = migrationPlanInputSchema.safeParse(
+      migrationPlanInputFromPlan(plan),
+    );
+    if (!reconstructedInputResult.success) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["records"],
+        message: "migration plan does not reconstruct a valid frozen census",
+      });
+    } else {
+      const reconstructedInput = normalizeMigrationPlanInput(
+        reconstructedInputResult.data,
+      );
+      if (plan.inputDigest !== hashCanonical(reconstructedInput)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["inputDigest"],
+          message: "migration plan input digest does not match its frozen census",
+        });
+      }
+      for (const [index, record] of plan.records.entries()) {
+        const expectedReasons = deriveMigrationQuarantineReasons(
+          reconstructedInput.observations[index]!,
+          reconstructedInput.observations,
+        );
+        const dispositionMatches =
+          expectedReasons.length === 0
+            ? record.disposition.state === "ready"
+            : record.disposition.state === "quarantined" &&
+              hashCanonical(record.disposition.reasons) ===
+                hashCanonical(expectedReasons);
+        if (!dispositionMatches) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["records", index, "disposition"],
+            message:
+              "migration record disposition must match the frozen conflict census",
+          });
+        }
+      }
+    }
+    const expectedIdempotencyKey = hashCanonical({
+      planId: plan.id,
+      inputDigest: plan.inputDigest,
+      scope: plan.scope,
+      cutoverEpoch: plan.cutoverEpoch,
+    });
+    if (plan.idempotencyKey !== expectedIdempotencyKey) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["idempotencyKey"],
+        message: "migration plan idempotency key does not match its frozen identity",
+      });
+    }
+    const { planDigest: _planDigest, ...planCore } = plan;
+    if (plan.planDigest !== hashCanonical(planCore)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["planDigest"],
+        message: "migration plan digest does not match its complete frozen plan",
+      });
     }
   });
 
@@ -396,6 +536,7 @@ export function buildMigrationPlan(
 
   const idFactory = options.idFactory ?? defaultIdFactory;
   const planId = migrationOpaqueIdSchema.parse(idFactory("plan", inputDigest));
+  const scopedSeed = `${input.scope.tenantId}:${input.scope.scopeId}`;
   const sourceKeys = new Set<string>();
   const runtimeIdByTool = new Map<string, RuntimeId>();
   const runtimeLabelByTool = new Map<string, string>();
@@ -419,45 +560,32 @@ export function buildMigrationPlan(
     if (!runtimeIdByTool.has(observation.source.tool)) {
       runtimeIdByTool.set(
         observation.source.tool,
-        runtimeIdSchema.parse(idFactory("runtime", observation.source.tool)),
+        runtimeIdSchema.parse(
+          idFactory("runtime", `${scopedSeed}:${observation.source.tool}`),
+        ),
       );
     }
-  }
-
-  const byName = new Map<string, LegacyProfileObservation[]>();
-  for (const observation of observations) {
-    const group = byName.get(observation.source.name) ?? [];
-    group.push(observation);
-    byName.set(observation.source.name, group);
   }
 
   const records = observations.map((observation): MigrationRecord => {
     const key = sourceKey(observation);
-    const reasons = new Set<MigrationQuarantineReason>();
-    const nameGroup = byName.get(observation.source.name) ?? [];
-    if (nameGroup.length > 1) {
-      const runtimeKeys = new Set(nameGroup.map((candidate) => candidate.source.tool));
-      reasons.add(
-        runtimeKeys.size > 1 ? "same_name_cross_runtime" : "duplicate_legacy_identity",
-      );
-    }
-    if (observation.root.state === "unsafe") {
-      reasons.add(rootQuarantineReason(observation.root.code));
-    }
-    if (observation.catalogSkipDigests.length > 0) reasons.add("catalog_skip");
+    const reasons = deriveMigrationQuarantineReasons(
+      observation,
+      observations,
+    );
 
     const target = migrationTargetSchema.parse({
-      accountId: idFactory("account", key),
+      accountId: idFactory("account", `${scopedSeed}:${key}`),
       runtimeId: runtimeIdByTool.get(observation.source.tool),
-      bindingId: idFactory("binding", key),
+      bindingId: idFactory("binding", `${scopedSeed}:${key}`),
     });
 
     const disposition =
-      reasons.size === 0
+      reasons.length === 0
         ? ({ state: "ready" } as const)
         : ({
             state: "quarantined",
-            reasons: [...reasons].sort(),
+            reasons,
           } as const);
 
     const binding =
@@ -493,7 +621,7 @@ export function buildMigrationPlan(
     });
   });
 
-  const plan = migrationPlanSchema.parse({
+  const planCore = {
     schemaVersion: 1,
     id: planId,
     idempotencyKey: hashCanonical({
@@ -510,6 +638,10 @@ export function buildMigrationPlan(
     sourceDigests: sortRecord(input.sourceDigests),
     backup: input.backup,
     records,
+  } as const;
+  const plan = migrationPlanSchema.parse({
+    ...planCore,
+    planDigest: hashCanonical(planCore),
   });
   return deepFreeze(plan);
 }
@@ -522,16 +654,95 @@ function rootQuarantineReason(
 }
 
 function sourceKey(observation: LegacyProfileObservation): string {
+  return sourceKeyFromSource(observation.source);
+}
+
+function sourceKeyFromSource(
+  source: LegacyProfileObservation["source"],
+): string {
   return [
-    observation.source.authority,
-    observation.source.authorityId,
-    observation.source.tool,
-    observation.source.name,
+    source.authority,
+    source.authorityId,
+    source.tool,
+    source.name,
   ].join(":");
 }
 
-function defaultIdFactory(kind: MigrationIdKind): string {
-  return `${kind}_${randomUUID().replaceAll("-", "")}`;
+function deriveMigrationQuarantineReasons(
+  observation: LegacyProfileObservation,
+  observations: readonly LegacyProfileObservation[],
+): MigrationQuarantineReason[] {
+  const reasons = new Set<MigrationQuarantineReason>();
+  const nameGroup = observations.filter(
+    (candidate) => candidate.source.name === observation.source.name,
+  );
+  if (nameGroup.length > 1) {
+    const runtimeKeys = new Set(
+      nameGroup.map((candidate) => candidate.source.tool),
+    );
+    reasons.add(
+      runtimeKeys.size > 1
+        ? "same_name_cross_runtime"
+        : "duplicate_legacy_identity",
+    );
+  }
+  if (observation.root.state === "verified") {
+    const rootKey = verifiedRootKey(observation.root);
+    if (
+      observations.filter(
+        (candidate) =>
+          candidate.root.state === "verified" &&
+          verifiedRootKey(candidate.root) === rootKey,
+      ).length > 1
+    ) {
+      reasons.add("duplicate_verified_root");
+    }
+  } else {
+    reasons.add(rootQuarantineReason(observation.root.code));
+  }
+  if (observation.catalogSkipDigests.length > 0) reasons.add("catalog_skip");
+  return [...reasons].sort();
+}
+
+function verifiedRootKey(
+  root: z.infer<typeof verifiedRootObservationSchema>,
+): MigrationDigest {
+  return hashCanonical({
+    realPath: root.realPath,
+    device: root.device,
+    inode: root.inode,
+    digest: root.digest,
+  });
+}
+
+function defaultIdFactory(kind: MigrationIdKind, seed: string): string {
+  return `${kind}_${createHash("sha256")
+    .update(`accounts-v2-migration:${kind}:${seed}`)
+    .digest("hex")
+    .slice(0, 32)}`;
+}
+
+function migrationPlanInputFromPlan(plan: MigrationPlan): MigrationPlanInput {
+  return {
+    scope: plan.scope,
+    machineId: plan.machineId,
+    createdAt: plan.createdAt,
+    cutoverEpoch: plan.cutoverEpoch,
+    sourceDigests: plan.sourceDigests,
+    backup: plan.backup,
+    observations: plan.records.map((record) => ({
+      source: record.source,
+      runtimeLabel: record.runtimeLabel,
+      inputDigest: record.inputDigest,
+      root: record.root,
+      authentication: record.authentication,
+      pointers: record.pointers,
+      sessionReferenceDigests: [...record.sessionReferenceDigests],
+      catalogSkipDigests: [...record.catalogSkipDigests],
+      historicalAliases: [...record.historicalAliases],
+      historicalSessionAliases: [...record.historicalSessionAliases],
+    })),
+  };
 }
 
 export interface RedactedMigrationRecord {
@@ -576,6 +787,7 @@ export interface RedactedMigrationPlan {
   id: string;
   idempotencyKey: MigrationDigest;
   inputDigest: MigrationDigest;
+  planDigest: MigrationDigest;
   scope: RegistryScope;
   machineIdDigest: MigrationDigest;
   createdAt: string;
@@ -592,6 +804,7 @@ export function redactMigrationPlan(planInput: MigrationPlan): RedactedMigration
     id: plan.id,
     idempotencyKey: plan.idempotencyKey,
     inputDigest: plan.inputDigest,
+    planDigest: plan.planDigest,
     scope: plan.scope,
     machineIdDigest: hashText(plan.machineId),
     createdAt: plan.createdAt,
@@ -682,6 +895,80 @@ export interface MigrationGateResult {
   nextState: "partial_ready" | "final_ready" | null;
   reasons: readonly string[];
 }
+
+const migrationGateReceiptCoreSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sequence: z.number().int().positive().safe(),
+    intent: z.enum(["partial", "final"]),
+    targetState: z.enum(["partial_ready", "final_ready"]),
+    sourceIntegrityDigest: migrationDigestSchema,
+    planId: migrationOpaqueIdSchema,
+    idempotencyKey: migrationDigestSchema,
+    evidence: migrationGateEvidenceSchema,
+  })
+  .strict();
+
+const migrationGateReceiptSchema = migrationGateReceiptCoreSchema
+  .extend({
+    digest: migrationDigestSchema,
+  })
+  .strict();
+
+export type MigrationGateReceipt = Readonly<z.infer<typeof migrationGateReceiptSchema>>;
+
+const ensureResultSchema = z.enum(["created", "adopted"]);
+type EnsureResult = z.infer<typeof ensureResultSchema>;
+
+const migrationBackfillCountsSchema = z
+  .object({
+    runtimes: z
+      .object({
+        created: z.number().int().nonnegative().safe(),
+        adopted: z.number().int().nonnegative().safe(),
+      })
+      .strict(),
+    accounts: z
+      .object({
+        created: z.number().int().nonnegative().safe(),
+        adopted: z.number().int().nonnegative().safe(),
+      })
+      .strict(),
+    crosswalks: z
+      .object({
+        created: z.number().int().nonnegative().safe(),
+        adopted: z.number().int().nonnegative().safe(),
+      })
+      .strict(),
+    epoch: ensureResultSchema,
+  })
+  .strict();
+
+type MigrationBackfillCounts = z.infer<typeof migrationBackfillCountsSchema>;
+
+const migrationBackfillReceiptCoreSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sequence: z.number().int().positive().safe(),
+    planId: migrationOpaqueIdSchema,
+    idempotencyKey: migrationDigestSchema,
+    scope: registryScopeSchema,
+    readyState: z.enum(["partial_ready", "final_ready"]),
+    sourceIntegrityDigest: migrationDigestSchema,
+    readyRecordsDigest: migrationDigestSchema,
+    result: migrationBackfillCountsSchema,
+  })
+  .strict();
+
+const migrationBackfillReceiptSchema = migrationBackfillReceiptCoreSchema
+  .extend({
+    digest: migrationDigestSchema,
+  })
+  .strict();
+
+export type MigrationBackfillReceipt = Readonly<
+  z.infer<typeof migrationBackfillReceiptSchema>
+>;
 
 export function evaluateMigrationGates(
   planInput: MigrationPlan,
@@ -785,6 +1072,8 @@ const migrationSidecarCoreSchema = z
       "final_applied",
     ]),
     aliasJournal: z.array(migrationAliasEntrySchema),
+    gateReceipts: z.array(migrationGateReceiptSchema),
+    backfillReceipts: z.array(migrationBackfillReceiptSchema),
   })
   .strict();
 
@@ -803,6 +1092,8 @@ export function createMigrationSidecar(planInput: MigrationPlan): MigrationSidec
     plan,
     state: "planned",
     aliasJournal: [],
+    gateReceipts: [],
+    backfillReceipts: [],
   });
   for (const record of plan.records) {
     for (const alias of record.historicalAliases) {
@@ -873,6 +1164,8 @@ export function appendMigrationAlias(
     plan: sidecar.plan,
     state: sidecar.state,
     aliasJournal: [...sidecar.aliasJournal, entry],
+    gateReceipts: sidecar.gateReceipts,
+    backfillReceipts: sidecar.backfillReceipts,
   });
 }
 
@@ -894,6 +1187,7 @@ const allowedTransitions: Readonly<Record<MigrationState, readonly MigrationStat
 
 export interface TransitionMigrationSidecarOptions {
   gateEvidence?: MigrationGateEvidence;
+  backfillReceipt?: MigrationBackfillReceipt;
 }
 
 export function transitionMigrationSidecar(
@@ -911,6 +1205,8 @@ export function transitionMigrationSidecar(
       `invalid migration state transition ${sidecar.state} -> ${target}`,
     );
   }
+  let gateReceipts = sidecar.gateReceipts;
+  let backfillReceipts = sidecar.backfillReceipts;
   if (target === "partial_ready" || target === "final_ready") {
     if (!options.gateEvidence) {
       throw new MigrationConflictError(
@@ -927,6 +1223,45 @@ export function transitionMigrationSidecar(
         `migration gates block ${target}: ${gate.reasons.join(", ")}`,
       );
     }
+    const evidence = migrationGateEvidenceSchema.parse(options.gateEvidence);
+    const receiptCore = migrationGateReceiptCoreSchema.parse({
+      schemaVersion: 1,
+      sequence: sidecar.gateReceipts.length + 1,
+      intent: target === "partial_ready" ? "partial" : "final",
+      targetState: target,
+      sourceIntegrityDigest: sidecar.integrityDigest,
+      planId: sidecar.plan.id,
+      idempotencyKey: sidecar.plan.idempotencyKey,
+      evidence,
+    });
+    gateReceipts = [
+      ...sidecar.gateReceipts,
+      migrationGateReceiptSchema.parse({
+        ...receiptCore,
+        digest: hashCanonical(receiptCore),
+      }),
+    ];
+  }
+  if (target === "partial_applied" || target === "final_applied") {
+    if (!options.backfillReceipt) {
+      throw new MigrationConflictError(
+        `entering ${target} requires a committed scope-bound backfill receipt`,
+      );
+    }
+    const receipt = migrationBackfillReceiptSchema.parse(options.backfillReceipt);
+    validateBackfillReceipt(sidecar.plan, receipt);
+    const expectedReadyState =
+      target === "partial_applied" ? "partial_ready" : "final_ready";
+    if (
+      receipt.readyState !== expectedReadyState ||
+      receipt.sourceIntegrityDigest !== sidecar.integrityDigest ||
+      receipt.sequence !== sidecar.backfillReceipts.length + 1
+    ) {
+      throw new MigrationConflictError(
+        `backfill receipt does not bind the exact ${expectedReadyState} predecessor`,
+      );
+    }
+    backfillReceipts = [...sidecar.backfillReceipts, receipt];
   }
   if (
     (target === "final_ready" || target === "final_applied") &&
@@ -941,6 +1276,8 @@ export function transitionMigrationSidecar(
     plan: sidecar.plan,
     state: target,
     aliasJournal: sidecar.aliasJournal,
+    gateReceipts,
+    backfillReceipts,
   });
 }
 
@@ -964,7 +1301,89 @@ function parseSidecar(value: unknown): MigrationSidecar {
     throw new MigrationDriftError("migration sidecar integrity digest mismatch");
   }
   validateAliasJournal(sidecar.plan, sidecar.aliasJournal);
+  validateTransitionReceipts(sidecar);
   return deepFreeze(sidecar);
+}
+
+function validateTransitionReceipts(sidecar: MigrationSidecar): void {
+  for (const [index, receipt] of sidecar.gateReceipts.entries()) {
+    validateGateReceipt(sidecar.plan, receipt);
+    if (receipt.sequence !== index + 1) {
+      throw new MigrationDriftError("migration gate receipt sequence is invalid");
+    }
+  }
+  for (const [index, receipt] of sidecar.backfillReceipts.entries()) {
+    validateBackfillReceipt(sidecar.plan, receipt);
+    if (receipt.sequence !== index + 1) {
+      throw new MigrationDriftError("migration backfill receipt sequence is invalid");
+    }
+  }
+
+  const gates = sidecar.gateReceipts;
+  const backfills = sidecar.backfillReceipts;
+  const partialGate = gates[0]?.targetState === "partial_ready";
+  const finalGate = gates.at(-1)?.targetState === "final_ready";
+  const partialBackfill = backfills[0]?.readyState === "partial_ready";
+  const finalBackfill = backfills.at(-1)?.readyState === "final_ready";
+  const valid =
+    (sidecar.state === "planned" && gates.length === 0 && backfills.length === 0) ||
+    (sidecar.state === "partial_ready" &&
+      gates.length === 1 &&
+      partialGate &&
+      backfills.length === 0) ||
+    (sidecar.state === "partial_applied" &&
+      gates.length === 1 &&
+      partialGate &&
+      backfills.length === 1 &&
+      partialBackfill) ||
+    (sidecar.state === "final_ready" &&
+      finalGate &&
+      ((gates.length === 1 && backfills.length === 0) ||
+        (gates.length === 2 &&
+          partialGate &&
+          backfills.length === 1 &&
+          partialBackfill))) ||
+    (sidecar.state === "final_applied" &&
+      finalGate &&
+      finalBackfill &&
+      gates.length === backfills.length &&
+      (gates.length === 1 ||
+        (gates.length === 2 && partialGate && partialBackfill)));
+  if (!valid) {
+    const requiredReceipt =
+      sidecar.state === "partial_ready" || sidecar.state === "final_ready"
+        ? "durable gate receipt"
+        : sidecar.state === "planned"
+          ? "empty receipt"
+          : "durable backfill receipt";
+    throw new MigrationDriftError(
+      `migration state "${sidecar.state}" lacks its required ${requiredReceipt} history`,
+    );
+  }
+}
+
+function validateGateReceipt(
+  plan: MigrationPlan,
+  receiptInput: MigrationGateReceipt,
+): void {
+  const receipt = migrationGateReceiptSchema.parse(receiptInput);
+  const { digest, ...coreValue } = receipt;
+  const core = migrationGateReceiptCoreSchema.parse(coreValue);
+  if (hashCanonical(core) !== digest) {
+    throw new MigrationDriftError("migration gate receipt digest is invalid");
+  }
+  if (
+    receipt.planId !== plan.id ||
+    receipt.idempotencyKey !== plan.idempotencyKey
+  ) {
+    throw new MigrationDriftError("migration gate receipt plan identity is invalid");
+  }
+  const gate = evaluateMigrationGates(plan, receipt.evidence, receipt.intent);
+  if (!gate.ready || gate.nextState !== receipt.targetState) {
+    throw new MigrationDriftError(
+      "migration gate receipt does not contain accepted evidence for its target state",
+    );
+  }
 }
 
 function validateAliasJournal(
@@ -1039,8 +1458,6 @@ export interface ScopedBackfillCrosswalk {
   bindingId: BindingId;
 }
 
-type EnsureResult = "created" | "adopted";
-
 export interface MigrationBackfillTransaction {
   ensureRuntime(runtime: ScopedBackfillRuntime): Promise<EnsureResult>;
   ensureAccount(account: ScopedBackfillAccount): Promise<EnsureResult>;
@@ -1064,6 +1481,7 @@ export interface MigrationBackfillResult {
   accounts: { created: number; adopted: number };
   crosswalks: { created: number; adopted: number };
   epoch: EnsureResult;
+  receipt: MigrationBackfillReceipt;
 }
 
 export async function applyScopedBackfill(
@@ -1100,8 +1518,8 @@ export async function applyScopedBackfill(
     runtimes.set(runtime.id, runtime);
   }
 
-  return port.transaction(sidecar.plan.scope, async (transaction) => {
-    const result: MigrationBackfillResult = {
+  const result = await port.transaction(sidecar.plan.scope, async (transaction) => {
+    const counts: MigrationBackfillCounts = {
       runtimes: { created: 0, adopted: 0 },
       accounts: { created: 0, adopted: 0 },
       crosswalks: { created: 0, adopted: 0 },
@@ -1109,7 +1527,7 @@ export async function applyScopedBackfill(
     };
 
     for (const runtime of [...runtimes.values()].sort((a, b) => a.id.localeCompare(b.id))) {
-      tally(result.runtimes, await transaction.ensureRuntime(deepFreeze(runtime)));
+      tally(counts.runtimes, await transaction.ensureRuntime(deepFreeze(runtime)));
     }
     for (const record of [...records].sort((a, b) => a.sourceKey.localeCompare(b.sourceKey))) {
       const account: ScopedBackfillAccount = {
@@ -1121,7 +1539,7 @@ export async function applyScopedBackfill(
         createdAt: sidecar.plan.createdAt,
         updatedAt: sidecar.plan.createdAt,
       };
-      tally(result.accounts, await transaction.ensureAccount(deepFreeze(account)));
+      tally(counts.accounts, await transaction.ensureAccount(deepFreeze(account)));
     }
     for (const record of [...records].sort((a, b) => a.sourceKey.localeCompare(b.sourceKey))) {
       const crosswalk: ScopedBackfillCrosswalk = {
@@ -1135,21 +1553,87 @@ export async function applyScopedBackfill(
         bindingId: record.target.bindingId,
       };
       tally(
-        result.crosswalks,
+        counts.crosswalks,
         await transaction.ensureCrosswalk(deepFreeze(crosswalk)),
       );
     }
-    result.epoch = await transaction.recordEpoch({
+    counts.epoch = await transaction.recordEpoch({
       planId: sidecar.plan.id,
       idempotencyKey: sidecar.plan.idempotencyKey,
       cutoverEpoch: sidecar.plan.cutoverEpoch,
     });
-    return deepFreeze(result);
+    return deepFreeze(counts);
+  });
+
+  const receiptCore = migrationBackfillReceiptCoreSchema.parse({
+    schemaVersion: 1,
+    sequence: sidecar.backfillReceipts.length + 1,
+    planId: sidecar.plan.id,
+    idempotencyKey: sidecar.plan.idempotencyKey,
+    scope: sidecar.plan.scope,
+    readyState: sidecar.state,
+    sourceIntegrityDigest: sidecar.integrityDigest,
+    readyRecordsDigest: readyRecordsDigest(sidecar.plan),
+    result,
+  });
+  const receipt = migrationBackfillReceiptSchema.parse({
+    ...receiptCore,
+    digest: hashCanonical(receiptCore),
+  });
+  return deepFreeze({
+    ...result,
+    receipt,
   });
 }
 
 function tally(counter: { created: number; adopted: number }, value: EnsureResult): void {
-  counter[value] += 1;
+  counter[ensureResultSchema.parse(value)] += 1;
+}
+
+function readyRecordsDigest(plan: MigrationPlan): MigrationDigest {
+  return hashCanonical(
+    plan.records.filter((record) => record.disposition.state === "ready"),
+  );
+}
+
+function validateBackfillReceipt(
+  plan: MigrationPlan,
+  receiptInput: MigrationBackfillReceipt,
+): void {
+  const receipt = migrationBackfillReceiptSchema.parse(receiptInput);
+  const { digest, ...coreValue } = receipt;
+  const core = migrationBackfillReceiptCoreSchema.parse(coreValue);
+  if (hashCanonical(core) !== digest) {
+    throw new MigrationDriftError("migration backfill receipt digest is invalid");
+  }
+  if (
+    receipt.planId !== plan.id ||
+    receipt.idempotencyKey !== plan.idempotencyKey ||
+    hashCanonical(receipt.scope) !== hashCanonical(plan.scope) ||
+    receipt.readyRecordsDigest !== readyRecordsDigest(plan)
+  ) {
+    throw new MigrationDriftError(
+      "migration backfill receipt is not bound to the frozen plan and scope",
+    );
+  }
+  const readyRecords = plan.records.filter(
+    (record) => record.disposition.state === "ready",
+  );
+  const runtimeCount = new Set(
+    readyRecords.map((record) => record.target.runtimeId),
+  ).size;
+  if (
+    receipt.result.runtimes.created + receipt.result.runtimes.adopted !==
+      runtimeCount ||
+    receipt.result.accounts.created + receipt.result.accounts.adopted !==
+      readyRecords.length ||
+    receipt.result.crosswalks.created + receipt.result.crosswalks.adopted !==
+      readyRecords.length
+  ) {
+    throw new MigrationDriftError(
+      "migration backfill receipt counts do not cover the frozen ready records",
+    );
+  }
 }
 
 export const migrationCompatibilityFixtureSchema = z
@@ -1174,7 +1658,41 @@ export const migrationCompatibilityFixtureSchema = z
         .strict(),
     ),
   })
-  .strict();
+  .strict()
+  .superRefine((fixture, context) => {
+    const versions = ["old", "transition", "new"] as const;
+    const seen = new Set<string>();
+    for (const [index, entry] of fixture.cases.entries()) {
+      const key = `${entry.client}->${entry.server}`;
+      if (seen.has(key)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["cases", index],
+          message: `compatibility matrix contains duplicate case ${key}`,
+        });
+      }
+      seen.add(key);
+    }
+    for (const client of versions) {
+      for (const server of versions) {
+        const key = `${client}->${server}`;
+        if (!seen.has(key)) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["cases"],
+            message: `compatibility matrix is missing case ${key}`,
+          });
+        }
+      }
+    }
+    if (fixture.cases.length !== versions.length ** 2) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["cases"],
+        message: "compatibility matrix must contain exactly one complete 3x3 grid",
+      });
+    }
+  });
 
 const migrationWalSchema = z
   .object({
@@ -1268,6 +1786,11 @@ export class MigrationSidecarStore {
           : migrationDigestSchema.parse(options.expectedPreviousDigest);
     return this.withLock(() => {
       this.assertDistinctLegacyStore();
+      if (existsSync(this.walPath) || existsSync(this.walTempPath)) {
+        throw new MigrationConflictError(
+          "pending migration WAL must be repaired before another install",
+        );
+      }
       const current = this.load();
       if (current?.integrityDigest === sidecar.integrityDigest) return current;
       if (!current && expectedPreviousDigest !== undefined && expectedPreviousDigest !== null) {
@@ -1533,6 +2056,69 @@ function assertSidecarSuccessor(
       throw new MigrationConflictError(
         "migration alias journal history is immutable",
       );
+    }
+  }
+  assertReceiptPrefix(
+    current.gateReceipts,
+    next.gateReceipts,
+    "migration gate receipt history is immutable",
+  );
+  assertReceiptPrefix(
+    current.backfillReceipts,
+    next.backfillReceipts,
+    "migration backfill receipt history is immutable",
+  );
+  if (current.state === next.state) {
+    if (
+      next.gateReceipts.length !== current.gateReceipts.length ||
+      next.backfillReceipts.length !== current.backfillReceipts.length
+    ) {
+      throw new MigrationConflictError(
+        "receipt journals may advance only with their matching state transition",
+      );
+    }
+    return;
+  }
+  if (next.state === "partial_ready" || next.state === "final_ready") {
+    const receipt = next.gateReceipts.at(-1);
+    if (
+      next.gateReceipts.length !== current.gateReceipts.length + 1 ||
+      next.backfillReceipts.length !== current.backfillReceipts.length ||
+      receipt?.sourceIntegrityDigest !== current.integrityDigest ||
+      receipt?.targetState !== next.state
+    ) {
+      throw new MigrationConflictError(
+        `durable gate receipt must bind ${current.state} -> ${next.state}`,
+      );
+    }
+    return;
+  }
+  const receipt = next.backfillReceipts.at(-1);
+  const expectedReadyState =
+    next.state === "partial_applied" ? "partial_ready" : "final_ready";
+  if (
+    next.backfillReceipts.length !== current.backfillReceipts.length + 1 ||
+    next.gateReceipts.length !== current.gateReceipts.length ||
+    receipt?.sourceIntegrityDigest !== current.integrityDigest ||
+    receipt?.readyState !== expectedReadyState
+  ) {
+    throw new MigrationConflictError(
+      `durable backfill receipt must bind ${current.state} -> ${next.state}`,
+    );
+  }
+}
+
+function assertReceiptPrefix(
+  current: readonly unknown[],
+  next: readonly unknown[],
+  message: string,
+): void {
+  if (next.length < current.length) {
+    throw new MigrationConflictError(message);
+  }
+  for (let index = 0; index < current.length; index += 1) {
+    if (hashCanonical(current[index]) !== hashCanonical(next[index])) {
+      throw new MigrationConflictError(message);
     }
   }
 }
