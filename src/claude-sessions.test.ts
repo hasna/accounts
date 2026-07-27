@@ -754,6 +754,7 @@ describe("accounts sessions CLI", () => {
       ...process.env,
       NODE_ENV: "test",
       HOME: fakeHome,
+      USERPROFILE: fakeHome,
       ACCOUNTS_HOME: accountsHome,
       NO_COLOR: "1",
     };
