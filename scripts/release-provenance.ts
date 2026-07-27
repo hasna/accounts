@@ -1,23 +1,42 @@
 #!/usr/bin/env bun
 
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 
 export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const PUBLISH_PREDICATE =
   "https://github.com/npm/attestation/tree/main/specs/publish/v0.1";
 export const PROVENANCE_PREDICATE = "https://slsa.dev/provenance/v1";
+export const RELEASE_NODE_VERSION = "24.18.0";
+export const RELEASE_NPM_VERSION = "11.16.0";
+export const RELEASE_BUN_VERSION = "1.3.14";
+export const MAX_JSON_BYTES = 8 * 1024 * 1024;
+export const MAX_TARBALL_BYTES = 32 * 1024 * 1024;
+export const FETCH_TIMEOUT_MS = 15_000;
+export const COMMAND_TIMEOUT_MS = 180_000;
+
 const REGISTRY = "https://registry.npmjs.org";
-const MIN_NPM = [11, 5, 1] as const;
+const GITHUB_API = "https://api.github.com";
+const GITHUB_API_VERSION = "2026-03-10";
+const RELEASE_TAG_PATTERN = "refs/tags/npm/accounts/v*";
+const RELEASE_ENVIRONMENT = "npm-release";
+const RELEASE_ENVIRONMENT_TAG_PATTERN = "npm/accounts/v*";
+const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 interface Manifest {
   name: string;
   version: string;
   repository: string | { url: string };
-  publishConfig?: { registry?: string; access?: string };
+  publishConfig?: { registry?: string; access?: string; tag?: string };
 }
 
 export interface PackResult {
@@ -26,11 +45,17 @@ export interface PackResult {
   filename: string;
   shasum: string;
   integrity: string;
+  size: number;
   files: Array<{ path: string; size: number; mode: number }>;
 }
 
+interface PackedArtifact {
+  result: PackResult;
+  bytes: Buffer;
+}
+
 export interface ReleaseCandidate {
-  schema: "hasna.accounts.release-candidate/v1";
+  schema: "hasna.accounts.release-candidate/v2";
   name: string;
   version: string;
   tag: string;
@@ -40,10 +65,35 @@ export interface ReleaseCandidate {
   integrity: string;
   shasum: string;
   filename: string;
+  size: number;
   fileCount: number;
+  artifactPath: string;
+  stagingTag: string;
+  intendedTag: string;
 }
 
+export interface GitEvidence {
+  head: string;
+  tagObjectType?: string;
+  tagCommit?: string;
+  mainContainsCommit: boolean;
+  status: string;
+}
+
+export type RegistryPhase = "staged" | "promoted";
 type RecordValue = Record<string, unknown>;
+
+interface ToolchainVersions {
+  node: string;
+  npm: string;
+  bun: string;
+}
+
+interface RunOptions {
+  inherit?: boolean;
+  timeoutMs?: number;
+  env?: NodeJS.ProcessEnv;
+}
 
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -59,19 +109,41 @@ function text(value: unknown, label: string): string {
   return value;
 }
 
-function run(executable: string, args: string[], cwd: string, inherit = false): string {
-  const result = spawnSync(executable, args, {
+function integer(value: unknown, label: string): number {
+  check(Number.isInteger(value) && (value as number) >= 0, `${label} must be a non-negative integer`);
+  return value as number;
+}
+
+function runResult(
+  executable: string,
+  args: string[],
+  cwd: string,
+  options: RunOptions = {},
+) {
+  const spawnOptions: SpawnSyncOptionsWithStringEncoding = {
     cwd,
     encoding: "utf8",
-    maxBuffer: 128 * 1024 * 1024,
-    stdio: inherit ? "inherit" : "pipe",
+    maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
+    timeout: options.timeoutMs ?? COMMAND_TIMEOUT_MS,
+    stdio: options.inherit ? "inherit" : "pipe",
     env: {
       ...process.env,
+      ...options.env,
       NO_UPDATE_NOTIFIER: "1",
       NPM_CONFIG_AUDIT: "false",
       NPM_CONFIG_FUND: "false",
     },
-  });
+  };
+  return spawnSync(executable, args, spawnOptions);
+}
+
+function run(
+  executable: string,
+  args: string[],
+  cwd: string,
+  options: RunOptions = {},
+): string {
+  const result = runResult(executable, args, cwd, options);
   check(!result.error, `could not run ${executable}: ${result.error?.message}`);
   const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
   check(
@@ -110,7 +182,27 @@ export function repositorySlug(manifest: Manifest): string {
 export function releaseTag(manifest: Pick<Manifest, "name" | "version">): string {
   const slug = manifest.name.split("/").at(-1);
   check(slug?.match(/^[a-z0-9][a-z0-9._-]*$/), `invalid package name: ${manifest.name}`);
+  check(
+    manifest.version.match(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/),
+    `invalid package version: ${manifest.version}`,
+  );
   return `npm/${slug}/v${manifest.version}`;
+}
+
+function assertDistTag(value: string, label: string): string {
+  check(
+    value.match(/^[a-z][a-z0-9._-]{0,127}$/) && !value.match(/^v?\d+(?:\.\d+){1,2}(?:[-+].*)?$/),
+    `${label} is not a safe npm dist-tag: ${value}`,
+  );
+  return value;
+}
+
+export function stagingDistTag(version: string): string {
+  return assertDistTag(`release-candidate-${version.toLowerCase().replace(/[^a-z0-9._-]/g, "-")}`, "staging tag");
+}
+
+function intendedDistTag(manifest: Manifest): string {
+  return assertDistTag(manifest.publishConfig?.tag ?? "latest", "intended tag");
 }
 
 export function packagePurl(name: string, version: string): string {
@@ -133,27 +225,49 @@ function parsePack(stdout: string): PackResult {
     filename: text(value.filename, "pack filename"),
     shasum: text(value.shasum, "pack shasum"),
     integrity: text(value.integrity, "pack integrity"),
+    size: integer(value.size, "pack size"),
     files: value.files.map((entry, index) => {
       const file = record(entry, `pack file ${index}`);
-      check(Number.isInteger(file.size) && Number.isInteger(file.mode), `invalid pack file ${index}`);
       return {
         path: text(file.path, `pack file ${index} path`),
-        size: file.size as number,
-        mode: file.mode as number,
+        size: integer(file.size, `pack file ${index} size`),
+        mode: integer(file.mode, `pack file ${index} mode`),
       };
     }),
   };
 }
 
-export function assertDeterministicPacks(first: PackResult, second: PackResult): void {
+function verifyArtifactBytes(pack: PackResult, bytes: Buffer): void {
+  check(bytes.length === pack.size, "npm pack size does not match the tarball bytes");
+  check(bytes.length <= MAX_TARBALL_BYTES, `tarball exceeds ${MAX_TARBALL_BYTES} bytes`);
+  check(
+    createHash("sha1").update(bytes).digest("hex") === pack.shasum &&
+      `sha512-${createHash("sha512").update(bytes).digest("base64")}` === pack.integrity,
+    "npm pack metadata does not match the tarball bytes",
+  );
+}
+
+export function assertDeterministicPacks(
+  first: PackResult,
+  second: PackResult,
+  firstBytes?: Uint8Array,
+  secondBytes?: Uint8Array,
+): void {
   check(
     JSON.stringify(first) === JSON.stringify(second),
     "two clean build-and-pack runs produced different artifacts; refusing release",
   );
+  if (firstBytes || secondBytes) {
+    check(firstBytes && secondBytes, "both packed byte streams are required");
+    check(
+      Buffer.from(firstBytes).equals(Buffer.from(secondBytes)),
+      "two clean build-and-pack runs produced different tarball bytes; refusing release",
+    );
+  }
 }
 
-function buildAndPack(root: string): PackResult {
-  run("bun", ["run", "build"], root, true);
+function buildAndPack(root: string): PackedArtifact {
+  run("bun", ["run", "build"], root, { inherit: true, timeoutMs: 300_000 });
   const destination = mkdtempSync(join(tmpdir(), "accounts-pack-"));
   try {
     const pack = parsePack(run("npm", [
@@ -161,78 +275,358 @@ function buildAndPack(root: string): PackResult {
     ], root));
     check(basename(pack.filename) === pack.filename, "npm pack returned an unsafe filename");
     const bytes = readFileSync(join(destination, pack.filename));
-    check(
-      createHash("sha1").update(bytes).digest("hex") === pack.shasum &&
-        `sha512-${createHash("sha512").update(bytes).digest("base64")}` === pack.integrity,
-      "npm pack metadata does not match the tarball bytes",
-    );
-    return pack;
+    verifyArtifactBytes(pack, bytes);
+    return { result: pack, bytes };
   } finally {
     rmSync(destination, { recursive: true, force: true });
   }
 }
 
-export function verifyDeterministicPack(root: string): PackResult {
+export function verifyDeterministicPack(root: string, artifactPath?: string): PackResult {
   const first = buildAndPack(root);
   const second = buildAndPack(root);
-  assertDeterministicPacks(first, second);
-  console.log(
-    `verified deterministic package ${second.name}@${second.version}: ` +
-      `${second.files.length} files, ${second.integrity}`,
-  );
-  return second;
-}
-
-function versionAtLeast(actual: number[], minimum: readonly number[]): boolean {
-  for (let index = 0; index < minimum.length; index++) {
-    if (actual[index] !== minimum[index]) return actual[index]! > minimum[index]!;
+  assertDeterministicPacks(first.result, second.result, first.bytes, second.bytes);
+  if (artifactPath) {
+    const output = resolve(artifactPath);
+    writeFileSync(output, second.bytes, { flag: "wx", mode: 0o600 });
   }
-  return true;
+  console.log(
+    `verified deterministic package ${second.result.name}@${second.result.version}: ` +
+      `${second.result.files.length} files, ${second.result.size} bytes, ${second.result.integrity}`,
+  );
+  return second.result;
 }
 
-export function assertTrustedPublishEnvironment(
+function workflowIdentity(
   manifest: Manifest,
   env: NodeJS.ProcessEnv,
-  npmVersion: string,
-): void {
+): { repository: string; tag: string; sha: string } {
   const repository = repositorySlug(manifest);
   const tag = releaseTag(manifest);
   const expected: Record<string, string> = {
     GITHUB_ACTIONS: "true",
     RUNNER_ENVIRONMENT: "github-hosted",
     GITHUB_EVENT_NAME: "push",
+    GITHUB_REF: `refs/tags/${tag}`,
     GITHUB_REF_TYPE: "tag",
     GITHUB_REF_NAME: tag,
+    GITHUB_REF_PROTECTED: "true",
     GITHUB_REPOSITORY: repository,
     GITHUB_WORKFLOW_REF: `${repository}/${RELEASE_WORKFLOW}@refs/tags/${tag}`,
   };
   for (const [name, value] of Object.entries(expected)) {
     check(env[name] === value, `${name} must be ${value}; received ${env[name] ?? "<unset>"}`);
   }
-  check(env.ACTIONS_ID_TOKEN_REQUEST_URL && env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, "GitHub OIDC is missing");
-  check(!env.NODE_AUTH_TOKEN && !env.NPM_TOKEN, "long-lived npm publish tokens are forbidden");
-  const npmMatch = npmVersion.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
-  check(npmMatch && versionAtLeast(npmMatch.slice(1).map(Number), MIN_NPM),
-    `npm ${MIN_NPM.join(".")} or newer is required`);
-  check(env.GITHUB_SHA?.match(/^[0-9a-f]{40}$/), "GITHUB_SHA must be a full commit SHA");
+  const sha = text(env.GITHUB_SHA, "GITHUB_SHA");
+  check(sha.match(/^[0-9a-f]{40}$/), "GITHUB_SHA must be a full commit SHA");
+  check(
+    env.NPM_DIST_TAG_TOKEN_CONFIGURED === "true",
+    "NPM_DIST_TAG_TOKEN is not configured in the protected release environment",
+  );
   check(manifest.publishConfig?.registry === REGISTRY, `publish registry must be ${REGISTRY}`);
   check(manifest.publishConfig?.access === "public", "publish access must be public");
+  return { repository, tag, sha };
+}
+
+function assertExactToolchain(versions: ToolchainVersions): void {
+  check(versions.node.trim() === `v${RELEASE_NODE_VERSION}`, `Node ${RELEASE_NODE_VERSION} is required`);
+  check(versions.npm.trim() === RELEASE_NPM_VERSION, `npm ${RELEASE_NPM_VERSION} is required`);
+  check(versions.bun.trim() === RELEASE_BUN_VERSION, `Bun ${RELEASE_BUN_VERSION} is required`);
+}
+
+export function assertTrustedPublishEnvironment(
+  manifest: Manifest,
+  env: NodeJS.ProcessEnv,
+  versions: ToolchainVersions,
+): void {
+  workflowIdentity(manifest, env);
+  assertExactToolchain(versions);
+  check(env.ACTIONS_ID_TOKEN_REQUEST_URL && env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, "GitHub OIDC is missing");
+  const credentialKeys = Object.entries(env)
+    .filter(([name, value]) =>
+      Boolean(value) &&
+      /^(?:NODE_AUTH_TOKEN|NPM_TOKEN|NPM_CONFIG_.*(?:AUTH|TOKEN))/i.test(name)
+    )
+    .map(([name]) => name);
+  check(
+    credentialKeys.length === 0,
+    "long-lived npm publish tokens are forbidden during trusted publication",
+  );
+}
+
+function assertPromotionEnvironment(
+  manifest: Manifest,
+  env: NodeJS.ProcessEnv,
+  versions: ToolchainVersions,
+): void {
+  workflowIdentity(manifest, env);
+  assertExactToolchain(versions);
+  check(env.NODE_AUTH_TOKEN, "the scoped npm dist-tag promotion token is missing");
+  const credentialKeys = Object.entries(env)
+    .filter(([name, value]) =>
+      Boolean(value) &&
+      /^(?:NODE_AUTH_TOKEN|NPM_TOKEN|NPM_CONFIG_.*(?:AUTH|TOKEN))/i.test(name)
+    )
+    .map(([name]) => name);
+  check(
+    credentialKeys.length === 1 && credentialKeys[0] === "NODE_AUTH_TOKEN",
+    "unexpected npm credential source",
+  );
+}
+
+function currentToolchain(root: string): ToolchainVersions {
+  return {
+    node: run("node", ["--version"], root).trim(),
+    npm: run("npm", ["--version"], root).trim(),
+    bun: run("bun", ["--version"], root).trim(),
+  };
+}
+
+export function assertGitEvidence(
+  manifest: Manifest,
+  sha: string,
+  evidence: GitEvidence,
+): void {
+  const tag = releaseTag(manifest);
+  check(evidence.head === sha, "HEAD does not match GITHUB_SHA");
+  check(evidence.tagObjectType !== undefined, `${tag} is missing`);
+  check(evidence.tagObjectType === "tag", `${tag} is not annotated`);
+  check(evidence.tagCommit === sha, `${tag} does not resolve to HEAD`);
+  check(evidence.mainContainsCommit, `${sha} is not contained in origin/main`);
+  check(!evidence.status.trim(), "release checkout is dirty");
+}
+
+function optionalGit(root: string, args: string[]): string | undefined {
+  const result = runResult("git", args, root);
+  if (result.error || result.status !== 0) return undefined;
+  return result.stdout?.trim();
 }
 
 function assertGitContext(root: string, manifest: Manifest, env: NodeJS.ProcessEnv): void {
   const sha = text(env.GITHUB_SHA, "GITHUB_SHA");
   const tag = releaseTag(manifest);
-  check(run("git", ["rev-parse", "HEAD"], root).trim() === sha, "HEAD does not match GITHUB_SHA");
-  check(run("git", ["cat-file", "-t", `refs/tags/${tag}`], root).trim() === "tag", `${tag} is not annotated`);
-  check(run("git", ["rev-parse", `${tag}^{commit}`], root).trim() === sha, `${tag} does not resolve to HEAD`);
-  run("git", ["merge-base", "--is-ancestor", sha, "origin/main"], root);
-  check(!run("git", ["status", "--porcelain", "--untracked-files=all"], root).trim(), "release checkout is dirty");
+  const mainResult = runResult("git", ["merge-base", "--is-ancestor", sha, "origin/main"], root);
+  assertGitEvidence(manifest, sha, {
+    head: run("git", ["rev-parse", "HEAD"], root).trim(),
+    tagObjectType: optionalGit(root, ["cat-file", "-t", `refs/tags/${tag}`]),
+    tagCommit: optionalGit(root, ["rev-parse", `${tag}^{commit}`]),
+    mainContainsCommit: !mainResult.error && mainResult.status === 0,
+    status: run("git", ["status", "--porcelain", "--untracked-files=all"], root),
+  });
 }
 
-function candidate(manifest: Manifest, pack: PackResult, commit: string): ReleaseCandidate {
+function refConditionIncludesReleaseTag(value: unknown): boolean {
+  const conditions = record(value, "ruleset conditions");
+  const refName = record(conditions.ref_name, "ruleset ref_name condition");
+  check(Array.isArray(refName.include), "ruleset ref includes must be an array");
+  check(Array.isArray(refName.exclude), "ruleset ref excludes must be an array");
+  return refName.include.length === 1 &&
+    refName.include[0] === RELEASE_TAG_PATTERN &&
+    refName.exclude.length === 0;
+}
+
+export function verifyReleaseRulesets(input: unknown): { id: number; name: string } {
+  check(Array.isArray(input), "GitHub rulesets response must be an array");
+  for (const entry of input) {
+    const ruleset = record(entry, "GitHub ruleset");
+    if (
+      ruleset.target !== "tag" ||
+      ruleset.enforcement !== "active" ||
+      !refConditionIncludesReleaseTag(ruleset.conditions)
+    ) continue;
+    check(Array.isArray(ruleset.rules), "ruleset rules must be an array");
+    const types = new Set(ruleset.rules.map((rule, index) =>
+      text(record(rule, `ruleset rule ${index}`).type, `ruleset rule ${index} type`)
+    ));
+    if (!["creation", "update", "deletion"].every((type) => types.has(type))) continue;
+    if (ruleset.bypass_actors !== undefined) {
+      check(Array.isArray(ruleset.bypass_actors), "ruleset bypass actors must be an array");
+      check(ruleset.bypass_actors.length > 0, "release tag ruleset must restrict authority to bypass actors");
+      let organizationAdminAuthority = false;
+      for (const [index, actorInput] of ruleset.bypass_actors.entries()) {
+        const actor = record(actorInput, `ruleset bypass actor ${index}`);
+        check(actor.bypass_mode === "always", "release tag bypass actors must use always mode");
+        const actorType = text(actor.actor_type, `ruleset bypass actor ${index} type`);
+        check(
+          ["OrganizationAdmin", "Team", "Integration", "EnterpriseOwner"].includes(actorType),
+          "release tag bypass actor type is not an accountable release authority",
+        );
+        organizationAdminAuthority ||= actorType === "OrganizationAdmin";
+      }
+      check(organizationAdminAuthority, "release tag creation must require organization-admin authority");
+    }
+    return {
+      id: integer(ruleset.id, "ruleset id"),
+      name: text(ruleset.name, "ruleset name"),
+    };
+  }
+  throw new Error(
+    `no active tag ruleset protects only ${RELEASE_TAG_PATTERN} with creation, update, and deletion restrictions`,
+  );
+}
+
+export function verifyReleaseEnvironment(
+  environmentInput: unknown,
+  policiesInput: unknown,
+  actorPermissionInput: unknown,
+): void {
+  const environment = record(environmentInput, "GitHub release environment");
+  const actorPermission = record(actorPermissionInput, "GitHub release actor permission");
+  const actor = record(actorPermission.user, "GitHub release actor");
+  check(actorPermission.permission === "admin", "release actor must have repository admin permission");
+  check(environment.name === RELEASE_ENVIRONMENT, `release environment must be ${RELEASE_ENVIRONMENT}`);
+  check(Array.isArray(environment.protection_rules), "release environment protection rules must be an array");
+  const rules = environment.protection_rules.map((entry, index) =>
+    record(entry, `environment protection rule ${index}`)
+  );
+  const reviewers = rules.find((rule) => rule.type === "required_reviewers");
+  check(reviewers, "release environment must require reviewers");
+  check(
+    reviewers.prevent_self_review === false,
+    "sole-maintainer release environment must allow the authorized reviewer to self-review",
+  );
+  check(
+    Array.isArray(reviewers.reviewers) && reviewers.reviewers.length === 1,
+    "release environment must have exactly one accountable reviewer",
+  );
+  const reviewer = record(reviewers.reviewers[0], "release environment reviewer");
+  const reviewerIdentity = record(reviewer.reviewer, "release environment reviewer identity");
+  check(reviewer.type === "User", "release environment reviewer must be the authorized user");
+  check(
+    reviewerIdentity.id === actor.id && reviewerIdentity.login === actor.login,
+    "release environment reviewer must exactly match the live release actor",
+  );
+  check(rules.some((rule) => rule.type === "branch_policy"), "release environment needs a tag policy");
+  const deployment = record(environment.deployment_branch_policy, "deployment branch policy");
+  check(
+    deployment.protected_branches === false && deployment.custom_branch_policies === true,
+    "release environment must use custom deployment policies only",
+  );
+  const policies = record(policiesInput, "deployment tag policies");
+  check(Array.isArray(policies.branch_policies), "deployment tag policies must be an array");
+  check(
+    policies.branch_policies.length === 1,
+    "release environment must have exactly one deployment tag policy",
+  );
+  check(
+    record(policies.branch_policies[0], "deployment tag policy").name ===
+        RELEASE_ENVIRONMENT_TAG_PATTERN &&
+      record(policies.branch_policies[0], "deployment tag policy").type === "tag",
+    `release environment must use the exact ${RELEASE_ENVIRONMENT_TAG_PATTERN} tag policy`,
+  );
+}
+
+export async function readLimited(response: Response, maxBytes: number): Promise<Buffer> {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    check(Number.isSafeInteger(length) && length >= 0, "response has an invalid content-length");
+    check(length <= maxBytes, `response exceeds ${maxBytes} bytes`);
+  }
+  check(response.body, "response has no body");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const next = await reader.read();
+    if (next.done) break;
+    total += next.value.length;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error(`response exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(next.value);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function fetchLimited(
+  url: URL,
+  maxBytes: number,
+  headers: Record<string, string> = {},
+): Promise<Buffer> {
+  const response = await fetch(url, {
+    headers,
+    redirect: "error",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  check(response.ok, `GET ${url.origin}${url.pathname} returned ${response.status}`);
+  return readLimited(response, maxBytes);
+}
+
+async function fetchJson(
+  url: URL,
+  maxBytes = MAX_JSON_BYTES,
+  headers: Record<string, string> = {},
+): Promise<unknown> {
+  const bytes = await fetchLimited(url, maxBytes, { accept: "application/json", ...headers });
+  return JSON.parse(bytes.toString("utf8")) as unknown;
+}
+
+function githubUrl(path: string): URL {
+  const url = new URL(path, GITHUB_API);
+  check(url.origin === GITHUB_API, "unsafe GitHub API URL");
+  return url;
+}
+
+async function assertLiveReleaseControls(
+  manifest: Manifest,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  const repository = repositorySlug(manifest);
+  check(env.GITHUB_REPOSITORY === repository, "ruleset repository disagrees with package metadata");
+  const token = text(env.GITHUB_TOKEN, "GITHUB_TOKEN");
+  const headers = {
+    accept: "application/vnd.github+json",
+    authorization: `Bearer ${token}`,
+    "x-github-api-version": GITHUB_API_VERSION,
+  };
+  const actorName = encodeURIComponent(text(env.GITHUB_ACTOR, "GITHUB_ACTOR"));
+  const [summaries, environment, policies, actorPermission] = await Promise.all([
+    fetchJson(
+      githubUrl(`/repos/${repository}/rulesets?includes_parents=true&targets=tag&per_page=100`),
+      MAX_JSON_BYTES,
+      headers,
+    ),
+    fetchJson(
+      githubUrl(`/repos/${repository}/environments/${RELEASE_ENVIRONMENT}`),
+      MAX_JSON_BYTES,
+      headers,
+    ),
+    fetchJson(
+      githubUrl(
+        `/repos/${repository}/environments/${RELEASE_ENVIRONMENT}/deployment-branch-policies?per_page=100`,
+      ),
+      MAX_JSON_BYTES,
+      headers,
+    ),
+    fetchJson(
+      githubUrl(`/repos/${repository}/collaborators/${actorName}/permission`),
+      MAX_JSON_BYTES,
+      headers,
+    ),
+  ]);
+  check(Array.isArray(summaries), "GitHub rulesets response must be an array");
+  const details = await Promise.all(summaries.map(async (entry, index) => {
+    const summary = record(entry, `ruleset summary ${index}`);
+    const id = integer(summary.id, `ruleset summary ${index} id`);
+    return fetchJson(githubUrl(`/repos/${repository}/rulesets/${id}`), MAX_JSON_BYTES, headers);
+  }));
+  const ruleset = verifyReleaseRulesets(details);
+  verifyReleaseEnvironment(environment, policies, actorPermission);
+  console.log(`verified active release tag ruleset ${ruleset.name} (${ruleset.id})`);
+  console.log(`verified protected ${RELEASE_ENVIRONMENT} environment and tag policy`);
+}
+
+function candidateFrom(
+  manifest: Manifest,
+  pack: PackResult,
+  commit: string,
+  artifactPath: string,
+): ReleaseCandidate {
   check(pack.name === manifest.name && pack.version === manifest.version, "pack metadata disagrees with package.json");
   return {
-    schema: "hasna.accounts.release-candidate/v1",
+    schema: "hasna.accounts.release-candidate/v2",
     name: manifest.name,
     version: manifest.version,
     tag: releaseTag(manifest),
@@ -242,16 +636,21 @@ function candidate(manifest: Manifest, pack: PackResult, commit: string): Releas
     integrity: pack.integrity,
     shasum: pack.shasum,
     filename: pack.filename,
+    size: pack.size,
     fileCount: pack.files.length,
+    artifactPath,
+    stagingTag: stagingDistTag(manifest.version),
+    intendedTag: intendedDistTag(manifest),
   };
 }
 
 function loadCandidate(path: string): ReleaseCandidate {
   const value = record(JSON.parse(readFileSync(path, "utf8")), "release candidate");
-  check(value.schema === "hasna.accounts.release-candidate/v1", "unsupported candidate schema");
-  check(Number.isInteger(value.fileCount) && (value.fileCount as number) > 0, "invalid candidate file count");
-  return {
-    schema: "hasna.accounts.release-candidate/v1",
+  check(value.schema === "hasna.accounts.release-candidate/v2", "unsupported candidate schema");
+  const artifactPath = text(value.artifactPath, "candidate artifact path");
+  check(isAbsolute(artifactPath), "candidate artifact path must be absolute");
+  const result: ReleaseCandidate = {
+    schema: "hasna.accounts.release-candidate/v2",
     name: text(value.name, "candidate name"),
     version: text(value.version, "candidate version"),
     tag: text(value.tag, "candidate tag"),
@@ -261,38 +660,84 @@ function loadCandidate(path: string): ReleaseCandidate {
     integrity: text(value.integrity, "candidate integrity"),
     shasum: text(value.shasum, "candidate shasum"),
     filename: text(value.filename, "candidate filename"),
-    fileCount: value.fileCount as number,
+    size: integer(value.size, "candidate size"),
+    fileCount: integer(value.fileCount, "candidate file count"),
+    artifactPath,
+    stagingTag: assertDistTag(text(value.stagingTag, "candidate staging tag"), "candidate staging tag"),
+    intendedTag: assertDistTag(text(value.intendedTag, "candidate intended tag"), "candidate intended tag"),
   };
+  check(result.commit.match(/^[0-9a-f]{40}$/), "candidate commit must be a full SHA");
+  check(result.size > 0 && result.fileCount > 0, "candidate artifact metadata must be nonempty");
+  return result;
 }
 
-function packageUrl(name: string, version = ""): string {
-  return `${REGISTRY}/${encodeURIComponent(name)}${version ? `/${encodeURIComponent(version)}` : ""}`;
+function assertCandidateContext(
+  value: ReleaseCandidate,
+  manifest: Manifest,
+  env: NodeJS.ProcessEnv,
+): void {
+  const expected = {
+    name: manifest.name,
+    version: manifest.version,
+    tag: releaseTag(manifest),
+    commit: text(env.GITHUB_SHA, "GITHUB_SHA"),
+    repository: repositorySlug(manifest),
+    workflow: RELEASE_WORKFLOW,
+    stagingTag: stagingDistTag(manifest.version),
+    intendedTag: intendedDistTag(manifest),
+  };
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    check(value[key as keyof ReleaseCandidate] === expectedValue, `candidate ${key} disagrees with release context`);
+  }
 }
 
-async function fetchJson(url: string): Promise<unknown> {
-  const response = await fetch(url, { headers: { accept: "application/json" }, redirect: "error" });
-  check(response.ok, `GET ${url} returned ${response.status}`);
-  return response.json();
+function verifyCandidateArtifact(value: ReleaseCandidate): Buffer {
+  const stat = lstatSync(value.artifactPath);
+  check(stat.isFile() && !stat.isSymbolicLink(), "candidate artifact must be a regular non-symlink file");
+  check(stat.size === value.size, "candidate artifact size changed after verification");
+  check(stat.size <= MAX_TARBALL_BYTES, `candidate artifact exceeds ${MAX_TARBALL_BYTES} bytes`);
+  const bytes = readFileSync(value.artifactPath);
+  check(
+    createHash("sha1").update(bytes).digest("hex") === value.shasum &&
+      `sha512-${createHash("sha512").update(bytes).digest("base64")}` === value.integrity,
+    "candidate artifact bytes changed after verification",
+  );
+  return bytes;
+}
+
+function packageUrl(name: string, version = ""): URL {
+  return new URL(`${REGISTRY}/${encodeURIComponent(name)}${version ? `/${encodeURIComponent(version)}` : ""}`);
 }
 
 async function ensureUnpublished(value: ReleaseCandidate): Promise<void> {
-  const response = await fetch(packageUrl(value.name, value.version), { redirect: "error" });
+  const response = await fetch(packageUrl(value.name, value.version), {
+    redirect: "error",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   check(response.status === 404, response.ok
     ? `${value.name}@${value.version} already exists; versions are immutable`
     : `registry preflight returned ${response.status}`);
   console.log(`${value.name}@${value.version} is not published`);
 }
 
-function safeUrl(value: unknown, label: string, prefix: string): URL {
+function safeRegistryUrl(value: unknown, label: string, prefix: string): URL {
   const url = new URL(text(value, label));
-  check(url.origin === REGISTRY && url.pathname.startsWith(prefix), `unsafe ${label}`);
+  check(
+    url.origin === REGISTRY &&
+      url.pathname.startsWith(prefix) &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash,
+    `unsafe ${label}`,
+  );
   return url;
 }
 
 export function verifyRegistryMetadata(
   value: ReleaseCandidate,
   input: unknown,
-): { tarballUrl: URL; attestationsUrl: URL } {
+): { tarballUrl: URL } {
   const metadata = record(input, "registry metadata");
   check(metadata.name === value.name && metadata.version === value.version, "registry package identity disagrees");
   check(metadata.gitHead === value.commit, "registry gitHead disagrees");
@@ -303,24 +748,53 @@ export function verifyRegistryMetadata(
     record(attestations.provenance, "registry provenance").predicateType === PROVENANCE_PREDICATE,
     "registry does not advertise SLSA v1 provenance",
   );
+  const attestationsUrl = safeRegistryUrl(
+    attestations.url,
+    "attestations URL",
+    "/-/npm/v1/attestations/",
+  );
+  check(
+    decodeURIComponent(attestationsUrl.pathname) ===
+      `/-/npm/v1/attestations/${value.name}@${value.version}`,
+    "registry attestations URL disagrees with the package identity",
+  );
   return {
-    tarballUrl: safeUrl(dist.tarball, "tarball URL", `/${value.name}/-/`),
-    attestationsUrl: safeUrl(attestations.url, "attestations URL", "/-/npm/v1/attestations/"),
+    tarballUrl: safeRegistryUrl(
+      dist.tarball,
+      "tarball URL",
+      `/${value.name}/-/`,
+    ),
   };
+}
+
+function decodeBase64(value: unknown, label: string): Buffer {
+  const encoded = text(value, label);
+  check(encoded.length % 4 === 0 && encoded.match(/^[A-Za-z0-9+/]+={0,2}$/), `${label} is not strict base64`);
+  const bytes = Buffer.from(encoded, "base64");
+  check(bytes.toString("base64") === encoded, `${label} is not canonical base64`);
+  check(bytes.length <= MAX_JSON_BYTES, `${label} exceeds ${MAX_JSON_BYTES} decoded bytes`);
+  return bytes;
 }
 
 function integrityHex(integrity: string): string {
   const match = integrity.match(/^sha512-([A-Za-z0-9+/]+={0,2})$/);
   check(match?.[1], "candidate integrity is not sha512");
-  return Buffer.from(match[1], "base64").toString("hex");
+  return decodeBase64(match[1], "candidate integrity").toString("hex");
 }
 
-function statement(item: unknown, value: ReleaseCandidate): RecordValue {
-  const attestation = record(item, "attestation");
+function auditedStatement(item: unknown, value: ReleaseCandidate): RecordValue {
+  const attestation = record(item, "cryptographically verified attestation");
   const predicateType = text(attestation.predicateType, "predicate type");
-  const envelope = record(record(attestation.bundle, "bundle").dsseEnvelope, "DSSE envelope");
+  const bundle = record(attestation.bundle, "Sigstore bundle");
+  const envelope = record(bundle.dsseEnvelope, "DSSE envelope");
+  check(Array.isArray(envelope.signatures) && envelope.signatures.length > 0, "unsigned DSSE bundle is forbidden");
+  const material = record(bundle.verificationMaterial, "Sigstore verification material");
+  check(
+    Array.isArray(material.tlogEntries) && material.tlogEntries.length > 0,
+    "Sigstore transparency-log evidence is required",
+  );
   const decoded = record(
-    JSON.parse(Buffer.from(text(envelope.payload, "DSSE payload"), "base64").toString("utf8")),
+    JSON.parse(decodeBase64(envelope.payload, "DSSE payload").toString("utf8")),
     "in-toto statement",
   );
   check(decoded.predicateType === predicateType, "attestation predicate types disagree");
@@ -336,21 +810,23 @@ function statement(item: unknown, value: ReleaseCandidate): RecordValue {
 }
 
 export function verifyAttestations(value: ReleaseCandidate, input: unknown): void {
-  const entries = record(input, "attestations document").attestations;
-  check(Array.isArray(entries), "attestations document has no entries");
-  const statements = new Map(entries.map((entry) => {
-    const decoded = statement(entry, value);
-    return [text(decoded.predicateType, "predicate type"), decoded];
-  }));
-  const publish = statements.get(PUBLISH_PREDICATE);
-  const provenance = statements.get(PROVENANCE_PREDICATE);
-  check(publish && provenance, "both npm publish and SLSA provenance attestations are required");
-  const published = record(publish.predicate, "publish predicate");
+  check(Array.isArray(input), "npm audit did not return cryptographically verified attestation bundles");
+  const statements = input.map((entry) => auditedStatement(entry, value));
+  const publish = statements.filter((entry) => entry.predicateType === PUBLISH_PREDICATE);
+  const provenance = statements.filter((entry) => entry.predicateType === PROVENANCE_PREDICATE);
+  check(
+    publish.length === 1 && provenance.length === 1,
+    "exactly one npm publish and one SLSA provenance attestation are required",
+  );
+  const published = record(publish[0]!.predicate, "publish predicate");
   check(
     published.name === value.name && published.version === value.version && published.registry === REGISTRY,
     "publish attestation disagrees",
   );
-  const build = record(record(provenance.predicate, "provenance predicate").buildDefinition, "build definition");
+  const build = record(
+    record(provenance[0]!.predicate, "provenance predicate").buildDefinition,
+    "build definition",
+  );
   const workflow = record(
     record(record(build.externalParameters, "external parameters").workflow, "workflow"),
     "workflow",
@@ -371,45 +847,122 @@ export function verifyAttestations(value: ReleaseCandidate, input: unknown): voi
   );
 }
 
-async function verifyTarball(value: ReleaseCandidate, url: URL): Promise<void> {
-  const response = await fetch(url, { redirect: "error" });
-  check(response.ok, `registry tarball returned ${response.status}`);
-  const bytes = Buffer.from(await response.arrayBuffer());
+export function verifyDownloadedTarball(value: ReleaseCandidate, bytes: Uint8Array): void {
+  const buffer = Buffer.from(bytes);
+  check(buffer.length === value.size, "downloaded registry tarball size differs from the reviewed pack");
+  check(buffer.length <= MAX_TARBALL_BYTES, `downloaded tarball exceeds ${MAX_TARBALL_BYTES} bytes`);
   check(
-    createHash("sha1").update(bytes).digest("hex") === value.shasum &&
-      `sha512-${createHash("sha512").update(bytes).digest("base64")}` === value.integrity,
+    createHash("sha1").update(buffer).digest("hex") === value.shasum &&
+      `sha512-${createHash("sha512").update(buffer).digest("base64")}` === value.integrity,
     "downloaded registry tarball differs from the reviewed pack",
   );
 }
 
-function verifyExactInstall(value: ReleaseCandidate): void {
+export function verifyDistTags(
+  value: ReleaseCandidate,
+  input: unknown,
+  phase: RegistryPhase,
+): void {
+  const tags = record(record(input, "registry package metadata")["dist-tags"], "registry dist-tags");
+  check(tags[value.stagingTag] === value.version, `${value.stagingTag} does not point to ${value.version}`);
+  if (phase === "staged") {
+    check(
+      tags[value.intendedTag] !== value.version,
+      `${value.intendedTag} was promoted before registry verification completed`,
+    );
+  } else {
+    check(
+      tags[value.intendedTag] === value.version,
+      `${value.intendedTag} does not agree with ${value.stagingTag}`,
+    );
+  }
+}
+
+export function extractVerifiedAttestations(
+  value: ReleaseCandidate,
+  input: unknown,
+): unknown[] {
+  const audit = record(input, "npm audit signatures result");
+  check(Array.isArray(audit.invalid) && audit.invalid.length === 0, "npm reported invalid signatures");
+  check(Array.isArray(audit.missing) && audit.missing.length === 0, "npm reported missing signatures");
+  check(Array.isArray(audit.verified), "npm audit signatures did not report verified packages");
+  const expectedLocation = `node_modules/${value.name}`;
+  const verified = audit.verified
+    .map((entry, index) => record(entry, `npm verified entry ${index}`))
+    .find((entry) =>
+      entry.name === value.name &&
+      entry.version === value.version &&
+      entry.location === expectedLocation
+    );
+  check(verified, `npm did not cryptographically verify ${value.name}@${value.version}`);
+  check(
+    Array.isArray(verified.attestationBundles) && verified.attestationBundles.length > 0,
+    "npm did not return the verified attestation bundles",
+  );
+  return verified.attestationBundles;
+}
+
+export function assertExactCliVersion(value: ReleaseCandidate, stdout: string): void {
+  check(stdout.trim() === value.version, `accounts --version returned ${stdout.trim() || "<empty>"}`);
+}
+
+function verifyExactInstallAndAttestations(value: ReleaseCandidate): unknown[] {
   const root = mkdtempSync(join(tmpdir(), "accounts-consumer-"));
   try {
-    writeFileSync(join(root, "package.json"), JSON.stringify({ private: true }));
+    writeFileSync(join(root, "package.json"), `${JSON.stringify({ private: true })}\n`, { mode: 0o600 });
     run("npm", [
       "install", "--ignore-scripts", "--audit=false", "--fund=false", "--save-exact",
       `${value.name}@${value.version}`,
-    ], root);
-    const installedPath = join(root, "node_modules", ...value.name.split("/"), "package.json");
-    const installed = record(JSON.parse(readFileSync(installedPath, "utf8")), "installed package");
+    ], root, { timeoutMs: 300_000 });
+    const packageRoot = join(root, "node_modules", ...value.name.split("/"));
+    const installed = record(
+      JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")),
+      "installed package",
+    );
     check(installed.name === value.name && installed.version === value.version, "exact install resolved another version");
-    run("npm", ["audit", "signatures"], root, true);
+    const cliPath = join(packageRoot, "dist", "cli.js");
+    const cliStat = lstatSync(cliPath);
+    check(cliStat.isFile() && !cliStat.isSymbolicLink(), "installed Accounts CLI is not a regular file");
+    assertExactCliVersion(value, run("node", [cliPath, "--version"], root));
+    const audit = JSON.parse(run("npm", [
+      "audit", "signatures", "--json", "--include-attestations",
+    ], root, { timeoutMs: 300_000 })) as unknown;
+    return extractVerifiedAttestations(value, audit);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
-async function verifyRegistryRelease(value: ReleaseCandidate, attempts: number, delayMs: number): Promise<void> {
+export function parseRetryOptions(attemptsInput: string, delayInput: string): {
+  attempts: number;
+  delayMs: number;
+} {
+  const attempts = Number(attemptsInput);
+  const delayMs = Number(delayInput);
+  check(Number.isInteger(attempts) && attempts > 0 && attempts <= 6, "attempts must be between 1 and 6");
+  check(Number.isInteger(delayMs) && delayMs >= 0 && delayMs <= 10_000, "delay must be between 0 and 10000 ms");
+  check((attempts - 1) * delayMs <= 60_000, "retry delay budget exceeds 60 seconds");
+  return { attempts, delayMs };
+}
+
+async function verifyRegistryRelease(
+  value: ReleaseCandidate,
+  phase: RegistryPhase,
+  attempts: number,
+  delayMs: number,
+): Promise<void> {
   let failure: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const urls = verifyRegistryMetadata(value, await fetchJson(packageUrl(value.name, value.version)));
-      verifyAttestations(value, await fetchJson(urls.attestationsUrl.href));
-      await verifyTarball(value, urls.tarballUrl);
-      verifyExactInstall(value);
+      const versionMetadata = await fetchJson(packageUrl(value.name, value.version));
+      const urls = verifyRegistryMetadata(value, versionMetadata);
+      verifyDistTags(value, await fetchJson(packageUrl(value.name)), phase);
+      verifyDownloadedTarball(value, await fetchLimited(urls.tarballUrl, MAX_TARBALL_BYTES));
+      const auditedBundles = verifyExactInstallAndAttestations(value);
+      verifyAttestations(value, auditedBundles);
       console.log(
-        `verified ${value.name}@${value.version}: gitHead, tag, integrity, tarball, ` +
-          "attestations, exact install, and npm signatures agree",
+        `verified ${value.name}@${value.version}: registry bytes, gitHead, ` +
+          `cryptographic attestations, provenance semantics, ${value.stagingTag}, exact install, and CLI agree`,
       );
       return;
     } catch (error) {
@@ -418,6 +971,26 @@ async function verifyRegistryRelease(value: ReleaseCandidate, attempts: number, 
     }
   }
   throw failure;
+}
+
+async function promoteDistTag(
+  root: string,
+  manifest: Manifest,
+  value: ReleaseCandidate,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  assertPromotionEnvironment(manifest, env, currentToolchain(root));
+  assertGitContext(root, manifest, env);
+  assertCandidateContext(value, manifest, env);
+  verifyCandidateArtifact(value);
+  await assertLiveReleaseControls(manifest, env);
+  verifyDistTags(value, await fetchJson(packageUrl(value.name)), "staged");
+  run("npm", [
+    "dist-tag", "add", `${value.name}@${value.version}`, value.intendedTag,
+    "--registry", REGISTRY,
+  ], root);
+  verifyDistTags(value, await fetchJson(packageUrl(value.name)), "promoted");
+  console.log(`promoted ${value.name}@${value.version} to ${value.intendedTag}`);
 }
 
 function option(args: string[], name: string, fallback?: string): string {
@@ -433,29 +1006,68 @@ async function main(): Promise<void> {
   const manifest = loadManifest(root);
   if (subcommand === "pack") {
     verifyDeterministicPack(root);
-  } else if (subcommand === "require-trusted-publish") {
-    assertTrustedPublishEnvironment(manifest, process.env, run("npm", ["--version"], root).trim());
+  } else if (subcommand === "reject-direct-publish") {
+    throw new Error(
+      "direct npm publish is forbidden; the release workflow must publish the preserved verified tarball",
+    );
+  } else if (subcommand === "preflight") {
+    assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
     assertGitContext(root, manifest, process.env);
-    console.log("trusted publish context verified");
+    await assertLiveReleaseControls(manifest, process.env);
+    console.log("trusted release preflight verified");
   } else if (subcommand === "candidate") {
-    assertTrustedPublishEnvironment(manifest, process.env, run("npm", ["--version"], root).trim());
+    assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
     assertGitContext(root, manifest, process.env);
-    const value = candidate(manifest, verifyDeterministicPack(root), text(process.env.GITHUB_SHA, "GITHUB_SHA"));
+    await assertLiveReleaseControls(manifest, process.env);
+    const artifactPath = resolve(option(args, "--artifact"));
+    const pack = verifyDeterministicPack(root, artifactPath);
+    const value = candidateFrom(
+      manifest,
+      pack,
+      text(process.env.GITHUB_SHA, "GITHUB_SHA"),
+      artifactPath,
+    );
     const output = resolve(option(args, "--out"));
-    writeFileSync(output, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(output, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", mode: 0o600 });
     console.log(`wrote release candidate ${output}`);
   } else if (subcommand === "ensure-unpublished") {
-    await ensureUnpublished(loadCandidate(resolve(option(args, "--candidate"))));
+    const value = loadCandidate(resolve(option(args, "--candidate")));
+    verifyCandidateArtifact(value);
+    await ensureUnpublished(value);
+  } else if (subcommand === "publish-staged") {
+    assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
+    assertGitContext(root, manifest, process.env);
+    await assertLiveReleaseControls(manifest, process.env);
+    const value = loadCandidate(resolve(option(args, "--candidate")));
+    assertCandidateContext(value, manifest, process.env);
+    verifyCandidateArtifact(value);
+    run("npm", [
+      "publish", value.artifactPath, "--ignore-scripts", "--provenance", "--access", "public",
+      "--tag", value.stagingTag, "--registry", REGISTRY,
+    ], root, { inherit: true, timeoutMs: 300_000 });
   } else if (subcommand === "verify-registry") {
-    const attempts = Number(option(args, "--attempts", "12"));
-    const delayMs = Number(option(args, "--delay-ms", "5000"));
-    check(Number.isInteger(attempts) && attempts > 0, "invalid attempts");
-    check(Number.isInteger(delayMs) && delayMs >= 0, "invalid delay");
-    await verifyRegistryRelease(loadCandidate(resolve(option(args, "--candidate"))), attempts, delayMs);
+    const value = loadCandidate(resolve(option(args, "--candidate")));
+    verifyCandidateArtifact(value);
+    const retry = parseRetryOptions(
+      option(args, "--attempts", "4"),
+      option(args, "--delay-ms", "5000"),
+    );
+    const phase = option(args, "--phase", "staged");
+    check(phase === "staged" || phase === "promoted", "phase must be staged or promoted");
+    await verifyRegistryRelease(value, phase, retry.attempts, retry.delayMs);
+  } else if (subcommand === "promote") {
+    await promoteDistTag(
+      root,
+      manifest,
+      loadCandidate(resolve(option(args, "--candidate"))),
+      process.env,
+    );
   } else {
     throw new Error(
-      "usage: release-provenance.ts pack | require-trusted-publish | candidate --out FILE | " +
-        "ensure-unpublished --candidate FILE | verify-registry --candidate FILE",
+      "usage: release-provenance.ts pack | reject-direct-publish | preflight | " +
+        "candidate --out FILE --artifact FILE | ensure-unpublished --candidate FILE | " +
+        "publish-staged --candidate FILE | verify-registry --candidate FILE " +
+        "[--phase staged|promoted] | promote --candidate FILE",
     );
   }
 }

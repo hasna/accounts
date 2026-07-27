@@ -47,7 +47,7 @@
     "vendor-kit:check": "bunx @hasna/contracts vendor-kit --check .",
     "conformance": "bunx @hasna/contracts repo-conformance .",
     "prepack": "bun run build",
-    "prepublishOnly": "bun run scripts/release-provenance.ts require-trusted-publish",
+    "prepublishOnly": "bun run scripts/release-provenance.ts reject-direct-publish",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:postgres": "bun run ./test/run-postgres.ts"

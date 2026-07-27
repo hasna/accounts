@@ -16,8 +16,12 @@ jobs:
   publish:
     if: github.repository == 'hasna/accounts'
     runs-on: ubuntu-latest
+    environment: npm-release
+    env:
+      NPM_DIST_TAG_TOKEN_CONFIGURED: ${{ secrets.NPM_DIST_TAG_TOKEN != '' }}
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       id-token: write
     services:
@@ -35,19 +39,30 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          bun-version: latest
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.x"
+          node-version: "24.18.0"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+
+      - name: Verify pinned release toolchain
+        run: |
+          set -euo pipefail
+          node_version="$(node --version)"
+          npm_version="$(npm --version)"
+          bun_version="$(bun --version)"
+          [[ "$node_version" == "v24.18.0" ]]
+          [[ "$npm_version" == "11.16.0" ]]
+          [[ "$bun_version" == "1.3.14" ]]
 
       - name: Install locked dependencies with release-age quarantine
         run: bun install --frozen-lockfile --minimum-release-age 604800
@@ -55,8 +70,14 @@ jobs:
       - name: Reject high-severity dependency advisories
         run: bun audit --audit-level high
 
+      - name: Verify protected release identity and live tag ruleset
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun run scripts/release-provenance.ts preflight
+
       - name: Verify release
         run: |
+          set -euo pipefail
           bun run typecheck
           bun run test:compat
           bun test
@@ -71,19 +92,41 @@ jobs:
             bun run test:postgres
 
       - name: Bind tag, commit, and deterministic package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           bun run scripts/release-provenance.ts candidate
           --out "$RUNNER_TEMP/release-candidate.json"
+          --artifact "$RUNNER_TEMP/release-candidate.tgz"
 
       - name: Reject an existing immutable version
         run: >-
           bun run scripts/release-provenance.ts ensure-unpublished
           --candidate "$RUNNER_TEMP/release-candidate.json"
 
-      - name: Publish through npm trusted publishing
-        run: npm publish --provenance --access public
+      - name: Publish preserved candidate under version quarantine
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          bun run scripts/release-provenance.ts publish-staged
+          --candidate "$RUNNER_TEMP/release-candidate.json"
 
-      - name: Verify registry provenance and exact install
+      - name: Verify staged registry bytes, provenance, signatures, and CLI
         run: >-
           bun run scripts/release-provenance.ts verify-registry
           --candidate "$RUNNER_TEMP/release-candidate.json"
+          --phase staged
+
+      - name: Promote the verified version to its intended dist-tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+        run: >-
+          bun run scripts/release-provenance.ts promote
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Verify final dist-tag agreement
+        run: >-
+          bun run scripts/release-provenance.ts verify-registry
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+          --phase promoted
