@@ -137,9 +137,22 @@ closed. The callback result is validated and deeply frozen before it leaves the
 callback; the receipt is derived only from that captured value, never from a
 port-supplied replacement.
 
-Runtime definitions must be identical for every record sharing a runtime ID.
-The crosswalk retains source authority, authority ID, legacy tool/name, and the
-frozen account, runtime, and binding IDs.
+The canonical runtime definition is the exact `(legacy tool key, runtime
+label)` tuple: those are the plan-record fields that become the v2 runtime
+`key` and `label`. Runtime labels must already use Unicode NFC, no leading or
+trailing whitespace, and one ordinary space for each whitespace run; tool keys
+remain lowercase runtime slugs. The deterministic allocator, plan schema,
+existing-plan validation, redacted view, transactional runtime/crosswalk
+derivation, and ready-record receipt checks all use that same tuple.
+
+Every runtime ID maps to exactly one canonical definition across every plan
+record, including quarantined records, and one canonical definition maps back
+to one runtime ID. Multiple records may legitimately share both the same
+definition and runtime ID. Rehashing a plan after changing a label, changing
+case, or introducing a noncanonical Unicode or whitespace variant therefore
+fails before disposition filtering or backfill. The crosswalk retains source
+authority, authority ID, legacy tool/name, and the frozen account, runtime, and
+binding IDs.
 
 ## Durable file contract and repair
 

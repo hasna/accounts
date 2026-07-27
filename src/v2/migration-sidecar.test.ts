@@ -206,6 +206,50 @@ function buildPlan(
   });
 }
 
+function rehashPlanWithRecords(
+  plan: MigrationPlan,
+  records: MigrationPlan["records"],
+): MigrationPlan {
+  const frozenInput = {
+    scope: plan.scope,
+    machineId: plan.machineId,
+    createdAt: plan.createdAt,
+    cutoverEpoch: plan.cutoverEpoch,
+    sourceDigests: plan.sourceDigests,
+    backup: plan.backup,
+    observations: records.map((record) => ({
+      source: record.source,
+      runtimeLabel: record.runtimeLabel,
+      inputDigest: record.inputDigest,
+      root: record.root,
+      authentication: record.authentication,
+      pointers: record.pointers,
+      sessionReferenceDigests: [...record.sessionReferenceDigests],
+      catalogSkipDigests: [...record.catalogSkipDigests],
+      historicalAliases: [...record.historicalAliases],
+      historicalSessionAliases: [...record.historicalSessionAliases],
+    })),
+  };
+  const inputDigest = canonicalDigest(frozenInput);
+  const idempotencyKey = canonicalDigest({
+    planId: plan.id,
+    inputDigest,
+    scope: plan.scope,
+    cutoverEpoch: plan.cutoverEpoch,
+  });
+  const planCore = {
+    ...plan,
+    inputDigest,
+    idempotencyKey,
+    records,
+  };
+  const { planDigest: _planDigest, ...coreWithoutDigest } = planCore;
+  return {
+    ...coreWithoutDigest,
+    planDigest: canonicalDigest(coreWithoutDigest),
+  } as MigrationPlan;
+}
+
 function passingEvidence(plan: MigrationPlan): MigrationGateEvidence {
   return {
     planId: plan.id,
@@ -833,6 +877,177 @@ describe("v2 migration plan", () => {
         }),
       ).code,
     ).toBe("migration_invalid_plan_input");
+  });
+
+  test.each([
+    {
+      label: "ready/ready",
+      observations: [
+        safeObservation("alice"),
+        safeObservation("bob", "claude", {
+          inputDigest: digest("runtime-ready-ready-bob"),
+        }),
+      ],
+      expectedDispositions: ["ready", "ready"],
+    },
+    {
+      label: "ready/quarantined",
+      observations: [
+        safeObservation("alice"),
+        safeObservation("missing", "claude", {
+          inputDigest: digest("runtime-ready-quarantined-missing"),
+          root: {
+            state: "unsafe" as const,
+            code: "missing" as const,
+            pathDigest: digest("runtime-ready-quarantined-path"),
+            reason: "missing",
+          },
+        }),
+      ],
+      expectedDispositions: ["ready", "quarantined"],
+    },
+    {
+      label: "quarantined/quarantined",
+      observations: [
+        safeObservation("missing", "claude", {
+          inputDigest: digest("runtime-quarantined-missing"),
+          root: {
+            state: "unsafe" as const,
+            code: "missing" as const,
+            pathDigest: digest("runtime-quarantined-missing-path"),
+            reason: "missing",
+          },
+        }),
+        safeObservation("unreadable", "claude", {
+          inputDigest: digest("runtime-quarantined-unreadable"),
+          root: {
+            state: "unsafe" as const,
+            code: "unreadable" as const,
+            pathDigest: digest("runtime-quarantined-unreadable-path"),
+            reason: "unreadable",
+          },
+        }),
+      ],
+      expectedDispositions: ["quarantined", "quarantined"],
+    },
+  ])(
+    "rejects a fully rehashed $label plan whose shared runtime id has conflicting definitions",
+    ({ observations, expectedDispositions }) => {
+      const plan = buildPlan(observations);
+      expect(plan.records.map((record) => record.disposition.state)).toEqual(
+        expectedDispositions,
+      );
+      expect(new Set(plan.records.map((record) => record.target.runtimeId))).toEqual(
+        new Set([plan.records[0]!.target.runtimeId]),
+      );
+      expect(migrationPlanSchema.safeParse(plan).success).toBe(true);
+
+      const marker = `Bearer runtime definition ${expectedDispositions.join("-")}`;
+      const forgedRecords = plan.records.map((record, index) =>
+        index === 1
+          ? {
+              ...record,
+              runtimeLabel: marker,
+            }
+          : record,
+      ) as MigrationPlan["records"];
+      const forgedPlan = rehashPlanWithRecords(plan, forgedRecords);
+
+      expect(forgedPlan.inputDigest).not.toBe(plan.inputDigest);
+      expect(forgedPlan.idempotencyKey).not.toBe(plan.idempotencyKey);
+      expect(forgedPlan.planDigest).not.toBe(plan.planDigest);
+      expect(migrationPlanSchema.safeParse(forgedPlan).success).toBe(false);
+
+      const sidecarError = captureError(() => createMigrationSidecar(forgedPlan));
+      expect(sidecarError.code).toBe("migration_invalid_sidecar_plan");
+      expect(JSON.stringify(sidecarError)).not.toContain(marker);
+      expect(String(sidecarError)).not.toContain(marker);
+    },
+  );
+
+  test.each([
+    ["case", "claude code"],
+    ["noncanonical whitespace", "Claude  Code"],
+    ["noncanonical Unicode", "Claude Cafe\u0301"],
+  ])(
+    "keeps builder and schema aligned for %s runtime-label variants",
+    (_variant, conflictingLabel) => {
+      const baseLabel =
+        conflictingLabel === "Claude Cafe\u0301" ? "Claude Café" : "Claude Code";
+      const observations = [
+        safeObservation("alice", "claude", { runtimeLabel: baseLabel }),
+        safeObservation("bob", "claude", {
+          runtimeLabel: baseLabel,
+          inputDigest: digest(`runtime-variant-${conflictingLabel}`),
+        }),
+      ];
+      const plan = buildPlan(observations);
+      const marker = conflictingLabel;
+      const forgedPlan = rehashPlanWithRecords(
+        plan,
+        plan.records.map((record, index) =>
+          index === 1 ? { ...record, runtimeLabel: marker } : record,
+        ) as MigrationPlan["records"],
+      );
+
+      expect(migrationPlanSchema.safeParse(forgedPlan).success).toBe(false);
+      const existingPlanError = captureError(() =>
+        buildMigrationPlan(planInput(observations), {
+          idFactory: stableId,
+          existingPlan: forgedPlan,
+        }),
+      );
+      expect(existingPlanError.code).toBe("migration_invalid_plan_input");
+      expect(JSON.stringify(existingPlanError)).not.toContain(marker);
+    },
+  );
+
+  test("preserves multiple records that share one identical canonical runtime definition", () => {
+    const plan = buildPlan([
+      safeObservation("alice"),
+      safeObservation("bob", "claude", {
+        inputDigest: digest("identical-runtime-definition-bob"),
+      }),
+    ]);
+
+    expect(new Set(plan.records.map((record) => record.target.runtimeId)).size).toBe(1);
+    expect(migrationPlanSchema.parse(plan)).toEqual(plan);
+    const conflictingRuntimeId = "runtime_distinct000000000001";
+    const conflictingIdPlan = rehashPlanWithRecords(
+      plan,
+      plan.records.map((record, index) =>
+        index === 1
+          ? {
+              ...record,
+              target: {
+                ...record.target,
+                runtimeId: conflictingRuntimeId,
+              },
+              binding: record.binding
+                ? {
+                    ...record.binding,
+                    runtimeId: conflictingRuntimeId,
+                  }
+                : undefined,
+            }
+          : record,
+      ) as MigrationPlan["records"],
+    );
+    expect(migrationPlanSchema.safeParse(conflictingIdPlan).success).toBe(false);
+
+    const marker = "Bearer conflicting runtime definition";
+    const builderError = captureError(() =>
+      buildPlan([
+        safeObservation("alice"),
+        safeObservation("bob", "claude", {
+          runtimeLabel: marker,
+          inputDigest: digest("conflicting-runtime-definition-bob"),
+        }),
+      ]),
+    );
+    expect(builderError.code).toBe("migration_runtime_definition_conflict");
+    expect(JSON.stringify(builderError)).not.toContain(marker);
+    expect(String(builderError)).not.toContain(marker);
   });
 
   test("redacts paths and aliases while retaining counts, digests, and conflict evidence", () => {

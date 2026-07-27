@@ -98,6 +98,20 @@ interface MigrationDiagnosticOptions {
 }
 
 const sourceAuthoritySchema = z.enum(["local-v1", "api-v1"]);
+const legacyToolSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9-]*$/, "legacy tool must be a runtime slug");
+const runtimeLabelSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(SAFE_TEXT_PATTERN)
+  .refine(
+    (value) => value === canonicalRuntimeLabel(value),
+    "runtime label must use canonical Unicode and whitespace",
+  );
 export const migrationAliasKindSchema = z.enum([
   "legacy_account",
   "session_ref",
@@ -217,11 +231,7 @@ export const legacyProfileObservationSchema = z
       .object({
         authority: sourceAuthoritySchema,
         authorityId: migrationOpaqueIdSchema,
-        tool: z
-          .string()
-          .min(1)
-          .max(64)
-          .regex(/^[a-z0-9][a-z0-9-]*$/, "legacy tool must be a runtime slug"),
+        tool: legacyToolSchema,
         name: z
           .string()
           .min(1)
@@ -229,7 +239,7 @@ export const legacyProfileObservationSchema = z
           .regex(/^[a-z0-9][a-z0-9-]*$/, "legacy name must be a profile slug"),
       })
       .strict(),
-    runtimeLabel: z.string().min(1).max(128).regex(SAFE_TEXT_PATTERN),
+    runtimeLabel: runtimeLabelSchema,
     inputDigest: migrationDigestSchema,
     root: migrationRootObservationSchema,
     authentication: z.enum(["authenticated", "needs_login", "unknown"]),
@@ -444,6 +454,101 @@ const migrationRecordSchema = z
 
 export type MigrationRecord = Readonly<z.infer<typeof migrationRecordSchema>>;
 
+type RuntimeDefinitionCarrier = Readonly<{
+  source: Readonly<{ tool: string }>;
+  runtimeLabel: string;
+}>;
+
+type RuntimeDefinitionRecord = RuntimeDefinitionCarrier &
+  Readonly<{
+    target: Readonly<{ runtimeId: RuntimeId }>;
+  }>;
+
+type CanonicalRuntimeDefinition = readonly [
+  legacyTool: string,
+  runtimeLabel: string,
+];
+
+interface RuntimeDefinitionConflict {
+  index: number;
+  runtimeId: RuntimeId;
+}
+
+function canonicalRuntimeDefinition(
+  value: RuntimeDefinitionCarrier,
+): CanonicalRuntimeDefinition {
+  return [value.source.tool, value.runtimeLabel] as const;
+}
+
+function sameRuntimeDefinition(
+  left: CanonicalRuntimeDefinition,
+  right: CanonicalRuntimeDefinition,
+): boolean {
+  return left[0] === right[0] && left[1] === right[1];
+}
+
+function runtimeDefinitionIdentity(
+  value: RuntimeDefinitionCarrier,
+): MigrationDigest {
+  return hashCanonical(canonicalRuntimeDefinition(value));
+}
+
+function findRuntimeDefinitionConflicts(
+  records: readonly RuntimeDefinitionRecord[],
+): readonly RuntimeDefinitionConflict[] {
+  const definitionByRuntimeId = new Map<
+    RuntimeId,
+    CanonicalRuntimeDefinition
+  >();
+  const runtimeIdByDefinition = new Map<MigrationDigest, RuntimeId>();
+  const conflicts: RuntimeDefinitionConflict[] = [];
+
+  for (const [index, record] of records.entries()) {
+    const definition = canonicalRuntimeDefinition(record);
+    const existingDefinition = definitionByRuntimeId.get(
+      record.target.runtimeId,
+    );
+    if (
+      existingDefinition &&
+      !sameRuntimeDefinition(existingDefinition, definition)
+    ) {
+      conflicts.push({ index, runtimeId: record.target.runtimeId });
+    } else {
+      definitionByRuntimeId.set(record.target.runtimeId, definition);
+    }
+
+    const identity = runtimeDefinitionIdentity(record);
+    const existingRuntimeId = runtimeIdByDefinition.get(identity);
+    if (
+      existingRuntimeId !== undefined &&
+      existingRuntimeId !== record.target.runtimeId
+    ) {
+      conflicts.push({ index, runtimeId: record.target.runtimeId });
+    } else {
+      runtimeIdByDefinition.set(identity, record.target.runtimeId);
+    }
+  }
+
+  return conflicts;
+}
+
+function assertRuntimeDefinitionConsistency(
+  records: readonly RuntimeDefinitionRecord[],
+): void {
+  const conflicts = findRuntimeDefinitionConflicts(records);
+  if (conflicts.length === 0) return;
+  throw new MigrationConflictError(
+    "runtime id maps to conflicting migration definitions",
+    {
+      code: "migration_runtime_definition_conflict",
+      count: conflicts.length + 1,
+      references: conflicts.map((conflict) =>
+        diagnosticReference("diagnostic.runtime-id", conflict.runtimeId),
+      ),
+    },
+  );
+}
+
 export const migrationPlanSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -466,7 +571,6 @@ export const migrationPlanSchema = z
     const bindingIds = new Set<string>();
     const legacyAccountAliases = new Set<string>();
     const sessionAliases = new Set<string>();
-    const runtimeTools = new Map<string, string>();
     const identifierKinds = new Map<string, MigrationIdKind>();
     const claimIdentifier = (
       value: string,
@@ -526,15 +630,6 @@ export const migrationPlanSchema = z
         "binding",
         ["records", index, "target", "bindingId"],
       );
-      const runtimeTool = runtimeTools.get(record.target.runtimeId);
-      if (runtimeTool && runtimeTool !== record.source.tool) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ["records", index, "target", "runtimeId"],
-          message: "one runtime id may not represent multiple legacy tools",
-        });
-      }
-      runtimeTools.set(record.target.runtimeId, record.source.tool);
       for (const [aliases, claims, label, path] of [
         [
           record.historicalAliases,
@@ -572,6 +667,14 @@ export const migrationPlanSchema = z
           message: "migration binding must remain inside the frozen plan scope and machine",
         });
       }
+    }
+    for (const conflict of findRuntimeDefinitionConflicts(plan.records)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["records", conflict.index, "target", "runtimeId"],
+        message:
+          "migration runtime identity must map one-to-one to its canonical definition",
+      });
     }
     const reconstructedInputResult = migrationPlanInputSchema.safeParse(
       migrationPlanInputFromPlan(plan),
@@ -813,6 +916,7 @@ function buildMigrationPlanInternal(
   const inputDigest = hashCanonical(input);
   if (options.existingPlan) {
     const existing = migrationPlanSchema.parse(options.existingPlan);
+    assertRuntimeDefinitionConsistency(existing.records);
     if (existing.inputDigest !== inputDigest) {
       throw new MigrationDriftError(
         "migration input digest changed for frozen plan",
@@ -848,8 +952,13 @@ function buildMigrationPlanInternal(
   const planId = invokeMigrationIdFactory(idFactory, "plan", inputDigest);
   const scopedSeed = `${input.scope.tenantId}:${input.scope.scopeId}`;
   const sourceKeys = new Set<string>();
-  const runtimeIdByTool = new Map<string, RuntimeId>();
-  const runtimeLabelByTool = new Map<string, string>();
+  const runtimeByTool = new Map<
+    string,
+    Readonly<{
+      definition: CanonicalRuntimeDefinition;
+      runtimeId: RuntimeId;
+    }>
+  >();
   const observations = [...input.observations].sort((left, right) =>
     sourceKey(left).localeCompare(sourceKey(right)),
   );
@@ -866,12 +975,16 @@ function buildMigrationPlanInternal(
       });
     }
     sourceKeys.add(key);
-    const existingRuntimeLabel = runtimeLabelByTool.get(observation.source.tool);
-    if (existingRuntimeLabel && existingRuntimeLabel !== observation.runtimeLabel) {
+    const definition = canonicalRuntimeDefinition(observation);
+    const existingRuntime = runtimeByTool.get(observation.source.tool);
+    if (
+      existingRuntime &&
+      !sameRuntimeDefinition(existingRuntime.definition, definition)
+    ) {
       throw new MigrationConflictError(
         "legacy tool has conflicting runtime labels",
         {
-          code: "migration_conflicting_runtime_labels",
+          code: "migration_runtime_definition_conflict",
           count: 2,
           references: [
             diagnosticReference(
@@ -882,17 +995,19 @@ function buildMigrationPlanInternal(
         },
       );
     }
-    runtimeLabelByTool.set(observation.source.tool, observation.runtimeLabel);
-    if (!runtimeIdByTool.has(observation.source.tool)) {
-      runtimeIdByTool.set(
+    if (!existingRuntime) {
+      runtimeByTool.set(
         observation.source.tool,
-        runtimeIdSchema.parse(
-          invokeMigrationIdFactory(
-            idFactory,
-            "runtime",
-            `${scopedSeed}:${observation.source.tool}`,
+        deepFreeze({
+          definition,
+          runtimeId: runtimeIdSchema.parse(
+            invokeMigrationIdFactory(
+              idFactory,
+              "runtime",
+              `${scopedSeed}:${runtimeDefinitionIdentity(observation)}`,
+            ),
           ),
-        ),
+        }),
       );
     }
   }
@@ -910,7 +1025,7 @@ function buildMigrationPlanInternal(
         "account",
         `${scopedSeed}:${key}`,
       ),
-      runtimeId: runtimeIdByTool.get(observation.source.tool),
+      runtimeId: runtimeByTool.get(observation.source.tool)?.runtimeId,
       bindingId: invokeMigrationIdFactory(
         idFactory,
         "binding",
@@ -1085,6 +1200,10 @@ function canonicalAlias(value: string): string {
   return value.normalize("NFC");
 }
 
+function canonicalRuntimeLabel(value: string): string {
+  return value.normalize("NFC").trim().replace(/\s+/gu, " ");
+}
+
 function defaultIdFactory(kind: MigrationIdKind, seed: string): string {
   return `${kind}_${createHash("sha256")
     .update(`accounts-v2-migration:${kind}:${seed}`)
@@ -1187,6 +1306,7 @@ function redactMigrationPlanInternal(
   planInput: MigrationPlan,
 ): RedactedMigrationPlan {
   const plan = migrationPlanSchema.parse(planInput);
+  assertRuntimeDefinitionConsistency(plan.records);
   return deepFreeze({
     schemaVersion: 1 as const,
     redactionVersion: 1 as const,
@@ -1200,71 +1320,81 @@ function redactMigrationPlanInternal(
     cutoverEpoch: plan.cutoverEpoch,
     sourceDigests: plan.sourceDigests,
     backup: plan.backup,
-    records: plan.records.map((record) => ({
-      sourceKeyDigest: migrationRedactionDigest("source.key", record.sourceKey),
-      source: {
-        authority: record.source.authority,
-        authorityIdDigest: migrationRedactionDigest(
-          "source.authority-id",
-          record.source.authorityId,
+    records: plan.records.map((record) => {
+      const [legacyTool, runtimeLabel] =
+        canonicalRuntimeDefinition(record);
+      return {
+        sourceKeyDigest: migrationRedactionDigest(
+          "source.key",
+          record.sourceKey,
         ),
-        toolDigest: migrationRedactionDigest("source.tool", record.source.tool),
-        nameDigest: migrationRedactionDigest("source.name", record.source.name),
-      },
-      runtimeLabelDigest: migrationRedactionDigest(
-        "runtime.label",
-        record.runtimeLabel,
-      ),
-      inputDigest: record.inputDigest,
-      target: record.target,
-      root:
-        record.root.state === "verified"
-          ? {
-              state: "verified" as const,
-              pathDigest: migrationRedactionDigest(
-                "root.path",
-                record.root.path,
-              ),
-              realPathDigest: migrationRedactionDigest(
-                "root.real-path",
-                record.root.realPath,
-              ),
-              deviceDigest: migrationRedactionDigest(
-                "root.device",
-                record.root.device,
-              ),
-              inodeDigest: migrationRedactionDigest(
-                "root.inode",
-                record.root.inode,
-              ),
-              entryCount: record.root.entryCount,
-              byteCount: record.root.byteCount,
-              digest: record.root.digest,
-            }
-          : {
-              state: record.root.state,
-              code: record.root.code,
-              pathDigest: migrationRedactionDigest(
-                "root.path",
-                record.root.pathDigest,
-              ),
-              reasonDigest: migrationRedactionDigest(
-                "root.unsafe-reason",
-                record.root.reason,
-              ),
-            },
-      authentication: record.authentication,
-      pointers: record.pointers,
-      sessionReferenceDigests: record.sessionReferenceDigests,
-      catalogSkipDigests: record.catalogSkipDigests,
-      historicalAliasDigests: record.historicalAliases.map((alias) =>
-        migrationRedactionDigest("alias", alias),
-      ),
-      historicalSessionAliasDigests: record.historicalSessionAliases.map(
-        (alias) => migrationRedactionDigest("alias.session", alias),
-      ),
-      disposition: record.disposition,
-    })),
+        source: {
+          authority: record.source.authority,
+          authorityIdDigest: migrationRedactionDigest(
+            "source.authority-id",
+            record.source.authorityId,
+          ),
+          toolDigest: migrationRedactionDigest("source.tool", legacyTool),
+          nameDigest: migrationRedactionDigest(
+            "source.name",
+            record.source.name,
+          ),
+        },
+        runtimeLabelDigest: migrationRedactionDigest(
+          "runtime.label",
+          runtimeLabel,
+        ),
+        inputDigest: record.inputDigest,
+        target: record.target,
+        root:
+          record.root.state === "verified"
+            ? {
+                state: "verified" as const,
+                pathDigest: migrationRedactionDigest(
+                  "root.path",
+                  record.root.path,
+                ),
+                realPathDigest: migrationRedactionDigest(
+                  "root.real-path",
+                  record.root.realPath,
+                ),
+                deviceDigest: migrationRedactionDigest(
+                  "root.device",
+                  record.root.device,
+                ),
+                inodeDigest: migrationRedactionDigest(
+                  "root.inode",
+                  record.root.inode,
+                ),
+                entryCount: record.root.entryCount,
+                byteCount: record.root.byteCount,
+                digest: record.root.digest,
+              }
+            : {
+                state: record.root.state,
+                code: record.root.code,
+                pathDigest: migrationRedactionDigest(
+                  "root.path",
+                  record.root.pathDigest,
+                ),
+                reasonDigest: migrationRedactionDigest(
+                  "root.unsafe-reason",
+                  record.root.reason,
+                ),
+              },
+        authentication: record.authentication,
+        pointers: record.pointers,
+        sessionReferenceDigests: record.sessionReferenceDigests,
+        catalogSkipDigests: record.catalogSkipDigests,
+        historicalAliasDigests: record.historicalAliases.map((alias) =>
+          migrationRedactionDigest("alias", alias),
+        ),
+        historicalSessionAliasDigests: record.historicalSessionAliases.map(
+          (alias) => migrationRedactionDigest("alias.session", alias),
+        ),
+        disposition: record.disposition,
+      };
+    }),
   });
 }
 
@@ -2260,18 +2390,21 @@ async function applyScopedBackfillInternal(
       "scoped backfill requires a gate-approved partial_ready or final_ready sidecar",
     );
   }
+  assertRuntimeDefinitionConsistency(sidecar.plan.records);
   const records = sidecar.plan.records.filter(
     (record): record is MigrationRecord & { disposition: { state: "ready" } } =>
       record.disposition.state === "ready",
   );
   const runtimes = new Map<RuntimeId, ScopedBackfillRuntime>();
   for (const record of records) {
+    const [legacyTool, runtimeLabel] =
+      canonicalRuntimeDefinition(record);
     const runtime: ScopedBackfillRuntime = {
       id: record.target.runtimeId,
       tenantId: sidecar.plan.scope.tenantId,
       scopeId: sidecar.plan.scope.scopeId,
-      key: record.source.tool,
-      label: record.runtimeLabel,
+      key: legacyTool,
+      label: runtimeLabel,
       createdAt: sidecar.plan.createdAt,
       updatedAt: sidecar.plan.createdAt,
     };
@@ -2340,11 +2473,12 @@ async function applyScopedBackfillInternal(
         for (const record of [...records].sort((a, b) =>
           a.sourceKey.localeCompare(b.sourceKey)
         )) {
+          const [legacyTool] = canonicalRuntimeDefinition(record);
           const crosswalk: ScopedBackfillCrosswalk = {
             sourceKey: record.sourceKey,
             sourceAuthority: record.source.authority,
             sourceAuthorityId: record.source.authorityId,
-            legacyTool: record.source.tool,
+            legacyTool,
             legacyName: record.source.name,
             accountId: record.target.accountId,
             runtimeId: record.target.runtimeId,
@@ -2432,6 +2566,7 @@ function tally(counter: { created: number; adopted: number }, value: EnsureResul
 }
 
 function readyRecordsDigest(plan: MigrationPlan): MigrationDigest {
+  assertRuntimeDefinitionConsistency(plan.records);
   return hashCanonical(
     plan.records.filter((record) => record.disposition.state === "ready"),
   );
@@ -2441,6 +2576,7 @@ function validateBackfillReceipt(
   plan: MigrationPlan,
   receiptInput: MigrationBackfillReceipt,
 ): void {
+  assertRuntimeDefinitionConsistency(plan.records);
   const receipt = migrationBackfillReceiptSchema.parse(receiptInput);
   const { digest, ...coreValue } = receipt;
   const core = migrationBackfillReceiptCoreSchema.parse(coreValue);
