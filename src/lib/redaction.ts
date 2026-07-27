@@ -11,6 +11,9 @@ const SET_COOKIE_ATTRIBUTE_PATTERN =
   /^(?:(?:expires|max-age|domain|path|samesite)[ \t]*=|(?:secure|httponly|partitioned)(?:[ \t]*[;,]|$))/i;
 const HTTP_TOKEN_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const AUTH_TOKEN68_PATTERN = /^[A-Za-z0-9._~+/-]+=*$/;
+const AUTH_TOKEN68_PADDING_PATTERN = /^=+$/;
+const ASSIGNMENT_RECORD_PATTERN =
+  /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*=/;
 const COOKIE_VALUE_FRAGMENT_PATTERN = /^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+$/;
 const COOKIE_VALUE_TAIL_PATTERN =
   /(?:^|;[ \t]*)[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*=[ \t]*(?:"[^"\r\n]*"|[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*)$/;
@@ -18,6 +21,7 @@ const AUTH_PARAMETER_TAIL_PATTERN =
   /(?:^|,[ \t]*)(?:credential|signedheaders|signature|username|realm|nonce|response|uri|algorithm|qop|nc|cnonce|opaque|charset|stale|userhash)[ \t]*=[ \t]*[^,\s]*$/i;
 
 type SensitiveHeaderName = "authorization" | "proxy-authorization" | "cookie" | "set-cookie";
+type FoldSeparator = "," | ";";
 
 function lineBreakEnd(value: string, start: number): number {
   return value[start] === "\r" && value[start + 1] === "\n" ? start + 2 : start + 1;
@@ -46,8 +50,29 @@ function startsAuthorizationValue(value: string): boolean {
   return AUTH_TOKEN68_PATTERN.test(credential) || AUTH_PARAMETER_PATTERN.test(credential);
 }
 
+function leadingFoldSeparator(
+  value: string,
+): { separator: FoldSeparator; remainder: string } | undefined {
+  const match = /^([,;])[ \t]*(.*)$/.exec(value);
+  if (!match) return undefined;
+  return {
+    separator: match[1] as FoldSeparator,
+    remainder: match[2]!.trim(),
+  };
+}
+
+function trailingFoldSeparator(value: string): FoldSeparator | undefined {
+  const match = /([,;])[ \t]*$/.exec(value);
+  return match?.[1] as FoldSeparator | undefined;
+}
+
 function authorizationTokenCanContinue(value: string, nextLine: string): boolean {
-  if (!AUTH_TOKEN68_PATTERN.test(nextLine)) return false;
+  if (
+    !AUTH_TOKEN68_PATTERN.test(nextLine) &&
+    !AUTH_TOKEN68_PADDING_PATTERN.test(nextLine)
+  ) {
+    return false;
+  }
   const compacted = compactFoldedHeaderValue(value);
   if (HTTP_TOKEN_PATTERN.test(compacted)) return true;
 
@@ -91,6 +116,7 @@ function cookieValueCanContinue(
   nextLine: string,
 ): boolean {
   if (!COOKIE_VALUE_TAIL_PATTERN.test(compactFoldedHeaderValue(value))) return false;
+  if (ASSIGNMENT_RECORD_PATTERN.test(nextLine)) return false;
   if (COOKIE_VALUE_FRAGMENT_PATTERN.test(nextLine)) return true;
 
   const delimiter = nextLine.indexOf(";");
@@ -103,6 +129,18 @@ function cookieValueCanContinue(
   return headerName === "set-cookie" && SET_COOKIE_ATTRIBUTE_PATTERN.test(remainder);
 }
 
+function separatedAuthorizationContinuation(value: string): boolean {
+  return AUTH_PARAMETER_PATTERN.test(value);
+}
+
+function separatedCookieContinuation(
+  headerName: SensitiveHeaderName,
+  value: string,
+): boolean {
+  if (isCookiePairLine(headerName, value)) return true;
+  return headerName === "set-cookie" && SET_COOKIE_ATTRIBUTE_PATTERN.test(value);
+}
+
 function isSyntacticContinuation(
   headerName: SensitiveHeaderName,
   headerValue: string,
@@ -112,18 +150,27 @@ function isSyntacticContinuation(
   const trimmed = nextLine.trim();
   if (!trimmed || HEADER_LINE_PATTERN.test(trimmed)) return false;
   const unfolded = unfoldedHeaderValue(headerValue);
+  const leadingSeparator = leadingFoldSeparator(trimmed);
+  const previousSeparator = trailingFoldSeparator(previousLine);
 
   if (headerName === "authorization" || headerName === "proxy-authorization") {
     if (!unfolded) return startsAuthorizationValue(trimmed);
-    if (previousLine.trimEnd().endsWith(",")) return AUTH_PARAMETER_PATTERN.test(trimmed);
+    if (leadingSeparator) {
+      return separatedAuthorizationContinuation(leadingSeparator.remainder);
+    }
+    if (previousSeparator) return separatedAuthorizationContinuation(trimmed);
+    if (ASSIGNMENT_RECORD_PATTERN.test(trimmed)) return false;
     return authorizationTokenCanContinue(headerValue, trimmed);
   }
 
   if (!unfolded) return isCookiePairLine(headerName, trimmed);
-  if (/[;,][ \t]*$/.test(previousLine)) {
-    if (isCookiePairLine(headerName, trimmed)) return true;
-    return headerName === "set-cookie" && SET_COOKIE_ATTRIBUTE_PATTERN.test(trimmed);
+  if (leadingSeparator) {
+    return separatedCookieContinuation(headerName, leadingSeparator.remainder);
   }
+  if (previousSeparator) {
+    return separatedCookieContinuation(headerName, trimmed);
+  }
+  if (ASSIGNMENT_RECORD_PATTERN.test(trimmed)) return false;
   return cookieValueCanContinue(headerName, headerValue, trimmed);
 }
 

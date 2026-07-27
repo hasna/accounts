@@ -343,3 +343,101 @@ test("empty sensitive headers preserve indented diagnostics instead of treating 
 
   expect(redactText(input)).toBe(input);
 });
+
+test("sensitive folds accept leading separators and padding-only credential tails", () => {
+  const input = [
+    "Authorization: AWS4-HMAC-SHA256 Credential=leading-auth/20260727/us-east-1/bedrock/aws4_request\r",
+    " , SignedHeaders=content-type;host;x-amz-date\r",
+    " , Signature=leading-auth-signature\r",
+    "X-Auth-Diagnostic: keep-auth-boundary\r",
+    "Proxy-Authorization: Digest username=\"leading-proxy-user\"",
+    " , nonce=\"leading-proxy-nonce\"",
+    " , response=\"leading-proxy-response\"",
+    "X-Proxy-Diagnostic: keep-proxy-boundary",
+    "Cookie: session=leading-cookie\r",
+    " ; csrf=leading-csrf\r",
+    "X-Cookie-Diagnostic: keep-cookie-boundary\r",
+    "Set-Cookie: sid=leading-set-cookie",
+    " ; Path=/",
+    " ; HttpOnly",
+    "X-Set-Cookie-Diagnostic: keep-set-cookie-boundary",
+    "Authorization: Basic cGFkZGVkLWF1dGg",
+    " ==",
+    "Proxy-Authorization: Basic cGFkZGVkLXByb3h5",
+    "\t==",
+    "status=200 keep-final-boundary",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "leading-auth",
+    "SignedHeaders",
+    "leading-auth-signature",
+    "leading-proxy-user",
+    "leading-proxy-nonce",
+    "leading-proxy-response",
+    "leading-cookie",
+    "leading-csrf",
+    "leading-set-cookie",
+    "Path=/",
+    "cGFkZGVkLWF1dGg",
+    "cGFkZGVkLXByb3h5",
+    "==",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const retained of [
+    "X-Auth-Diagnostic: keep-auth-boundary",
+    "X-Proxy-Diagnostic: keep-proxy-boundary",
+    "X-Cookie-Diagnostic: keep-cookie-boundary",
+    "X-Set-Cookie-Diagnostic: keep-set-cookie-boundary",
+    "status=200 keep-final-boundary",
+  ]) {
+    expect(redacted).toContain(retained);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(6);
+});
+
+test("cookie folds terminate before generic compact and spaced diagnostic assignments", () => {
+  const input = [
+    "Cookie: session=compact-cookie-secret\r",
+    " status=429\r",
+    " detail=compact cookie diagnostic\r",
+    " X-Request-ID: keep-cookie-adjacent\r",
+    "Set-Cookie: sid=compact-set-cookie-secret",
+    " stack=Error",
+    " message=compact set-cookie diagnostic",
+    " X-Trace-ID: keep-set-cookie-adjacent",
+    "Cookie: session=spaced-cookie-secret",
+    " diagnostic_code = E_COOKIE",
+    "Set-Cookie: sid=spaced-set-cookie-secret",
+    " upstream_result = rejected",
+    "completed=true",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "compact-cookie-secret",
+    "compact-set-cookie-secret",
+    "spaced-cookie-secret",
+    "spaced-set-cookie-secret",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const retained of [
+    "status=429",
+    "detail=compact cookie diagnostic",
+    "X-Request-ID: keep-cookie-adjacent",
+    "stack=Error",
+    "message=compact set-cookie diagnostic",
+    "X-Trace-ID: keep-set-cookie-adjacent",
+    "diagnostic_code = E_COOKIE",
+    "upstream_result = rejected",
+    "completed=true",
+  ]) {
+    expect(redacted).toContain(retained);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
