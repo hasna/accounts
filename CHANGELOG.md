@@ -6,6 +6,43 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-07-27
+
+### Added
+
+- Add the read-only `accounts sessions` / `accounts sessions list` catalog for
+  Claude sessions represented by verified Accounts-managed profiles. The
+  command provides deterministic table and JSON views with bounded metadata;
+  it performs no application writes to session or profile trees, never writes
+  credential or transcript content, and never emits credentials, prompts,
+  messages, or transcript content. Read-only fallback may update filesystem
+  access-time metadata when `O_NOATIME` is unavailable or not permitted.
+
+### Changed
+
+- Derive canonical `catalogRef` values from the physical storage/session tuple
+  instead of mutable account metadata. Managed roots remain visible across
+  account renames, multiple account records for the same root are
+  deduplicated, and the resolver accepts the deterministic v1 references
+  exposed through `catalogRefAliases`.
+- Harden the bundled MCP build graph by pinning patched `fast-uri` and `hono`
+  versions, keeping its validation dependencies out of clean consumer
+  installs, enforcing high-severity dependency audits in CI, and extending
+  Bun's release-age quarantine to seven days.
+
+### Fixed
+
+- Keep large JSON output complete under Bun, format large built-package tables
+  without overflowing Node's call-argument ceiling, treat a closed stdout pipe
+  as a normal exit, preserve settled entries while session trees churn, and
+  isolate Windows home-directory fixtures so the portable suite exercises the
+  intended managed roots.
+
+### Not Included
+
+- The cross-owner continuation broker is not part of 0.2.12. It remains
+  fail-closed and unreleased; this release provides read-only discovery only.
+
 ## [0.2.11] - 2026-07-24
 
 ### Testing
