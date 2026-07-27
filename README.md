@@ -177,7 +177,12 @@ captured stdout, stderr, and error strings. A separate credential option keeps
 one pending value across LF, CRLF, or bare CR and consumes the next syntactic
 value; quoting, escaping, or opaque non-bare syntax keeps dash-leading text
 bound as that value. Only a complete bare option or a complete sensitive
-attached form replaces pending state. Attached values that resemble options,
+attached form replaces pending state. Bare option syntax is exactly one or two
+compatibility-normalized leading dashes, an alphanumeric body start, then only
+alphanumerics, dots, underscores, or dashes; exact `--` is reserved for the
+end-of-options marker. Three-or-more dash runs and dot- or underscore-leading
+bodies, including malformed attached credential-looking forms, remain one
+opaque bound value. Attached values that resemble options,
 including `--api-key=--client-key` and its colon form, are redacted in place
 without consuming the next safe token. While a separate value is pending, the
 complete physical token is classified before embedded punctuation. Unless the

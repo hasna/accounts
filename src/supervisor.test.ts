@@ -383,13 +383,27 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
   const one = addProfile({ name: "one", tool: "credentialgrammar" });
   const two = addProfile({ name: "two", tool: "credentialgrammar" });
   const initialSecrets = Array.from(
-    { length: 18 },
+    { length: 23 },
     (_, index) => `supervisor-initial-credential-${index}`,
   );
   const switchedSecrets = Array.from(
-    { length: 18 },
+    { length: 23 },
     (_, index) => `supervisor-switched-credential-${index}`,
   );
+  const malformedOptionSyntax = [
+    "---api-key=",
+    "--.client-key:",
+    "--_master-key=",
+    "－－－api-key=",
+    "−−−client-key:",
+  ];
+  const malformedRetained = [
+    "keep-supervisor-malformed-three-dash",
+    "keep-supervisor-malformed-dot",
+    "keep-supervisor-malformed-underscore",
+    "keep-supervisor-malformed-fullwidth",
+    "keep-supervisor-malformed-minus",
+  ];
   const credentialArgs = (secrets: string[]) => [
     scriptPath,
     "--secret-key",
@@ -428,6 +442,21 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     `--label=opaque/--label=${secrets[17]}`,
     "keep-after-complete-token-value",
     "--api-key",
+    `---api-key=${secrets[18]}`,
+    malformedRetained[0]!,
+    "--api-key",
+    `--.client-key:${secrets[19]}`,
+    malformedRetained[1]!,
+    "--api-key",
+    `--_master-key=${secrets[20]}`,
+    malformedRetained[2]!,
+    "--api-key",
+    `－－－api-key=${secrets[21]}`,
+    malformedRetained[3]!,
+    "--api-key",
+    `−−−client-key:${secrets[22]}`,
+    malformedRetained[4]!,
+    "--api-key",
     "--",
     "--client-key",
     "keep-supervisor-positional-client-value",
@@ -451,12 +480,43 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
         initialSecrets.every((secret) => entry.args.some((arg) => arg.includes(secret))),
       ),
     );
+    const initialStatusCli = Bun.spawn({
+      cmd: [
+        process.execPath,
+        "run",
+        "src/cli.ts",
+        "supervisor",
+        "status",
+        "credentialgrammar",
+        "--json",
+      ],
+      env: { ...process.env, ACCOUNTS_HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [
+      initialStatusExit,
+      initialStatusStdout,
+      initialStatusStderr,
+    ] = await Promise.all([
+      initialStatusCli.exited,
+      new Response(initialStatusCli.stdout).text(),
+      new Response(initialStatusCli.stderr).text(),
+    ]);
+    expect(initialStatusExit, initialStatusStderr).toBe(0);
     const initialPublic = JSON.stringify({
       persisted: readFileSync(supervisorStatePath("credentialgrammar"), "utf8"),
       status: await sendSupervisorRequest("credentialgrammar", { type: "status" }),
       read: readSupervisorState("credentialgrammar"),
+      statusCli: initialStatusStdout,
     });
     for (const secret of initialSecrets) expect(initialPublic).not.toContain(secret);
+    for (const syntax of malformedOptionSyntax) {
+      expect(initialPublic).not.toContain(syntax);
+    }
+    for (const retained of malformedRetained) {
+      expect(initialPublic).toContain(retained);
+    }
     expect(initialPublic).toContain("keep-after-opaque-bound-value");
     expect(initialPublic).toContain("keep-after-complete-token-value");
     expect(initialPublic).toContain("keep-supervisor-positional-client-value");
@@ -471,6 +531,12 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     });
     const responseJson = JSON.stringify(response);
     for (const secret of switchedSecrets) expect(responseJson).not.toContain(secret);
+    for (const syntax of malformedOptionSyntax) {
+      expect(responseJson).not.toContain(syntax);
+    }
+    for (const retained of malformedRetained) {
+      expect(responseJson).toContain(retained);
+    }
     expect(responseJson).toContain("keep-after-complete-token-value");
     expect(responseJson).toContain("keep-supervisor-positional-client-value");
     expect(responseJson).toContain("--api-key=keep-supervisor-positional-attached-value");
@@ -480,12 +546,43 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
         switchedSecrets.every((secret) => entry.args.some((arg) => arg.includes(secret))),
       ),
     );
+    const switchedStatusCli = Bun.spawn({
+      cmd: [
+        process.execPath,
+        "run",
+        "src/cli.ts",
+        "supervisor",
+        "status",
+        "credentialgrammar",
+        "--json",
+      ],
+      env: { ...process.env, ACCOUNTS_HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [
+      switchedStatusExit,
+      switchedStatusStdout,
+      switchedStatusStderr,
+    ] = await Promise.all([
+      switchedStatusCli.exited,
+      new Response(switchedStatusCli.stdout).text(),
+      new Response(switchedStatusCli.stderr).text(),
+    ]);
+    expect(switchedStatusExit, switchedStatusStderr).toBe(0);
     const switchedPublic = JSON.stringify({
       persisted: readFileSync(supervisorStatePath("credentialgrammar"), "utf8"),
       status: await sendSupervisorRequest("credentialgrammar", { type: "status" }),
       read: readSupervisorState("credentialgrammar"),
+      statusCli: switchedStatusStdout,
     });
     for (const secret of switchedSecrets) expect(switchedPublic).not.toContain(secret);
+    for (const syntax of malformedOptionSyntax) {
+      expect(switchedPublic).not.toContain(syntax);
+    }
+    for (const retained of malformedRetained) {
+      expect(switchedPublic).toContain(retained);
+    }
     expect(switchedPublic).toContain("keep-after-opaque-bound-value");
     expect(switchedPublic).toContain("keep-after-complete-token-value");
     expect(switchedPublic).toContain("keep-supervisor-positional-client-value");

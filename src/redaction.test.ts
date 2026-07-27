@@ -379,6 +379,85 @@ test("argument redaction keeps credential-shaped opaque tokens bound to pending 
   }
 });
 
+test("argument redaction treats malformed bare-option grammar as one opaque pending value", () => {
+  const variants = [
+    (secret: string) => "-",
+    (secret: string) => "---",
+    (secret: string) => "----",
+    (secret: string) => "--.",
+    (secret: string) => "--_",
+    (secret: string) => "-.",
+    (secret: string) => "-_",
+    (secret: string) => `---api-key=${secret}`,
+    (secret: string) => `----client-key:${secret}`,
+    (secret: string) => `--.master-key=${secret}`,
+    (secret: string) => `--_access-key-id:${secret}`,
+    (secret: string) => `-.api-key=${secret}`,
+    (secret: string) => `-_client-key:${secret}`,
+    (secret: string) => `－－－api-key=${secret}`,
+    (secret: string) => `−−−client-key:${secret}`,
+  ];
+
+  for (const [index, render] of variants.entries()) {
+    const secret = `argv-malformed-option-secret-${index}`;
+    expect(
+      redactArgv([
+        "provider",
+        "--api-key",
+        render(secret),
+        `keep-after-malformed-argv-${index}`,
+      ]),
+    ).toEqual([
+      "provider",
+      "--api-key",
+      "[REDACTED]",
+      `keep-after-malformed-argv-${index}`,
+    ]);
+  }
+});
+
+test("argument redaction preserves supported option grammar around credential chains", () => {
+  expect(
+    redactArgv([
+      "provider",
+      "--api-key",
+      "--client.key",
+      "dot-body-secret",
+      "--api-key",
+      "--client_key",
+      "underscore-body-secret",
+      "-k",
+      "-vk",
+      "cluster-secret",
+      "-k",
+      "-vvkattached-secret",
+      "keep-after-attached-short",
+      "－ｋ",
+      "unicode-short-secret",
+      "--verbose",
+      "keep-verbose",
+    ]),
+  ).toEqual([
+    "provider",
+    "--api-key",
+    "--client.key",
+    "[REDACTED]",
+    "--api-key",
+    "--client_key",
+    "[REDACTED]",
+    "-k",
+    "-vk",
+    "[REDACTED]",
+    "-k",
+    "-vvk[REDACTED]",
+    "keep-after-attached-short",
+    "-k",
+    "[REDACTED]",
+    "--verbose",
+    "keep-verbose",
+  ]);
+});
+
 test("argument redaction honors exact end-of-options markers in ordinary and pending states", () => {
   const afterOrdinaryMarker = [
     "provider",
@@ -462,6 +541,66 @@ test("command-text pending options keep opaque dash-leading values bound across 
       expect(redacted, input).toContain("[REDACTED]");
       expect(redacted, input).toContain(retained);
     }
+  }
+});
+
+test("command-text pending values reject malformed bare-option grammar across line endings", () => {
+  const variants = [
+    (secret: string) => "-",
+    (secret: string) => "---",
+    (secret: string) => "----",
+    (secret: string) => "--.",
+    (secret: string) => "--_",
+    (secret: string) => "-.",
+    (secret: string) => "-_",
+    (secret: string) => `---api-key=${secret}`,
+    (secret: string) => `----client-key:${secret}`,
+    (secret: string) => `--.master-key=${secret}`,
+    (secret: string) => `--_access-key-id:${secret}`,
+    (secret: string) => `-.k=${secret}`,
+    (secret: string) => `-_k:${secret}`,
+    (secret: string) => `－－－api-key=${secret}`,
+    (secret: string) => `−−−client-key:${secret}`,
+  ];
+
+  for (const [lineIndex, lineEnding] of [" ", "\n", "\r\n", "\r"].entries()) {
+    for (const [variantIndex, render] of variants.entries()) {
+      const secret = `command-malformed-option-secret-${lineIndex}-${variantIndex}`;
+      const retained =
+        `status=keep-after-malformed-command-${lineIndex}-${variantIndex}`;
+      const malformed = render(secret);
+      const redacted = redactText(
+        `provider --api-key${lineEnding}${malformed} ${retained}`,
+      );
+
+      expect(redacted, malformed).not.toContain(secret);
+      expect(redacted, malformed).toBe(
+        `provider --api-key${lineEnding}[REDACTED] ${retained}`,
+      );
+    }
+  }
+});
+
+test("standalone malformed attached credentials stay fail-closed without erasing safe tokens", () => {
+  const variants = [
+    (secret: string) => `---api-key=${secret}`,
+    (secret: string) => `----client-key:${secret}`,
+    (secret: string) => `--.master-key=${secret}`,
+    (secret: string) => `--_access-key-id:${secret}`,
+    (secret: string) => `-.api-key=${secret}`,
+    (secret: string) => `-_client-key:${secret}`,
+    (secret: string) => `－－－api-key=${secret}`,
+    (secret: string) => `−−−client-key:${secret}`,
+  ];
+
+  for (const [index, render] of variants.entries()) {
+    const secret = `standalone-malformed-attached-secret-${index}`;
+    const retained = `status=keep-standalone-malformed-${index}`;
+    const redacted = redactText(`provider ${render(secret)} ${retained}`);
+
+    expect(redacted).not.toContain(secret);
+    expect(redacted).toContain("[REDACTED]");
+    expect(redacted).toContain(retained);
   }
 });
 

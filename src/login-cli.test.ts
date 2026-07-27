@@ -592,9 +592,23 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
   expect(runCli("add", "acct", "--tool", "argv-grammar").status).toBe(0);
 
   const secrets = Array.from(
-    { length: 19 },
+    { length: 24 },
     (_, index) => `actual-switch-credential-${index}`,
   );
+  const malformedOptionSyntax = [
+    "---api-key=",
+    "--.client-key:",
+    "--_master-key=",
+    "－－－api-key=",
+    "−−−client-key:",
+  ];
+  const malformedRetained = [
+    "keep-switch-malformed-three-dash",
+    "keep-switch-malformed-dot",
+    "keep-switch-malformed-underscore",
+    "keep-switch-malformed-fullwidth",
+    "keep-switch-malformed-minus",
+  ];
   const credentialArgs = [
     "--secret-key",
     secrets[0]!,
@@ -634,6 +648,21 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     `--label=opaque/--label=${secrets[18]}`,
     "keep-after-complete-token-value",
     "--api-key",
+    `---api-key=${secrets[19]}`,
+    malformedRetained[0]!,
+    "--api-key",
+    `--.client-key:${secrets[20]}`,
+    malformedRetained[1]!,
+    "--api-key",
+    `--_master-key=${secrets[21]}`,
+    malformedRetained[2]!,
+    "--api-key",
+    `－－－api-key=${secrets[22]}`,
+    malformedRetained[3]!,
+    "--api-key",
+    `−−−client-key:${secrets[23]}`,
+    malformedRetained[4]!,
+    "--api-key",
     "--",
     "--client-key",
     "keep-switch-positional-client-value",
@@ -661,6 +690,12 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     for (const secret of secrets) {
       expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
     }
+    for (const syntax of malformedOptionSyntax) {
+      expect(`${result.stdout}${result.stderr}`).not.toContain(syntax);
+    }
+    for (const retained of malformedRetained) {
+      expect(result.stdout).toContain(retained);
+    }
     expect(result.stdout).toContain("[REDACTED]");
     expect(result.stdout).toContain("keep-after-opaque-bound-value");
     expect(result.stdout).toContain("keep-after-complete-token-value");
@@ -683,6 +718,10 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
       expect(output.commandLine).toContain("'keep-after-opaque-bound-value'");
       expect(output.command).toContain("keep-after-complete-token-value");
       expect(output.commandLine).toContain("'keep-after-complete-token-value'");
+      for (const retained of malformedRetained) {
+        expect(output.command).toContain(retained);
+        expect(output.commandLine).toContain(`'${retained}'`);
+      }
       expect(output.command).toContain("keep-switch-positional-client-value");
       expect(output.command).toContain("--api-key=keep-switch-positional-attached-value");
       expect(output.command).toContain("keep-switch-positional-short-value");

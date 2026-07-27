@@ -469,6 +469,69 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch errors keep malformed bare-option tokens bound across line endings", () => {
+    const p = profile("codex");
+    const variants = [
+      { render: (_secret: string) => "-", exposed: "-" },
+      { render: (_secret: string) => "---", exposed: "---" },
+      { render: (_secret: string) => "----", exposed: "----" },
+      { render: (_secret: string) => "--.", exposed: "--." },
+      { render: (_secret: string) => "--_", exposed: "--_" },
+      { render: (_secret: string) => "-.", exposed: "-." },
+      { render: (_secret: string) => "-_", exposed: "-_" },
+      {
+        render: (secret: string) => `---api-key=${secret}`,
+        exposed: "---api-key=",
+      },
+      {
+        render: (secret: string) => `--.client-key:${secret}`,
+        exposed: "--.client-key:",
+      },
+      {
+        render: (secret: string) => `--_master-key=${secret}`,
+        exposed: "--_master-key=",
+      },
+      {
+        render: (secret: string) => `－－－api-key=${secret}`,
+        exposed: "－－－api-key=",
+      },
+      {
+        render: (secret: string) => `−−−client-key:${secret}`,
+        exposed: "−−−client-key:",
+      },
+    ];
+
+    for (const [lineIndex, lineEnding] of [" ", "\n", "\r\n", "\r"].entries()) {
+      for (const [variantIndex, variant] of variants.entries()) {
+        const secret =
+          `prelaunch-malformed-option-secret-${lineIndex}-${variantIndex}`;
+        const retained =
+          `status=keep-prelaunch-malformed-${lineIndex}-${variantIndex}`;
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(
+                `provider --api-key${lineEnding}${variant.render(secret)} ${retained}`,
+              ),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(secret);
+        expect(message).not.toContain(
+          `--api-key${lineEnding}${variant.exposed}`,
+        );
+        expect(message).toContain(retained);
+      }
+    }
+  });
+
   test("prelaunch command redaction covers logical values continued across lines", () => {
     const p = profile("codex");
 

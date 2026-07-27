@@ -431,7 +431,7 @@ function normalizeCommandToken(value: string): string {
 }
 
 function isBareCommandOption(value: string): boolean {
-  return /^--?[A-Za-z0-9_.-]+$/.test(value);
+  return /^--?[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(value);
 }
 
 function credentialOption(
@@ -754,6 +754,10 @@ function commandOptionView(
     let option: CredentialOption | undefined;
     if (
       separator > 0 &&
+      (
+        !includeNonSensitive ||
+        isBareCommandOption(normalized.slice(0, separator))
+      ) &&
       isSensitiveCredentialKey(normalized.slice(0, separator))
     ) {
       option = {

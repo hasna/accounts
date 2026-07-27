@@ -118,10 +118,16 @@ quoted/escaped-origin metadata. A separate option's single pending value
 survives LF, CRLF, or bare CR and consumes the next syntactic value; quoted or
 escaped dash-leading text remains the value. Opaque dash-leading text remains
 bound too: only a complete bare option or a complete sensitive attached form
-can replace pending state. Attached credential values that themselves resemble
-options are redacted in place before punctuation splitting, so the next safe
-token remains visible. A pending separate value is classified as one complete
-physical token before embedded punctuation is considered. Unless that whole
+can replace pending state. The shared bare-option grammar requires exactly one
+or two compatibility-normalized leading dashes followed by an alphanumeric
+body start; later body characters may be alphanumeric, dot, underscore, or
+dash. Exact `--` is handled only as the end-of-options sentinel. Longer dash
+runs and dot- or underscore-leading bodies, including credential-looking
+attached forms, stay opaque bound values. Attached credential values that
+themselves resemble options are redacted in place before punctuation splitting,
+so the next safe token remains visible. A pending separate value is classified
+as one complete physical token before embedded punctuation is considered.
+Unless that whole
 token is proven bare option syntax or a supported sensitive attached form, the
 whole token is redacted and the next whitespace-separated token remains
 visible. Open quotes and odd trailing backslashes enter one carried

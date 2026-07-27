@@ -67,6 +67,21 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
           "--label=opaque/--label=mcp-complete-token-secret",
           "keep-after-complete-token-value",
           "--api-key",
+          "---api-key=mcp-malformed-three-dash-secret",
+          "keep-mcp-malformed-three-dash",
+          "--api-key",
+          "--.client-key:mcp-malformed-dot-secret",
+          "keep-mcp-malformed-dot",
+          "--api-key",
+          "--_master-key=mcp-malformed-underscore-secret",
+          "keep-mcp-malformed-underscore",
+          "--api-key",
+          "－－－api-key=mcp-malformed-fullwidth-secret",
+          "keep-mcp-malformed-fullwidth",
+          "--api-key",
+          "−−−client-key:mcp-malformed-minus-secret",
+          "keep-mcp-malformed-minus",
+          "--api-key",
           "--",
           "--client-key",
           "keep-mcp-positional-client-value",
@@ -82,6 +97,24 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
     expect(text).not.toContain("mcp-chained-short-secret");
     expect(text).not.toContain("mcp-opaque-bound-secret");
     expect(text).not.toContain("mcp-complete-token-secret");
+    for (const secret of [
+      "mcp-malformed-three-dash-secret",
+      "mcp-malformed-dot-secret",
+      "mcp-malformed-underscore-secret",
+      "mcp-malformed-fullwidth-secret",
+      "mcp-malformed-minus-secret",
+    ]) {
+      expect(text).not.toContain(secret);
+    }
+    for (const syntax of [
+      "---api-key=",
+      "--.client-key:",
+      "--_master-key=",
+      "－－－api-key=",
+      "−−−client-key:",
+    ]) {
+      expect(text).not.toContain(syntax);
+    }
     const output = JSON.parse(text ?? "{}") as {
       command: string[];
       commandLine: string;
@@ -101,6 +134,21 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
       "[REDACTED]",
       "keep-after-complete-token-value",
       "--api-key",
+      "[REDACTED]",
+      "keep-mcp-malformed-three-dash",
+      "--api-key",
+      "[REDACTED]",
+      "keep-mcp-malformed-dot",
+      "--api-key",
+      "[REDACTED]",
+      "keep-mcp-malformed-underscore",
+      "--api-key",
+      "[REDACTED]",
+      "keep-mcp-malformed-fullwidth",
+      "--api-key",
+      "[REDACTED]",
+      "keep-mcp-malformed-minus",
+      "--api-key",
       "--",
       "--client-key",
       "keep-mcp-positional-client-value",
@@ -118,6 +166,17 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
     expect(output.commandLine).toContain(
       "'--api-key' '[REDACTED]' 'keep-after-complete-token-value'",
     );
+    for (const retained of [
+      "keep-mcp-malformed-three-dash",
+      "keep-mcp-malformed-dot",
+      "keep-mcp-malformed-underscore",
+      "keep-mcp-malformed-fullwidth",
+      "keep-mcp-malformed-minus",
+    ]) {
+      expect(output.commandLine).toContain(
+        `'--api-key' '[REDACTED]' '${retained}'`,
+      );
+    }
     expect(output.commandLine).toContain(
       "'--api-key' '--' '--client-key' 'keep-mcp-positional-client-value'",
     );
