@@ -166,8 +166,27 @@ using `=`, `:`, or a following value and the supported short `-k` forms share
 that policy. Combined short clusters ending in `k` and compatibility-normalized
 Unicode dash/letter forms are treated as credential options too. The same
 bounded, quote-aware option scanner redacts command-shaped values embedded in
-captured stdout, stderr, and error strings while retaining later options,
-independent diagnostics, newline boundaries, and explicit `--` boundaries.
+captured stdout, stderr, and error strings. A separate credential option keeps
+one pending value across LF, CRLF, or bare CR and consumes the next syntactic
+value; quoting or escaping keeps dash-leading text bound as that value. An
+open quote or odd trailing backslash keeps the logical value redacted across
+later physical fragments. An unquoted next option remains a new option. A
+blank physical line or an explicit
+`status`, `message`, `stack`, or `detail` record ends the pending command
+record, including an active quote or backslash continuation; this explicit
+record boundary takes precedence over incomplete shell syntax so sensitive
+state cannot carry into independent diagnostics. Options may begin after the
+package's safe
+punctuation boundaries (`:`, `=`, `|`, `/`, `<`, `>`, brackets, parentheses,
+commas, and semicolons), while embedded word, URL, email, and arithmetic forms
+remain ordinary text. Balanced punctuation inside structured URL/email values
+stays data, while a closing outer wrapper or quote resumes option parsing. The
+scanner still retains later options and explicit unquoted `--` boundaries, and
+its line, token, and quoted-segment passes remain forward-only for bounded
+linear work.
+Captured stderr and stdout are bounded and redacted as separate process
+records, so a missing value at the end of one stream never consumes the first
+token from the other stream.
 
 Switch output is an explicit `hasna.accounts.switch-output/v1` DTO. It exposes
 only bounded profile/tool identifiers, status booleans, a redacted command and

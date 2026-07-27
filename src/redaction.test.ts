@@ -381,6 +381,343 @@ test("command-text redaction shares argv option grammar across quoting and bound
   expect(redacted).not.toContain("quoted-tail-marker");
 });
 
+test("command-text pending credential values cross physical lines without swallowing records", () => {
+  const lineEndings = ["\n", "\r\n", "\r"];
+
+  for (const lineEnding of lineEndings) {
+    const secrets = [
+      "multiline-plain-secret",
+      "--multiline-quoted-secret",
+      "--multiline-escaped-quoted-secret",
+      "--multiline-doubled-quote-secret",
+      "--multiline-mixed-wrapper-secret",
+      "--multiline-escaped-dash-secret",
+      "--multiline-end-marker-secret",
+      "multiline-repeated-option-secret",
+    ];
+    const input = [
+      `provider --api-key${lineEnding}${secrets[0]}${lineEnding}status=keep-plain-status`,
+      `provider --client-key${lineEnding}"${secrets[1]}"${lineEnding}message=keep-quoted-message`,
+      `provider --master-key${lineEnding}\\"${secrets[2]}\\"${lineEnding}detail=keep-escaped-detail`,
+      `provider --encryption-key${lineEnding}"${secrets[3]}""-tail"${lineEnding}stack=keep-doubled-stack`,
+      `provider --service-account-key${lineEnding}(\\"${secrets[4]}\\")${lineEnding}status=keep-wrapper-status`,
+      `provider --auth-header${lineEnding}\\${secrets[5]}${lineEnding}detail=keep-escaped-dash-detail`,
+      `provider --credentials${lineEnding}"--"${secrets[6]}${lineEnding}message=keep-marker-message`,
+      `provider --api-key${lineEnding}--client-key${lineEnding}${secrets[7]}${lineEnding}detail=keep-repeated-detail`,
+      `provider --api-key${lineEnding}--verbose keep-missing-option${lineEnding}status=keep-missing-status`,
+      `provider --api-key${lineEnding}(--verbose) keep-wrapped-missing-option${lineEnding}message=keep-wrapped-missing-message`,
+      `provider --api-key${lineEnding}--${lineEnding}keep-after-unquoted-marker`,
+      `provider --api-key${lineEnding}${lineEnding}keep-after-blank-record`,
+    ].join(`${lineEnding}${lineEnding}`);
+
+    const redacted = redactText(input);
+
+    for (const secret of secrets) expect(redacted).not.toContain(secret);
+    for (const retained of [
+      "status=keep-plain-status",
+      "message=keep-quoted-message",
+      "detail=keep-escaped-detail",
+      "stack=keep-doubled-stack",
+      "status=keep-wrapper-status",
+      "detail=keep-escaped-dash-detail",
+      "message=keep-marker-message",
+      "detail=keep-repeated-detail",
+      "--verbose keep-missing-option",
+      "status=keep-missing-status",
+      "(--verbose) keep-wrapped-missing-option",
+      "message=keep-wrapped-missing-message",
+      "--",
+      "keep-after-unquoted-marker",
+      "keep-after-blank-record",
+    ]) {
+      expect(redacted).toContain(retained);
+    }
+  }
+});
+
+test("command-text option boundaries cover safe punctuation and reject embedded near-misses", () => {
+  const safePrefixes = [
+    "|",
+    "/",
+    "<",
+    ">",
+    "(",
+    ")",
+    "[",
+    "]",
+    "{",
+    "}",
+    ",",
+    ";",
+    ":",
+    "=",
+  ];
+  const safeLines = safePrefixes.map(
+    (prefix, index) =>
+      `diagnostic${prefix}--api-key punctuation-secret-${index} --verbose keep-punctuation-${index}`,
+  );
+  const nearMisses = [
+    "word--api-key keep-word-near-miss",
+    "https://example.invalid/--api-key keep-url-near-miss",
+    "https://example.invalid/－－api-key keep-unicode-url-near-miss",
+    "www.example.invalid/--api-key keep-www-near-miss",
+    "person@--api-key keep-email-near-miss",
+    "person@example.invalid/--api-key keep-email-path-near-miss",
+    "1--api-key keep-arithmetic-near-miss",
+    "1/--api-key keep-division-near-miss",
+    "1<--api-key keep-less-than-near-miss",
+    "1>--api-key keep-greater-than-near-miss",
+    "(1)/--api-key keep-parenthesized-division-near-miss",
+    "(1)<--api-key keep-parenthesized-less-than-near-miss",
+    "(1)>--api-key keep-parenthesized-greater-than-near-miss",
+    "left+--api-key keep-plus-near-miss",
+    "left*--api-key keep-times-near-miss",
+  ];
+
+  const redacted = redactText([...safeLines, ...nearMisses].join("\n"));
+
+  for (let index = 0; index < safePrefixes.length; index++) {
+    expect(redacted).not.toContain(`punctuation-secret-${index}`);
+    expect(redacted).toContain(`--verbose keep-punctuation-${index}`);
+  }
+  for (const nearMiss of nearMisses) expect(redacted).toContain(nearMiss);
+});
+
+test("logical command values remain redacted across escaped and quoted newlines", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const secrets = [
+      "bare-continuation-secret",
+      "fragment-continuation-secret",
+      "quoted-continuation-secret",
+    ];
+    const input = [
+      `provider --api-key \\${lineEnding}${secrets[0]}${lineEnding}status=keep-bare-continuation`,
+      `provider --client-key first-fragment\\${lineEnding}${secrets[1]}${lineEnding}message=keep-fragment-continuation`,
+      `provider --master-key "quoted-first-fragment${lineEnding}${secrets[2]}"${lineEnding}detail=keep-quoted-continuation`,
+      `provider --api-key \\${lineEnding}--verbose keep-missing-after-continuation${lineEnding}stack=keep-missing-continuation`,
+    ].join(`${lineEnding}${lineEnding}`);
+
+    const redacted = redactText(input);
+
+    for (const secret of secrets) expect(redacted).not.toContain(secret);
+    for (const retained of [
+      "status=keep-bare-continuation",
+      "message=keep-fragment-continuation",
+      "detail=keep-quoted-continuation",
+      "--verbose keep-missing-after-continuation",
+      "stack=keep-missing-continuation",
+    ]) {
+      expect(redacted).toContain(retained);
+    }
+  }
+});
+
+test("attached logical values redact every fragment and retain later options", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const secrets = [
+      "attached-quoted-secret",
+      "attached-escaped-secret",
+      "attached-short-secret",
+    ];
+    const input = [
+      `provider --api-key="first${lineEnding}${secrets[0]}" --verbose keep-attached-quoted`,
+      `provider --client-key:first\\${lineEnding}${secrets[1]} --mode keep-attached-escaped`,
+      `provider -k"first${lineEnding}${secrets[2]}" --trace keep-attached-short`,
+      "provider x|--master-key=punctuation-secret|--color keep-punctuation-suffix",
+    ].join(`${lineEnding}${lineEnding}`);
+
+    const redacted = redactText(input);
+
+    for (const secret of [...secrets, "punctuation-secret"]) {
+      expect(redacted).not.toContain(secret);
+    }
+    for (const retained of [
+      "--verbose keep-attached-quoted",
+      "--mode keep-attached-escaped",
+      "--trace keep-attached-short",
+      "|--color keep-punctuation-suffix",
+    ]) {
+      expect(redacted).toContain(retained);
+    }
+  }
+});
+
+test("punctuation-delimited later options retain separate value redaction", () => {
+  const boundaries = [
+    ":",
+    "=",
+    "|",
+    "/",
+    "<",
+    ">",
+    "(",
+    ")",
+    "[",
+    "]",
+    "{",
+    "}",
+    ",",
+    ";",
+  ];
+  const lines: string[] = [];
+  for (const [index, boundary] of boundaries.entries()) {
+    lines.push(
+      `provider --api-key plain-${index}-secret${boundary}--trace keep-plain-${index}`,
+      `provider --client-key "quoted-${index}-secret"${boundary}--mode keep-quoted-${index}`,
+      `provider --master-key (wrapped-${index}-secret)${boundary}--color keep-wrapped-${index}`,
+    );
+  }
+
+  const redacted = redactText(lines.join("\n"));
+
+  for (const [index, boundary] of boundaries.entries()) {
+    expect(redacted).not.toContain(`plain-${index}-secret`);
+    expect(redacted).not.toContain(`quoted-${index}-secret`);
+    expect(redacted).not.toContain(`wrapped-${index}-secret`);
+    expect(redacted).toContain(`${boundary}--trace keep-plain-${index}`);
+    expect(redacted).toContain(`${boundary}--mode keep-quoted-${index}`);
+    expect(redacted).toContain(`${boundary}--color keep-wrapped-${index}`);
+  }
+});
+
+test("numeric-ending pending values never swallow punctuation-delimited credential options", () => {
+  const boundaries = ["/", "<", ">"];
+  const lines: string[] = [];
+  for (const [index, boundary] of boundaries.entries()) {
+    lines.push(
+      `provider --api-key first-${index}9${boundary}--client-key plain-second-${index}-secret --trace keep-plain-numeric-${index}`,
+      `provider --api-key "first-${index}9"${boundary}--client-key quoted-second-${index}-secret --trace keep-quoted-numeric-${index}`,
+      `provider --api-key first-${index}\\9${boundary}--client-key escaped-second-${index}-secret --trace keep-escaped-numeric-${index}`,
+    );
+  }
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    for (const [index, boundary] of boundaries.entries()) {
+      lines.push(
+        `provider --api-key first-${index}9\\${lineEnding}tail${boundary}--client-key continued-second-${index}-secret --trace keep-continued-numeric-${index}`,
+      );
+    }
+  }
+
+  const redacted = redactText(lines.join("\n"));
+
+  for (let index = 0; index < boundaries.length; index++) {
+    for (const kind of ["plain", "quoted", "escaped", "continued"]) {
+      expect(redacted).not.toContain(`${kind}-second-${index}-secret`);
+      expect(redacted).toContain(`--trace keep-${kind}-numeric-${index}`);
+    }
+  }
+});
+
+test("active logical values stop at explicit independent record boundaries", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const input = [
+      `provider --api-key "redacted-before-blank${lineEnding}${lineEnding}keep-after-blank-boundary"`,
+      `provider --client-key first\\${lineEnding}status=keep-after-status-boundary${lineEnding}keep-after-status-line`,
+      `provider --master-key "redacted-before-empty-status${lineEnding}status=${lineEnding}keep-after-empty-status"`,
+    ].join(`${lineEnding}${lineEnding}`);
+
+    const redacted = redactText(input);
+
+    expect(redacted).not.toContain("redacted-before-blank");
+    expect(redacted).not.toContain("first");
+    expect(redacted).not.toContain("redacted-before-empty-status");
+    expect(redacted).toContain("keep-after-blank-boundary");
+    expect(redacted).toContain("status=keep-after-status-boundary");
+    expect(redacted).toContain("keep-after-status-line");
+    expect(redacted).toContain(`status=${lineEnding}keep-after-empty-status`);
+  }
+});
+
+test("URL and email punctuation never turns embedded text into credential options", () => {
+  const nearMisses = [
+    "https://example.invalid/?arg=--api-key keep-url-query",
+    "https://example.invalid/path;--api-key keep-url-param",
+    "mailto:person@example.invalid?subject=--api-key keep-mailto-query",
+    "mailto:?subject=--api-key keep-mailto-empty-query",
+    "person@example.invalid?subject=--api-key keep-email-query",
+    "url=https://example.invalid/--api-key keep-assigned-url",
+    "href:https://example.invalid/--api-key keep-colon-url",
+    "(https://example.invalid/--api-key) keep-parenthesized-url",
+    "[https://example.invalid/--api-key] keep-bracketed-url",
+    "{https://example.invalid/--api-key} keep-braced-url",
+    "prefix|https://example.invalid/--api-key keep-piped-url",
+    "prefix,https://example.invalid/--api-key keep-comma-url",
+    "url=mailto:?subject=--api-key keep-assigned-mailto",
+    "(mailto:?subject=--api-key) keep-parenthesized-mailto",
+    "url=www.example.invalid/--api-key keep-assigned-www",
+    "https://example.invalid/path(foo)/--api-key keep-url-paren-path",
+    "https://example.invalid/path[foo]/--api-key keep-url-bracket-path",
+    "https://example.invalid/path{foo}/--api-key keep-url-brace-path",
+    "https://example.invalid/path<foo>/--api-key keep-url-angle-path",
+    "https://example.invalid/?redirect=(foo)/--api-key keep-url-paren-query",
+    "https://example.invalid/wiki/Foo_(bar)/--api-key keep-wiki-path",
+    "url=https://example.invalid/path(foo)/--api-key keep-assigned-paren-path",
+    "mailto:?subject=(test)/--api-key keep-mailto-paren-query",
+  ];
+
+  expect(redactText(nearMisses.join("\n"))).toBe(nearMisses.join("\n"));
+});
+
+test("structured values end at syntactic closures before real credential options", () => {
+  const cases = [
+    {
+      input:
+        "(https://example.invalid)/--api-key true-secret-paren --trace keep-paren",
+      secret: "true-secret-paren",
+      retained: "--trace keep-paren",
+    },
+    {
+      input:
+        "[https://example.invalid]|--api-key true-secret-bracket --trace keep-bracket",
+      secret: "true-secret-bracket",
+      retained: "--trace keep-bracket",
+    },
+    {
+      input:
+        "{mailto:?subject=test},--api-key true-secret-brace --trace keep-brace",
+      secret: "true-secret-brace",
+      retained: "--trace keep-brace",
+    },
+    {
+      input:
+        "<https://example.invalid>;--api-key true-secret-angle --trace keep-angle",
+      secret: "true-secret-angle",
+      retained: "--trace keep-angle",
+    },
+    {
+      input:
+        "(www.example.invalid):--api-key true-secret-www --trace keep-www",
+      secret: "true-secret-www",
+      retained: "--trace keep-www",
+    },
+    {
+      input:
+        '"https://example.invalid"|--api-key true-secret-quoted --trace keep-quoted',
+      secret: "true-secret-quoted",
+      retained: "--trace keep-quoted",
+    },
+    {
+      input:
+        "(person@example.invalid)/--api-key true-secret-email --trace keep-email",
+      secret: "true-secret-email",
+      retained: "--trace keep-email",
+    },
+    {
+      input:
+        "url=(https://example.invalid)/--api-key true-secret-assigned --trace keep-assigned",
+      secret: "true-secret-assigned",
+      retained: "--trace keep-assigned",
+    },
+  ];
+
+  const redacted = redactText(cases.map(({ input }) => input).join("\n"));
+
+  for (const { secret, retained } of cases) {
+    expect(redacted).not.toContain(secret);
+    expect(redacted).toContain(retained);
+  }
+});
+
 test("recursive public redaction uses prototype-safe objects", () => {
   const input = JSON.parse(
     '{"safe":"kept","__proto__":{"secret-key":"prototype-secret"},"nested":{"constructor":{"credentials":"nested-secret"}}}',
@@ -1455,4 +1792,76 @@ test("command-text option redaction stays bounded on multi-megabyte captured out
   expect(redacted).toContain("--verbose keep-command-0");
   expect(redacted).toContain("--verbose keep-command-29999");
   expect(elapsedMs).toBeLessThan(1_500);
+});
+
+test("command-text punctuation discovery remains linear on a dense single token", () => {
+  const input =
+    Array.from(
+      { length: 50_000 },
+      (_, index) => `diagnostic/--verbose)keep-${index};`,
+    ).join("") +
+    "diagnostic/--api-key punctuation-density-secret";
+  expect(input.length).toBeGreaterThan(1024 * 1024);
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("punctuation-density-secret");
+  expect(redacted).toContain("keep-0");
+  expect(redacted).toContain("keep-49999");
+  expect(elapsedMs).toBeLessThan(1_500);
+});
+
+test("dense punctuation-delimited sensitive options remain linear", () => {
+  const input = Array.from(
+    { length: 6_400 },
+    (_, index) => `x|--api-key=dense-sensitive-${index}`,
+  ).join("");
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("dense-sensitive-0");
+  expect(redacted).not.toContain("dense-sensitive-6399");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(6_400);
+  expect(elapsedMs).toBeLessThan(1_500);
+});
+
+test("command-text scanning remains linear across many physical-line tokens", () => {
+  const input =
+    Array.from(
+      { length: 8_000 },
+      (_, index) => `--verbose keep-token-${index}`,
+    ).join(" ") +
+    " --api-key many-token-secret";
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("many-token-secret");
+  expect(redacted).toContain("--verbose keep-token-0");
+  expect(redacted).toContain("--verbose keep-token-7999");
+  expect(elapsedMs).toBeLessThan(2_000);
+});
+
+test("quoted command-segment scanning remains linear with many quoted fields", () => {
+  const input =
+    Array.from(
+      { length: 8_000 },
+      (_, index) => `"keep-quoted-${index}"`,
+    ).join(" ") +
+    ' "provider --api-key quoted-scaling-secret --verbose keep-quoted-option"';
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("quoted-scaling-secret");
+  expect(redacted).toContain("keep-quoted-0");
+  expect(redacted).toContain("keep-quoted-7999");
+  expect(redacted).toContain("--verbose keep-quoted-option");
+  expect(elapsedMs).toBeLessThan(2_000);
 });

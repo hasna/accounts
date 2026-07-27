@@ -355,6 +355,192 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch command redaction carries bound values across every physical line ending", () => {
+    const p = profile("codex");
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      const secrets = [
+        "prelaunch-multiline-plain-secret",
+        "--prelaunch-multiline-quoted-secret",
+        "--prelaunch-multiline-wrapper-secret",
+      ];
+      const cases = [
+        {
+          output: `provider --api-key${lineEnding}${secrets[0]}${lineEnding}status=keep-prelaunch-plain`,
+          secret: secrets[0]!,
+          retained: "status=keep-prelaunch-plain",
+        },
+        {
+          output: `provider --client-key${lineEnding}"${secrets[1]}"${lineEnding}message=keep-prelaunch-quoted`,
+          secret: secrets[1]!,
+          retained: "message=keep-prelaunch-quoted",
+        },
+        {
+          output: `provider --master-key${lineEnding}(\\"${secrets[2]}\\")${lineEnding}detail=keep-prelaunch-wrapper`,
+          secret: secrets[2]!,
+          retained: "detail=keep-prelaunch-wrapper",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(sample.secret);
+        expect(message).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch command redaction covers logical values continued across lines", () => {
+    const p = profile("codex");
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      const cases = [
+        {
+          output: `provider --api-key \\${lineEnding}prelaunch-bare-continuation-secret${lineEnding}status=keep-prelaunch-bare-continuation`,
+          secret: "prelaunch-bare-continuation-secret",
+          retained: "status=keep-prelaunch-bare-continuation",
+        },
+        {
+          output: `provider --client-key first-fragment\\${lineEnding}prelaunch-fragment-continuation-secret${lineEnding}message=keep-prelaunch-fragment-continuation`,
+          secret: "prelaunch-fragment-continuation-secret",
+          retained: "message=keep-prelaunch-fragment-continuation",
+        },
+        {
+          output: `provider --master-key "quoted-first-fragment${lineEnding}prelaunch-quoted-continuation-secret"${lineEnding}detail=keep-prelaunch-quoted-continuation`,
+          secret: "prelaunch-quoted-continuation-secret",
+          retained: "detail=keep-prelaunch-quoted-continuation",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(sample.secret);
+        expect(message).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch redacts attached multiline values without swallowing later options", () => {
+    const p = profile("codex");
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      const cases = [
+        {
+          output: `provider --api-key="first${lineEnding}prelaunch-attached-quoted-secret" --verbose keep-prelaunch-attached-quoted`,
+          secret: "prelaunch-attached-quoted-secret",
+          retained: "--verbose keep-prelaunch-attached-quoted",
+        },
+        {
+          output: `provider --client-key:first\\${lineEnding}prelaunch-attached-escaped-secret --mode keep-prelaunch-attached-escaped`,
+          secret: "prelaunch-attached-escaped-secret",
+          retained: "--mode keep-prelaunch-attached-escaped",
+        },
+        {
+          output: "provider x|--master-key=prelaunch-punctuation-secret|--trace keep-prelaunch-punctuation-suffix",
+          secret: "prelaunch-punctuation-secret",
+          retained: "|--trace keep-prelaunch-punctuation-suffix",
+        },
+        {
+          output: 'provider --api-key "prelaunch-separate-punctuation-secret"|--color keep-prelaunch-separate-punctuation',
+          secret: "prelaunch-separate-punctuation-secret",
+          retained: "|--color keep-prelaunch-separate-punctuation",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).not.toContain(sample.secret);
+        expect(message).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch command redaction recognizes safe punctuation boundaries", () => {
+    const p = profile("codex");
+    const safePrefixes = ["|", "/", "<", ">", "(", ")", "[", "]", "{", "}", ",", ";"];
+
+    for (const [index, prefix] of safePrefixes.entries()) {
+      const secret = `prelaunch-punctuation-secret-${index}`;
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(
+              `diagnostic${prefix}--api-key ${secret} --verbose keep-prelaunch-punctuation-${index}`,
+            ),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain(secret);
+      expect(message).toContain(`--verbose keep-prelaunch-punctuation-${index}`);
+    }
+
+    for (const nearMiss of [
+      "word--api-key keep-prelaunch-word-near-miss",
+      "https://example.invalid/--api-key keep-prelaunch-url-near-miss",
+      "https://example.invalid/?arg=--api-key keep-prelaunch-url-query-near-miss",
+      "https://example.invalid/path;--api-key keep-prelaunch-url-param-near-miss",
+      "mailto:person@example.invalid?subject=--api-key keep-prelaunch-mailto-near-miss",
+      "mailto:?subject=--api-key keep-prelaunch-empty-mailto-near-miss",
+      "person@--api-key keep-prelaunch-email-near-miss",
+      "1--api-key keep-prelaunch-arithmetic-near-miss",
+    ]) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(nearMiss),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain(nearMiss);
+    }
+  });
+
   test("controlled prelaunch errors redact credential-shaped headers", () => {
     resetHome();
     const p = profileInHome("codex");
@@ -413,6 +599,28 @@ describe("configs prelaunch", () => {
       }
     } finally {
       cleanup();
+    }
+  });
+
+  test("a missing stderr command value never consumes the independent stdout record", () => {
+    const p = profile("codex");
+
+    for (const stderrEnding of ["", "\n", "\r\n", "\r"]) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stderr: Buffer.from(`provider --api-key${stderrEnding}`),
+            stdout: Buffer.from("keep-independent-stdout-record"),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("provider --api-key");
+      expect(message).toContain("keep-independent-stdout-record");
+      expect(message).not.toContain("[REDACTED]");
     }
   });
 

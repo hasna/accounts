@@ -8,7 +8,7 @@ const SERIALIZED_FIELD_PATTERN =
   /(^|[,{])([ \t]*)(("(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*")|('(?:\\(?:['"\\/bfnrt]|u[0-9A-Fa-f]{4})|[^'\\\r\n])*'))[ \t]*:[ \t]*/gm;
 const HEADER_LINE_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:/;
 const EXPLICIT_DIAGNOSTIC_RECORD_PATTERN =
-  /^(?:status|message|stack|detail)[ \t]*=[ \t]*\S/i;
+  /^(?:status|message|stack|detail)[ \t]*=/i;
 const SENSITIVE_TERMINAL_TOKENS = new Set([
   "auth",
   "bearer",
@@ -377,9 +377,9 @@ function decodeSerializedKey(encoded: string): string | undefined {
 }
 
 function redactPlainText(value: string): string {
-  return redactCommandText(
-    redactSensitiveFields(
-      redactEscapedSerializedFields(value),
+  return redactSensitiveFields(
+    redactEscapedSerializedFields(
+      redactCommandText(value),
     ),
   ).replace(SECRET_PATTERN, "[REDACTED]");
 }
@@ -478,9 +478,16 @@ interface CommandOptionView {
 const EMBEDDED_OPTION_BOUNDARIES = new Set([
   ":",
   "=",
+  "|",
+  "/",
+  "<",
+  ">",
   "(",
+  ")",
   "[",
+  "]",
   "{",
+  "}",
   ",",
   ";",
 ]);
@@ -488,25 +495,235 @@ const EMBEDDED_OPTION_TERMINATORS = new Set([
   ")",
   "]",
   "}",
+  ">",
   ",",
   ";",
 ]);
 
-function commandOptionView(value: string): CommandOptionView | undefined {
-  for (let start = 0; start < value.length; start++) {
+interface CommandSegmentContext {
+  length: number;
+  hasAt: boolean;
+  isUrl: boolean;
+  startsWithWww: boolean;
+  schemeCandidate: boolean;
+  mailtoCandidate: boolean;
+  wwwCandidate: boolean;
+  outerClosures: string[];
+  structuredClosures: string[];
+}
+
+const COMMAND_SEGMENT_RESTART_BOUNDARIES = new Set([
+  "=",
+  ":",
+  "|",
+  ",",
+  ";",
+  "(",
+  ")",
+  "[",
+  "]",
+  "{",
+  "}",
+  "<",
+  ">",
+]);
+const COMMAND_WRAPPER_CLOSURES = new Map([
+  ["(", ")"],
+  ["[", "]"],
+  ["{", "}"],
+  ["<", ">"],
+]);
+
+function commandSegmentContext(): CommandSegmentContext {
+  return {
+    length: 0,
+    hasAt: false,
+    isUrl: false,
+    startsWithWww: false,
+    schemeCandidate: true,
+    mailtoCandidate: true,
+    wwwCandidate: true,
+    outerClosures: [],
+    structuredClosures: [],
+  };
+}
+
+function resetCommandSegmentContext(context: CommandSegmentContext): void {
+  context.length = 0;
+  context.hasAt = false;
+  context.isUrl = false;
+  context.startsWithWww = false;
+  context.schemeCandidate = true;
+  context.mailtoCandidate = true;
+  context.wwwCandidate = true;
+}
+
+function clearCommandSegmentContext(context: CommandSegmentContext): void {
+  resetCommandSegmentContext(context);
+  context.outerClosures.length = 0;
+  context.structuredClosures.length = 0;
+}
+
+function observeCommandSegmentChar(
+  context: CommandSegmentContext,
+  char: string,
+  next = "",
+  afterNext = "",
+): void {
+  if (
+    char === " " ||
+    char === "\t" ||
+    char === "\r" ||
+    char === "\n"
+  ) {
+    clearCommandSegmentContext(context);
+    return;
+  }
+
+  const wasStructured = isStructuredCommandSegment(context);
+  const wrapperClosure = COMMAND_WRAPPER_CLOSURES.get(char);
+  if (wrapperClosure) {
+    (
+      wasStructured
+        ? context.structuredClosures
+        : context.outerClosures
+    ).push(wrapperClosure);
+  }
+
+  const position = context.length;
+  if (char === "@") context.hasAt = true;
+  if (
+    char === ":" &&
+    context.schemeCandidate &&
+    position > 0 &&
+    (
+      (next === "/" && afterNext === "/") ||
+      (context.mailtoCandidate && position === "mailto".length)
+    )
+  ) {
+    context.isUrl = true;
+  }
+
+  if (position === 0) {
+    context.schemeCandidate = /[A-Za-z]/.test(char);
+  } else if (context.schemeCandidate && !/[A-Za-z0-9+.-]/.test(char)) {
+    context.schemeCandidate = false;
+  }
+  if (
+    position >= "mailto".length ||
+    char.toLowerCase() !== "mailto"[position]
+  ) {
+    context.mailtoCandidate = false;
+  }
+  if (position >= "www.".length || char.toLowerCase() !== "www."[position]) {
+    context.wwwCandidate = false;
+  }
+  context.length++;
+  if (context.wwwCandidate && context.length === "www.".length) {
+    context.startsWithWww = true;
+  }
+
+  let closedOuterWrapper = false;
+  if (
+    context.structuredClosures.at(-1) === char
+  ) {
+    context.structuredClosures.pop();
+  } else if (context.outerClosures.at(-1) === char) {
+    context.outerClosures.pop();
+    context.structuredClosures.length = 0;
+    closedOuterWrapper = true;
+  }
+  if (
+    closedOuterWrapper ||
+    (
+      COMMAND_SEGMENT_RESTART_BOUNDARIES.has(char) &&
+      !isStructuredCommandSegment(context)
+    )
+  ) {
+    resetCommandSegmentContext(context);
+  }
+}
+
+function isStructuredCommandSegment(context: CommandSegmentContext): boolean {
+  return context.hasAt || context.isUrl || context.startsWithWww;
+}
+
+function isArithmeticOptionBoundary(value: string, start: number): boolean {
+  const previous = value[start - 1];
+  if (previous !== "/" && previous !== "<" && previous !== ">") {
+    return false;
+  }
+
+  let cursor = start - 2;
+  while (
+    cursor >= 0 &&
+    (
+      value[cursor] === " " ||
+      value[cursor] === "\t" ||
+      value[cursor] === ")" ||
+      value[cursor] === "]" ||
+      value[cursor] === "}"
+    )
+  ) {
+    cursor--;
+  }
+  return /[0-9]/.test(value[cursor] ?? "");
+}
+
+function commandOptionView(
+  value: string,
+  includeNonSensitive = false,
+  protectArithmetic = true,
+): CommandOptionView | undefined {
+  const segment = commandSegmentContext();
+
+  for (let start = 0; start < value.length;) {
     const previous = value[start - 1];
+    const structuredBoundary =
+      start !== 0 &&
+      isStructuredCommandSegment(segment);
+    const boundary =
+      start === 0 ||
+      (
+        EMBEDDED_OPTION_BOUNDARIES.has(previous!) &&
+        (!protectArithmetic || !isArithmeticOptionBoundary(value, start)) &&
+        !structuredBoundary
+      );
     if (
-      (start !== 0 && !EMBEDDED_OPTION_BOUNDARIES.has(previous!)) ||
+      !boundary ||
       !normalizeCommandToken(value[start]!).startsWith("-")
     ) {
+      observeCommandSegmentChar(
+        segment,
+        value[start]!,
+        value[start + 1],
+        value[start + 2],
+      );
+      start++;
       continue;
     }
 
     let end = start;
-    while (
-      end < value.length &&
-      !EMBEDDED_OPTION_TERMINATORS.has(value[end]!)
-    ) {
+    while (end < value.length) {
+      const char = value[end]!;
+      if (EMBEDDED_OPTION_TERMINATORS.has(char)) break;
+      if (
+        end > start &&
+        EMBEDDED_OPTION_BOUNDARIES.has(char) &&
+        normalizeCommandToken(value[end + 1] ?? "").startsWith("-")
+      ) {
+        const possibleAttachedKey = normalizeCommandToken(
+          value.slice(start, end),
+        );
+        if (
+          (char === "=" || char === ":") &&
+          isSensitiveCredentialKey(possibleAttachedKey)
+        ) {
+          end++;
+          continue;
+        }
+        break;
+      }
       end++;
     }
     const token = value.slice(start, end);
@@ -542,7 +759,22 @@ function commandOptionView(value: string): CommandOptionView | undefined {
         endOfOptions: false,
       };
     }
-    start = Math.max(start, end - 1);
+    if (includeNonSensitive) {
+      return {
+        prefix: value.slice(0, start),
+        suffix: value.slice(end),
+        endOfOptions: false,
+      };
+    }
+    while (start < end) {
+      observeCommandSegmentChar(
+        segment,
+        value[start]!,
+        value[start + 1],
+        value[start + 2],
+      );
+      start++;
+    }
   }
   return undefined;
 }
@@ -551,44 +783,85 @@ interface CommandToken {
   start: number;
   end: number;
   decoded: string;
+  quoted: boolean;
+  escaped: boolean;
+  openQuote?: "'" | '"';
+  trailingEscape: boolean;
 }
 
 function scanCommandToken(
   value: string,
   start: number,
   lineEnd: number,
+  protectArithmetic = true,
 ): CommandToken {
   let decoded = "";
   let quote: "'" | '"' | undefined;
   let index = start;
+  let quoted = false;
+  let escaped = false;
+  let optionDecodedStart = normalizeCommandToken(value[start] ?? "").startsWith("-")
+    ? 0
+    : undefined;
+  let sensitiveAttachedSeen = false;
+  const segment = commandSegmentContext();
 
   while (index < lineEnd) {
     const char = value[index]!;
     if (!quote && (char === " " || char === "\t")) break;
+    const startsEmbeddedOption =
+      !quote &&
+      EMBEDDED_OPTION_BOUNDARIES.has(char) &&
+      normalizeCommandToken(value[index + 1] ?? "").startsWith("-") &&
+      !isStructuredCommandSegment(segment);
+    if (
+      startsEmbeddedOption &&
+      index > start &&
+      (
+        !protectArithmetic ||
+        sensitiveAttachedSeen ||
+        !isArithmeticOptionBoundary(value, index + 1)
+      )
+    ) {
+      break;
+    }
+    const optionStartsAfterBoundary = startsEmbeddedOption && index === start;
     if (char === "\\") {
+      escaped = true;
       if (index + 1 < lineEnd) {
-        const escaped = value[index + 1]!;
-        if (escaped === "'" || escaped === '"') {
+        const escapedChar = value[index + 1]!;
+        quoted ||= escapedChar === "'" || escapedChar === '"';
+        if (escapedChar === "'" || escapedChar === '"') {
           if (!quote) {
-            quote = escaped;
+            quote = escapedChar;
             index += 2;
             continue;
           }
-          if (quote === escaped) {
+          if (quote === escapedChar) {
             quote = undefined;
+            segment.structuredClosures.length = 0;
+            resetCommandSegmentContext(segment);
             index += 2;
             continue;
           }
         }
-        decoded += escaped;
+        decoded += escapedChar;
+        observeCommandSegmentChar(
+          segment,
+          escapedChar,
+          value[index + 2],
+          value[index + 3],
+        );
         index += 2;
         continue;
       }
       decoded += char;
+      observeCommandSegmentChar(segment, char);
       index++;
       continue;
     }
     if (char === "'" || char === '"') {
+      quoted = true;
       if (!quote) {
         quote = char;
         index++;
@@ -596,15 +869,137 @@ function scanCommandToken(
       }
       if (quote === char) {
         quote = undefined;
+        segment.structuredClosures.length = 0;
+        resetCommandSegmentContext(segment);
         index++;
         continue;
       }
     }
+    if (
+      !quote &&
+      optionDecodedStart !== undefined &&
+      (char === "=" || char === ":") &&
+      credentialOption(
+          `${decoded.slice(optionDecodedStart)}${char}`,
+          true,
+        )?.kind === "attached"
+    ) {
+      sensitiveAttachedSeen = true;
+    }
     decoded += char;
+    observeCommandSegmentChar(
+      segment,
+      char,
+      value[index + 1],
+      value[index + 2],
+    );
+    if (optionStartsAfterBoundary) optionDecodedStart = decoded.length;
     index++;
   }
 
-  return { start, end: index, decoded };
+  let trailingBackslashes = 0;
+  for (
+    let cursor = index - 1;
+    cursor >= start && value[cursor] === "\\";
+    cursor--
+  ) {
+    trailingBackslashes++;
+  }
+  return {
+    start,
+    end: index,
+    decoded,
+    quoted,
+    escaped,
+    openQuote: quote,
+    trailingEscape: trailingBackslashes % 2 === 1,
+  };
+}
+
+function isExplicitCommandRecordBoundary(
+  value: string,
+  lineStart: number,
+  lineEnd: number,
+): boolean {
+  const line = value.slice(lineStart, lineEnd).trim();
+  return EXPLICIT_DIAGNOSTIC_RECORD_PATTERN.test(line);
+}
+
+function findUnescapedQuote(
+  value: string,
+  start: number,
+  end: number,
+  quote: "'" | '"',
+): number | undefined {
+  let backslashes = 0;
+  for (let index = start; index < end; index++) {
+    const char = value[index]!;
+    if (char === "\\") {
+      backslashes++;
+      continue;
+    }
+    if (char === quote && backslashes % 2 === 0) return index;
+    backslashes = 0;
+  }
+  return undefined;
+}
+
+function isEscapedAt(value: string, index: number): boolean {
+  let backslashes = 0;
+  for (
+    let cursor = index - 1;
+    cursor >= 0 && value[cursor] === "\\";
+    cursor--
+  ) {
+    backslashes++;
+  }
+  return backslashes % 2 === 1;
+}
+
+function isInsideCommandQuote(value: string, index: number): boolean {
+  let quote: "'" | '"' | undefined;
+  for (let cursor = 0; cursor < index; cursor++) {
+    const char = value[cursor]!;
+    if (char === "\\") {
+      cursor++;
+      continue;
+    }
+    if (char !== "'" && char !== '"') continue;
+    if (!quote) quote = char;
+    else if (quote === char) quote = undefined;
+  }
+  return quote !== undefined;
+}
+
+function hasSubstantiveCommandValue(value: string): boolean {
+  return /[^\s'"\\()[\]{}<>:;=|/,]/u.test(value);
+}
+
+function commandValueOptionSplit(
+  token: CommandToken,
+  raw: string,
+): { valueEnd: number; optionStart: number } | undefined {
+  const view = commandOptionView(token.decoded, true, false);
+  if (!view) return undefined;
+  const candidateEnd = token.decoded.length - view.suffix.length;
+  const candidate = token.decoded.slice(view.prefix.length, candidateEnd);
+  if (!candidate) return undefined;
+
+  const optionOffset = raw.lastIndexOf(candidate);
+  if (optionOffset <= 0) return undefined;
+  const boundaryOffset = optionOffset - 1;
+  if (
+    !EMBEDDED_OPTION_BOUNDARIES.has(raw[boundaryOffset]!) ||
+    isEscapedAt(raw, boundaryOffset) ||
+    isInsideCommandQuote(raw, boundaryOffset) ||
+    !hasSubstantiveCommandValue(raw.slice(0, boundaryOffset))
+  ) {
+    return undefined;
+  }
+  return {
+    valueEnd: token.start + boundaryOffset,
+    optionStart: token.start + optionOffset,
+  };
 }
 
 function outerQuotedParts(
@@ -634,8 +1029,10 @@ function replaceCommandToken(
     : redactedToken;
 }
 
-function replaceCommandValue(raw: string): string {
+function replaceCommandValue(raw: string, syntaxProtected = false): string {
   const outer = outerQuotedParts(raw);
+  if (syntaxProtected && outer?.suffix) return "[REDACTED]";
+  if (syntaxProtected && !outer) return "[REDACTED]";
   return outer
     ? `${outer.quote}[REDACTED]${outer.quote}${outer.suffix}`
     : "[REDACTED]";
@@ -643,19 +1040,95 @@ function replaceCommandValue(raw: string): string {
 
 /**
  * Redact credential options embedded in captured command output. The scanner
- * is single-pass, quote-aware, line-bounded, and shares option classification
- * with `redactArgv`.
+ * is single-pass and shares option classification with `redactArgv`. A
+ * pending separate value crosses one or more physical line endings until the
+ * next syntactic token, but a blank line or an explicit status/message/stack/
+ * detail record terminates that command record. Quoted or escaped tokens
+ * remain bound values even when their decoded text resembles another option.
+ * Open quotes and odd trailing backslashes keep that logical value redacted
+ * across later physical fragments.
  */
 function redactCommandTokens(value: string): string {
   const parts: string[] = [];
   let outputCursor = 0;
-  let index = 0;
+  let lineStart = 0;
+  let redactNext = false;
+  let pendingCrossedLine = false;
+  let endOfOptions = false;
+  let valueContinuation:
+    | {
+        quote?: "'" | '"';
+        escaped: boolean;
+        crossedLine: boolean;
+      }
+    | undefined;
 
-  while (index < value.length) {
-    const lineEnd = physicalLineEnd(value, index);
-    let tokenCursor = index;
-    let redactNext = false;
-    let endOfOptions = false;
+  while (lineStart < value.length) {
+    const lineEnd = physicalLineEnd(value, lineStart);
+    const blankLine = value.slice(lineStart, lineEnd).trim().length === 0;
+    const explicitRecord = isExplicitCommandRecordBoundary(
+      value,
+      lineStart,
+      lineEnd,
+    );
+    if (
+      redactNext &&
+      pendingCrossedLine &&
+      (blankLine || explicitRecord)
+    ) {
+      redactNext = false;
+      pendingCrossedLine = false;
+    }
+    if (
+      valueContinuation?.crossedLine &&
+      (blankLine || explicitRecord)
+    ) {
+      valueContinuation = undefined;
+    }
+
+    let tokenCursor = lineStart;
+    if (valueContinuation) {
+      while (
+        tokenCursor < lineEnd &&
+        (value[tokenCursor] === " " || value[tokenCursor] === "\t")
+      ) {
+        tokenCursor++;
+      }
+      if (tokenCursor < lineEnd && valueContinuation.quote) {
+        const close = findUnescapedQuote(
+          value,
+          tokenCursor,
+          lineEnd,
+          valueContinuation.quote,
+        );
+        const continuationEnd = close === undefined ? lineEnd : close + 1;
+        parts.push(
+          value.slice(outputCursor, tokenCursor),
+          "[REDACTED]",
+        );
+        outputCursor = continuationEnd;
+        if (close === undefined) {
+          tokenCursor = lineEnd;
+        } else {
+          valueContinuation = undefined;
+          tokenCursor = continuationEnd;
+        }
+      } else if (tokenCursor < lineEnd) {
+        const token = scanCommandToken(value, tokenCursor, lineEnd, false);
+        const raw = value.slice(token.start, token.end);
+        const split = commandValueOptionSplit(token, raw);
+        const redactionEnd = split?.valueEnd ?? token.end;
+        parts.push(
+          value.slice(outputCursor, token.start),
+          "[REDACTED]",
+        );
+        outputCursor = redactionEnd;
+        valueContinuation = !split && token.trailingEscape
+          ? { escaped: true, crossedLine: false }
+          : undefined;
+        tokenCursor = split?.optionStart ?? token.end;
+      }
+    }
 
     while (tokenCursor < lineEnd) {
       while (
@@ -666,54 +1139,127 @@ function redactCommandTokens(value: string): string {
       }
       if (tokenCursor >= lineEnd) break;
 
-      const token = scanCommandToken(value, tokenCursor, lineEnd);
-      const raw = value.slice(token.start, token.end);
+      const item = scanCommandToken(
+        value,
+        tokenCursor,
+        lineEnd,
+        !redactNext,
+      );
+      const raw = value.slice(item.start, item.end);
       const optionView = !endOfOptions
-        ? commandOptionView(token.decoded)
+        ? commandOptionView(item.decoded)
         : undefined;
+      const nextOptionView =
+        redactNext
+          ? commandOptionView(item.decoded, true)
+          : undefined;
 
       if (redactNext) {
+        const bareLineContinuation =
+          !item.quoted &&
+          item.trailingEscape &&
+          item.decoded === "\\";
+        if (bareLineContinuation) {
+          pendingCrossedLine = false;
+          tokenCursor = item.end;
+          continue;
+        }
+        const split = commandValueOptionSplit(item, raw);
+        if (split) {
+          parts.push(
+            value.slice(outputCursor, item.start),
+            replaceCommandValue(
+              value.slice(item.start, split.valueEnd),
+              item.quoted || item.escaped,
+            ),
+          );
+          outputCursor = split.valueEnd;
+          redactNext = false;
+          pendingCrossedLine = false;
+          tokenCursor = split.optionStart;
+          continue;
+        }
         if (
-          optionView ||
-          token.decoded.startsWith("-")
+          !item.quoted &&
+          !item.escaped &&
+          (nextOptionView || normalizeCommandToken(item.decoded).startsWith("-"))
         ) {
           redactNext = false;
         } else {
           parts.push(
-            value.slice(outputCursor, token.start),
-            replaceCommandValue(raw),
+            value.slice(outputCursor, item.start),
+            replaceCommandValue(raw, item.quoted || item.escaped),
           );
-          outputCursor = token.end;
+          outputCursor = item.end;
           redactNext = false;
-          tokenCursor = token.end;
+          pendingCrossedLine = false;
+          if (item.openQuote || item.trailingEscape) {
+            valueContinuation = {
+              quote: item.openQuote,
+              escaped: item.openQuote === undefined && item.trailingEscape,
+              crossedLine: false,
+            };
+          }
+          tokenCursor = item.end;
           continue;
         }
       }
 
+      pendingCrossedLine = false;
       if (!endOfOptions && optionView?.endOfOptions) {
         endOfOptions = true;
       } else if (optionView?.option) {
         if (optionView.option.kind === "attached") {
+          const suffixStart =
+            optionView.suffix &&
+            raw.endsWith(optionView.suffix) &&
+            !isEscapedAt(raw, raw.length - optionView.suffix.length) &&
+            !isInsideCommandQuote(
+              raw,
+              raw.length - optionView.suffix.length,
+            )
+              ? item.end - optionView.suffix.length
+              : undefined;
+          const optionRaw = suffixStart === undefined
+            ? raw
+            : value.slice(item.start, suffixStart);
           const retainedSuffix = /['"\\]/.test(raw)
             ? ""
             : optionView.suffix;
           parts.push(
-            value.slice(outputCursor, token.start),
+            value.slice(outputCursor, item.start),
             replaceCommandToken(
-              raw,
-              `${optionView.prefix}${optionView.option.redactedToken}${retainedSuffix}`,
+              optionRaw,
+              `${optionView.prefix}${optionView.option.redactedToken}${
+                suffixStart === undefined ? retainedSuffix : ""
+              }`,
             ),
           );
-          outputCursor = token.end;
+          outputCursor = suffixStart ?? item.end;
+          if (item.openQuote || item.trailingEscape) {
+            valueContinuation = {
+              quote: item.openQuote,
+              escaped: item.openQuote === undefined && item.trailingEscape,
+              crossedLine: false,
+            };
+          }
+          if (suffixStart !== undefined) {
+            tokenCursor = suffixStart;
+            continue;
+          }
         } else {
           redactNext = true;
         }
       }
-      tokenCursor = token.end;
+      tokenCursor = item.end;
     }
 
     if (lineEnd >= value.length) break;
-    index = lineBreakEnd(value, lineEnd);
+    endOfOptions = false;
+    if (redactNext) pendingCrossedLine = true;
+    if (valueContinuation) valueContinuation.crossedLine = true;
+    lineStart = lineBreakEnd(value, lineEnd);
+    if (lineStart >= value.length) break;
   }
 
   if (outputCursor === 0) return value;
@@ -724,40 +1270,46 @@ function redactCommandTokens(value: string): string {
 function redactQuotedCommandSegments(value: string): string {
   const parts: string[] = [];
   let cursor = 0;
-  let index = 0;
+  let lineStart = 0;
 
-  while (index < value.length) {
-    const quote = value[index];
-    if (quote !== "'" && quote !== '"') {
-      index++;
-      continue;
-    }
-
-    const lineEnd = physicalLineEnd(value, index);
-    let close = index + 1;
-    while (close < lineEnd) {
-      if (value[close] === "\\") {
-        close += 2;
+  while (lineStart < value.length) {
+    const lineEnd = physicalLineEnd(value, lineStart);
+    let index = lineStart;
+    while (index < lineEnd) {
+      const quote = value[index];
+      if (quote !== "'" && quote !== '"') {
+        index++;
         continue;
       }
-      if (value[close] === quote) break;
-      close++;
-    }
-    if (close >= lineEnd) {
-      index++;
-      continue;
-    }
 
-    const inner = value.slice(index + 1, close);
-    const redacted = redactCommandTokens(inner);
-    if (redacted !== inner) {
-      parts.push(
-        value.slice(cursor, index + 1),
-        redacted,
-      );
-      cursor = close;
+      let close = index + 1;
+      while (close < lineEnd) {
+        if (value[close] === "\\") {
+          close += 2;
+          continue;
+        }
+        if (value[close] === quote) break;
+        close++;
+      }
+      if (close >= lineEnd) {
+        index++;
+        continue;
+      }
+
+      const inner = value.slice(index + 1, close);
+      const redacted = redactCommandTokens(inner);
+      if (redacted !== inner) {
+        parts.push(
+          value.slice(cursor, index + 1),
+          redacted,
+        );
+        cursor = close;
+      }
+      index = close + 1;
     }
-    index = close + 1;
+    lineStart = lineEnd < value.length
+      ? lineBreakEnd(value, lineEnd)
+      : value.length;
   }
 
   if (cursor === 0) return value;

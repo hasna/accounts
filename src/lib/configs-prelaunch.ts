@@ -142,19 +142,30 @@ function defaultRunner(command: string, args: string[]) {
   });
 }
 
-function capturedOutputRecords(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr">): string {
+function capturedOutputRecords(
+  result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr">,
+): string[] {
   const stderr = result.stderr?.toString("utf8") ?? "";
   const stdout = result.stdout?.toString("utf8") ?? "";
-  if (!stderr) return stdout;
-  if (!stdout) return stderr;
-  return `${stderr}${/[\r\n]$/.test(stderr) ? "" : "\n"}${stdout}`;
+  return [stderr, stdout].filter(Boolean);
 }
 
 function outputSummary(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr">): string {
-  const combined = capturedOutputRecords(result).trim();
-  if (!combined) return "";
-  const bounded = combined.split(/\r\n|\r|\n/).slice(0, 3).join("\n");
-  return `: ${redactText(bounded).replace(/\n/g, " ")}`;
+  const bounded: string[] = [];
+  let remainingLines = 3;
+  for (const record of capturedOutputRecords(result)) {
+    if (remainingLines === 0) break;
+    const trimmed = record.trim();
+    if (!trimmed) continue;
+    const lines = trimmed.split(/\r\n|\r|\n/).slice(0, remainingLines);
+    if (lines.length === 0) continue;
+    bounded.push(lines.join("\n"));
+    remainingLines -= lines.length;
+  }
+  if (bounded.length === 0) return "";
+  return `: ${bounded
+    .map((record) => redactText(record).replace(/\r\n|\r|\n/g, " "))
+    .join(" ")}`;
 }
 
 export function runConfigsPrelaunch(

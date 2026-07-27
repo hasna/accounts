@@ -105,10 +105,25 @@ fail-closed record boundary. Argument redaction handles credential-bearing long
 options separated by `=`, `:`, or the next argv item, the supported `-k value`
 and `-kvalue` forms, combined clusters ending in `k`, and Unicode compatibility
 forms of the short option. Captured command text uses that same policy through
-a line-bounded, quote-aware, forward-only scanner. It handles quoted and
-escaped values, repeated and missing values, punctuation-wrapped options,
-newline resets, and explicit `--` boundaries while preserving unrelated
-diagnostic text.
+a quote-aware, forward-only token scanner that emits physical-newline and
+quoted/escaped-origin metadata. A separate option's single pending value
+survives LF, CRLF, or bare CR and consumes the next syntactic value; quoted or
+escaped dash-leading text remains the value, while an unquoted genuine option
+starts a new option. Open quotes and odd trailing backslashes preserve
+fail-closed redaction across later physical fragments inside one command
+record. Blank physical lines and explicit `status`, `message`, `stack`, or
+`detail` records take precedence over incomplete shell syntax and terminate
+both missing-value and active continuation state, preventing unbounded carry
+into independent output. Physical lines, tokens, embedded punctuation, and
+quoted segments are each scanned forward-only. Safe
+punctuation boundaries include `:`, `=`, `|`, `/`, `<`, `>`, brackets,
+parentheses, commas, and semicolons. Embedded word, URL, email, and arithmetic
+near-misses remain ordinary text. Balanced punctuation opened inside a
+structured URL/email value does not end that context, while a closing outer
+wrapper or quote resumes option parsing. Explicit unquoted `--` still ends
+options for that physical command record.
+Prelaunch stderr and stdout are line-bounded and passed through the scanner as
+separate records; pending option state cannot cross a process-stream boundary.
 
 `src/lib/switch.ts` separates the internal `SwitchResult`, which may contain
 raw launch material, from the explicit public
