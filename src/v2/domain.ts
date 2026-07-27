@@ -32,11 +32,40 @@ export const registryScopeSchema = z
 export type RegistryScope = Readonly<z.infer<typeof registryScopeSchema>>;
 export type ScopeRef = RegistryScope;
 
-const timestampSchema = z.string().datetime();
+const CANONICAL_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * Canonical v2 timestamp representation.
+ *
+ * PostgreSQL and JavaScript Date values preserve milliseconds, not arbitrary
+ * fractional precision. Requiring the exact UTC millisecond form prevents
+ * normalization from silently changing authorization and concurrency values.
+ */
+export const timestampSchema = z
+  .string()
+  .regex(
+    CANONICAL_TIMESTAMP_PATTERN,
+    "timestamp must use canonical RFC3339 UTC with exact millisecond precision",
+  )
+  .refine(
+    (value) => {
+      const parsed = new Date(value);
+      return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+    },
+    "timestamp must be a valid canonical RFC3339 UTC millisecond instant",
+  );
+
 export const renameAccountInputSchema = z
   .object({
     name: profileNameSchema,
     updatedAt: timestampSchema,
+  })
+  .strict();
+
+export const renameAccountRequestSchema = renameAccountInputSchema
+  .extend({
+    expectedUpdatedAt: timestampSchema,
   })
   .strict();
 
@@ -87,6 +116,7 @@ export const runtimeV2ListSchema = z.object({ runtimes: z.array(runtimeV2DtoSche
 export type AccountV2Dto = Account;
 export type RuntimeV2Dto = Runtime;
 export type RenameAccountInput = Readonly<z.infer<typeof renameAccountInputSchema>>;
+export type RenameAccountRequest = Readonly<z.infer<typeof renameAccountRequestSchema>>;
 
 export function toAccountV2Dto(value: Account & object): AccountV2Dto {
   return accountSchema.strip().parse(value);
@@ -126,6 +156,16 @@ export function parseAccountRenameInput(
   });
 }
 
+export function toAccountRenameRequest(
+  current: Account,
+  rename: RenameAccountInput,
+): RenameAccountRequest {
+  return renameAccountRequestSchema.parse({
+    ...rename,
+    expectedUpdatedAt: current.updatedAt,
+  });
+}
+
 export function assertAccountRenameRequest(
   current: Account,
   rename: RenameAccountInput,
@@ -148,6 +188,11 @@ export function assertAccountRenameTransition(
   actual: Account,
 ): void {
   assertSameAccountIdentity(current, actual);
+  if (actual.email !== current.email) {
+    throw new RegistryConflictError(
+      "v2 registry rename response changed a non-target account field",
+    );
+  }
   if (actual.name !== requested.name) {
     throw new RegistryConflictError(
       "v2 registry rename response did not apply the requested name",
@@ -158,7 +203,7 @@ export function assertAccountRenameTransition(
       "v2 registry rename response did not advance updatedAt",
     );
   }
-  if (!sameTimestamp(actual.updatedAt, requested.updatedAt)) {
+  if (actual.updatedAt !== requested.updatedAt) {
     throw new RegistryConflictError(
       "v2 registry rename response did not apply the requested timestamp",
     );
@@ -171,7 +216,7 @@ export function assertSameAccountIdentity(expected: Account, actual: Account): v
     actual.tenantId !== expected.tenantId ||
     actual.scopeId !== expected.scopeId ||
     actual.runtimeId !== expected.runtimeId ||
-    !sameTimestamp(actual.createdAt, expected.createdAt)
+    actual.createdAt !== expected.createdAt
   ) {
     throw new RegistryConflictError(
       "v2 registry returned different immutable account identity fields",
@@ -184,7 +229,7 @@ export function assertSameRuntimeIdentity(expected: Runtime, actual: Runtime): v
     actual.id !== expected.id ||
     actual.tenantId !== expected.tenantId ||
     actual.scopeId !== expected.scopeId ||
-    !sameTimestamp(actual.createdAt, expected.createdAt)
+    actual.createdAt !== expected.createdAt
   ) {
     throw new RegistryConflictError(
       "v2 registry returned different immutable runtime identity fields",
@@ -209,11 +254,7 @@ export function assertRuntimeLookupIdentity(expectedId: RuntimeId, actual: Runti
 }
 
 function timestampAdvances(current: string, next: string): boolean {
-  return Date.parse(next) > Date.parse(current);
-}
-
-function sameTimestamp(first: string, second: string): boolean {
-  return Date.parse(first) === Date.parse(second);
+  return next > current;
 }
 
 export class RegistryScopeError extends Error {

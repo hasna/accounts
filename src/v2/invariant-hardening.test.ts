@@ -173,7 +173,7 @@ describe("shared account rename transition invariant", () => {
   );
 
   test("HTTP, local and PostgreSQL apply the same exact rename transition", async () => {
-    const before = account();
+    const before = accountSchema.parse({ ...account(), email: "before@example.test" });
     const local = new LocalAccountsRegistry({ accounts: [before] });
     const postgres = postgresHarness({ accounts: [before] });
     const http = new HttpAccountsRegistry({
@@ -194,6 +194,18 @@ describe("shared account rename transition invariant", () => {
         updatedAt: LATER,
       });
     }
+  });
+
+  test("local rename changes only name and updatedAt", async () => {
+    const before = accountSchema.parse({ ...account(), email: "before@example.test" });
+    const registry = new LocalAccountsRegistry({ accounts: [before] });
+    const renamed = await registry.renameAccount(scope, before.id, "renamed", LATER);
+
+    expect(renamed).toEqual({
+      ...before,
+      name: "renamed",
+      updatedAt: LATER,
+    });
   });
 });
 
@@ -251,10 +263,11 @@ describe("PostgreSQL exact-row identity and rollback boundaries", () => {
     ["id", { account_id: "account_00000000002" }, /identity/i],
     ["runtime", { runtime_id: "runtime_00000000002" }, /identity/i],
     ["createdAt", { created_at: OLDER }, /identity/i],
+    ["email", { email: "changed@example.test" }, /non-target|email|immutable/i],
     ["name", { name: "wrong-name" }, /requested name/i],
     ["timestamp", { updated_at: "2026-07-27T12:00:00.000Z" }, /requested timestamp/i],
   ])("rename rejects a wrong returned %s and rolls back", async (_label, patch, error) => {
-    const before = account();
+    const before = accountSchema.parse({ ...account(), email: "before@example.test" });
     const harness = postgresHarness({
       accounts: [before],
       tamper: (operation, row) =>
@@ -267,6 +280,52 @@ describe("PostgreSQL exact-row identity and rollback boundaries", () => {
     expect(harness.account(before.id)).toEqual(before);
     expect(harness.rollbacks()).toBe(1);
   });
+
+  test.each([
+    ["account creation", "createAccount", { created_at: "2026-07-27T10:00:00.0000Z" }],
+    ["runtime registration", "registerRuntime", { updated_at: "2026-07-27T10:00:00Z" }],
+  ])(
+    "PostgreSQL %s rejects noncanonical timestamp normalization and rolls back",
+    async (_label, operation, patch) => {
+      const harness = postgresHarness({
+        tamper: (seenOperation, row) =>
+          seenOperation === operation ? { ...row, ...patch } : row,
+      });
+      const action =
+        operation === "createAccount"
+          ? harness.registry.createAccount(scope, account())
+          : harness.registry.registerRuntime(scope, runtime());
+
+      await expect(action).rejects.toThrow(/millisecond|timestamp|format|datetime/i);
+      expect(harness.rollbacks()).toBe(1);
+    },
+  );
+
+  test.each([
+    ["account creation", "createAccount"],
+    ["runtime registration", "registerRuntime"],
+  ])(
+    "PostgreSQL %s preserves canonical millisecond timestamps returned as Date values",
+    async (_label, operation) => {
+      const harness = postgresHarness({
+        tamper: (seenOperation, row) =>
+          seenOperation === operation
+            ? {
+                ...row,
+                created_at: new Date(String(row.created_at)),
+                updated_at: new Date(String(row.updated_at)),
+              }
+            : row,
+      });
+      const result =
+        operation === "createAccount"
+          ? await harness.registry.createAccount(scope, account())
+          : await harness.registry.registerRuntime(scope, runtime());
+
+      expect(result.createdAt).toBe(NOW);
+      expect(result.updatedAt).toBe(NOW);
+    },
+  );
 
   test("getRuntime rejects a wrong same-scope runtime id", async () => {
     const before = runtime();

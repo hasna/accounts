@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   accountSchema,
   accountV2DtoSchema,
+  renameAccountInputSchema,
   registryScopeSchema,
   runtimeSchema,
   toAccountV2Dto,
@@ -29,6 +30,39 @@ function account(): Account {
 }
 
 describe("v2 domain boundary", () => {
+  test.each([
+    ["missing milliseconds", "2026-07-27T10:00:00Z"],
+    ["sub-millisecond precision", "2026-07-27T10:00:00.0001Z"],
+    ["excess fractional precision", "2026-07-27T10:00:00.000000Z"],
+    ["offset alias", "2026-07-27T12:00:00.000+02:00"],
+    ["invalid calendar date", "2026-02-30T10:00:00.000Z"],
+  ])("rejects noncanonical %s timestamps at every entity ingress", (_label, timestamp) => {
+    expect(accountSchema.safeParse({ ...account(), createdAt: timestamp }).success).toBe(false);
+    expect(
+      runtimeSchema.safeParse({
+        id: runtimeId,
+        tenantId,
+        scopeId,
+        key: "claude",
+        label: "Claude Code",
+        createdAt: NOW,
+        updatedAt: timestamp,
+      }).success,
+    ).toBe(false);
+    expect(
+      renameAccountInputSchema.safeParse({
+        name: "renamed",
+        updatedAt: timestamp,
+      }).success,
+    ).toBe(false);
+  });
+
+  test("preserves the exact canonical millisecond timestamp representation", () => {
+    const value = account();
+    expect(value.createdAt).toBe(NOW);
+    expect(value.updatedAt).toBe(NOW);
+  });
+
   test("uses opaque identity fields and excludes machine authentication from Account/Runtime", () => {
     expect(accountSchema.safeParse({ ...account(), id: "work" }).success).toBe(false);
     expect(
@@ -244,5 +278,65 @@ describe("v2 domain boundary", () => {
       credentialRef: "vault:original",
     });
     expect(overlay.get(scope, input.id)).toBeNull();
+  });
+
+  test.each([
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["NaN", Number.NaN],
+    ["positive infinity", Number.POSITIVE_INFINITY],
+    ["unsafe integer", Number.MAX_SAFE_INTEGER + 1],
+    ["overflow exponent", 1e309],
+  ])("rejects %s machine-binding generations", (_label, generation) => {
+    expect(
+      machineBindingSchema.safeParse({
+        id: "binding_00000000001",
+        tenantId,
+        scopeId,
+        accountId,
+        runtimeId,
+        machineId: "machine_00000000001",
+        rootPath: "/machines/original/accounts/work",
+        authentication: "authenticated",
+        generation,
+      }).success,
+    ).toBe(false);
+  });
+
+  test("allows the final safe generation once, permits exact replay, and rejects exhaustion", () => {
+    const scope = registryScopeSchema.parse({ tenantId, scopeId });
+    const initial = machineBindingSchema.parse({
+      id: "binding_00000000001",
+      ...scope,
+      accountId,
+      runtimeId,
+      machineId: "machine_00000000001",
+      rootPath: "/machines/original/accounts/work",
+      authentication: "authenticated",
+      generation: Number.MAX_SAFE_INTEGER - 1,
+    });
+    const final = machineBindingSchema.parse({
+      ...initial,
+      rootPath: "/machines/final/accounts/work",
+      generation: Number.MAX_SAFE_INTEGER,
+    });
+    const overlay = new MachineBindingOverlay(initial.machineId);
+
+    expect(overlay.put(scope, initial)).toEqual(initial);
+    expect(overlay.put(scope, final)).toEqual(final);
+    expect(overlay.put(scope, { ...final })).toEqual(final);
+    expect(() =>
+      overlay.put(scope, {
+        ...final,
+        rootPath: "/machines/unrepresentable/accounts/work",
+      }),
+    ).toThrow(/exhausted/i);
+    expect(() =>
+      overlay.put(scope, {
+        ...final,
+        generation: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    ).toThrow(/safe integer|generation/i);
+    expect(overlay.get(scope, final.id)).toEqual(final);
   });
 });

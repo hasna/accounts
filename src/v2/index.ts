@@ -10,6 +10,7 @@ export {
   RegistryNotFoundError,
   RegistryScopeError,
   renameAccountInputSchema,
+  renameAccountRequestSchema,
   registryScopeSchema,
   runtimeIdSchema,
   runtimeSchema,
@@ -17,6 +18,7 @@ export {
   runtimeV2ListSchema,
   scopeIdSchema,
   tenantIdSchema,
+  timestampSchema,
   toAccountV2Dto,
   toRuntimeV2Dto,
 } from "./domain.js";
@@ -30,6 +32,7 @@ export type {
   Runtime,
   RuntimeId,
   RuntimeV2Dto,
+  RenameAccountRequest,
   ScopeRef,
   ScopeId,
   TenantId,
@@ -42,6 +45,7 @@ export type { HttpAccountsRegistryOptions } from "./http-registry.js";
 export { PostgresAccountsRegistry } from "./postgres-registry.js";
 export {
   bindingAuthenticationSchema,
+  machineBindingGenerationSchema,
   machineBindingSchema,
   MachineBindingOverlay,
 } from "./machine-binding.js";

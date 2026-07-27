@@ -98,6 +98,27 @@ describe("AccountsRegistry structural adapter foundation", () => {
     });
   }
 
+  for (const fixture of fixtures()) {
+    test(`${fixture.name} rejects noncanonical account and runtime timestamps before serialization`, async () => {
+      const runtimeA = runtime(scopeA, "01");
+      const accountA = account(scopeA, "account_00000000001", runtimeA.id);
+
+      await expect(
+        fixture.registry.registerRuntime(scopeA, {
+          ...runtimeA,
+          updatedAt: "2026-07-27T10:00:00Z",
+        } as Runtime),
+      ).rejects.toThrow(/timestamp|millisecond/);
+      await expect(
+        fixture.registry.createAccount(scopeA, {
+          ...accountA,
+          createdAt: "2026-07-27T10:00:00.0001Z",
+        } as Account),
+      ).rejects.toThrow(/timestamp|millisecond/);
+      expect(fixture.evidence()).toEqual([]);
+    });
+  }
+
   test("HTTP paths and PostgreSQL statements carry both tenant and scope", async () => {
     const all = fixtures();
     const http = all.find((fixture) => fixture.name === "http");
@@ -227,6 +248,95 @@ describe("AccountsRegistry structural adapter foundation", () => {
     expect(methods).toEqual(["GET", "POST"]);
   });
 
+  test("HTTP rename sends the exact pre-read timestamp as a stale-write precondition", async () => {
+    const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
+    const requests: Array<{ headers: Headers; body: Record<string, unknown> }> = [];
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async (_input, init) => {
+        if ((init?.method ?? "GET") === "GET") return response(before);
+        requests.push({
+          headers: new Headers(init?.headers),
+          body: JSON.parse(String(init?.body)),
+        });
+        return response({ ...before, name: "renamed", updatedAt: LATER });
+      }) as typeof fetch,
+    });
+
+    await expect(registry.renameAccount(scopeA, before.id, "renamed", LATER)).resolves.toMatchObject({
+      name: "renamed",
+      updatedAt: LATER,
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.body).toEqual({
+      name: "renamed",
+      updatedAt: LATER,
+      expectedUpdatedAt: NOW,
+    });
+    expect(requests[0]!.headers.get("if-match")).toBe(`"${NOW}"`);
+  });
+
+  test("HTTP rename fails when a concurrent writer invalidates the pre-read timestamp", async () => {
+    const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
+    let stored = before;
+    let postedBody: Record<string, unknown> | null = null;
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async (_input, init) => {
+        if ((init?.method ?? "GET") === "GET") {
+          const snapshot = stored;
+          stored = { ...stored, name: "concurrent", updatedAt: "2026-07-27T10:30:00.000Z" };
+          return response(snapshot);
+        }
+        postedBody = JSON.parse(String(init?.body));
+        if (postedBody?.expectedUpdatedAt !== stored.updatedAt) {
+          return response({ error: "stale precondition" }, 409);
+        }
+        stored = {
+          ...stored,
+          name: String(postedBody.name),
+          updatedAt: String(postedBody.updatedAt),
+        };
+        return response(stored);
+      }) as typeof fetch,
+    });
+
+    await expect(registry.renameAccount(scopeA, before.id, "renamed", LATER)).rejects.toThrow(
+      /conflict/i,
+    );
+    expect(postedBody).toMatchObject({ expectedUpdatedAt: NOW });
+    expect(stored).toMatchObject({
+      name: "concurrent",
+      updatedAt: "2026-07-27T10:30:00.000Z",
+    });
+  });
+
+  test("HTTP rename rejects an email mutation in the response", async () => {
+    const before = accountSchema.parse({
+      ...account(scopeA, "account_00000000001", runtime(scopeA, "01").id),
+      email: "before@example.test",
+    });
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async (_input, init) =>
+        (init?.method ?? "GET") === "GET"
+          ? response(before)
+          : response({
+              ...before,
+              name: "renamed",
+              email: "changed@example.test",
+              updatedAt: LATER,
+            })) as typeof fetch,
+    });
+
+    await expect(registry.renameAccount(scopeA, before.id, "renamed", LATER)).rejects.toThrow(
+      /non-target|email|immutable/i,
+    );
+  });
+
   test("Postgres validates rename input before issuing a mutation", async () => {
     const postgres = postgresFixture();
     const accountId = account(
@@ -238,6 +348,25 @@ describe("AccountsRegistry structural adapter foundation", () => {
       postgres.registry.renameAccount(scopeA, accountId, "renamed", "not-a-timestamp"),
     ).rejects.toThrow();
     expect(postgres.evidence()).toEqual([]);
+  });
+
+  test("Postgres rename carries every non-target field in its optimistic precondition", async () => {
+    const postgres = postgresFixture();
+    const runtimeA = runtime(scopeA, "01");
+    const before = accountSchema.parse({
+      ...account(scopeA, "account_00000000001", runtimeA.id),
+      email: "before@example.test",
+    });
+    await postgres.registry.registerRuntime(scopeA, runtimeA);
+    await postgres.registry.createAccount(scopeA, before);
+    await postgres.registry.renameAccount(scopeA, before.id, "renamed", LATER);
+
+    const statement = postgres.evidence().find((sql) => sql.trimStart().startsWith("UPDATE"));
+    expect(statement).toContain("name = $6");
+    expect(statement).toContain("runtime_id = $7");
+    expect(statement).toContain("created_at = $8");
+    expect(statement).toContain("updated_at = $9");
+    expect(statement).toContain("email IS NOT DISTINCT FROM $10");
   });
 
   test("local registry isolates constructor, write and every read view from caller mutation", async () => {
@@ -346,11 +475,16 @@ describe("AccountsRegistry structural adapter foundation", () => {
       { name: "renamed", updatedAt: "2026-07-27T09:00:00.000Z" },
       /advance/,
     ],
-    ["invalid timestamp", { name: "renamed", updatedAt: "not-a-timestamp" }, /datetime/],
+    ["invalid timestamp", { name: "renamed", updatedAt: "not-a-timestamp" }, /timestamp|datetime/],
     [
       "wrong newer timestamp",
       { name: "renamed", updatedAt: "2026-07-27T12:00:00.000Z" },
       /requested timestamp/,
+    ],
+    [
+      "noncanonical equivalent timestamp",
+      { name: "renamed", updatedAt: "2026-07-27T11:00:00.0000Z" },
+      /timestamp|millisecond/,
     ],
   ])("HTTP rename rejects a semantically invalid %s response", async (_label, patch, error) => {
     const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
@@ -457,6 +591,12 @@ function httpFixture(): AdapterFixture {
       const itemKey = `${prefix}${id}`;
       const existing = accounts.get(itemKey);
       if (!existing) return response({ error: "missing" }, 404);
+      if (
+        parsedBody.expectedUpdatedAt !== existing.updatedAt ||
+        new Headers(init?.headers).get("if-match") !== `"${existing.updatedAt}"`
+      ) {
+        return response({ error: "stale precondition" }, 409);
+      }
       const renamed = accountSchema.parse({
         ...existing,
         name: parsedBody.name,

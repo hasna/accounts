@@ -20,6 +20,15 @@ export const bindingAuthenticationSchema = z.enum([
   "unknown",
 ]);
 
+export const machineBindingGenerationSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .refine(
+    Number.isSafeInteger,
+    "machine binding generation must be a nonnegative safe integer",
+  );
+
 export const machineBindingSchema = z
   .object({
     id: bindingIdSchema,
@@ -31,7 +40,7 @@ export const machineBindingSchema = z
     rootPath: z.string().min(1).refine(isAbsolute, "binding rootPath must be absolute"),
     credentialRef: z.string().min(1).max(512).optional(),
     authentication: bindingAuthenticationSchema,
-    generation: z.number().int().nonnegative(),
+    generation: machineBindingGenerationSchema,
   })
   .strict();
 
@@ -153,6 +162,11 @@ function assertBindingTransition(current: MachineBinding, next: MachineBinding):
     throw new Error("machine binding generation cannot move backwards");
   }
   if (next.generation === current.generation && !sameBinding(current, next)) {
+    if (current.generation === Number.MAX_SAFE_INTEGER) {
+      throw new Error(
+        "machine binding generation is exhausted; only an exact idempotent replay is permitted",
+      );
+    }
     throw new Error("same-generation machine binding update must be an exact idempotent replay");
   }
 }

@@ -157,6 +157,7 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
          SET name = $4, updated_at = $5
          WHERE tenant_id = $1 AND scope_id = $2 AND account_id = $3
            AND name = $6 AND runtime_id = $7 AND created_at = $8 AND updated_at = $9
+           AND email IS NOT DISTINCT FROM $10
          RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at`,
         [
           scope.tenantId,
@@ -168,6 +169,7 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
           current.runtimeId,
           current.createdAt,
           current.updatedAt,
+          current.email ?? null,
         ],
       );
       const renamed = toAccount(requiredExactRow(result, "account rename"));
@@ -271,7 +273,7 @@ function toRuntime(row: RuntimeRow): Runtime {
 }
 
 function iso(value: string | Date): string {
-  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+  return value instanceof Date ? value.toISOString() : value;
 }
 
 function isUniqueViolation(error: unknown): boolean {

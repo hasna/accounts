@@ -9,6 +9,7 @@ import {
   assertSameAccountIdentity,
   assertSameRuntimeIdentity,
   parseAccountRename,
+  toAccountRenameRequest,
   RegistryConflictError,
   RegistryNotFoundError,
   registryScopeSchema,
@@ -97,9 +98,13 @@ export class HttpAccountsRegistry implements AccountsRegistry {
       throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
     }
     const rename = parseAccountRename(current, nameInput, updatedAt);
+    const request = toAccountRenameRequest(current, rename);
     const body = await this.request(scope, `/accounts/${encodeURIComponent(accountId)}/rename`, {
       method: "POST",
-      body: rename,
+      body: request,
+      headers: {
+        "If-Match": `"${request.expectedUpdatedAt}"`,
+      },
     });
     const renamed = accountSchema.parse(body);
     assertEntityScope(scope, renamed);
@@ -150,6 +155,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
       method: string;
       body?: unknown;
       allowNotFound?: boolean;
+      headers?: Readonly<Record<string, string>>;
     },
   ): Promise<unknown | null> {
     const root =
@@ -161,6 +167,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
         Accept: "application/json",
         Authorization: `Bearer ${this.apiKey}`,
         ...(options.body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...options.headers,
       },
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
     });
