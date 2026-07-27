@@ -226,32 +226,46 @@ stack trace.
 - Resuming into the existing owner launches native Claude with exactly
   `--resume <uuid>`. It never translates the request to `--continue`.
 - Cross-account continuation is supported only by the versioned Claude Code
-  `2.1.220` adapter and always launches exactly
+  `2.1.220` adapter on Linux with current-UID ownership checks, and always
+  launches exactly
   `--resume <uuid> --fork-session`.
 - Cross-account mode requires one stable, complete root JSONL containing only
-  the adapter's explicit simple `user`/`assistant` record schema, with one
-  unambiguous project identity and no dependency-bearing records, companion
-  directory, task/file-history or unknown UUID sidecars, special/link/hardlink
-  anomaly, active writer, or target collision. There is no force bypass.
-- Accounts pins the canonical Claude executable path, stat identity, and
-  content digest across its exact-version probe and launch. Direct caller
-  credential overrides recognized by the adapter are cleared so authentication
-  remains bound to the selected local profile.
+  canonical JSON lines in the adapter's explicit simple `user`/`assistant`
+  schema. Every turn must have a unique UUID, `isSidechain=false`, and one
+  linear parent chain. Tools, attachments, tasks, schedules, subagents,
+  provider-auth hooks, unknown fields, sidecars, special/link/hardlink
+  anomalies, active writers, and target collisions fail closed. Cross-account
+  mode also requires the exact cataloged source cwd and project key; it rejects
+  a different `--cwd`. There is no force bypass.
+- Accounts copies the canonical Claude executable into a private pin, verifies
+  its stat identity and digest, and executes the inherited Linux descriptor
+  (`/proc/self/fd/3`) across the exact-version probe and launch. It deletes the
+  Claude/Anthropic, AWS, Google/Vertex, Azure/Foundry, custom-header, token/FD,
+  provider-routing, and loader-injection caller environment surfaces, then
+  binds both Claude config and secure storage to the selected profile.
 - The source is byte-snapshotted into a private `0700` transaction directory;
-  artifacts and journal files are `0600`. Candidate promotion is serialized
-  per target account, never overwrites, and never shares a transcript inode.
+  artifacts and journal files are `0600`, and files plus containing directories
+  are fsynced. Candidate promotion is serialized by canonical target storage
+  root, uses crash-recoverable no-overwrite copies, and never shares a
+  transcript inode.
 - After the interactive Claude process exits, validation is offline: Accounts
-  requires one new UUID, persisted copied history, unchanged source bytes, and
-  independent source/seed/fork inodes. It sends no smoke prompt.
+  requires exactly one new root UUID in the correct project, a canonical source
+  prefix normalized only for Claude's session-ID rewrite, a new persisted turn
+  with exact cwd and linear ancestry, an otherwise unchanged target root map,
+  unchanged source bytes, and independent source/seed/fork inodes. Replay
+  authenticates the retained fork inode/mode and validated prefix while
+  allowing only valid chained appends. It sends no smoke prompt.
 - Failed, uncertain, and successful artifacts are retained for recovery.
   Pre-launch crash windows and dead broker locks recover only after exact
   artifact validation; retries never launch a second fork after a launch
   attempt.
 
 Use `--dry-run --json` to validate the applicable adapter, layout, collision,
-and quiescence gates without creating a journal, copying a transcript, or
-launching Claude. Accounts never infers the launch directory from its caller;
-it uses the cataloged session cwd unless an absolute `--cwd` is supplied.
+settings, and quiescence gates. Dry-run may run the exact-version probe, but it
+does not create a journal, copy or mutate a session, change a model setting, or
+launch an interactive Claude process. Accounts never infers the launch
+directory from its caller. Same-owner native resume may use an explicit
+absolute `--cwd`; cross-account continuation requires the cataloged source cwd.
 
 ## Cloud Runtime Entrypoints
 

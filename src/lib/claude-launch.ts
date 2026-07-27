@@ -364,7 +364,13 @@ export function prepareWindowsBatchCommand(
   };
 }
 
-async function relayProcess(tool: ToolDef, args: string[], env: NodeJS.ProcessEnv, cwd: string): Promise<number> {
+async function relayProcess(
+  tool: ToolDef,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  executableFd?: number,
+): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
     const executable = resolveExecutable(tool.bin, env);
     const batchCommand = process.platform === "win32" && /\.(?:bat|cmd)$/i.test(executable)
@@ -373,7 +379,13 @@ async function relayProcess(tool: ToolDef, args: string[], env: NodeJS.ProcessEn
     const child = spawn(batchCommand?.command ?? executable, batchCommand?.args ?? args, {
       cwd,
       env,
-      stdio: "inherit",
+      // fd 3 is reserved for a Linux /proc/self/fd/3 executable pin. stdin,
+      // stdout, and stderr remain inherited so native TTY and signal behavior
+      // is unchanged.
+      stdio:
+        executableFd === undefined
+          ? "inherit"
+          : ["inherit", "inherit", "inherit", executableFd],
       windowsVerbatimArguments: batchCommand?.windowsVerbatimArguments,
     });
     let forwardedSignal: NodeJS.Signals | undefined;
@@ -414,10 +426,13 @@ export async function runClaudeLaunch(
   args: string[],
   env: NodeJS.ProcessEnv,
   cwd: string,
+  executableFd?: number,
 ): Promise<number> {
-  if (tool.id !== "claude" || !keychainSupported()) return relayProcess(tool, args, env, cwd);
+  if (tool.id !== "claude" || !keychainSupported()) {
+    return relayProcess(tool, args, env, cwd, executableFd);
+  }
   const credential = claudeKeychainCredentialFromProfile(profile.dir, profile.name);
-  if (!credential) return relayProcess(tool, args, env, cwd);
+  if (!credential) return relayProcess(tool, args, env, cwd, executableFd);
 
   const release = await acquireKeychainLock();
   let pendingSignal: NodeJS.Signals | undefined;
@@ -431,7 +446,7 @@ export async function runClaudeLaunch(
     prior = captureClaudeKeychain();
     keychainTouched = true;
     writeClaudeKeychain(credential);
-    const code = await relayProcess(tool, args, env, cwd);
+    const code = await relayProcess(tool, args, env, cwd, executableFd);
     return pendingSignal ? signalExitCode(pendingSignal) : code;
   } finally {
     try {
