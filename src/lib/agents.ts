@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:os";
 import type { Profile } from "../types.js";
 import { controlledProbeEnv } from "./env.js";
-import { redactText } from "./redaction.js";
+import { redactPublicValue, redactText } from "./redaction.js";
 import { getTool } from "./tools.js";
 
 export type AgentEntry = Record<string, unknown>;
@@ -36,6 +36,42 @@ export interface ProcessInfo {
 }
 
 export type ProcessScanner = () => ProcessInfo[];
+
+function isProjectedRecord(value: unknown): value is AgentEntry {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Convert provider-owned agent data into getter-free, cycle-safe public
+ * records. Strings are recursively redacted and unsafe values are omitted
+ * before either JSON serialization or human rendering can observe them.
+ */
+export function projectAgentEntries(value: unknown): AgentEntry[] {
+  const projected = redactPublicValue(value);
+  if (!Array.isArray(projected)) return [];
+  return projected.filter(isProjectedRecord);
+}
+
+function projectProcessInfo(value: unknown): ProcessInfo[] {
+  return projectAgentEntries(value).flatMap((entry) => {
+    const { pid, ppid, command, configDir } = entry;
+    if (
+      typeof pid !== "number" ||
+      !Number.isSafeInteger(pid) ||
+      typeof ppid !== "number" ||
+      !Number.isSafeInteger(ppid) ||
+      typeof command !== "string"
+    ) {
+      return [];
+    }
+    return [{
+      pid,
+      ppid,
+      command,
+      ...(typeof configDir === "string" ? { configDir } : {}),
+    }];
+  });
+}
 
 function scriptExecutable(): string {
   return existsSync("/usr/bin/script") ? "/usr/bin/script" : "script";
@@ -247,10 +283,11 @@ export function listAgentsAcrossProfiles(opts: ListAgentsOptions = {}): ProfileA
     const parsed = extractJsonArray(result.raw);
     if (!parsed) return { ...base, error: "could not parse agents output" };
 
-    for (const a of parsed as AgentEntry[]) {
+    const publicAgents = projectAgentEntries(parsed);
+    for (const a of publicAgents) {
       if (typeof a.pid === "number") reported.add(a.pid);
     }
-    const agents = (parsed as AgentEntry[]).filter(
+    const agents = publicAgents.filter(
       (a) => !opts.backgroundOnly || a.kind === "background",
     );
     return { ...base, agents };
@@ -261,7 +298,7 @@ export function listAgentsAcrossProfiles(opts: ListAgentsOptions = {}): ProfileA
   // rather than silently dropped. Skipped when filtering to one profile.
   if (!opts.profile) {
     const scanner = opts.processScanner ?? scanToolProcesses;
-    const scanned = scanner();
+    const scanned = projectProcessInfo(scanner());
     if (scanned.length > 0) {
       const untracked = scanned.filter(
         (p) =>

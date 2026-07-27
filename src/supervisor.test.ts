@@ -158,12 +158,12 @@ test("accounts run/supervisor prelaunch passes --allow-empty-sources for identit
   expect(apply).not.toContain("--identity-export");
 });
 
-test("supervisor launch logs reject false end markers before projection", async () => {
-  const secret = "supervisor-false-marker-secret";
+test("supervisor start and failure logs recover credentials after unmatched quotes", async () => {
+  const secret = "supervisor-unmatched-secret";
   const profile = addProfile({ name: "false-marker", tool: "codex" });
   const tool = {
     ...getTool("codex"),
-    bin: `missing-supervisor －－ --client-key=${secret} --trace keep-supervisor-log`,
+    bin: `missing-supervisor "unterminated －－ --client-key=${secret} --trace keep-supervisor-log`,
   };
   const logs: string[] = [];
 
@@ -178,6 +178,8 @@ test("supervisor launch logs reject false end markers before projection", async 
   expect(projected).not.toContain(secret);
   expect(projected).toContain("[REDACTED]");
   expect(projected).toContain("keep-supervisor-log");
+  expect(logs.some((message) => message.includes("starting"))).toBe(true);
+  expect(logs.some((message) => message.includes("failed to start"))).toBe(true);
 });
 
 test("runSupervisedTool restarts a child under the requested profile", async () => {

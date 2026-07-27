@@ -809,6 +809,8 @@ interface CommandToken {
   quoted: boolean;
   escaped: boolean;
   openQuote?: "'" | '"';
+  openQuoteStart?: number;
+  openQuoteEscaped: boolean;
   trailingEscape: boolean;
 }
 
@@ -851,6 +853,8 @@ function scanCommandToken(
   let index = start;
   let quoted = false;
   let escaped = false;
+  let quoteStart: number | undefined;
+  let quoteOpenedEscaped = false;
   let optionDecodedStart = normalizeCommandToken(value[start] ?? "").startsWith("-")
     ? 0
     : undefined;
@@ -899,11 +903,15 @@ function scanCommandToken(
         if (escapedChar === "'" || escapedChar === '"') {
           if (!quote) {
             quote = escapedChar;
+            quoteStart = index + 1;
+            quoteOpenedEscaped = true;
             index += 2;
             continue;
           }
           if (quote === escapedChar) {
             quote = undefined;
+            quoteStart = undefined;
+            quoteOpenedEscaped = false;
             segment.structuredClosures.length = 0;
             resetCommandSegmentContext(segment);
             index += 2;
@@ -929,11 +937,15 @@ function scanCommandToken(
       quoted = true;
       if (!quote) {
         quote = char;
+        quoteStart = index;
+        quoteOpenedEscaped = false;
         index++;
         continue;
       }
       if (quote === char) {
         quote = undefined;
+        quoteStart = undefined;
+        quoteOpenedEscaped = false;
         segment.structuredClosures.length = 0;
         resetCommandSegmentContext(segment);
         index++;
@@ -971,6 +983,8 @@ function scanCommandToken(
     quoted,
     escaped,
     openQuote: quote,
+    openQuoteStart: quoteStart,
+    openQuoteEscaped: quoteOpenedEscaped,
     trailingEscape: trailingBackslashes % 2 === 1,
   };
 }
@@ -1123,6 +1137,8 @@ function scanCommandValueContinuation(
 function redactCommandTokens(
   value: string,
   allowEndOfOptions = true,
+  recoverUnterminatedQuotes = true,
+  literalOptionSyntax = false,
 ): string {
   const parts: string[] = [];
   let outputCursor = 0;
@@ -1206,7 +1222,7 @@ function redactCommandTokens(
       const exactEndOfOptions =
         allowEndOfOptions && isExactCommandEndOfOptions(item, raw);
       const optionView = !endOfOptions
-        ? commandOptionView(item.decoded)
+        ? commandOptionView(literalOptionSyntax ? raw : item.decoded)
         : undefined;
       const nextOptionView =
         redactNext && !exactEndOfOptions
@@ -1293,6 +1309,28 @@ function redactCommandTokens(
           }
         } else {
           redactNext = true;
+        }
+      } else if (
+        recoverUnterminatedQuotes &&
+        !endOfOptions &&
+        item.openQuote &&
+        item.openQuoteStart !== undefined &&
+        !item.openQuoteEscaped
+      ) {
+        const recoveryStart = item.openQuoteStart + 1;
+        const suffix = value.slice(recoveryStart, item.end);
+        const recovered = redactCommandTokens(
+          suffix,
+          allowEndOfOptions,
+          false,
+          true,
+        );
+        if (recovered !== suffix) {
+          parts.push(
+            value.slice(outputCursor, recoveryStart),
+            recovered,
+          );
+          outputCursor = item.end;
         }
       }
       tokenCursor = item.end;

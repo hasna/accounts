@@ -625,8 +625,8 @@ test("immediate crash and missing executable are returned as nonzero diagnostics
   }
 });
 
-test("provider launch errors reject false end markers before surfacing", async () => {
-  const secret = "provider-launch-false-marker-secret";
+test("provider launch errors recover credentials after unmatched quotes before surfacing", async () => {
+  const secret = "provider-launch-unmatched-secret";
   const profile = {
     name: "provider-launch-error",
     tool: "codex",
@@ -635,7 +635,7 @@ test("provider launch errors reject false end markers before surfacing", async (
   };
   const tool = {
     ...getTool("codex"),
-    bin: `missing-provider －－ --client-key=${secret} --trace keep-provider-launch`,
+    bin: `missing-provider "unterminated －－ --client-key=${secret} --trace keep-provider-launch`,
   };
   let message = "";
 

@@ -2511,3 +2511,68 @@ test("quoted command-segment scanning remains linear with many quoted fields", (
   expect(redacted).toContain("--verbose keep-quoted-option");
   expect(elapsedMs).toBeLessThan(2_000);
 });
+
+test("unterminated command quotes recover later standalone credential syntax", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const input = [
+      'provider "unterminated diagnostic --api-key unmatched-double-secret --trace keep-unmatched-double',
+      "provider 'unterminated diagnostic --client-key=unmatched-single-secret --mode keep-unmatched-single",
+      'provider "unterminated diagnostic －－ --master-key unmatched-fullwidth-secret --color keep-unmatched-fullwidth',
+      'provider "unterminated diagnostic \\-- --service-auth=unmatched-escaped-marker-secret --verbose keep-unmatched-escaped-marker',
+      'provider "unterminated diagnostic \'--\' --credentials unmatched-quoted-marker-secret --debug keep-unmatched-quoted-marker',
+    ].join(lineEnding);
+
+    const redacted = redactText(input);
+
+    for (const secret of [
+      "unmatched-double-secret",
+      "unmatched-single-secret",
+      "unmatched-fullwidth-secret",
+      "unmatched-escaped-marker-secret",
+      "unmatched-quoted-marker-secret",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    for (const retained of [
+      "keep-unmatched-double",
+      "keep-unmatched-single",
+      "keep-unmatched-fullwidth",
+      "keep-unmatched-escaped-marker",
+      "keep-unmatched-quoted-marker",
+    ]) {
+      expect(redacted).toContain(retained);
+    }
+  }
+});
+
+test("unterminated quote recovery preserves valid quoted, escaped, and exact-sentinel data", () => {
+  const inputs = [
+    'provider "unterminated diagnostic \'--api-key\' quoted-benign --trace keep-valid-quoted',
+    String.raw`provider "unterminated diagnostic \--api-key escaped-benign --trace keep-escaped-content`,
+    'provider "unterminated diagnostic -- --api-key exact-sentinel-positional --trace exact-sentinel-positional-trace',
+  ];
+
+  for (const input of inputs) {
+    expect(redactText(input)).toBe(input);
+  }
+});
+
+test("unterminated quote recovery stays linear on dense captured output", () => {
+  const lines = Array.from(
+    { length: 22_000 },
+    (_, index) =>
+      `provider "unterminated-${index} --api-key dense-unmatched-secret-${index} --trace keep-dense-unmatched-${index}`,
+  );
+  const input = lines.join("\n");
+  expect(input.length).toBeGreaterThan(2 * 1024 * 1024);
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("dense-unmatched-secret-0");
+  expect(redacted).not.toContain("dense-unmatched-secret-21999");
+  expect(redacted).toContain("keep-dense-unmatched-0");
+  expect(redacted).toContain("keep-dense-unmatched-21999");
+  expect(elapsedMs).toBeLessThan(2_000);
+});

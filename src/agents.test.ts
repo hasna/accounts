@@ -8,8 +8,10 @@ import {
   extractJsonArray,
   isToolSessionCommand,
   listAgentsAcrossProfiles,
+  projectAgentEntries,
   runClaudeAgentsJson,
   type AgentsRunner,
+  type ProcessInfo,
 } from "./lib/agents.js";
 import { addCustomTool } from "./lib/tools.js";
 
@@ -143,14 +145,14 @@ test.skipIf(process.platform !== "linux")("agents probe quotes custom executable
   expect(existsSync(injectionMarker)).toBe(false);
 });
 
-test.skipIf(process.platform === "win32")("agents probe errors reject false end markers before projection", () => {
+test.skipIf(process.platform === "win32")("agents probe errors recover credentials after unmatched quotes", () => {
   const executable = join(home, "failing-agent-probe");
-  const secret = "agent-probe-false-marker-secret";
+  const secret = "agent-probe-unmatched-secret";
   writeFileSync(
     executable,
     [
       "#!/bin/sh",
-      `printf '%s\\n' 'provider －－ --client-key=${secret} --trace keep-agent-probe' >&2`,
+      `printf '%s\\n' 'provider "unterminated －－ --client-key=${secret} --trace keep-agent-probe' >&2`,
       "exit 2",
       "",
     ].join("\n"),
@@ -296,4 +298,241 @@ test("backgroundOnly does not leak interactive sessions into (untracked)", () =>
     ],
   });
   expect(results.some((r) => r.profile === "(untracked)")).toBe(false);
+});
+
+test("provider agent projection is getter-free, proxy-safe, cycle-safe, and recursively redacted", () => {
+  let getterCount = 0;
+  let proxyTrapCount = 0;
+  const nested = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(nested, {
+    state: { value: "working", enumerable: true },
+    message: {
+      value: "provider --api-key nested-message-secret --trace keep-agent-message",
+      enumerable: true,
+    },
+    token: { value: "nested-token-secret", enumerable: true },
+    getter: {
+      get() {
+        getterCount++;
+        return "agent-getter-secret";
+      },
+      enumerable: true,
+    },
+  });
+  nested.cycle = nested;
+  const proxy = new Proxy(
+    { message: "proxy-agent-secret" },
+    {
+      ownKeys(target) {
+        proxyTrapCount++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        proxyTrapCount++;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      getPrototypeOf(target) {
+        proxyTrapCount++;
+        return Reflect.getPrototypeOf(target);
+      },
+    },
+  );
+  const entry = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(entry, {
+    kind: { value: "background", enumerable: true },
+    pid: { value: 42, enumerable: true },
+    sessionId: { value: "session-safe", enumerable: true },
+    nested: { value: nested, enumerable: true },
+    list: {
+      value: [
+        "provider --client-key array-agent-secret --mode keep-agent-array",
+        proxy,
+      ],
+      enumerable: true,
+    },
+    throwing: {
+      get() {
+        getterCount++;
+        throw new Error("agent-throwing-getter-secret");
+      },
+      enumerable: true,
+    },
+  });
+
+  const projected = projectAgentEntries([entry, proxy, null, "raw-agent-secret"]);
+  const serialized = JSON.stringify(projected);
+
+  expect(getterCount).toBe(0);
+  expect(proxyTrapCount).toBe(0);
+  expect(projected).toHaveLength(1);
+  expect(projected[0]?.kind).toBe("background");
+  expect(projected[0]?.pid).toBe(42);
+  expect(serialized).not.toContain("nested-message-secret");
+  expect(serialized).not.toContain("nested-token-secret");
+  expect(serialized).not.toContain("array-agent-secret");
+  expect(serialized).not.toContain("proxy-agent-secret");
+  expect(serialized).not.toContain("agent-getter-secret");
+  expect(serialized).not.toContain("agent-throwing-getter-secret");
+  expect(serialized).toContain("keep-agent-message");
+  expect(serialized).toContain("keep-agent-array");
+});
+
+test("agents library projections redact provider payloads and untracked process command lines", () => {
+  addProfile({ name: "acct1", tool: "claude" });
+  let processGetterCount = 0;
+  let processProxyTrapCount = 0;
+  const runner: AgentsRunner = () => ({
+    ok: true,
+    raw: JSON.stringify([
+      {
+        kind: "background",
+        pid: 10,
+        sessionId: "session-safe",
+        metadata: {
+          token: "provider-token-secret",
+          message: "provider --api-key provider-message-secret --trace keep-provider-message",
+        },
+      },
+    ]),
+  });
+  const safeProcess = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(safeProcess, {
+    pid: { value: 99, enumerable: true },
+    ppid: { value: 1, enumerable: true },
+    command: {
+      value:
+        "claude --resume safe-session --client-key process-command-secret --trace keep-process-command",
+      enumerable: true,
+    },
+    configDir: { value: "/profiles/safe", enumerable: true },
+    getter: {
+      get() {
+        processGetterCount++;
+        return "process-getter-secret";
+      },
+      enumerable: true,
+    },
+    toString: {
+      value: () => {
+        processGetterCount++;
+        return "process-coercion-secret";
+      },
+      enumerable: true,
+    },
+  });
+  const unsafeProcess = new Proxy(
+    {
+      pid: 100,
+      ppid: 1,
+      command: "claude --api-key process-proxy-secret",
+    },
+    {
+      ownKeys(target) {
+        processProxyTrapCount++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        processProxyTrapCount++;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      getPrototypeOf(target) {
+        processProxyTrapCount++;
+        return Reflect.getPrototypeOf(target);
+      },
+    },
+  );
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(),
+    runner,
+    processScanner: () => [safeProcess, unsafeProcess] as unknown as ProcessInfo[],
+  });
+  const serialized = JSON.stringify(results);
+
+  expect(processGetterCount).toBe(0);
+  expect(processProxyTrapCount).toBe(0);
+  expect(serialized).not.toContain("provider-token-secret");
+  expect(serialized).not.toContain("provider-message-secret");
+  expect(serialized).not.toContain("process-command-secret");
+  expect(serialized).not.toContain("process-getter-secret");
+  expect(serialized).not.toContain("process-coercion-secret");
+  expect(serialized).not.toContain("process-proxy-secret");
+  expect(serialized).toContain("keep-provider-message");
+  expect(serialized).toContain("keep-process-command");
+  expect(results[0]?.agents[0]).toMatchObject({
+    kind: "background",
+    pid: 10,
+    sessionId: "session-safe",
+  });
+  expect(results.find((result) => result.profile === "(untracked)")?.agents[0]).toMatchObject({
+    kind: "process",
+    pid: 99,
+    configDir: "/profiles/safe",
+  });
+});
+
+test.skipIf(process.platform === "win32")("accounts agents JSON and human output use projected provider records", () => {
+  const executable = join(home, "projected-agent-provider");
+  const payload = JSON.stringify([
+    {
+      kind: "background",
+      pid: 77,
+      sessionId: "session-safe",
+      state: "working",
+      name: "provider --api-key agent-human-name-secret --trace keep-agent-human-name",
+      cwd: "/safe --client-key=agent-human-cwd-secret --mode keep-agent-human-cwd",
+      token: "agent-json-token-secret",
+      metadata: {
+        message:
+          "provider --credentials agent-json-message-secret --debug keep-agent-json-message",
+      },
+    },
+  ]);
+  writeFileSync(
+    executable,
+    `#!/bin/sh\nprintf '%s\\n' '${payload.replaceAll("'", "'\\''")}'\n`,
+  );
+  chmodSync(executable, 0o755);
+  addCustomTool({
+    id: "projected-agent-provider",
+    label: "Projected Agent Provider",
+    envVar: "PROJECTED_AGENT_HOME",
+    defaultDir: join(home, "projected-agent-default"),
+    bin: executable,
+  });
+  addProfile({ name: "projected", tool: "projected-agent-provider" });
+  const run = (json: boolean) =>
+    spawnSync(
+      process.execPath,
+      [
+        "run",
+        "src/cli.ts",
+        "agents",
+        "--tool",
+        "projected-agent-provider",
+        ...(json ? ["--json"] : []),
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ACCOUNTS_HOME: home,
+          NO_COLOR: "1",
+        },
+      },
+    );
+  const jsonResult = run(true);
+  const humanResult = run(false);
+
+  for (const result of [jsonResult, humanResult]) {
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).not.toContain("agent-human-name-secret");
+    expect(result.stdout).not.toContain("agent-human-cwd-secret");
+    expect(result.stdout).not.toContain("agent-json-token-secret");
+    expect(result.stdout).not.toContain("agent-json-message-secret");
+    expect(result.stdout).toContain("[REDACTED]");
+  }
+  expect(humanResult.stdout).toContain("keep-agent-human-name");
+  expect(humanResult.stdout).toContain("keep-agent-human-cwd");
+  expect(jsonResult.stdout).toContain("keep-agent-json-message");
 });

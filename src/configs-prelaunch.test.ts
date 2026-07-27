@@ -355,6 +355,57 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch AccountsError recovers credential syntax after unterminated quotes", () => {
+    const p = profile("codex");
+
+    for (const [lineIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+      const cases = [
+        {
+          output:
+            `provider "unterminated --api-key prelaunch-unmatched-${lineIndex}-separate-secret ` +
+            "--trace keep-prelaunch-unmatched-separate",
+          secret: `prelaunch-unmatched-${lineIndex}-separate-secret`,
+          retained: "keep-prelaunch-unmatched-separate",
+        },
+        {
+          output:
+            `provider 'unterminated --client-key=prelaunch-unmatched-${lineIndex}-attached-secret` +
+            "|--mode keep-prelaunch-unmatched-attached",
+          secret: `prelaunch-unmatched-${lineIndex}-attached-secret`,
+          retained: "keep-prelaunch-unmatched-attached",
+        },
+        {
+          output:
+            `provider "unterminated tail\\${lineEnding}` +
+            `diagnostic/--master-key prelaunch-unmatched-${lineIndex}-continued-secret ` +
+            "--color keep-prelaunch-unmatched-continued",
+          secret: `prelaunch-unmatched-${lineIndex}-continued-secret`,
+          retained: "keep-prelaunch-unmatched-continued",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+
+        expect(message, sample.output).toContain("configs prelaunch apply failed");
+        expect(message, sample.output).not.toContain(sample.secret);
+        expect(message, sample.output).toContain("[REDACTED]");
+        expect(message, sample.output).toContain(sample.retained);
+      }
+    }
+  });
+
   test("prelaunch command redaction carries bound values across every physical line ending", () => {
     const p = profile("codex");
 
