@@ -173,15 +173,34 @@ See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
 `projects/<encoded-project>/<uuid>.jsonl` under verified local Claude profiles.
 The live `~/.claude` directory is included only when an Accounts profile
 explicitly represents it. Foreign or missing profile paths and symlinks are
-ignored. Session files with multiple hard links are also rejected.
+rejected with a warning. A renamed managed profile remains represented through
+its stored canonical config dir, provided that dir is still a direct child of
+the Accounts-managed Claude profiles root. Traversal and nested roots are
+rejected. Session files with multiple hard links are also rejected.
 
-The default table shows owner, project, UUID, update time, and size. `--json`
-also returns an opaque `catalogRef`, the source profile identity, canonical
-profile and source paths, the encoded project key, and the bounded
-`sessionIdCheck` result needed to
-distinguish collisions or report a filename/metadata mismatch. The bounded
-metadata scan is discovery only and does not assert that the whole transcript
-is valid; continuation brokers must validate the complete source strictly.
+The default table shows owner, project, UUID, update time, size, and a bounded
+session-ID check. `BOUNDED-MISMATCH` and `NOT-OBSERVED` remain visible instead
+of looking like healthy entries. `--json` also returns an opaque `catalogRef`,
+the source profile identity, canonical profile and source paths, the encoded
+project key, and the bounded `sessionIdCheck` result needed to distinguish
+collisions or report a filename/metadata mismatch. The v2 reference includes the
+canonical profile root, encoded project key, UUID, and source path, but no
+mutable account name or profile identity. Multiple account records representing
+the same canonical source storage are emitted as one entry with sorted
+`representations`; the deterministic primary representation remains in the
+flat compatibility fields and the table shows every represented owner.
+`catalogRefAliases` contains the sorted, deduplicated v1 references emitted by
+the landed catalog, and the catalog resolver accepts either a canonical ref or
+one of those explicit aliases. Unknown development refs fail closed. A
+continuation journal must canonicalize a resolved alias before creating a new
+transaction rather than treating an alias change as a second request. The
+bounded metadata scan is discovery only and does not assert that the whole
+transcript is valid; continuation brokers must validate the complete source
+strictly.
+
+`--uuid` requires canonical hexadecimal `8-4-4-4-12` UUID syntax. A valid UUID
+with no match returns an empty result successfully; malformed syntax exits
+nonzero with a validation error.
 
 Catalog reads never change transcript content and prompts/messages are never
 emitted. On platforms that support it, Accounts requests `O_NOATIME`; when the
@@ -191,9 +210,13 @@ filesystem access-time metadata.
 Scanning a machine that is actively writing sessions never truncates the
 catalog silently. A path that keeps changing is retried, and anything still
 unreadable is listed as a `warning:` on stderr, so a consumer can tell "no such
-session" from "not observed on this pass". stdout stays a clean stream: closing
-the pipe early — `accounts sessions --json | head` — exits 0 without a stack
-trace.
+session" from "not observed on this pass". Registered Claude roots that are
+missing or outside the trusted direct-child/default-root boundary are also
+reported instead of disappearing silently. A represented profile with malformed
+UTF-16 identity metadata is skipped and reported by reason and canonical source
+path only; the identity text is not emitted. stdout stays a clean stream:
+closing the pipe early — `accounts sessions --json | head` — exits 0 without a
+stack trace.
 
 ## Cloud Runtime Entrypoints
 

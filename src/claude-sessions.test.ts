@@ -15,11 +15,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import type { Profile } from "./types.js";
 import {
   CLAUDE_SESSION_METADATA_MAX_BYTES,
   listClaudeSessions,
+  matchesClaudeSessionReference,
+  resolveClaudeSessionReference,
   type ClaudeSessionCatalogEntry,
   type ClaudeSessionScanSkip,
 } from "./lib/claude-sessions.js";
@@ -74,6 +76,7 @@ function bulkUuid(index: number): string {
 function bulkCatalogEntry(index: number): ClaudeSessionCatalogEntry {
   const uuid = bulkUuid(index);
   const sourcePath = `/profiles/bulk/projects/-bulk/${uuid}.jsonl`;
+  const catalogRefAlias = `claude-session:v1:${index}`;
   return {
     identity: {
       ownerProfile: "bulk",
@@ -84,7 +87,22 @@ function bulkCatalogEntry(index: number): ClaudeSessionCatalogEntry {
       uuid,
       sourcePath,
     },
-    catalogRef: `claude-session:v1:${index}`,
+    storageIdentity: {
+      profilePath: "/profiles/bulk",
+      encodedProject: "-bulk",
+      uuid,
+      sourcePath,
+    },
+    catalogRef: `claude-session:v2:${index}`,
+    catalogRefAliases: [catalogRefAlias],
+    representations: [
+      {
+        ownerProfile: "bulk",
+        profileIdentity: "/profiles/bulk",
+        profilePath: "/profiles/bulk",
+        catalogRefAlias,
+      },
+    ],
     ownerProfile: "bulk",
     profileIdentity: "/profiles/bulk",
     profilePath: "/profiles/bulk",
@@ -97,6 +115,10 @@ function bulkCatalogEntry(index: number): ClaudeSessionCatalogEntry {
     sizeBytes: index,
     updatedAt: "2026-01-01T00:00:00.000Z",
   };
+}
+
+function encodedCatalogRef(version: 1 | 2, parts: readonly string[]): string {
+  return `claude-session:v${version}:${parts.map((part) => encodeURIComponent(part)).join(":")}`;
 }
 
 /** The published binary runs on node, which `bun test` is not. */
@@ -202,11 +224,29 @@ describe("Claude session catalog discovery", () => {
     const managedEntry = sessions.find(
       (entry) => entry.sourcePath === canonicalPath(managedSource),
     )!;
-    expect(managedEntry.catalogRef).toContain(encodeURIComponent(managed.identity));
-    expect(managedEntry.catalogRef).toContain(encodeURIComponent(canonicalPath(managed.dir)));
-    expect(managedEntry.catalogRef).toContain(encodeURIComponent("-same-project"));
-    expect(managedEntry.catalogRef).toContain(UUID_A);
-    expect(managedEntry.catalogRef).toContain(encodeURIComponent(canonicalPath(managedSource)));
+    expect(managedEntry.catalogRef).toBe(
+      encodedCatalogRef(2, [
+        canonicalPath(managed.dir),
+        "-same-project",
+        UUID_A,
+        canonicalPath(managedSource),
+      ]),
+    );
+    expect(managedEntry.catalogRefAliases).toEqual([
+      encodedCatalogRef(1, [
+        managed.identity,
+        canonicalPath(managed.dir),
+        "-same-project",
+        UUID_A,
+        canonicalPath(managedSource),
+      ]),
+    ]);
+    expect(managedEntry.storageIdentity).toEqual({
+      profilePath: canonicalPath(managed.dir),
+      encodedProject: "-same-project",
+      uuid: UUID_A,
+      sourcePath: canonicalPath(managedSource),
+    });
     expect(sessions.map((entry) => entry.identity.sourcePath).sort()).toEqual(
       [canonicalPath(defaultSource), canonicalPath(managedSource)].sort(),
     );
@@ -215,6 +255,252 @@ describe("Claude session catalog discovery", () => {
       sessions.find((entry) => entry.sourcePath === canonicalPath(defaultSource))?.sessionIdCheck,
     ).toBe("bounded-match");
     expect(JSON.stringify(sessions)).not.toContain("SECRET_ONE");
+  });
+
+  test("deduplicates and deterministically represents profiles that share one default root", () => {
+    const sharedDir = join(fakeHome, ".claude");
+    const primary = { ...profile("primary", sharedDir), identity: "identity://primary" };
+    const secondary = { ...profile("secondary", sharedDir), identity: "identity://secondary" };
+    const source = writeSession(
+      sharedDir,
+      "-shared-default",
+      UUID_A,
+      join(root, "repo-shared"),
+    );
+
+    const first = listClaudeSessions([primary, secondary], {
+      profilesRoot,
+      defaultDir: sharedDir,
+    });
+    const reordered = listClaudeSessions([secondary, primary], {
+      profilesRoot,
+      defaultDir: sharedDir,
+    });
+
+    expect(first).toEqual(reordered);
+    expect(first).toHaveLength(1);
+    expect(first[0]?.ownerProfile).toBe("primary");
+    expect(first[0]?.representations).toEqual([
+      {
+        ownerProfile: "primary",
+        profileIdentity: "identity://primary",
+        profilePath: canonicalPath(sharedDir),
+        catalogRefAlias: encodedCatalogRef(1, [
+          "identity://primary",
+          canonicalPath(sharedDir),
+          "-shared-default",
+          UUID_A,
+          canonicalPath(source),
+        ]),
+      },
+      {
+        ownerProfile: "secondary",
+        profileIdentity: "identity://secondary",
+        profilePath: canonicalPath(sharedDir),
+        catalogRefAlias: encodedCatalogRef(1, [
+          "identity://secondary",
+          canonicalPath(sharedDir),
+          "-shared-default",
+          UUID_A,
+          canonicalPath(source),
+        ]),
+      },
+    ]);
+    expect(first[0]?.catalogRefAliases).toEqual(
+      first[0]!.representations.map((representation) => representation.catalogRefAlias).sort(),
+    );
+    expect(first[0]?.catalogRef).toBe(
+      encodedCatalogRef(2, [
+        canonicalPath(sharedDir),
+        "-shared-default",
+        UUID_A,
+        canonicalPath(source),
+      ]),
+    );
+
+    const filtered = listClaudeSessions([secondary, primary], {
+      profilesRoot,
+      defaultDir: sharedDir,
+      profile: "secondary",
+    });
+    expect(filtered).toEqual(first);
+  });
+
+  test("deduplicates exact duplicate profile source records", () => {
+    const representedDefault = {
+      ...profile("main", join(fakeHome, ".claude")),
+      identity: "identity://represented-default",
+    };
+    writeSession(
+      representedDefault.dir,
+      "-represented-default",
+      UUID_A,
+      join(root, "repo-default"),
+    );
+
+    const sessions = listClaudeSessions(
+      [representedDefault, { ...representedDefault }],
+      {
+        profilesRoot,
+        defaultDir: representedDefault.dir,
+      },
+    );
+
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.ownerProfile).toBe("main");
+  });
+
+  test("keeps the canonical ref stable when mutable profile identity metadata changes", () => {
+    const managed = profile("managed");
+    writeSession(managed.dir, "-identity-change", UUID_A, join(root, "repo-identity"));
+
+    const before = listClaudeSessions(
+      [{ ...managed, identity: "identity://before" }],
+      {
+        profilesRoot,
+        defaultDir: join(fakeHome, ".claude"),
+      },
+    )[0]!;
+    const after = listClaudeSessions(
+      [{ ...managed, identity: "identity://after" }],
+      {
+        profilesRoot,
+        defaultDir: join(fakeHome, ".claude"),
+      },
+    )[0]!;
+
+    expect(after.catalogRef).toBe(before.catalogRef);
+    expect(after.storageIdentity).toEqual(before.storageIdentity);
+    expect(after.catalogRefAliases).not.toEqual(before.catalogRefAliases);
+  });
+
+  test("resolves canonical and landed v1 aliases while bare UUIDs stay storage-ambiguous", () => {
+    const sharedDir = join(fakeHome, ".claude");
+    const primary = { ...profile("primary", sharedDir), identity: "identity://primary" };
+    const secondary = { ...profile("secondary", sharedDir), identity: "identity://secondary" };
+    const distinct = profile("distinct");
+    writeSession(sharedDir, "-shared", UUID_A, join(root, "repo-shared"));
+    writeSession(distinct.dir, "-distinct", UUID_A, join(root, "repo-distinct"));
+
+    const entries = listClaudeSessions([secondary, distinct, primary], {
+      profilesRoot,
+      defaultDir: sharedDir,
+    });
+    expect(entries).toHaveLength(2);
+    const shared = entries.find((entry) => entry.profilePath === canonicalPath(sharedDir))!;
+    expect(shared.catalogRefAliases).toHaveLength(2);
+    expect(resolveClaudeSessionReference(entries, shared.catalogRef)).toBe(shared);
+    for (const alias of shared.catalogRefAliases) {
+      expect(matchesClaudeSessionReference(shared, alias)).toBe(true);
+      expect(resolveClaudeSessionReference(entries, alias)).toBe(shared);
+    }
+    expect(() =>
+      resolveClaudeSessionReference(entries, "claude-session:v1:unknown-development-ref"),
+    ).toThrow("invalid or stale Claude session catalogRef");
+    expect(() => resolveClaudeSessionReference(entries, UUID_A)).toThrow(
+      "Claude session UUID is ambiguous",
+    );
+
+    const sameStorageOnly = entries.filter((entry) => entry === shared);
+    expect(resolveClaudeSessionReference(sameStorageOnly, UUID_A)).toBe(shared);
+  });
+
+  test("uses canonical storage identity as the total sort tie-breaker", () => {
+    const firstRoot = join(profilesRoot, "claude", "storage-a");
+    const secondRoot = join(profilesRoot, "claude", "storage-b");
+    const firstProfile = { ...profile("same-owner", firstRoot), identity: "identity://z" };
+    const secondProfile = { ...profile("same-owner", secondRoot), identity: "identity://a" };
+    const sharedCwd = join(root, "same-project");
+    writeSession(firstRoot, "-same", UUID_A, sharedCwd);
+    writeSession(secondRoot, "-same", UUID_A, sharedCwd);
+
+    const forward = listClaudeSessions([firstProfile, secondProfile], {
+      profilesRoot,
+      defaultDir: join(fakeHome, ".claude"),
+    });
+    const reversed = listClaudeSessions([secondProfile, firstProfile], {
+      profilesRoot,
+      defaultDir: join(fakeHome, ".claude"),
+    });
+
+    expect(forward).toEqual(reversed);
+    expect(forward).toHaveLength(2);
+    expect(forward.map((entry) => entry.catalogRef)).toEqual(
+      [...forward.map((entry) => entry.catalogRef)].sort(),
+    );
+    expect(() => resolveClaudeSessionReference(forward, UUID_A)).toThrow(
+      "Claude session UUID is ambiguous",
+    );
+  });
+
+  test("skips one malformed profile identity without aborting the catalog or exposing it", () => {
+    const valid = profile("valid");
+    const malformed = {
+      ...profile("malformed"),
+      identity: "SENSITIVE_IDENTITY_PREFIX\uD800",
+    };
+    writeSession(valid.dir, "-valid", UUID_A, join(root, "repo-valid"));
+    writeSession(malformed.dir, "-malformed", UUID_B, join(root, "repo-malformed"));
+    const skipped: ClaudeSessionScanSkip[] = [];
+
+    const sessions = listClaudeSessions([malformed, valid], {
+      profilesRoot,
+      defaultDir: join(fakeHome, ".claude"),
+      onSkip: (skip) => {
+        skipped.push(skip);
+      },
+    });
+
+    expect(sessions.map((entry) => entry.ownerProfile)).toEqual(["valid"]);
+    expect(skipped).toEqual([
+      {
+        path: canonicalPath(malformed.dir),
+        reason: "invalid-profile-identity",
+      },
+    ]);
+    expect(JSON.stringify({ sessions, skipped })).not.toContain("SENSITIVE_IDENTITY_PREFIX");
+  });
+
+  test("reports and rejects malicious, stale, nested, traversal, and symlink stored roots", () => {
+    const foreign = profile("foreign", join(root, "foreign"));
+    const nested = profile("nested", join(profilesRoot, "claude", "parent", "nested"));
+    const traversalTarget = join(profilesRoot, "claude", "traversal-target");
+    const traversal = profile(
+      "traversal",
+      `${join(profilesRoot, "claude", "temporary")}${sep}..${sep}traversal-target`,
+    );
+    const linked = profile("linked", join(profilesRoot, "claude", "linked"));
+    const missing = profile("missing", join(profilesRoot, "claude", "missing"));
+    const outside = join(root, "outside");
+
+    writeSession(foreign.dir, "-foreign", UUID_A, join(root, "repo-foreign"));
+    writeSession(nested.dir, "-nested", UUID_B, join(root, "repo-nested"));
+    writeSession(traversalTarget, "-traversal", UUID_C, join(root, "repo-traversal"));
+    writeSession(outside, "-linked", UUID_D, join(root, "repo-linked"));
+    mkdirSync(join(profilesRoot, "claude"), { recursive: true });
+    symlinkSync(outside, linked.dir, "dir");
+
+    const skipped: ClaudeSessionScanSkip[] = [];
+    const sessions = listClaudeSessions(
+      [linked, traversal, nested, missing, foreign],
+      {
+        profilesRoot,
+        defaultDir: join(fakeHome, ".claude"),
+        onSkip: (skip) => {
+          skipped.push(skip);
+        },
+      },
+    );
+
+    expect(sessions).toEqual([]);
+    expect(skipped.map((skip) => skip.reason)).toEqual([
+      "untrusted-profile-root",
+      "untrusted-profile-root",
+      "missing-profile-root",
+      "untrusted-profile-root",
+      "untrusted-profile-root",
+    ]);
+    expect(JSON.stringify(skipped)).not.toContain("PROMPT_MUST_NOT_ESCAPE");
   });
 
   test("excludes stale foreign, missing, non-Claude, and unrepresented default directories", () => {
@@ -468,6 +754,7 @@ describe("accounts sessions CLI", () => {
       ...process.env,
       NODE_ENV: "test",
       HOME: fakeHome,
+      USERPROFILE: fakeHome,
       ACCOUNTS_HOME: accountsHome,
       NO_COLOR: "1",
     };
@@ -550,7 +837,7 @@ describe("accounts sessions CLI", () => {
       uuid: UUID_A,
       sourcePath: canonicalPath(sessionPath(work.dir, "-repo-one", UUID_A)),
     });
-    expect(parsed[0]?.catalogRef).toMatch(/^claude-session:v1:/);
+    expect(parsed[0]?.catalogRef).toMatch(/^claude-session:v2:/);
     expect(parsed[0]?.sessionIdCheck).toBe("bounded-match");
     expect(json.stdout).not.toContain("FIRST_SECRET_PROMPT");
 
@@ -563,6 +850,148 @@ describe("accounts sessions CLI", () => {
     const directJson = runCli("sessions", "--profile", "personal", "--json");
     expect(directJson.status).toBe(0);
     expect(JSON.parse(directJson.stdout)).toHaveLength(1);
+  });
+
+  test("keeps managed and default-root sessions stable through real accounts rename commands", () => {
+    const managed = profile("managed-old");
+    const representedDefault = profile("default-old", join(fakeHome, ".claude"));
+    const managedSource = writeSession(
+      managed.dir,
+      "-managed",
+      UUID_A,
+      join(root, "repo-managed"),
+    );
+    const defaultSource = writeSession(
+      representedDefault.dir,
+      "-default",
+      UUID_B,
+      join(root, "repo-default"),
+    );
+    writeStore([managed, representedDefault]);
+
+    const beforeResult = runCli("sessions", "--json");
+    expect(beforeResult.status).toBe(0);
+    expect(beforeResult.stderr).toBe("");
+    const before = parseCatalog(beforeResult);
+
+    const managedRename = runCli(
+      "rename",
+      "managed-old",
+      "managed-new",
+      "--tool",
+      "claude",
+    );
+    const defaultRename = runCli(
+      "rename",
+      "default-old",
+      "default-new",
+      "--tool",
+      "claude",
+    );
+    expect(managedRename.status).toBe(0);
+    expect(defaultRename.status).toBe(0);
+
+    const afterResult = runCli("sessions", "--json");
+    expect(afterResult.status).toBe(0);
+    expect(afterResult.stderr).toBe("");
+    const after = parseCatalog(afterResult);
+    const beforeBySource = new Map(before.map((entry) => [entry.sourcePath, entry]));
+    const afterBySource = new Map(after.map((entry) => [entry.sourcePath, entry]));
+
+    for (const [source, renamedOwner] of [
+      [canonicalPath(managedSource), "managed-new"],
+      [canonicalPath(defaultSource), "default-new"],
+    ] as const) {
+      expect(afterBySource.get(source)?.catalogRef).toBe(beforeBySource.get(source)?.catalogRef);
+      expect(afterBySource.get(source)?.catalogRefAliases).toEqual(
+        beforeBySource.get(source)?.catalogRefAliases,
+      );
+      expect(afterBySource.get(source)?.ownerProfile).toBe(renamedOwner);
+      expect(
+        (
+          afterBySource.get(source)?.representations as
+            | Array<{ ownerProfile: string }>
+            | undefined
+        )?.map((representation) => representation.ownerProfile),
+      ).toEqual([renamedOwner]);
+    }
+
+    const stored = JSON.parse(readFileSync(join(accountsHome, "accounts.json"), "utf8")) as {
+      profiles: Profile[];
+    };
+    expect(stored.profiles.find((entry) => entry.name === "managed-new")?.dir).toBe(managed.dir);
+    expect(stored.profiles.find((entry) => entry.name === "default-new")?.dir).toBe(
+      representedDefault.dir,
+    );
+  });
+
+  test("rejects invalid UUID filter syntax while a valid no-match remains successful", () => {
+    writeStore([]);
+
+    const invalid = runCli("sessions", "--uuid", "not-a-uuid", "--json");
+    expect(invalid.status).not.toBe(0);
+    expect(invalid.stdout).toBe("");
+    expect(invalid.stderr).toContain("--uuid must be a valid UUID");
+
+    const noMatch = runCli("sessions", "--uuid", UUID_D, "--json");
+    expect(noMatch.status).toBe(0);
+    expect(JSON.parse(noMatch.stdout)).toEqual([]);
+    expect(noMatch.stderr).toBe("");
+  });
+
+  test("isolates malformed UTF-16 identity from a real CLI catalog pass", () => {
+    const valid = profile("valid");
+    const malformed = {
+      ...profile("malformed"),
+      identity: "CLI_IDENTITY_MUST_NOT_ESCAPE\uD800",
+    };
+    writeSession(valid.dir, "-valid", UUID_A, join(root, "repo-valid"));
+    writeSession(malformed.dir, "-malformed", UUID_B, join(root, "repo-malformed"));
+    writeStore([malformed, valid]);
+
+    const result = runCli("sessions", "--json");
+    expect(result.status).toBe(0);
+    expect(parseCatalog(result).map((entry) => entry.ownerProfile)).toEqual(["valid"]);
+    expect(result.stderr).toContain("invalid-profile-identity");
+    expect(result.stdout).not.toContain("CLI_IDENTITY_MUST_NOT_ESCAPE");
+    expect(result.stderr).not.toContain("CLI_IDENTITY_MUST_NOT_ESCAPE");
+    expect(result.stderr).not.toContain("URIError");
+  });
+
+  test("warns instead of silently omitting rejected registered Claude roots", () => {
+    const nested = profile(
+      "nested",
+      join(profilesRoot, "claude", "unexpected-parent", "nested"),
+    );
+    const missing = profile("missing");
+    writeSession(nested.dir, "-nested", UUID_A, join(root, "repo-nested"));
+    writeStore([nested, missing]);
+
+    const result = runCli("sessions", "--json");
+    expect(result.status).toBe(0);
+    expect(parseCatalog(result)).toEqual([]);
+    expect(result.stderr).toContain("warning: 2 source root/path(s)");
+    expect(result.stderr).toContain("missing-profile-root");
+    expect(result.stderr).toContain("untrusted-profile-root");
+    expect(result.stderr).not.toContain("PROMPT_MUST_NOT_ESCAPE");
+  });
+
+  test("shows bounded metadata integrity states in the human table", () => {
+    const match = bulkCatalogEntry(1);
+    const mismatch = {
+      ...bulkCatalogEntry(2),
+      sessionIdCheck: "bounded-mismatch" as const,
+    };
+    const notObserved = {
+      ...bulkCatalogEntry(3),
+      sessionIdCheck: "not-observed" as const,
+    };
+
+    const table = formatClaudeSessionTable([match, mismatch, notObserved]);
+    expect(table).toContain("ID CHECK");
+    expect(table).toContain("bounded-match");
+    expect(table).toContain("BOUNDED-MISMATCH");
+    expect(table).toContain("NOT-OBSERVED");
   });
 
   test("flushes valid JSON for at least 2,000 sessions from source and built Bun entrypoints", () => {
@@ -725,7 +1154,22 @@ describe("accounts sessions CLI", () => {
         uuid: UUID_A,
         sourcePath: `/profiles/safe/projects/-project/${UUID_A}.jsonl`,
       },
-      catalogRef: "claude-session:v1:test",
+      storageIdentity: {
+        profilePath: "/profiles/safe",
+        encodedProject: "-project",
+        uuid: UUID_A,
+        sourcePath: `/profiles/safe/projects/-project/${UUID_A}.jsonl`,
+      },
+      catalogRef: "claude-session:v2:test",
+      catalogRefAliases: ["claude-session:v1:test"],
+      representations: [
+        {
+          ownerProfile: `\u202e\u2066safe`,
+          profileIdentity: "identity://safe",
+          profilePath: "/profiles/safe",
+          catalogRefAlias: "claude-session:v1:test",
+        },
+      ],
       ownerProfile: `\u202e\u2066safe`,
       profileIdentity: "identity://safe",
       profilePath: "/profiles/safe",

@@ -1,7 +1,9 @@
 import chalk from "chalk";
 import { Argument, type Command } from "commander";
+import { AccountsError } from "../types.js";
 import { resolveStore } from "./store.js";
 import {
+  isClaudeSessionUuid,
   listClaudeSessions,
   type ClaudeSessionCatalogEntry,
   type ClaudeSessionCatalogOptions,
@@ -65,7 +67,7 @@ function truncate(value: string, width: number): string {
 
 function printable(value: string): string {
   return value.replace(
-    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\uD800-\uDFFF]/gu,
     (character) => {
       const codePoint = character.codePointAt(0)!;
       return codePoint <= 0xffff
@@ -89,13 +91,26 @@ function pad(value: string, width: number): string {
 export function formatClaudeSessionTable(entries: readonly ClaudeSessionCatalogEntry[]): string {
   if (entries.length === 0) return "no Claude sessions found.";
   const rows = entries.map((entry) => ({
-    OWNER: truncate(printable(entry.ownerProfile), 20),
+    OWNER: truncate(
+      printable(
+        [...new Set(entry.representations.map((representation) => representation.ownerProfile))]
+          .sort()
+          .join(","),
+      ),
+      20,
+    ),
     PROJECT: truncate(printable(entry.cwd ?? entry.encodedProject), 40),
     UUID: entry.uuid,
     UPDATED: entry.updatedAt.slice(0, 19).replace("T", " "),
     SIZE: formatBytes(entry.sizeBytes),
+    "ID CHECK":
+      entry.sessionIdCheck === "bounded-match"
+        ? "bounded-match"
+        : entry.sessionIdCheck === "bounded-mismatch"
+          ? "BOUNDED-MISMATCH"
+          : "NOT-OBSERVED",
   }));
-  const headers = ["OWNER", "PROJECT", "UUID", "UPDATED", "SIZE"] as const;
+  const headers = ["OWNER", "PROJECT", "UUID", "UPDATED", "SIZE", "ID CHECK"] as const;
   // Folded, never spread: one call argument per row overflows the engine's call
   // arity ceiling, so a large catalog would exit with a RangeError and an empty
   // stdout instead of a table.
@@ -117,7 +132,7 @@ function addOptions(command: Command): Command {
   return command
     .option("--profile <name>", "filter by Accounts owner profile")
     .option("--project <identity>", "filter by canonical cwd/project identity or encoded project key")
-    .option("--uuid <uuid>", "filter by session UUID (owner and project remain part of identity)")
+    .option("--uuid <uuid>", "filter by canonical session UUID (owner and project remain part of identity)")
     .option("--json", "output structured JSON");
 }
 
@@ -181,7 +196,7 @@ function warnSkipped(skipped: readonly ClaudeSessionScanSkip[]): void {
   if (skipped.length === 0) return;
   console.error(
     chalk.yellow(
-      `warning: ${skipped.length} path(s) changed while being scanned and are missing from this catalog`,
+      `warning: ${skipped.length} source root/path(s) could not be represented and are missing from this catalog`,
     ),
   );
   for (const skip of skipped.slice(0, MAX_REPORTED_SKIPS)) {
@@ -193,6 +208,11 @@ function warnSkipped(skipped: readonly ClaudeSessionScanSkip[]): void {
 }
 
 async function printSessions(options: SessionsCliOptions): Promise<void> {
+  if (options.uuid && !isClaudeSessionUuid(options.uuid)) {
+    throw new AccountsError(
+      "--uuid must be a valid UUID in canonical 8-4-4-4-12 hexadecimal form",
+    );
+  }
   const profiles = await resolveStore().listProfiles("claude");
   const skipped: ClaudeSessionScanSkip[] = [];
   const catalogOptions: ClaudeSessionCatalogOptions = {
