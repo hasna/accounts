@@ -3,8 +3,8 @@
   "name": "accounts",
   "class": "service",
   "contractVersion": "v1",
-  "kitVersion": "0.5.2",
-  "description": "Manage and switch between multiple AI coding tool profiles/accounts. Local mode keeps the registry at ~/.hasna/accounts/accounts.json; self-hosted/cloud modes use the authenticated accounts-serve HTTP API and PostgreSQL.",
+  "kitVersion": "0.8.1",
+  "description": "Manage and switch between multiple AI coding tool profiles/accounts. Local mode keeps the registry under ~/.hasna/accounts; self_hosted/cloud modes use the authenticated accounts-serve HTTP API and PostgreSQL.",
   "bins": [
     "accounts",
     "accounts-mcp",
@@ -13,18 +13,21 @@
   ],
   "deploymentModes": [
     "local",
-    "self-hosted",
+    "self_hosted",
     "cloud"
+  ],
+  "hosting": [
+    "user-hosted"
   ],
   "serviceSurfaces": [
     {
       "name": "accounts-api",
+      "kind": "api",
       "status": "supported",
       "bin": "accounts-serve",
-      "mcpBin": "accounts-mcp",
       "authMode": "api-key",
       "deploymentModes": [
-        "self-hosted",
+        "self_hosted",
         "cloud"
       ],
       "health": {
@@ -43,6 +46,7 @@
         "public": true
       },
       "apiBasePath": "/v1",
+      "openApiPath": "/src/server/openapi.ts",
       "readinessGates": [
         {
           "id": "accounts-migrations",
@@ -52,13 +56,60 @@
           "status": "pending"
         }
       ]
+    },
+    {
+      "name": "accounts-sdk",
+      "kind": "sdk",
+      "status": "supported",
+      "authMode": "api-key",
+      "deploymentModes": [
+        "self_hosted",
+        "cloud"
+      ],
+      "exportSubpath": "./sdk",
+      "generatedFrom": "/src/server/openapi.ts",
+      "clientClassName": "AccountsClient"
+    },
+    {
+      "name": "accounts-mcp",
+      "kind": "mcp",
+      "status": "supported",
+      "mcpBin": "accounts-mcp",
+      "authMode": "local-only",
+      "deploymentModes": [
+        "local"
+      ]
+    },
+    {
+      "name": "accounts-cli",
+      "kind": "cli",
+      "status": "supported",
+      "bin": "accounts",
+      "authMode": "local-only",
+      "deploymentModes": [
+        "local"
+      ]
     }
   ],
   "storage": {
     "mode": "local",
+    "engines": [
+      "sqlite",
+      "postgres"
+    ],
     "envPrefix": "HASNA_ACCOUNTS_",
     "aliasEnvPrefix": "ACCOUNTS_",
-    "databaseUrlSecretRef": "hasna/oss/accounts/database-url",
-    "sqlitePath": "~/.hasna/accounts/accounts.json"
+    "sqlitePath": "~/.hasna/accounts/accounts.db",
+    "pgTestGate": {
+      "envVar": "HASNA_ACCOUNTS_TEST_DATABASE_URL",
+      "command": "bun run test:postgres"
+    }
+  },
+  "metadata": {
+    "release": {
+      "artifactScan": {
+        "script": "scan:artifact"
+      }
+    }
   }
 }

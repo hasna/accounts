@@ -43,9 +43,10 @@
     "dev": "bun run src/cli.ts",
     "sdk:generate": "bun run src/sdk/generate-sdk.ts",
     "test:compat": "tsc --noEmit -p tsconfig.compat.json",
-    "vendor-kit:check": "bunx @hasna/contracts vendor-kit --check .",
-    "conformance": "bunx @hasna/contracts repo-conformance .",
-    "prepack": "bun run build",
+    "vendor-kit:check": "contracts vendor-kit --check .",
+    "conformance": "contracts repo-conformance .",
+    "scan:artifact": "contracts artifact-scan .",
+    "prepack": "bun run build && bun run scan:artifact",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:postgres": "bun run ./test/run-postgres.ts"
@@ -89,7 +90,7 @@
   "author": "Andrei Hasna <andrei@hasna.com>",
   "license": "Apache-2.0",
   "dependencies": {
-    "@hasna/contracts": "0.5.2",
+    "@hasna/contracts": "0.8.1",
     "@hasna/events": "^0.1.7",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
