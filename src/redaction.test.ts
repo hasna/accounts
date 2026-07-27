@@ -406,7 +406,7 @@ test("sensitive folds accept leading separators and padding-only credential tail
   expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(8);
 });
 
-test("cookie folds terminate before generic compact and spaced diagnostic assignments", () => {
+test("cookie folds preserve explicit diagnostics and fail closed on ambiguous assignments", () => {
   const input = [
     "Cookie: session=compact-cookie-secret\r",
     " status=429\r",
@@ -430,6 +430,8 @@ test("cookie folds terminate before generic compact and spaced diagnostic assign
     "compact-set-cookie-secret",
     "spaced-cookie-secret",
     "spaced-set-cookie-secret",
+    "diagnostic_code = E_COOKIE",
+    "upstream_result = rejected",
   ]) {
     expect(redacted).not.toContain(secret);
   }
@@ -440,11 +442,272 @@ test("cookie folds terminate before generic compact and spaced diagnostic assign
     "stack=Error",
     "message=compact set-cookie diagnostic",
     "X-Trace-ID: keep-set-cookie-adjacent",
-    "diagnostic_code = E_COOKIE",
-    "upstream_result = rejected",
     "completed=true",
   ]) {
     expect(redacted).toContain(retained);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
+
+test("quoted credential values remain sensitive across every supported folded line ending", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const input = [
+      `Authorization: Digest username="auth-alpha${lineEnding} auth-beta", realm="auth-realm"`,
+      `Proxy-Authorization: Custom vendor="proxy-alpha${lineEnding}\tproxy-beta", extension=proxy-tail`,
+      `Cookie: session="cookie-alpha${lineEnding} cookie-beta"; theme=night`,
+      `Set-Cookie: sid="set-alpha${lineEnding}\tset-beta"; Path=/; HttpOnly`,
+      "status=401 keep-status",
+      "message=keep-message",
+    ].join(lineEnding);
+
+    const redacted = redactText(input);
+
+    for (const secret of [
+      "auth-alpha",
+      "auth-beta",
+      "auth-realm",
+      "proxy-alpha",
+      "proxy-beta",
+      "proxy-tail",
+      "cookie-alpha",
+      "cookie-beta",
+      "theme=night",
+      "set-alpha",
+      "set-beta",
+      "Path=/",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain("status=401 keep-status");
+    expect(redacted).toContain("message=keep-message");
+    expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+  }
+});
+
+test("arbitrary extension auth parameters stay redacted while explicit diagnostics reset state", () => {
+  const input = [
+    "Authorization: Custom foo=alpha,",
+    " extparam=beta,",
+    ' vendor_thing="gamma",',
+    " x-next=delta",
+    " x-without-separator=epsilon",
+    " stack=Error: independent authorization failure",
+    " detail=provider rejected the independent request",
+    " status=403 keep-status",
+    " message=keep-message",
+    "Proxy-Authorization: Custom first=proxy-alpha",
+    " , second=proxy-beta",
+    " , third=proxy-gamma",
+    " status=407 keep-proxy-status",
+    "Cookie: first=cookie-alpha;",
+    " arbitrary_cookie=cookie-beta;",
+    " another_cookie=cookie-gamma",
+    " no_separator_cookie=cookie-delta",
+    " detail=independent cookie diagnostic",
+    "Set-Cookie: sid=set-alpha;",
+    " VendorFlag=set-beta;",
+    " VendorMode=set-gamma",
+    " no_separator_set_cookie=set-delta",
+    " message=independent set-cookie diagnostic",
+    "X-Request-ID: keep-adjacent-header",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "foo=alpha",
+    "extparam=beta",
+    "vendor_thing",
+    "gamma",
+    "x-next=delta",
+    "x-without-separator=epsilon",
+    "first=proxy-alpha",
+    "second=proxy-beta",
+    "third=proxy-gamma",
+    "first=cookie-alpha",
+    "arbitrary_cookie=cookie-beta",
+    "another_cookie=cookie-gamma",
+    "no_separator_cookie=cookie-delta",
+    "sid=set-alpha",
+    "VendorFlag=set-beta",
+    "VendorMode=set-gamma",
+    "no_separator_set_cookie=set-delta",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const diagnostic of [
+    "stack=Error: independent authorization failure",
+    "detail=provider rejected the independent request",
+    "status=403 keep-status",
+    "message=keep-message",
+    "status=407 keep-proxy-status",
+    "detail=independent cookie diagnostic",
+    "message=independent set-cookie diagnostic",
+    "X-Request-ID: keep-adjacent-header",
+  ]) {
+    expect(redacted).toContain(diagnostic);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
+
+test("malformed quoted folds fail closed and later records start with clean state", () => {
+  const input = [
+    'Authorization: Digest username="unterminated-alpha',
+    " hidden-auth-continuation",
+    "status=401 independent-status",
+    "Cookie: session=visible-cookie-secret;",
+    " next=hidden-cookie-continuation",
+    "stack=Error independent-cookie-stack",
+    "Authorization: Basic final-auth-secret",
+    "detail=final independent detail",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "unterminated-alpha",
+    "hidden-auth-continuation",
+    "visible-cookie-secret",
+    "hidden-cookie-continuation",
+    "final-auth-secret",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const diagnostic of [
+    "status=401 independent-status",
+    "stack=Error independent-cookie-stack",
+    "detail=final independent detail",
+  ]) {
+    expect(redacted).toContain(diagnostic);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(3);
+});
+
+test("large folded credential records are redacted in bounded linear time", () => {
+  const folded = Array.from(
+    { length: 12_000 },
+    (_, index) => ` vendor-${index}=credential-fragment-${index},`,
+  );
+  const input = [
+    "Authorization: Custom seed=credential-seed,",
+    ...folded,
+    " final-extension=credential-tail",
+    "status=429 keep-after-large-record",
+  ].join("\n");
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("credential-seed");
+  expect(redacted).not.toContain("credential-fragment-11999");
+  expect(redacted).not.toContain("credential-tail");
+  expect(redacted).toContain("status=429 keep-after-large-record");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(1);
+  expect(elapsedMs).toBeLessThan(1_500);
+});
+
+test("escaped quotes, controls, and Unicode fragments fail closed inside credential folds", () => {
+  const input = [
+    'Authorization: Digest username="escaped-alpha\\"quoted',
+    ' unicode-auth-\u0001秘密", vendor=auth-tail',
+    "Proxy-Authorization: Basic proxy-prefix-",
+    " \u0002proxy-秘密-tail",
+    'Cookie: session="escaped-cookie\\"quoted',
+    ' unicode-cookie-\u0003秘密"; theme=night',
+    "Set-Cookie: sid=set-prefix-",
+    " \u0004set-秘密-tail; Path=/",
+    "status=401 keep-status",
+    "stack=Error: keep-stack",
+  ].join("\r\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "escaped-alpha",
+    "unicode-auth",
+    "auth-tail",
+    "proxy-prefix",
+    "proxy-秘密-tail",
+    "escaped-cookie",
+    "unicode-cookie",
+    "theme=night",
+    "set-prefix",
+    "set-秘密-tail",
+    "Path=/",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted).toContain("status=401 keep-status");
+  expect(redacted).toContain("stack=Error: keep-stack");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
+
+test("diagnostic-named parameters remain sensitive when separators keep them inside a credential record", () => {
+  const input = [
+    "Authorization: Custom seed=auth-seed,",
+    " message=auth-message,",
+    " detail=auth-detail",
+    " status=403 independent-status",
+    "Cookie: sid=cookie-seed;",
+    " message=cookie-message;",
+    " detail=cookie-detail",
+    " stack=Error independent-stack",
+    "X-Trace-ID: keep-final-boundary",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "auth-seed",
+    "auth-message",
+    "auth-detail",
+    "cookie-seed",
+    "cookie-message",
+    "cookie-detail",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted).toContain("status=403 independent-status");
+  expect(redacted).toContain("stack=Error independent-stack");
+  expect(redacted).toContain("X-Trace-ID: keep-final-boundary");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(2);
+});
+
+test("empty sensitive headers fail closed on malformed and extension continuations", () => {
+  const input = [
+    "Authorization:",
+    " Basic",
+    " split-auth-secret",
+    " status=401 keep-auth-status",
+    "Proxy-Authorization:",
+    " extension=proxy-secret",
+    " stack=Error keep-proxy-stack",
+    "Cookie:",
+    " opaque-cookie-secret",
+    " message=keep-cookie-message",
+    "Set-Cookie:",
+    " vendor-set-cookie-secret",
+    " detail=keep-set-cookie-detail",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "split-auth-secret",
+    "proxy-secret",
+    "opaque-cookie-secret",
+    "vendor-set-cookie-secret",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const diagnostic of [
+    "status=401 keep-auth-status",
+    "stack=Error keep-proxy-stack",
+    "message=keep-cookie-message",
+    "detail=keep-set-cookie-detail",
+  ]) {
+    expect(redacted).toContain(diagnostic);
   }
   expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
 });

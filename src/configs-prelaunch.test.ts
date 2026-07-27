@@ -270,13 +270,15 @@ describe("configs prelaunch", () => {
     resetHome();
     const p = profileInHome("codex");
     const probe = join(home, "configs-redaction-probe");
-    const dummyCredential = "dummy-controlled-error-credential";
+    const credentialFragments = [
+      "controlled-cookie-alpha",
+      "controlled-cookie-beta",
+    ];
     writeFileSync(
       probe,
       [
         "#!/bin/sh",
-        `printf 'Authorization: Bearer %s\\n' ${JSON.stringify(dummyCredential)}`,
-        `printf 'x-api-key=%s\\n' ${JSON.stringify(dummyCredential)} >&2`,
+        "printf '%s\\n' 'Cookie: sid=controlled-cookie-alpha;' ' arbitrary=controlled-cookie-beta' 'stack=Error keep-stack' >&2",
         "exit 2",
       ].join("\n"),
     );
@@ -290,7 +292,8 @@ describe("configs prelaunch", () => {
         message = error instanceof Error ? error.message : String(error);
       }
       expect(message).toContain("[REDACTED]");
-      expect(message).not.toContain(dummyCredential);
+      for (const fragment of credentialFragments) expect(message).not.toContain(fragment);
+      expect(message).toContain("stack=Error keep-stack");
     } finally {
       cleanup();
     }

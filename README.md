@@ -136,6 +136,13 @@ use `env -u` for the same keys. The hook changes only the provider child, not
 the parent shell. This also prevents a custom tool's profile environment from
 restoring those controls.
 
+Controlled launch and prelaunch errors also redact complete
+`Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` records,
+including folded quoted values, token fragments, arbitrary extension
+parameters, and cookie attributes. Folded input is scanned once and fails
+closed until a clear record boundary, so malformed or unfamiliar credential
+syntax is not emitted merely because its parameter name is unknown.
+
 Printed POSIX handoffs validate every environment-variable name, single-quote
 every value and command word without expansion, and place an explicit `env --`
 option boundary before assignments. Profile directories and custom `extraEnv`

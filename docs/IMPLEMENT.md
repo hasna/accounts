@@ -71,6 +71,19 @@ AWS/Google SDK settings are intentionally preserved as part of the caller's
 existing trust binding. Provider flags/config, edited handoff commands, and
 other caller-selected diagnostics remain residual caller-trusted controls.
 
+`src/lib/redaction.ts` applies a separate output boundary to controlled launch
+and prelaunch diagnostics. Its sensitive-header scanner tracks quote, escape,
+separator, and record state in one forward pass. It does not use an
+authorization-parameter allowlist: arbitrary extension parameters and cookie
+names remain inside a folded credential record. Open quotes and ambiguous
+indented continuations fail closed. A new header, an unambiguous structured
+diagnostic record, or an explicit `status`, `message`, `stack`, or `detail`
+record after a syntactically complete non-separated value ends the record.
+Unknown assignment names and diagnostic-looking names after a dangling
+credential separator remain sensitive. This keeps the supported independent
+diagnostics visible without rescanning the accumulated header prefix or
+exposing malformed folds.
+
 ## Apply safety
 
 - Refuse apply when the profile has no auth snapshot and no oauth in the profile dir.

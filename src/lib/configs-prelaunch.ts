@@ -144,7 +144,9 @@ function defaultRunner(command: string, args: string[]) {
 
 function outputSummary(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr">): string {
   const combined = `${result.stderr?.toString("utf8") ?? ""}${result.stdout?.toString("utf8") ?? ""}`.trim();
-  return combined ? `: ${redactText(combined.split("\n").slice(0, 3).join(" "))}` : "";
+  if (!combined) return "";
+  const bounded = combined.split(/\r\n|\r|\n/).slice(0, 3).join("\n");
+  return `: ${redactText(bounded).replace(/\n/g, " ")}`;
 }
 
 export function runConfigsPrelaunch(
