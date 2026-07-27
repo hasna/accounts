@@ -40,7 +40,12 @@ import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.
 import { formatEnvAssignments, formatExportLines, profileEnv, providerLaunchEnv } from "./lib/env.js";
 import { redactText } from "./lib/redaction.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
-import { publicSwitchResult, switchProfile, type SwitchMode } from "./lib/switch.js";
+import {
+  publicSwitchResult,
+  publicToolLabel,
+  switchProfile,
+  type SwitchMode,
+} from "./lib/switch.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -709,7 +714,7 @@ addConfigsOptions(program
             { allowMissing: true },
           );
           if (!response) {
-            die(`no running accounts supervisor for ${getTool(profile.tool).label}. Start one with \`accounts run ${profile.tool}\`.`);
+            die(`no running accounts supervisor for ${publicToolLabel(profile.tool)}. Start one with \`accounts run ${profile.tool}\`.`);
           }
           if (!response.ok) die(response.error);
           if (opts.json) {
@@ -873,7 +878,7 @@ addConfigsOptions(program
         );
         process.exit(code);
       }
-      console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
+      console.error(chalk.green(`✓ accounts supervisor running ${publicToolLabel(plan.tool.id)} as ${chalk.bold(plan.profile.name)}`));
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
       console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
       const code = await runSupervisedTool(plan.profile, plan.tool, runArgs, {
@@ -951,7 +956,7 @@ addConfigsOptions(supervisor
         },
         { allowMissing: true },
       );
-      if (!response) die(`no running accounts supervisor for ${getTool(profile.tool).label}`);
+      if (!response) die(`no running accounts supervisor for ${publicToolLabel(profile.tool)}`);
       if (!response.ok) die(response.error);
       if (opts.json) {
         console.log(JSON.stringify(response, null, 2));

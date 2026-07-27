@@ -504,8 +504,9 @@ test("non-launch switch handoff command unsets request debugging before provider
 });
 
 test("switch human, JSON, and launch output use the safe DTO while launch keeps raw args transient", () => {
+  const labelSecret = "caller-controlled-tool-label-secret";
   writeFakeTool("safe-output-tool", "SAFE_OUTPUT_HOME", "safe-output");
-  addFakeLoginTool("safe-output", "Safe Output", "SAFE_OUTPUT_HOME", "safe-output-tool");
+  addFakeLoginTool("safe-output", labelSecret, "SAFE_OUTPUT_HOME", "safe-output-tool");
   expect(runCli("add", "acct", "--tool", "safe-output").status).toBe(0);
 
   const envSecret = "switch-extra-env-secret";
@@ -533,6 +534,7 @@ test("switch human, JSON, and launch output use the safe DTO while launch keeps 
   expect(human.status, human.stderr).toBe(0);
   expect(`${human.stdout}${human.stderr}`).not.toContain(argvSecret);
   expect(`${human.stdout}${human.stderr}`).not.toContain(envSecret);
+  expect(`${human.stdout}${human.stderr}`).not.toContain(labelSecret);
   expect(human.stdout).toContain("--api-key");
   expect(human.stdout).toContain("[REDACTED]");
 
@@ -551,11 +553,12 @@ test("switch human, JSON, and launch output use the safe DTO while launch keeps 
   expect(json.status, json.stderr).toBe(0);
   expect(`${json.stdout}${json.stderr}`).not.toContain(argvSecret);
   expect(`${json.stdout}${json.stderr}`).not.toContain(envSecret);
+  expect(`${json.stdout}${json.stderr}`).not.toContain(labelSecret);
   const output = JSON.parse(json.stdout) as Record<string, unknown>;
   expect(output["schema"]).toBe("hasna.accounts.switch-output/v1");
   expect(output).not.toHaveProperty("env");
   expect(output).not.toHaveProperty("exports");
-  expect(output["tool"]).toEqual({ id: "safe-output", label: "Safe Output" });
+  expect(output["tool"]).toEqual({ id: "safe-output", label: "Custom tool" });
   expect(output["profile"]).toEqual({ name: "acct", tool: "safe-output" });
 
   rmSync(logPath, { force: true });
@@ -574,7 +577,85 @@ test("switch human, JSON, and launch output use the safe DTO while launch keeps 
   expect(launched.status, launched.stderr).toBe(0);
   expect(`${launched.stdout}${launched.stderr}`).not.toContain(argvSecret);
   expect(`${launched.stdout}${launched.stderr}`).not.toContain(envSecret);
+  expect(`${launched.stdout}${launched.stderr}`).not.toContain(labelSecret);
   expect(readLogEntries().at(-1)?.args).toContain(`--api-key ${argvSecret}`);
+});
+
+test("switch surfaces redact normalized, clustered, and Unicode credential arguments", () => {
+  writeFakeTool("argv-grammar-tool", "ARGV_GRAMMAR_HOME", "argv-grammar");
+  addFakeLoginTool(
+    "argv-grammar",
+    "Argv Grammar",
+    "ARGV_GRAMMAR_HOME",
+    "argv-grammar-tool",
+  );
+  expect(runCli("add", "acct", "--tool", "argv-grammar").status).toBe(0);
+
+  const secrets = Array.from(
+    { length: 11 },
+    (_, index) => `actual-switch-credential-${index}`,
+  );
+  const credentialArgs = [
+    "--secret-key",
+    secrets[0]!,
+    `--service-account-key=${secrets[1]}`,
+    `--auth-header:${secrets[2]}`,
+    "--service-auth",
+    secrets[3]!,
+    "--bearer",
+    secrets[4]!,
+    "--credentials",
+    secrets[5]!,
+    "-vk",
+    secrets[6]!,
+    "-vvk",
+    secrets[7]!,
+    "－ｋ",
+    secrets[8]!,
+    "−k",
+    secrets[9]!,
+    `-vk${secrets[10]}`,
+  ];
+
+  for (const surfaceArgs of [
+    [],
+    ["--json"],
+  ]) {
+    const result = runCliWith([
+      "switch",
+      "acct",
+      "--tool",
+      "argv-grammar",
+      "--mode",
+      "active",
+      ...surfaceArgs,
+      "--",
+      ...credentialArgs,
+    ]);
+    expect(result.status, result.stderr).toBe(0);
+    for (const secret of secrets) {
+      expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
+    }
+    expect(result.stdout).toContain("[REDACTED]");
+  }
+
+  rmSync(logPath, { force: true });
+  const launched = runCliWith([
+    "switch",
+    "acct",
+    "--tool",
+    "argv-grammar",
+    "--mode",
+    "active",
+    "--launch",
+    "--",
+    ...credentialArgs,
+  ]);
+  expect(launched.status, launched.stderr).toBe(0);
+  for (const secret of secrets) {
+    expect(`${launched.stdout}${launched.stderr}`).not.toContain(secret);
+    expect(readLogEntries().at(-1)?.args).toContain(secret);
+  }
 });
 
 test("accounts shell removes request debugging while preserving same-binding environment", () => {

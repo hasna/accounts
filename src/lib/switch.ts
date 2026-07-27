@@ -11,8 +11,13 @@ import {
 } from "./env.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 import { resolveStore, type AccountsStore } from "./store.js";
-import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
-import { redactArgv, redactEnvironment } from "./redaction.js";
+import {
+  BUILTIN_TOOLS,
+  getTool,
+  mergeToolArgs,
+  normalizePermissionPreset,
+} from "./tools.js";
+import { redactArgv, redactEnvironment, redactText } from "./redaction.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
 
@@ -61,9 +66,25 @@ function commandLine(env: Record<string, string>, command: string[]): string {
   return `${formatEnvAssignments(env)} ${command.map(quotePosixShellWord).join(" ")}`.trim();
 }
 
+/** Return a trusted display label without reflecting caller-controlled custom labels. */
+export function publicToolLabel(toolId: string): string {
+  return BUILTIN_TOOLS.find((tool) => tool.id === toolId)?.label ?? "Custom tool";
+}
+
+export function publicSwitchMessage(
+  profileName: string,
+  toolLabel: string,
+  applied: boolean,
+): string {
+  return applied
+    ? `${profileName} is now the live/default ${toolLabel} profile`
+    : `${profileName} is now the active ${toolLabel} profile`;
+}
+
 /** Project an internal launch result to the only shape allowed on public output. */
 export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
   const command = redactArgv(result.command);
+  const toolLabel = publicToolLabel(result.tool.id);
   return {
     schema: "hasna.accounts.switch-output/v1",
     profile: {
@@ -72,15 +93,15 @@ export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
     },
     tool: {
       id: result.tool.id,
-      label: result.tool.label,
+      label: toolLabel,
     },
     applied: result.applied,
     active: result.active,
     command,
     commandLine: commandLine(redactEnvironment(result.env), command),
-    ...(result.permissions ? { permissions: result.permissions } : {}),
+    ...(result.permissions ? { permissions: redactText(result.permissions) } : {}),
     restartRequired: result.restartRequired,
-    message: result.message,
+    message: publicSwitchMessage(result.profile.name, toolLabel, result.applied),
   };
 }
 
@@ -118,9 +139,11 @@ export async function switchProfile(
   const command = commandFor(profile, tool, opts);
   prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
   const restartRequired = opts.resume === true || applied || mode === "env";
-  const message = applied
-    ? `${profile.name} is now the live/default ${tool.label} profile`
-    : `${profile.name} is now the active ${tool.label} profile`;
+  const message = publicSwitchMessage(
+    profile.name,
+    publicToolLabel(tool.id),
+    applied,
+  );
 
   return {
     profile: await store.getProfile(profile.name, tool.id),

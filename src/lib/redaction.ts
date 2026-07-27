@@ -8,6 +8,8 @@ const HEADER_LINE_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:/;
 const EXPLICIT_DIAGNOSTIC_RECORD_PATTERN =
   /^(?:status|message|stack|detail)[ \t]*=[ \t]*\S/i;
 const SENSITIVE_TERMINAL_TOKENS = new Set([
+  "auth",
+  "bearer",
   "credential",
   "passphrase",
   "password",
@@ -26,12 +28,16 @@ const SENSITIVE_KEY_QUALIFIERS = new Set([
   "bearer",
   "oauth",
   "session",
+  "secret",
+  "service",
+  "account",
   "x",
   "goog",
   "amz",
 ]);
 const SENSITIVE_EXACT_KEYS = new Set([
   "auth",
+  "authheader",
   "authorization",
   "proxyauthorization",
   "cookie",
@@ -53,10 +59,18 @@ const SENSITIVE_EXACT_KEYS = new Set([
   "xgoogapikey",
   "xamzsecuritytoken",
   "credential",
+  "credentials",
   "password",
   "passphrase",
   "secret",
   "token",
+]);
+const SENSITIVE_TOKEN_STEMS = new Map([
+  ["credentials", "credential"],
+  ["passphrases", "passphrase"],
+  ["passwords", "password"],
+  ["secrets", "secret"],
+  ["tokens", "token"],
 ]);
 
 type FoldSeparator = "," | ";";
@@ -69,7 +83,8 @@ function semanticKeyTokens(value: string): string[] {
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
     .split(/[^A-Za-z0-9]+/)
     .filter(Boolean)
-    .map((token) => token.toLowerCase());
+    .map((token) => token.toLowerCase())
+    .map((token) => SENSITIVE_TOKEN_STEMS.get(token) ?? token);
 }
 
 /**
@@ -415,24 +430,41 @@ export function redactArgv(argv: string[]): string[] {
       continue;
     }
 
-    if (arg === "-k") {
-      redacted.push(arg);
-      redactNext = true;
-      continue;
-    }
-    if (/^-k.+/.test(arg)) {
-      redacted.push("-k[REDACTED]");
+    const normalizedArg = arg
+      .normalize("NFKC")
+      .replace(/^[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]+/, (dashes) =>
+        "-".repeat(dashes.length),
+      );
+
+    const separator = normalizedArg.search(/[=:]/);
+    if (
+      separator > 0 &&
+      isSensitiveCredentialKey(normalizedArg.slice(0, separator))
+    ) {
+      redacted.push(`${normalizedArg.slice(0, separator + 1)}[REDACTED]`);
       continue;
     }
 
-    const separator = arg.search(/[=:]/);
-    if (separator > 0 && isSensitiveCredentialKey(arg.slice(0, separator))) {
-      redacted.push(`${arg.slice(0, separator + 1)}[REDACTED]`);
+    const shortOption = /^-(?!-)(.*)$/.exec(normalizedArg)?.[1];
+    const shortCredentialIndex = shortOption?.toLowerCase().indexOf("k") ?? -1;
+    if (
+      shortOption &&
+      shortCredentialIndex >= 0 &&
+      /^[A-Za-z]+$/.test(shortOption.slice(0, shortCredentialIndex + 1))
+    ) {
+      if (shortCredentialIndex === shortOption.length - 1) {
+        redacted.push(normalizedArg);
+        redactNext = true;
+      } else {
+        redacted.push(
+          `-${shortOption.slice(0, shortCredentialIndex + 1)}[REDACTED]`,
+        );
+      }
       continue;
     }
 
     redacted.push(redactText(arg));
-    if (isSensitiveCredentialKey(arg)) redactNext = true;
+    if (isSensitiveCredentialKey(normalizedArg)) redactNext = true;
   }
   return redacted;
 }
@@ -443,7 +475,7 @@ export function redactPublicValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((entry) => redactPublicValue(entry));
   if (!value || typeof value !== "object") return value;
 
-  const result: Record<string, unknown> = {};
+  const result: Record<string, unknown> = Object.create(null);
   for (const [key, nested] of Object.entries(value)) {
     result[key] = isSensitiveCredentialKey(key)
       ? "[REDACTED]"

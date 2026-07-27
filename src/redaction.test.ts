@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { isSensitiveCredentialKey, redactArgv, redactText } from "./lib/redaction.js";
+import {
+  isSensitiveCredentialKey,
+  redactArgv,
+  redactPublicValue,
+  redactText,
+} from "./lib/redaction.js";
 
 test("sensitive request headers redact their complete values", () => {
   const samples = [
@@ -77,6 +82,12 @@ test("semantic credential-key normalization covers separator and camel-case vari
     "databasepassword",
     "webhookcredential",
     "auth",
+    "secret-key",
+    "service-account-key",
+    "auth-header",
+    "service-auth",
+    "bearer",
+    "credentials",
   ];
   const benign = [
     "oauth_scope",
@@ -88,6 +99,10 @@ test("semantic credential-key normalization covers separator and camel-case vari
     "tokenBucket",
     "secretariat",
     "monkey",
+    "bearer-mode",
+    "credential-provider",
+    "service-account",
+    "authorization-policy",
   ];
 
   for (const key of sensitive) expect(isSensitiveCredentialKey(key), key).toBe(true);
@@ -201,6 +216,64 @@ test("argument redaction uses the same semantic credential-key classifier", () =
     "--webhookCredential",
     "[REDACTED]",
   ]);
+});
+
+test("argument redaction fails closed on combined and Unicode credential short options", () => {
+  const secrets = [
+    "argv-secret-key",
+    "argv-service-account",
+    "argv-auth-header",
+    "argv-service-auth",
+    "argv-bearer",
+    "argv-credentials",
+    "argv-vk",
+    "argv-vvk",
+    "argv-fullwidth-k",
+    "argv-unicode-minus-k",
+    "argv-cluster-attached",
+  ];
+  const redacted = redactArgv([
+    "provider",
+    "--secret-key",
+    secrets[0]!,
+    `--service-account-key=${secrets[1]}`,
+    `--auth-header:${secrets[2]}`,
+    "--service-auth",
+    secrets[3]!,
+    "--bearer",
+    secrets[4]!,
+    "--credentials",
+    secrets[5]!,
+    "-vk",
+    secrets[6]!,
+    "-vvk",
+    secrets[7]!,
+    "－ｋ",
+    secrets[8]!,
+    "−k",
+    secrets[9]!,
+    `-vk${secrets[10]}`,
+    "--bearer-mode",
+    "keep-bearer-mode",
+  ]);
+
+  const output = JSON.stringify(redacted);
+  for (const secret of secrets) expect(output).not.toContain(secret);
+  expect(redacted.at(-1)).toBe("keep-bearer-mode");
+});
+
+test("recursive public redaction uses prototype-safe objects", () => {
+  const input = JSON.parse(
+    '{"safe":"kept","__proto__":{"secret-key":"prototype-secret"},"nested":{"constructor":{"credentials":"nested-secret"}}}',
+  ) as Record<string, unknown>;
+
+  const redacted = redactPublicValue(input) as Record<string, unknown>;
+
+  expect(Object.getPrototypeOf(redacted)).toBeNull();
+  expect(Object.getPrototypeOf(redacted["nested"])).toBeNull();
+  expect(JSON.stringify(redacted)).not.toContain("prototype-secret");
+  expect(JSON.stringify(redacted)).not.toContain("nested-secret");
+  expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
 });
 
 test("dot, space, escaped, and single-quoted credential keys fail closed", () => {

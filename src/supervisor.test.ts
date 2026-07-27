@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -346,23 +357,149 @@ test("supervisor keeps raw credential arguments transient while persistence and 
   }
 });
 
+test("supervisor redacts normalized, clustered, and Unicode credential arguments end to end", async () => {
+  const logPath = join(home, "credential-grammar.log");
+  const scriptPath = join(home, "credential-grammar.mjs");
+  writeFileSync(
+    scriptPath,
+    [
+      'import { appendFileSync } from "node:fs";',
+      "appendFileSync(process.env.FAKE_LOG, JSON.stringify({",
+      "  active: process.env.ACCOUNTS_ACTIVE,",
+      "  home: process.env.CREDENTIAL_GRAMMAR_HOME,",
+      "  args: process.argv.slice(2),",
+      '}) + "\\n");',
+      'process.on("SIGTERM", () => process.exit(0));',
+      "setInterval(() => undefined, 1000);",
+    ].join("\n"),
+  );
+  addCustomTool({
+    id: "credentialgrammar",
+    label: "Credential Grammar",
+    envVar: "CREDENTIAL_GRAMMAR_HOME",
+    defaultDir: join(home, "credential-grammar-default"),
+    bin: process.execPath,
+  });
+  const one = addProfile({ name: "one", tool: "credentialgrammar" });
+  const two = addProfile({ name: "two", tool: "credentialgrammar" });
+  const initialSecrets = Array.from(
+    { length: 10 },
+    (_, index) => `supervisor-initial-credential-${index}`,
+  );
+  const switchedSecrets = Array.from(
+    { length: 10 },
+    (_, index) => `supervisor-switched-credential-${index}`,
+  );
+  const credentialArgs = (secrets: string[]) => [
+    scriptPath,
+    "--secret-key",
+    secrets[0]!,
+    `--service-account-key=${secrets[1]}`,
+    `--auth-header:${secrets[2]}`,
+    "--service-auth",
+    secrets[3]!,
+    "--bearer",
+    secrets[4]!,
+    "--credentials",
+    secrets[5]!,
+    "-vk",
+    secrets[6]!,
+    "-vvk",
+    secrets[7]!,
+    "－ｋ",
+    secrets[8]!,
+    `-vk${secrets[9]}`,
+  ];
+  const previousFakeLog = process.env.FAKE_LOG;
+  process.env.FAKE_LOG = logPath;
+  const running = runSupervisedTool(
+    one,
+    getTool("credentialgrammar"),
+    credentialArgs(initialSecrets),
+    { stdio: "ignore", restartDelayMs: 25 },
+  );
+
+  try {
+    await waitFor(() => (existsSync(supervisorSocketPath("credentialgrammar")) ? true : undefined));
+    await waitFor(() =>
+      readLog(logPath).find((entry) =>
+        initialSecrets.every((secret) => entry.args.some((arg) => arg.includes(secret))),
+      ),
+    );
+    const initialPublic = JSON.stringify({
+      persisted: readFileSync(supervisorStatePath("credentialgrammar"), "utf8"),
+      status: await sendSupervisorRequest("credentialgrammar", { type: "status" }),
+      read: readSupervisorState("credentialgrammar"),
+    });
+    for (const secret of initialSecrets) expect(initialPublic).not.toContain(secret);
+
+    const response = await sendSupervisorRequest("credentialgrammar", {
+      type: "switch_profile",
+      name: two.name,
+      resume: false,
+      args: credentialArgs(switchedSecrets),
+    });
+    const responseJson = JSON.stringify(response);
+    for (const secret of switchedSecrets) expect(responseJson).not.toContain(secret);
+    await waitFor(() =>
+      readLog(logPath).find((entry) =>
+        switchedSecrets.every((secret) => entry.args.some((arg) => arg.includes(secret))),
+      ),
+    );
+    const switchedPublic = JSON.stringify({
+      persisted: readFileSync(supervisorStatePath("credentialgrammar"), "utf8"),
+      status: await sendSupervisorRequest("credentialgrammar", { type: "status" }),
+      read: readSupervisorState("credentialgrammar"),
+    });
+    for (const secret of switchedSecrets) expect(switchedPublic).not.toContain(secret);
+
+    await sendSupervisorRequest("credentialgrammar", { type: "stop" });
+    expect(await running).toBe(0);
+  } finally {
+    process.env.FAKE_LOG = previousFakeLog;
+    await sendSupervisorRequest(
+      "credentialgrammar",
+      { type: "stop" },
+      { allowMissing: true },
+    ).catch(() => undefined);
+  }
+});
+
 test("legacy supervisor state is redacted defensively when read", () => {
   mkdirSync(dirname(supervisorStatePath("codewith")), { recursive: true });
   writeFileSync(
     supervisorStatePath("codewith"),
-    JSON.stringify({
-      version: 1,
-      tool: "codewith",
-      profile: "one",
-      pid: 123,
-      socketPath: supervisorSocketPath("codewith"),
-      command: ["codewith", "--webhookCredential", "legacy-supervisor-secret"],
-      args: ["--passphrase", "legacy-unknown-args-secret"],
-      lastError: "oauth.key=legacy-last-error-secret",
-      custom: { "session key": "legacy-custom-secret" },
-      startedAt: "2026-07-27T00:00:00.000Z",
-      updatedAt: "2026-07-27T00:00:00.000Z",
-    }),
+    `{
+      "version": 1,
+      "tool": "codewith",
+      "profile": "one",
+      "pid": 123,
+      "socketPath": ${JSON.stringify(supervisorSocketPath("codewith"))},
+      "command": ["codewith", "--webhookCredential", "legacy-supervisor-secret"],
+      "args": ["--passphrase", "legacy-unknown-args-secret"],
+      "lastError": "oauth.key=legacy-last-error-secret",
+      "custom": { "session key": "legacy-custom-secret" },
+      "startedAt": "2026-07-27T00:00:00.000Z",
+      "updatedAt": "2026-07-27T00:00:00.000Z",
+      "prelaunch": {
+        "supported": true,
+        "required": true,
+        "status": "ok",
+        "reasons": ["keep-reason"],
+        "manifest": {
+          "path": "/safe/manifest.json",
+          "exists": true,
+          "sourceIds": ["global-codewith"],
+          "sourceCount": 1,
+          "sourceIdsTruncated": false,
+          "drift": "ok",
+          "reasons": [],
+          "unknownCredential": "legacy-prelaunch-secret",
+          "__proto__": { "credentials": "legacy-prototype-secret" }
+        },
+        "unknownCredential": "legacy-prelaunch-top-secret"
+      }
+    }`,
   );
 
   const state = readSupervisorState("codewith");
@@ -370,14 +507,132 @@ test("legacy supervisor state is redacted defensively when read", () => {
   expect(state).not.toHaveProperty("args");
   expect(state).not.toHaveProperty("lastError");
   expect(state).not.toHaveProperty("custom");
+  expect(state?.prelaunch).not.toHaveProperty("unknownCredential");
+  expect(state?.prelaunch?.manifest).not.toHaveProperty("unknownCredential");
+  expect(Object.hasOwn(state?.prelaunch?.manifest ?? {}, "__proto__")).toBe(false);
   for (const secret of [
     "legacy-supervisor-secret",
     "legacy-unknown-args-secret",
     "legacy-last-error-secret",
     "legacy-custom-secret",
+    "legacy-prelaunch-secret",
+    "legacy-prelaunch-top-secret",
+    "legacy-prototype-secret",
   ]) {
     expect(JSON.stringify(state)).not.toContain(secret);
   }
+});
+
+test("supervisor refuses symlinked ACCOUNTS_HOME without touching the target", async () => {
+  const originalHome = home;
+  const scriptPath = join(originalHome, "symlink-home-child.mjs");
+  writeFileSync(scriptPath, "process.exit(0);\n");
+  addCustomTool({
+    id: "symlinkhome",
+    label: "Symlink Home",
+    envVar: "SYMLINK_HOME",
+    defaultDir: join(originalHome, "symlink-home-default"),
+    bin: process.execPath,
+  });
+  const profile = addProfile({ name: "one", tool: "symlinkhome" });
+  const outside = join(originalHome, "outside-home");
+  const linkedHome = join(originalHome, "linked-home");
+  mkdirSync(join(outside, "supervisors"), { recursive: true, mode: 0o755 });
+  writeFileSync(join(outside, "accounts.json"), readFileSync(join(originalHome, "accounts.json")));
+  const sentinel = join(outside, "supervisors", "symlinkhome.sock");
+  writeFileSync(sentinel, "outside-sentinel");
+  symlinkSync(outside, linkedHome, "dir");
+  process.env.ACCOUNTS_HOME = linkedHome;
+
+  try {
+    await expect(
+      runSupervisedTool(profile, getTool("symlinkhome"), [scriptPath], { stdio: "ignore" }),
+    ).rejects.toThrow(/symlink|boundary/i);
+    expect(readFileSync(sentinel, "utf8")).toBe("outside-sentinel");
+    expect(statSync(join(outside, "supervisors")).mode & 0o777).toBe(0o755);
+  } finally {
+    process.env.ACCOUNTS_HOME = originalHome;
+  }
+});
+
+test("supervisor refuses a symlinked supervisors component without touching the target", async () => {
+  const scriptPath = join(home, "symlink-supervisors-child.mjs");
+  writeFileSync(scriptPath, "process.exit(0);\n");
+  addCustomTool({
+    id: "symlinkdir",
+    label: "Symlink Directory",
+    envVar: "SYMLINK_DIR_HOME",
+    defaultDir: join(home, "symlink-dir-default"),
+    bin: process.execPath,
+  });
+  const profile = addProfile({ name: "one", tool: "symlinkdir" });
+  const outside = join(home, "outside-supervisors");
+  const supervisors = dirname(supervisorSocketPath("symlinkdir"));
+  mkdirSync(outside, { mode: 0o755 });
+  const sentinel = join(outside, "symlinkdir.sock");
+  writeFileSync(sentinel, "outside-sentinel");
+  symlinkSync(outside, supervisors, "dir");
+
+  await expect(
+    runSupervisedTool(profile, getTool("symlinkdir"), [scriptPath], { stdio: "ignore" }),
+  ).rejects.toThrow(/symlink|boundary/i);
+  expect(readFileSync(sentinel, "utf8")).toBe("outside-sentinel");
+  expect(statSync(outside).mode & 0o777).toBe(0o755);
+});
+
+test("supervisor refuses to unlink a non-socket control path", async () => {
+  const scriptPath = join(home, "socket-type-child.mjs");
+  writeFileSync(scriptPath, "process.exit(0);\n");
+  addCustomTool({
+    id: "sockettype",
+    label: "Socket Type",
+    envVar: "SOCKET_TYPE_HOME",
+    defaultDir: join(home, "socket-type-default"),
+    bin: process.execPath,
+  });
+  const profile = addProfile({ name: "one", tool: "sockettype" });
+  const socketPath = supervisorSocketPath("sockettype");
+  mkdirSync(dirname(socketPath), { recursive: true });
+  const statePath = supervisorStatePath("sockettype");
+  writeFileSync(statePath, "state-sentinel");
+  writeFileSync(socketPath, "not-a-socket");
+
+  await expect(
+    runSupervisedTool(profile, getTool("sockettype"), [scriptPath], { stdio: "ignore" }),
+  ).rejects.toThrow(/non-socket|control path/i);
+  expect(readFileSync(statePath, "utf8")).toBe("state-sentinel");
+  expect(readFileSync(socketPath, "utf8")).toBe("not-a-socket");
+});
+
+test("supervisor revalidates its filesystem boundary after prelaunch", async () => {
+  if (process.platform === "win32") return;
+
+  const scriptPath = join(home, "boundary-swap-child.mjs");
+  writeFileSync(scriptPath, "process.exit(0);\n");
+  const profile = addProfile({ name: "one", tool: "codewith" });
+  const tool = { ...getTool("codewith"), bin: process.execPath };
+  const supervisors = dirname(supervisorSocketPath("codewith"));
+  const held = join(home, "held-supervisors");
+  const outside = join(home, "outside-boundary");
+  mkdirSync(outside);
+  const sentinel = join(outside, "codewith.json");
+
+  const running = runSupervisedTool(profile, tool, [scriptPath], {
+    stdio: "ignore",
+    configsPrelaunch: {
+      mode: "apply",
+      runner: () => {
+        writeManifest(profile);
+        renameSync(supervisors, held);
+        writeFileSync(sentinel, "outside-sentinel");
+        symlinkSync(outside, supervisors, "dir");
+        return { status: 0, stdout: Buffer.from("ok"), stderr: Buffer.from("") };
+      },
+    },
+  });
+
+  await expect(running).rejects.toThrow(/symlink|boundary|changed/i);
+  expect(readFileSync(sentinel, "utf8")).toBe("outside-sentinel");
 });
 
 test("supervisor public switch response is a strict safe DTO and filesystem is owner-only", async () => {
@@ -395,9 +650,10 @@ test("supervisor public switch response is a strict safe DTO and filesystem is o
 
   const envSecret = "supervisor-extra-env-secret";
   const argSecret = "supervisor-short-arg-secret";
+  const labelSecret = "supervisor-caller-label-secret";
   addCustomTool({
     id: "safedto",
-    label: "Safe DTO",
+    label: labelSecret,
     envVar: "SAFE_DTO_HOME",
     extraEnv: { SERVICE_API_KEY: envSecret },
     defaultDir: join(home, "safe-dto-default"),
@@ -435,17 +691,18 @@ test("supervisor public switch response is a strict safe DTO and filesystem is o
     const publicJson = JSON.stringify(response);
     expect(publicJson).not.toContain(argSecret);
     expect(publicJson).not.toContain(envSecret);
+    expect(publicJson).not.toContain(labelSecret);
     const publicResult = response?.ok && "queued" in response ? response.result : undefined;
     expect(publicResult).toEqual({
       schema: "hasna.accounts.switch-output/v1",
       profile: { name: "two", tool: "safedto" },
-      tool: { id: "safedto", label: "Safe DTO" },
+      tool: { id: "safedto", label: "Custom tool" },
       applied: false,
       active: true,
       command: [process.execPath, scriptPath, "-k", "[REDACTED]"],
       commandLine: publicResult?.commandLine,
       restartRequired: false,
-      message: "two is now the active Safe DTO profile",
+      message: "two is now the active Custom tool profile",
     });
     expect(publicResult?.commandLine).toContain("'-k' '[REDACTED]'");
     expect(response?.ok && "queued" in response ? response.result : undefined).not.toHaveProperty("env");

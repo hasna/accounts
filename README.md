@@ -152,7 +152,9 @@ credential-bearing header.
 Credential keys are classified through one separator/camel-case-aware policy,
 so dot-, space-, separator-, and camel-case forms such as `oauth.key`,
 `oauth key`, `oauth_token`, `consumerSecret`, `sessionKey`, and
-`webhookCredential`
+`webhookCredential`, plus stemmed forms such as `credentials`,
+`secret-key`, `service-account-key`, `auth-header`, `service-auth`, and
+`bearer`,
 receive the same treatment without matching benign names such as
 `tokenBucket` or `passwordless`. Valid JSON is redacted recursively after
 decoding escaped keys, while malformed serialized fragments remain
@@ -160,15 +162,25 @@ fail-closed. Supervisor child arguments stay raw only for the immediate spawn;
 persisted state, restart responses, legacy state reads, and text/JSON status
 surfaces store or return argument-aware redacted command arrays. Long options
 using `=`, `:`, or a following value and the supported short `-k` forms share
-that policy.
+that policy. Combined short clusters ending in `k` and compatibility-normalized
+Unicode dash/letter forms are treated as credential options too.
 
 Switch output is an explicit `hasna.accounts.switch-output/v1` DTO. It exposes
 only bounded profile/tool identifiers, status booleans, a redacted command and
 handoff line, and the user-facing message; internal profile metadata, tool
 configuration, environment maps, and export scripts do not cross that output
-boundary. Raw arguments and environment values remain available only to the
-immediate provider spawn. Unix supervisor directories, state files, and sockets
-are owner-only (`0700`, `0600`, and `0600`).
+boundary. Built-in labels come from the package-owned registry; caller-defined
+tool labels are represented as the opaque `Custom tool` label on switch and
+supervisor output. Raw arguments and environment values remain available only
+to the immediate provider spawn. Legacy prelaunch state is projected through
+its explicit schema rather than recursively copying unknown fields, and public
+recursive redaction uses prototype-safe objects.
+
+Unix supervisor directories, state files, and sockets are owner-only (`0700`,
+`0600`, and `0600`). Accounts refuses symlinked `ACCOUNTS_HOME` or supervisor
+components, refuses non-socket control-path replacement, snapshots directory
+identity, and revalidates the boundary before state writes, unlinks, chmods,
+listens, provider spawn, and post-prelaunch persistence.
 
 Printed POSIX handoffs validate every environment-variable name, single-quote
 every value and command word without expansion, and place an explicit `env --`

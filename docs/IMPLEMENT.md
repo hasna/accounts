@@ -91,12 +91,16 @@ stdout are separated by a record boundary before line bounding and redaction.
 This keeps provably independent records visible without repeated suffix scans,
 fusing process streams, or exposing malformed folds.
 Credential-key classification is centralized and normalizes separators and
-camel case, including dot and space boundaries, before applying terminal
-semantic tokens. Valid JSON documents are walked recursively after JSON key
-escape decoding; escaped and single-quoted keys in malformed serialized
-fragments use the same fail-closed record boundary. Argument redaction handles
-credential-bearing long options separated by `=`, `:`, or the next argv item,
-plus the supported `-k value` and `-kvalue` forms.
+camel case, including dot and space boundaries, before applying stemmed
+terminal semantic tokens. This includes `credentials`, `secret-key`,
+`service-account-key`, `auth-header`, `service-auth`, and `bearer` without
+turning benign suffixes such as `credential-provider` into credentials. Valid
+JSON documents are walked recursively after JSON key escape decoding; escaped
+and single-quoted keys in malformed serialized fragments use the same
+fail-closed record boundary. Argument redaction handles credential-bearing long
+options separated by `=`, `:`, or the next argv item, the supported `-k value`
+and `-kvalue` forms, combined clusters ending in `k`, and Unicode compatibility
+forms of the short option.
 
 `src/lib/switch.ts` separates the internal `SwitchResult`, which may contain
 raw launch material, from the explicit public
@@ -106,14 +110,22 @@ command/handoff data, and message. Environment maps, export scripts, complete
 profiles, and complete tool definitions remain internal. The supervisor client
 also projects socket responses rather than trusting unknown fields, and legacy
 state parsing constructs the current schema field by field instead of spreading
-persisted data.
+persisted data. Nested prelaunch state has its own explicit allowlist, recursive
+redaction allocates null-prototype objects, and caller-defined tool labels are
+represented by an opaque `Custom tool` label rather than reflected into public
+switch or supervisor messages.
 
 Supervisor arguments remain raw only in memory long enough to spawn the
 provider child. State files, legacy-state reads, switch responses, and
 live/stale status output all use argument-aware redaction before data leaves
 that boundary. On Unix, the supervisor directory is forced to `0700` and its
 state file and control socket to `0600`, including when `ACCOUNTS_HOME` points
-at a pre-existing permissive directory.
+at a pre-existing permissive directory. Every existing directory component is
+checked with `lstat`; symlinked Accounts or supervisor roots and non-socket
+control leaves are refused before chmod, unlink, write, connect, or listen.
+The supervisor snapshots real paths and directory identities, revalidates them
+after prelaunch and before provider spawn/persistence, and uses a no-follow
+temporary state file plus fsync and rename so a changed boundary fails closed.
 
 ## Apply safety
 
