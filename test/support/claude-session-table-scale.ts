@@ -36,12 +36,29 @@ const identity = {
   uuid: "00000000-0000-4000-8000-000000000000",
   sourcePath: "/profiles/bulk/projects/-bulk/session.jsonl",
 };
+const representations = [
+  {
+    ownerProfile: "bulk",
+    profileIdentity: "/profiles/bulk",
+    profilePath: "/profiles/bulk",
+    catalogRefAlias: "claude-session:v1:bulk",
+  },
+];
 
 function entry(index: number): ClaudeSessionCatalogEntry {
   const uuid = `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+  const sourcePath = `/profiles/bulk/projects/-bulk/${uuid}.jsonl`;
   return {
     identity,
-    catalogRef: `claude-session:v1:${index}`,
+    storageIdentity: {
+      profilePath: "/profiles/bulk",
+      encodedProject: "-bulk",
+      uuid,
+      sourcePath,
+    },
+    catalogRef: `claude-session:v2:${index}`,
+    catalogRefAliases: [],
+    representations,
     ownerProfile: "bulk",
     profileIdentity: "/profiles/bulk",
     profilePath: "/profiles/bulk",
@@ -49,7 +66,7 @@ function entry(index: number): ClaudeSessionCatalogEntry {
     projectIdentity: "/repo-bulk",
     cwd: "/repo-bulk",
     uuid,
-    sourcePath: `/profiles/bulk/projects/-bulk/${uuid}.jsonl`,
+    sourcePath,
     sessionIdCheck: "bounded-match",
     sizeBytes: index,
     updatedAt: "2026-01-01T00:00:00.000Z",

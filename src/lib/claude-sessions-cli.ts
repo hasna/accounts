@@ -91,7 +91,14 @@ function pad(value: string, width: number): string {
 export function formatClaudeSessionTable(entries: readonly ClaudeSessionCatalogEntry[]): string {
   if (entries.length === 0) return "no Claude sessions found.";
   const rows = entries.map((entry) => ({
-    OWNER: truncate(printable(entry.ownerProfile), 20),
+    OWNER: truncate(
+      printable(
+        [...new Set(entry.representations.map((representation) => representation.ownerProfile))]
+          .sort()
+          .join(","),
+      ),
+      20,
+    ),
     PROJECT: truncate(printable(entry.cwd ?? entry.encodedProject), 40),
     UUID: entry.uuid,
     UPDATED: entry.updatedAt.slice(0, 19).replace("T", " "),
@@ -189,7 +196,7 @@ function warnSkipped(skipped: readonly ClaudeSessionScanSkip[]): void {
   if (skipped.length === 0) return;
   console.error(
     chalk.yellow(
-      `warning: ${skipped.length} source path(s) could not be represented and are missing from this catalog`,
+      `warning: ${skipped.length} source root/path(s) could not be represented and are missing from this catalog`,
     ),
   );
   for (const skip of skipped.slice(0, MAX_REPORTED_SKIPS)) {

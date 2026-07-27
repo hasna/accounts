@@ -10,8 +10,8 @@ import {
   type Dirent,
   type Stats,
 } from "node:fs";
-import { basename, isAbsolute, join, resolve } from "node:path";
-import type { Profile } from "../types.js";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { AccountsError, type Profile } from "../types.js";
 import { profilesDir } from "../storage.js";
 import { getTool } from "./tools.js";
 
@@ -42,10 +42,35 @@ export interface ClaudeSessionIdentity {
   sourcePath: string;
 }
 
+/** Canonical on-disk coordinates that identify one session independently of Accounts metadata. */
+export interface ClaudeSessionStorageIdentity {
+  profilePath: string;
+  encodedProject: string;
+  uuid: string;
+  sourcePath: string;
+}
+
+/** One Accounts registry record that represents the canonical session storage root. */
+export interface ClaudeSessionProfileRepresentation {
+  ownerProfile: string;
+  profileIdentity: string;
+  profilePath: string;
+  /** Exact reference shape emitted by the landed v1 catalog for this representation. */
+  catalogRefAlias: string;
+}
+
 export interface ClaudeSessionCatalogEntry {
+  /** Backward-compatible primary representation plus canonical source coordinates. */
   identity: ClaudeSessionIdentity;
-  /** Opaque, globally unique reference derived only from canonical source coordinates. */
+  /** Canonical storage/session tuple used by the opaque reference. */
+  storageIdentity: ClaudeSessionStorageIdentity;
+  /** Opaque reference derived only from immutable canonical storage coordinates. */
   catalogRef: string;
+  /** Deterministic legacy v1 references accepted as aliases for this entry. */
+  catalogRefAliases: string[];
+  /** All sorted registry records that represent this one canonical source root. */
+  representations: ClaudeSessionProfileRepresentation[];
+  /** Deterministic primary display representation (the first item in `representations`). */
   ownerProfile: string;
   profileIdentity: string;
   profilePath: string;
@@ -70,7 +95,9 @@ export interface ClaudeSessionScanSkip {
     | "unstable-directory"
     | "unstable-session"
     | "invalid-profile-identity"
-    | "invalid-source-identity";
+    | "invalid-source-identity"
+    | "missing-profile-root"
+    | "untrusted-profile-root";
 }
 
 export interface ClaudeSessionCatalogOptions {
@@ -99,6 +126,13 @@ interface VerifiedProfileRoot {
   snapshot: DirectorySnapshot;
 }
 
+interface VerifiedStorageRoot {
+  dir: string;
+  profilePath: string;
+  snapshot: DirectorySnapshot;
+  representations: VerifiedProfileRoot[];
+}
+
 interface DirectorySnapshot {
   path: string;
   realPath: string;
@@ -124,6 +158,44 @@ type SessionObservation =
 
 const EXCLUDED: SessionObservation = { status: "excluded" };
 const UNSTABLE: SessionObservation = { status: "unstable" };
+
+/** Match either the canonical storage reference or one explicitly exposed legacy alias. */
+export function matchesClaudeSessionReference(
+  entry: ClaudeSessionCatalogEntry,
+  reference: string,
+): boolean {
+  return entry.catalogRef === reference || entry.catalogRefAliases.includes(reference);
+}
+
+/**
+ * Resolve a canonical/legacy catalog reference or an unambiguous bare UUID.
+ * Unknown legacy references fail closed; callers must never reinterpret them
+ * as a new transaction identity.
+ */
+export function resolveClaudeSessionReference(
+  entries: readonly ClaudeSessionCatalogEntry[],
+  referenceOrUuid: string,
+): ClaudeSessionCatalogEntry {
+  const uuidMatch = isClaudeSessionUuid(referenceOrUuid);
+  const matches = uuidMatch
+    ? entries.filter((entry) => entry.uuid === referenceOrUuid.toLowerCase())
+    : entries.filter((entry) => matchesClaudeSessionReference(entry, referenceOrUuid));
+  if (matches.length === 0) {
+    throw new AccountsError(
+      uuidMatch
+        ? "no Accounts-owned Claude session matches that UUID"
+        : "invalid or stale Claude session catalogRef",
+    );
+  }
+  if (matches.length > 1) {
+    throw new AccountsError(
+      uuidMatch
+        ? "Claude session UUID is ambiguous; use the opaque catalogRef from accounts sessions --json"
+        : "Claude session catalogRef is ambiguous; refresh the catalog before continuing",
+    );
+  }
+  return matches[0]!;
+}
 
 function safeResolve(path: string): string | undefined {
   if (!path || !isAbsolute(path) || path.includes("\0") || /[\r\n]/.test(path)) return undefined;
@@ -252,11 +324,39 @@ function readVerifiedDirectory(
   return undefined;
 }
 
+function hasPathTraversal(path: string): boolean {
+  return path.split(/[\\/]+/).some((part) => part === "..");
+}
+
+/** Return the stored direct-child name, rejecting traversal and nested roots. */
+function directChildName(parent: string, child: string): string | undefined {
+  const rel = relative(parent, child);
+  if (
+    !rel ||
+    rel === ".." ||
+    rel.startsWith(`..${sep}`) ||
+    isAbsolute(rel) ||
+    dirname(rel) !== "."
+  ) {
+    return undefined;
+  }
+  return rel;
+}
+
+function reportProfileRootSkip(
+  profile: Profile,
+  reason: "missing-profile-root" | "untrusted-profile-root",
+  onSkip?: ClaudeSessionCatalogOptions["onSkip"],
+  resolvedPath?: string,
+): void {
+  onSkip?.({ path: resolvedPath ?? profile.dir, reason });
+}
+
 /**
  * Accept only profile roots represented by Accounts on this machine:
- * the exact managed `profiles/claude/<owner>` path, or Claude's exact default
- * dir when a registry profile explicitly points at it. Cloud-stale `/Users`,
- * `/tmp`, and other foreign paths therefore never become discovery roots.
+ * the stored canonical direct child of `profiles/claude` (independent of the
+ * mutable profile name), or Claude's exact default dir. Cloud-stale, foreign,
+ * traversal, nested, and symlink roots are rejected and reported.
  */
 function verifyProfileRoot(
   profile: Profile,
@@ -266,30 +366,65 @@ function verifyProfileRoot(
 ): VerifiedProfileRoot | undefined {
   if (profile.tool !== "claude") return undefined;
   const dir = safeResolve(profile.dir);
-  if (!dir) return undefined;
-  const expectedManaged = resolve(managedRoot, "claude", profile.name);
-  const isManaged = samePath(dir, expectedManaged);
-  if (!isManaged && !samePath(dir, defaultRoot)) return undefined;
+  if (!dir || hasPathTraversal(profile.dir)) {
+    reportProfileRootSkip(profile, "untrusted-profile-root", onSkip, dir);
+    return undefined;
+  }
+  const managedClaudePath = resolve(managedRoot, "claude");
+  const managedChild = directChildName(managedClaudePath, dir);
+  const isDefault = samePath(dir, defaultRoot);
+  if (!managedChild && !isDefault) {
+    reportProfileRootSkip(profile, "untrusted-profile-root", onSkip, dir);
+    return undefined;
+  }
+
+  const rootStat = lstatNoThrow(dir);
+  if (!rootStat) {
+    reportProfileRootSkip(profile, "missing-profile-root", onSkip, dir);
+    return undefined;
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    reportProfileRootSkip(profile, "untrusted-profile-root", onSkip, dir);
+    return undefined;
+  }
+
   let managedClaudeSnapshot: DirectorySnapshot | undefined;
-  if (isManaged) {
+  if (managedChild) {
     const managedSnapshot = snapshotDirectory(managedRoot);
-    const claudeSnapshot = snapshotDirectory(resolve(managedRoot, "claude"));
+    const claudeSnapshot = snapshotDirectory(managedClaudePath);
     if (
       !managedSnapshot ||
       !claudeSnapshot ||
       !samePath(claudeSnapshot.realPath, join(managedSnapshot.realPath, "claude"))
     ) {
+      reportProfileRootSkip(profile, "untrusted-profile-root", onSkip, dir);
       return undefined;
     }
     managedClaudeSnapshot = claudeSnapshot;
   }
   const snapshot = snapshotDirectory(dir);
-  if (!snapshot) return undefined;
+  if (!snapshot) {
+    reportProfileRootSkip(profile, "untrusted-profile-root", onSkip, dir);
+    return undefined;
+  }
   if (
     managedClaudeSnapshot &&
     (!unchangedDirectory(managedClaudeSnapshot) ||
-      !samePath(snapshot.realPath, join(managedClaudeSnapshot.realPath, profile.name)))
+      !samePath(snapshot.realPath, join(managedClaudeSnapshot.realPath, managedChild!)))
   ) {
+    reportProfileRootSkip(profile, "untrusted-profile-root", onSkip, dir);
+    return undefined;
+  }
+
+  // Scan through the canonical path so registry spelling and record order can
+  // never affect source paths, references, or serialized output.
+  const canonicalSnapshot = snapshotDirectory(snapshot.realPath);
+  if (
+    !canonicalSnapshot ||
+    !samePath(canonicalSnapshot.realPath, snapshot.realPath) ||
+    !sameDirectory(canonicalSnapshot.stat, snapshot.stat)
+  ) {
+    reportProfileRootSkip(profile, "untrusted-profile-root", onSkip, dir);
     return undefined;
   }
   const profileIdentity = profile.identity ?? snapshot.realPath;
@@ -300,9 +435,9 @@ function verifyProfileRoot(
   return {
     ownerProfile: profile.name,
     profileIdentity,
-    dir,
+    dir: canonicalSnapshot.path,
     profilePath: snapshot.realPath,
-    snapshot,
+    snapshot: canonicalSnapshot,
   };
 }
 
@@ -547,7 +682,12 @@ function observeSession(
 }
 
 function matchesFilters(entry: ClaudeSessionCatalogEntry, options: ClaudeSessionCatalogOptions): boolean {
-  if (options.profile && entry.ownerProfile !== options.profile) return false;
+  if (
+    options.profile &&
+    !entry.representations.some((representation) => representation.ownerProfile === options.profile)
+  ) {
+    return false;
+  }
   if (options.uuid && entry.uuid !== options.uuid.toLowerCase()) return false;
   const projectFilter = options.project ? (canonicalCwd(options.project) ?? options.project) : undefined;
   if (
@@ -575,8 +715,18 @@ function encodeCatalogParts(parts: readonly string[]): string | undefined {
   return parts.map((part) => encodeURIComponent(part)).join(":");
 }
 
-function catalogRef(
-  ownerProfile: string,
+function canonicalCatalogRef(
+  profilePath: string,
+  encodedProject: string,
+  uuid: string,
+  sourcePath: string,
+): string | undefined {
+  const encoded = encodeCatalogParts([profilePath, encodedProject, uuid, sourcePath]);
+  return encoded === undefined ? undefined : `claude-session:v2:${encoded}`;
+}
+
+/** Exact reference algorithm landed in PR #22. */
+function legacyCatalogRef(
   profileIdentity: string,
   profilePath: string,
   encodedProject: string,
@@ -584,23 +734,80 @@ function catalogRef(
   sourcePath: string,
 ): string | undefined {
   const encoded = encodeCatalogParts([
-    ownerProfile,
     profileIdentity,
     profilePath,
     encodedProject,
     uuid,
     sourcePath,
   ]);
-  return encoded === undefined ? undefined : `claude-session:v2:${encoded}`;
+  return encoded === undefined ? undefined : `claude-session:v1:${encoded}`;
 }
 
-/** Stable identity of one registry representation of a canonical profile root. */
-function representedProfileRef(profile: VerifiedProfileRoot): string | undefined {
-  return encodeCatalogParts([
-    profile.ownerProfile,
-    profile.profileIdentity,
-    profile.profilePath,
-  ]);
+function compareVerifiedProfiles(a: VerifiedProfileRoot, b: VerifiedProfileRoot): number {
+  return (
+    compareText(a.ownerProfile, b.ownerProfile) ||
+    compareText(a.profileIdentity, b.profileIdentity) ||
+    compareText(a.profilePath, b.profilePath)
+  );
+}
+
+/** Group every deterministic account representation by one canonical storage root. */
+function verifiedStorageRoots(
+  profiles: readonly Profile[],
+  managedRoot: string,
+  defaultRoot: string,
+  onSkip?: ClaudeSessionCatalogOptions["onSkip"],
+): VerifiedStorageRoot[] {
+  const orderedProfiles = [...profiles].sort(
+    (a, b) =>
+      compareText(a.tool, b.tool) ||
+      compareText(a.name, b.name) ||
+      compareText(a.dir, b.dir) ||
+      compareText(a.identity ?? "", b.identity ?? "") ||
+      compareText(a.createdAt, b.createdAt),
+  );
+  const roots = new Map<string, VerifiedStorageRoot>();
+  const representationRefs = new Map<string, Set<string>>();
+
+  for (const profile of orderedProfiles) {
+    const verified = verifyProfileRoot(profile, managedRoot, defaultRoot, onSkip);
+    if (!verified) continue;
+    const representationRef = encodeCatalogParts([
+      verified.ownerProfile,
+      verified.profileIdentity,
+      verified.profilePath,
+    ]);
+    if (!representationRef) {
+      onSkip?.({ path: verified.profilePath, reason: "invalid-source-identity" });
+      continue;
+    }
+
+    const rootKey = comparablePath(verified.profilePath);
+    const existing = roots.get(rootKey);
+    if (!existing) {
+      roots.set(rootKey, {
+        dir: verified.dir,
+        profilePath: verified.profilePath,
+        snapshot: verified.snapshot,
+        representations: [verified],
+      });
+      representationRefs.set(rootKey, new Set([representationRef]));
+      continue;
+    }
+
+    const refs = representationRefs.get(rootKey)!;
+    if (!refs.has(representationRef)) {
+      refs.add(representationRef);
+      existing.representations.push(verified);
+    }
+  }
+
+  return [...roots.values()]
+    .map((root) => ({
+      ...root,
+      representations: root.representations.sort(compareVerifiedProfiles),
+    }))
+    .sort((a, b) => compareText(a.profilePath, b.profilePath));
 }
 
 /**
@@ -629,18 +836,14 @@ export function listClaudeSessions(
   const maxBytes = options.metadataMaxBytes ?? CLAUDE_SESSION_METADATA_MAX_BYTES;
   const maxLines = options.metadataMaxLines ?? CLAUDE_SESSION_METADATA_MAX_LINES;
   const results: ClaudeSessionCatalogEntry[] = [];
-  const representedProfiles = new Set<string>();
+  const storageRoots = verifiedStorageRoots(
+    profiles,
+    managedRoot,
+    defaultRoot,
+    options.onSkip,
+  );
 
-  for (const profile of profiles) {
-    const verified = verifyProfileRoot(profile, managedRoot, defaultRoot, options.onSkip);
-    if (!verified) continue;
-    const profileRef = representedProfileRef(verified);
-    if (!profileRef) {
-      options.onSkip?.({ path: verified.profilePath, reason: "invalid-source-identity" });
-      continue;
-    }
-    if (representedProfiles.has(profileRef)) continue;
-    representedProfiles.add(profileRef);
+  for (const verified of storageRoots) {
     const projectsPath = join(verified.dir, "projects");
     const projects = readVerifiedDirectory(projectsPath, verified.snapshot);
     if (!projects) {
@@ -679,9 +882,7 @@ export function listClaudeSessions(
         }
         const { cwd, sessionIdCheck, sourcePath } = observation.metadata;
         const projectIdentity = cwd ?? `encoded:${encodedProject}`;
-        const reference = catalogRef(
-          verified.ownerProfile,
-          verified.profileIdentity,
+        const reference = canonicalCatalogRef(
           verified.profilePath,
           encodedProject,
           uuid,
@@ -691,19 +892,56 @@ export function listClaudeSessions(
           options.onSkip?.({ path: candidatePath, reason: "invalid-source-identity" });
           continue;
         }
+        const representations: ClaudeSessionProfileRepresentation[] = [];
+        let invalidRepresentation = false;
+        for (const represented of verified.representations) {
+          const alias = legacyCatalogRef(
+            represented.profileIdentity,
+            verified.profilePath,
+            encodedProject,
+            uuid,
+            sourcePath,
+          );
+          if (!alias) {
+            invalidRepresentation = true;
+            break;
+          }
+          representations.push({
+            ownerProfile: represented.ownerProfile,
+            profileIdentity: represented.profileIdentity,
+            profilePath: verified.profilePath,
+            catalogRefAlias: alias,
+          });
+        }
+        if (invalidRepresentation || representations.length === 0) {
+          options.onSkip?.({ path: candidatePath, reason: "invalid-source-identity" });
+          continue;
+        }
+        const primary = representations[0]!;
+        const catalogRefAliases = [
+          ...new Set(representations.map((representation) => representation.catalogRefAlias)),
+        ].sort(compareText);
         const entry: ClaudeSessionCatalogEntry = {
           identity: {
-            ownerProfile: verified.ownerProfile,
-            profileIdentity: verified.profileIdentity,
+            ownerProfile: primary.ownerProfile,
+            profileIdentity: primary.profileIdentity,
             profilePath: verified.profilePath,
             encodedProject,
             projectIdentity,
             uuid,
             sourcePath,
           },
+          storageIdentity: {
+            profilePath: verified.profilePath,
+            encodedProject,
+            uuid,
+            sourcePath,
+          },
           catalogRef: reference,
-          ownerProfile: verified.ownerProfile,
-          profileIdentity: verified.profileIdentity,
+          catalogRefAliases,
+          representations,
+          ownerProfile: primary.ownerProfile,
+          profileIdentity: primary.profileIdentity,
           profilePath: verified.profilePath,
           encodedProject,
           projectIdentity,
@@ -724,6 +962,7 @@ export function listClaudeSessions(
       compareText(a.ownerProfile, b.ownerProfile) ||
       compareText(a.projectIdentity, b.projectIdentity) ||
       compareText(a.uuid, b.uuid) ||
+      compareText(a.catalogRef, b.catalogRef) ||
       compareText(a.sourcePath, b.sourcePath),
   );
 }
