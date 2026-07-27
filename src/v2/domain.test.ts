@@ -185,4 +185,64 @@ describe("v2 domain boundary", () => {
     expect(overlay.get(firstScope, first.id)?.generation).toBe(3);
     expect(overlay.get(secondScope, second.id)?.generation).toBe(2);
   });
+
+  test("machine binding ingress and every egress view cannot mutate overlay state", () => {
+    const scope = registryScopeSchema.parse({ tenantId, scopeId });
+    const input = machineBindingSchema.parse({
+      id: "binding_00000000001",
+      ...scope,
+      accountId,
+      runtimeId,
+      machineId: "machine_00000000001",
+      rootPath: "/machines/original/accounts/work",
+      credentialRef: "vault:original",
+      authentication: "authenticated",
+      generation: 1,
+    });
+    const overlay = new MachineBindingOverlay(input.machineId);
+    const inserted = overlay.put(scope, input);
+    overlay.setCurrent(scope, input.runtimeId, input.id);
+    overlay.setApplied(scope, input.runtimeId, input.id);
+
+    const fetched = overlay.get(scope, input.id);
+    const accountBindings = overlay.forAccount(scope, input.accountId);
+    expect(Object.isFrozen(accountBindings)).toBe(true);
+    expect(inserted).not.toBe(fetched);
+    expect(fetched).not.toBe(overlay.get(scope, input.id));
+    const views = [
+      inserted,
+      fetched,
+      accountBindings[0],
+      overlay.current(scope, input.runtimeId),
+      overlay.applied(scope, input.runtimeId),
+    ];
+    for (const view of views) {
+      if (!view) throw new Error("expected binding view");
+      expect(Object.isFrozen(view)).toBe(true);
+      expect(() =>
+        Object.assign(view as Record<string, unknown>, {
+          tenantId: "tenant_000000000099",
+          scopeId: "scope_000000000099",
+          accountId: "account_00000000099",
+          rootPath: "/foreign/root",
+          credentialRef: "vault:foreign",
+        }),
+      ).toThrow();
+    }
+
+    Object.assign(input as unknown as Record<string, unknown>, {
+      id: "binding_00000000099",
+      tenantId: "tenant_000000000099",
+      rootPath: "/foreign/input-root",
+      credentialRef: "vault:foreign-input",
+    });
+    expect(overlay.get(scope, "binding_00000000001")).toMatchObject({
+      tenantId,
+      scopeId,
+      accountId,
+      rootPath: "/machines/original/accounts/work",
+      credentialRef: "vault:original",
+    });
+    expect(overlay.get(scope, input.id)).toBeNull();
+  });
 });

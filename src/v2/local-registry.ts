@@ -40,27 +40,31 @@ export class LocalAccountsRegistry implements AccountsRegistry {
 
   async listAccounts(scopeInput: RegistryScope): Promise<readonly Account[]> {
     const scope = registryScopeSchema.parse(scopeInput);
-    return [...this.accounts.values()]
-      .filter((account) => inScope(scope, account))
-      .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+    return Object.freeze(
+      [...this.accounts.values()]
+        .filter((account) => inScope(scope, account))
+        .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
+        .map(immutableAccount),
+    );
   }
 
   async getAccount(scopeInput: RegistryScope, accountIdInput: AccountId): Promise<Account | null> {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
-    return this.accounts.get(key(scope, accountId)) ?? null;
+    const account = this.accounts.get(key(scope, accountId));
+    return account ? immutableAccount(account) : null;
   }
 
   async createAccount(scopeInput: RegistryScope, accountInput: Account): Promise<Account> {
     const scope = registryScopeSchema.parse(scopeInput);
-    const account = accountSchema.parse(accountInput);
+    const account = immutableAccount(accountInput);
     assertEntityScope(scope, account);
     const accountKey = key(scope, account.id);
     if (this.accounts.has(accountKey)) {
       throw new RegistryConflictError(`account id "${account.id}" already exists in this scope`);
     }
     this.accounts.set(accountKey, account);
-    return account;
+    return immutableAccount(account);
   }
 
   async renameAccount(
@@ -77,56 +81,76 @@ export class LocalAccountsRegistry implements AccountsRegistry {
     });
     const current = this.accounts.get(key(scope, accountId));
     if (!current) throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
-    const renamed = accountSchema.parse({
+    const renamed = immutableAccount({
       ...current,
       name: rename.name,
       updatedAt: rename.updatedAt,
     });
     this.accounts.set(key(scope, accountId), renamed);
-    return renamed;
+    return immutableAccount(renamed);
   }
 
   async listRuntimes(scopeInput: RegistryScope): Promise<readonly Runtime[]> {
     const scope = registryScopeSchema.parse(scopeInput);
-    return [...this.runtimes.values()]
-      .filter((runtime) => inScope(scope, runtime))
-      .sort((a, b) => a.key.localeCompare(b.key) || a.id.localeCompare(b.id));
+    return Object.freeze(
+      [...this.runtimes.values()]
+        .filter((runtime) => inScope(scope, runtime))
+        .sort((a, b) => a.key.localeCompare(b.key) || a.id.localeCompare(b.id))
+        .map(immutableRuntime),
+    );
   }
 
   async getRuntime(scopeInput: RegistryScope, runtimeIdInput: RuntimeId): Promise<Runtime | null> {
     const scope = registryScopeSchema.parse(scopeInput);
     const runtimeId = runtimeIdSchema.parse(runtimeIdInput);
-    return this.runtimes.get(key(scope, runtimeId)) ?? null;
+    const runtime = this.runtimes.get(key(scope, runtimeId));
+    return runtime ? immutableRuntime(runtime) : null;
   }
 
   async registerRuntime(scopeInput: RegistryScope, runtimeInput: Runtime): Promise<Runtime> {
     const scope = registryScopeSchema.parse(scopeInput);
-    const runtime = runtimeSchema.parse(runtimeInput);
+    const runtime = immutableRuntime(runtimeInput);
     assertEntityScope(scope, runtime);
     const runtimeKey = key(scope, runtime.id);
     if (this.runtimes.has(runtimeKey)) {
       throw new RegistryConflictError(`runtime id "${runtime.id}" already exists in this scope`);
     }
     this.runtimes.set(runtimeKey, runtime);
-    return runtime;
+    return immutableRuntime(runtime);
   }
 
   snapshot(): { accounts: readonly Account[]; runtimes: readonly Runtime[] } {
-    return {
-      accounts: [...this.accounts.values()],
-      runtimes: [...this.runtimes.values()],
-    };
+    return Object.freeze({
+      accounts: Object.freeze([...this.accounts.values()].map(immutableAccount)),
+      runtimes: Object.freeze([...this.runtimes.values()].map(immutableRuntime)),
+    });
   }
 
   private seedAccount(input: Account): void {
-    const account = accountSchema.parse(input);
-    this.accounts.set(key(account, account.id), account);
+    const account = immutableAccount(input);
+    const accountKey = key(account, account.id);
+    if (this.accounts.has(accountKey)) {
+      throw new RegistryConflictError(`account id "${account.id}" already exists in this scope`);
+    }
+    this.accounts.set(accountKey, account);
   }
 
   private seedRuntime(input: Runtime): void {
-    const runtime = runtimeSchema.parse(input);
-    this.runtimes.set(key(runtime, runtime.id), runtime);
+    const runtime = immutableRuntime(input);
+    const runtimeKey = key(runtime, runtime.id);
+    if (this.runtimes.has(runtimeKey)) {
+      throw new RegistryConflictError(`runtime id "${runtime.id}" already exists in this scope`);
+    }
+    this.runtimes.set(runtimeKey, runtime);
   }
+}
+
+function immutableAccount(input: Account): Account {
+  return Object.freeze(accountSchema.parse(input));
+}
+
+function immutableRuntime(input: Runtime): Runtime {
+  return Object.freeze(runtimeSchema.parse(input));
 }
 
 function key(scope: RegistryScope, id: string): string {

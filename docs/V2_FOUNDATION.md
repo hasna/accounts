@@ -18,6 +18,15 @@ with real HTTP or PostgreSQL backends. Name uniqueness and runtime-association
 enforcement are intentionally deferred until the tenant-backfill and collision
 gates are complete.
 
+The process-local adapter and machine-binding overlay isolate their stored state
+from callers: constructor and write inputs are parsed into frozen snapshots, and
+every object or collection returned by read, write, or snapshot operations is a
+fresh frozen view. Duplicate scoped IDs in local constructor seeds fail instead
+of overwriting earlier entities. The HTTP adapter also treats responses as
+untrusted: exact lookups must return the requested identity, and rename
+responses must apply the requested new name and an advancing requested
+timestamp without changing immutable identity fields.
+
 The HTTP and PostgreSQL adapters are contract-first foundations for the later
 wire/schema migration slice. Both constrain every operation by tenant and
 scope. V2 DTOs omit arbitrary account metadata and reject or strip machine

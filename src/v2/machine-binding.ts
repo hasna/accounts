@@ -55,7 +55,7 @@ export class MachineBindingOverlay {
 
   put(scopeInput: ScopeRef, input: MachineBinding): MachineBinding {
     const scope = registryScopeSchema.parse(scopeInput);
-    const binding = machineBindingSchema.parse(input);
+    const binding = immutableBinding(input);
     assertEntityScope(scope, binding);
     if (binding.machineId !== this.machineId) {
       throw new Error("machine binding belongs to a different machine");
@@ -72,23 +72,28 @@ export class MachineBindingOverlay {
       throw new Error("binding identity fields are immutable");
     }
     this.bindings.set(bindingKey, binding);
-    return binding;
+    return immutableBinding(binding);
   }
 
   get(scopeInput: ScopeRef, bindingIdInput: BindingId): MachineBinding | null {
     const scope = registryScopeSchema.parse(scopeInput);
     const bindingId = bindingIdSchema.parse(bindingIdInput);
-    return this.bindings.get(scopedKey(scope, bindingId)) ?? null;
+    const binding = this.bindings.get(scopedKey(scope, bindingId));
+    return binding ? immutableBinding(binding) : null;
   }
 
   forAccount(scopeInput: ScopeRef, accountIdInput: AccountId): readonly MachineBinding[] {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
-    return [...this.bindings.values()].filter(
-      (binding) =>
-        binding.tenantId === scope.tenantId &&
-        binding.scopeId === scope.scopeId &&
-        binding.accountId === accountId,
+    return Object.freeze(
+      [...this.bindings.values()]
+        .filter(
+          (binding) =>
+            binding.tenantId === scope.tenantId &&
+            binding.scopeId === scope.scopeId &&
+            binding.accountId === accountId,
+        )
+        .map(immutableBinding),
     );
   }
 
@@ -135,4 +140,8 @@ export class MachineBindingOverlay {
 
 function scopedKey(scope: ScopeRef, id: string): string {
   return `${scope.tenantId}\0${scope.scopeId}\0${id}`;
+}
+
+function immutableBinding(input: MachineBinding): MachineBinding {
+  return Object.freeze(machineBindingSchema.parse(input));
 }

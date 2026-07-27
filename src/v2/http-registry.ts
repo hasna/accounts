@@ -94,6 +94,16 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     if (!current) {
       throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
     }
+    if (rename.name === current.name) {
+      throw new RegistryConflictError(
+        "requested account name must be different from the current name",
+      );
+    }
+    if (!timestampAdvances(current.updatedAt, rename.updatedAt)) {
+      throw new RegistryConflictError(
+        "requested updatedAt must advance the current account timestamp",
+      );
+    }
     const body = await this.request(scope, `/accounts/${encodeURIComponent(accountId)}/rename`, {
       method: "POST",
       body: rename,
@@ -101,6 +111,17 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     const renamed = accountSchema.parse(body);
     assertEntityScope(scope, renamed);
     assertSameAccountIdentity(current, renamed);
+    if (renamed.name !== rename.name) {
+      throw new RegistryConflictError("v2 registry rename response did not apply the requested name");
+    }
+    if (!timestampAdvances(current.updatedAt, renamed.updatedAt)) {
+      throw new RegistryConflictError("v2 registry rename response did not advance updatedAt");
+    }
+    if (Date.parse(renamed.updatedAt) !== Date.parse(rename.updatedAt)) {
+      throw new RegistryConflictError(
+        "v2 registry rename response did not apply the requested timestamp",
+      );
+    }
     return renamed;
   }
 
@@ -122,6 +143,11 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     if (body === null) return null;
     const runtime = runtimeSchema.parse(body);
     assertEntityScope(scope, runtime);
+    if (runtime.id !== runtimeId) {
+      throw new RegistryConflictError(
+        "v2 registry returned a different runtime identity for lookup",
+      );
+    }
     return runtime;
   }
 
@@ -173,7 +199,15 @@ export class HttpAccountsRegistry implements AccountsRegistry {
 }
 
 function assertSameAccountIdentity(expected: Account, actual: Account): void {
-  if (actual.id !== expected.id || actual.runtimeId !== expected.runtimeId) {
+  if (
+    actual.id !== expected.id ||
+    actual.runtimeId !== expected.runtimeId ||
+    Date.parse(actual.createdAt) !== Date.parse(expected.createdAt)
+  ) {
     throw new RegistryConflictError("v2 registry returned different immutable account identity fields");
   }
+}
+
+function timestampAdvances(current: string, next: string): boolean {
+  return Date.parse(next) > Date.parse(current);
 }

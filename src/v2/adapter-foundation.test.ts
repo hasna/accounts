@@ -200,6 +200,14 @@ describe("AccountsRegistry structural adapter foundation", () => {
       account(scopeA, "account_00000000001", runtime(scopeA, "02").id),
       /identity/,
     ],
+    [
+      "createdAt",
+      {
+        ...account(scopeA, "account_00000000001", runtime(scopeA, "01").id),
+        createdAt: "2026-07-27T09:00:00.000Z",
+      },
+      /identity/,
+    ],
   ])("HTTP rename rejects a response that changes immutable %s", async (_label, after, error) => {
     const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
     const methods: string[] = [];
@@ -230,6 +238,170 @@ describe("AccountsRegistry structural adapter foundation", () => {
       postgres.registry.renameAccount(scopeA, accountId, "renamed", "not-a-timestamp"),
     ).rejects.toThrow();
     expect(postgres.evidence()).toEqual([]);
+  });
+
+  test("local registry isolates constructor, write and every read view from caller mutation", async () => {
+    const seededRuntime = runtime(scopeA, "01");
+    const seededAccount = account(scopeA, "account_00000000001", seededRuntime.id);
+    const registry = new LocalAccountsRegistry({
+      runtimes: [seededRuntime],
+      accounts: [seededAccount],
+    });
+
+    const createdAccount = account(scopeA, "account_00000000002", seededRuntime.id);
+    const createdRuntime = runtime(scopeA, "02");
+    const createView = await registry.createAccount(scopeA, createdAccount);
+    const registerView = await registry.registerRuntime(scopeA, createdRuntime);
+    const renamedView = await registry.renameAccount(scopeA, seededAccount.id, "renamed", LATER);
+    const accountList = await registry.listAccounts(scopeA);
+    const runtimeList = await registry.listRuntimes(scopeA);
+    const snapshot = registry.snapshot();
+    const firstAccountRead = await registry.getAccount(scopeA, seededAccount.id);
+    expect(Object.isFrozen(accountList)).toBe(true);
+    expect(Object.isFrozen(runtimeList)).toBe(true);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.accounts)).toBe(true);
+    expect(Object.isFrozen(snapshot.runtimes)).toBe(true);
+    expect(firstAccountRead).not.toBe(await registry.getAccount(scopeA, seededAccount.id));
+    const views = [
+      createView,
+      registerView,
+      renamedView,
+      firstAccountRead,
+      await registry.getRuntime(scopeA, seededRuntime.id),
+      accountList[0],
+      runtimeList[0],
+      snapshot.accounts[0],
+      snapshot.runtimes[0],
+    ];
+    for (const view of views) {
+      if (!view) throw new Error("expected registry view");
+      expect(Object.isFrozen(view)).toBe(true);
+      expect(() =>
+        Object.assign(view as Record<string, unknown>, {
+          tenantId: scopeB.tenantId,
+          scopeId: scopeB.scopeId,
+          name: "foreign",
+          key: "foreign",
+        }),
+      ).toThrow();
+    }
+
+    Object.assign(seededAccount as unknown as Record<string, unknown>, {
+      tenantId: scopeB.tenantId,
+      name: "foreign-input",
+    });
+    Object.assign(seededRuntime as unknown as Record<string, unknown>, {
+      scopeId: scopeB.scopeId,
+      key: "foreign-input",
+    });
+    Object.assign(createdAccount as unknown as Record<string, unknown>, {
+      tenantId: scopeB.tenantId,
+      name: "foreign-created-input",
+    });
+    Object.assign(createdRuntime as unknown as Record<string, unknown>, {
+      scopeId: scopeB.scopeId,
+      key: "foreign-created-input",
+    });
+
+    expect((await registry.getAccount(scopeA, "account_00000000001" as Account["id"]))?.name).toBe(
+      "renamed",
+    );
+    expect((await registry.getAccount(scopeA, "account_00000000002" as Account["id"]))?.name).toBe(
+      "same-name",
+    );
+    expect((await registry.getRuntime(scopeA, "runtime_00000000001" as Runtime["id"]))?.key).toBe(
+      "claude",
+    );
+    expect((await registry.getRuntime(scopeA, "runtime_00000000002" as Runtime["id"]))?.key).toBe(
+      "claude",
+    );
+    expect(await registry.listAccounts(scopeB)).toEqual([]);
+    expect(await registry.listRuntimes(scopeB)).toEqual([]);
+  });
+
+  test("local registry constructor rejects duplicate scoped account and runtime ids", () => {
+    const duplicateRuntime = runtime(scopeA, "01");
+    const duplicateAccount = account(scopeA, "account_00000000001", duplicateRuntime.id);
+    expect(
+      () =>
+        new LocalAccountsRegistry({
+          accounts: [duplicateAccount, { ...duplicateAccount, name: "replacement" }],
+        }),
+    ).toThrow(/account id.*already exists/);
+    expect(
+      () =>
+        new LocalAccountsRegistry({
+          runtimes: [duplicateRuntime, { ...duplicateRuntime, key: "replacement" }],
+        }),
+    ).toThrow(/runtime id.*already exists/);
+  });
+
+  test.each([
+    ["unchanged name", { name: "same-name", updatedAt: LATER }, /requested name/],
+    ["wrong name", { name: "other-name", updatedAt: LATER }, /requested name/],
+    ["unchanged timestamp", { name: "renamed", updatedAt: NOW }, /advance/],
+    [
+      "older timestamp",
+      { name: "renamed", updatedAt: "2026-07-27T09:00:00.000Z" },
+      /advance/,
+    ],
+    ["invalid timestamp", { name: "renamed", updatedAt: "not-a-timestamp" }, /datetime/],
+    [
+      "wrong newer timestamp",
+      { name: "renamed", updatedAt: "2026-07-27T12:00:00.000Z" },
+      /requested timestamp/,
+    ],
+  ])("HTTP rename rejects a semantically invalid %s response", async (_label, patch, error) => {
+    const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async (_input, init) =>
+        (init?.method ?? "GET") === "GET"
+          ? response(before)
+          : response({ ...before, ...patch })) as typeof fetch,
+    });
+
+    await expect(registry.renameAccount(scopeA, before.id, "renamed", LATER)).rejects.toThrow(error);
+  });
+
+  test.each([
+    ["same current name", "same-name", LATER, /different/],
+    ["unchanged timestamp", "renamed", NOW, /advance/],
+    ["older timestamp", "renamed", "2026-07-27T09:00:00.000Z", /advance/],
+  ])(
+    "HTTP rename rejects a semantically invalid %s request before mutation",
+    async (_label, requestedName, requestedAt, error) => {
+      const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
+      const methods: string[] = [];
+      const registry = new HttpAccountsRegistry({
+        baseUrl: "https://accounts.example.test",
+        apiKey: "fixture-authorization",
+        fetchImpl: (async (_input, init) => {
+          const method = init?.method ?? "GET";
+          methods.push(method);
+          return response(before);
+        }) as typeof fetch,
+      });
+
+      await expect(
+        registry.renameAccount(scopeA, before.id, requestedName, requestedAt),
+      ).rejects.toThrow(error);
+      expect(methods).toEqual(["GET"]);
+    },
+  );
+
+  test("HTTP getRuntime rejects a different runtime id returned for an exact lookup", async () => {
+    const requested = runtime(scopeA, "01");
+    const returned = runtime(scopeA, "02");
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async () => response(returned)) as typeof fetch,
+    });
+
+    await expect(registry.getRuntime(scopeA, requested.id)).rejects.toThrow(/runtime identity/);
   });
 });
 
