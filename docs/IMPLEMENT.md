@@ -124,19 +124,24 @@ token remains visible. A pending separate value is classified as one complete
 physical token before embedded punctuation is considered. Unless that whole
 token is proven bare option syntax or a supported sensitive attached form, the
 whole token is redacted and the next whitespace-separated token remains
-visible. Open quotes and odd trailing backslashes preserve
-fail-closed redaction across later physical fragments inside one command
-record. Blank physical lines and explicit `status`, `message`, `stack`, or
+visible. Open quotes and odd trailing backslashes enter one carried
+logical-value scanner across later physical fragments. The active scanner
+redacts through quote closure and every adjacent non-whitespace suffix; it does
+not split embedded punctuation or reinterpret complete bare options, supported
+sensitive option spellings, or exact `--` text inside that logical token.
+Option classification resumes only at following whitespace. Blank physical
+lines and explicit `status`, `message`, `stack`, or
 `detail` records take precedence over incomplete shell syntax and terminate
 both missing-value and active continuation state, preventing unbounded carry
 into independent output. Physical lines, tokens, embedded punctuation, and
 quoted segments are each scanned forward-only. When no separate value is
-pending, safe punctuation boundaries include `:`, `=`, `|`, `/`, `<`, `>`, brackets,
-parentheses, commas, and semicolons. Embedded word, URL, email, and arithmetic
-near-misses remain ordinary text. Balanced punctuation opened inside a
-structured URL/email value does not end that context, while a closing outer
-wrapper or quote resumes option parsing. Explicit unquoted `--` still ends
-options for that physical command record.
+pending or active, safe punctuation boundaries include `:`, `=`, `|`, `/`, `<`,
+`>`, brackets, parentheses, commas, and semicolons. Embedded word, URL, email,
+and arithmetic near-misses remain ordinary text. Balanced punctuation opened
+inside a structured URL/email value does not end that context, while a closing
+outer wrapper or quote resumes option parsing. Explicit unquoted `--` still
+ends options for that physical command record only when it is not part of a
+pending or active sensitive value.
 Prelaunch stderr and stdout are line-bounded and passed through the scanner as
 separate records; pending option state cannot cross a process-stream boundary.
 

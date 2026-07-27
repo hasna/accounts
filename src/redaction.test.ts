@@ -795,6 +795,126 @@ test("logical command values remain redacted across escaped and quoted newlines"
   }
 });
 
+test("active logical values consume continuation suffixes without re-entering option parsing", () => {
+  const starts = [
+    { label: "separate", value: "--api-key seed\\" },
+    { label: "attached", value: "--client-key=seed\\" },
+    { label: "colon", value: "--master-key:seed\\" },
+    { label: "short", value: "-kseed\\" },
+  ];
+  const suffixes = [
+    (secret: string) => `tail/--label=${secret}`,
+    (secret: string) => `tail|--label:${secret}`,
+    (secret: string) => `tail<--label=opaque:${secret}`,
+    (secret: string) => `tail(--label=opaque=${secret})`,
+    (secret: string) => `tail((/|<--label:opaque=${secret}>))`,
+    (secret: string) => `tail/－－label=opaque:${secret}`,
+  ];
+
+  for (const [lineEndingIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+    for (const start of starts) {
+      for (const [suffixIndex, renderSuffix] of suffixes.entries()) {
+        const secret =
+          `active-${start.label}-${lineEndingIndex}-${suffixIndex}-suffix-secret`;
+        const followingSecret =
+          `active-${start.label}-${lineEndingIndex}-${suffixIndex}-following-secret`;
+        const retained =
+          `keep-active-${start.label}-${lineEndingIndex}-${suffixIndex}`;
+        const input =
+          `provider ${start.value}${lineEnding}${renderSuffix(secret)} ` +
+          `--client-key=${followingSecret} --trace ${retained}`;
+        const redacted = redactText(input);
+
+        expect(redacted, input).not.toContain(secret);
+        expect(redacted, input).not.toContain(followingSecret);
+        expect(redacted, input).toContain(`--trace ${retained}`);
+      }
+    }
+  }
+});
+
+test("active quoted logical values consume closure suffixes through whitespace", () => {
+  const starts = [
+    {
+      label: "separate-double",
+      value: '--api-key "seed',
+      close: (suffix: string) => `tail"${suffix}`,
+    },
+    {
+      label: "attached-single",
+      value: "--client-key='seed",
+      close: (suffix: string) => `tail'${suffix}`,
+    },
+    {
+      label: "short-escaped-double",
+      value: '-k"seed',
+      close: (suffix: string) => `tail\\"quoted"${suffix}`,
+    },
+  ];
+
+  for (const [lineEndingIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+    for (const start of starts) {
+      const suffixSecret =
+        `quoted-${start.label}-${lineEndingIndex}-suffix-secret`;
+      const followingSecret =
+        `quoted-${start.label}-${lineEndingIndex}-following-secret`;
+      const retained = `keep-quoted-${start.label}-${lineEndingIndex}`;
+      const input =
+        `provider ${start.value}${lineEnding}` +
+        start.close(
+          `/--${lineEnding === "\r" ? "label:" : "label="}${suffixSecret}`,
+        ) +
+        " " +
+        `--client-key=${followingSecret} --trace ${retained}`;
+      const redacted = redactText(input);
+
+      expect(redacted, input).not.toContain(suffixSecret);
+      expect(redacted, input).not.toContain(followingSecret);
+      expect(redacted, input).toContain(`--trace ${retained}`);
+    }
+  }
+});
+
+test("active logical values keep embedded end markers and option names as value data", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const escapedFollowing = `escaped-marker-following-${lineEnding.length}-secret`;
+    const quotedFollowing = `quoted-marker-following-${lineEnding.length}-secret`;
+    const input = [
+      `provider --api-key seed\\${lineEnding}tail/-- --client-key=${escapedFollowing} --trace keep-escaped-marker`,
+      `provider --master-key "seed${lineEnding}tail"/-- --client-key=${quotedFollowing} --mode keep-quoted-marker`,
+      `provider --client-key seed\\${lineEnding}--master-key --trace keep-bare-option-value`,
+      `provider -kseed\\${lineEnding}-- --trace keep-exact-marker-value`,
+    ].join(`${lineEnding}${lineEnding}`);
+    const redacted = redactText(input);
+
+    expect(redacted).not.toContain(escapedFollowing);
+    expect(redacted).not.toContain(quotedFollowing);
+    expect(redacted).not.toContain("tail/--");
+    expect(redacted).not.toContain("--master-key --trace");
+    expect(redacted).toContain("--trace keep-escaped-marker");
+    expect(redacted).toContain("--mode keep-quoted-marker");
+    expect(redacted).toContain("--trace keep-bare-option-value");
+    expect(redacted).toContain("--trace keep-exact-marker-value");
+  }
+});
+
+test("repeated escaped and quoted continuations redact one logical token", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const escapedSecret = `repeated-escaped-${lineEnding.length}-suffix-secret`;
+    const quotedSecret = `repeated-quoted-${lineEnding.length}-suffix-secret`;
+    const input = [
+      `provider --api-key seed\\${lineEnding}middle\\${lineEnding}tail((/|<--label=${escapedSecret}>)) --trace keep-repeated-escaped`,
+      `provider --client-key "seed\\${lineEnding}middle\\"quoted\\"\\${lineEnding}tail"/－－label:${quotedSecret} --mode keep-repeated-quoted`,
+    ].join(`${lineEnding}${lineEnding}`);
+    const redacted = redactText(input);
+
+    expect(redacted).not.toContain(escapedSecret);
+    expect(redacted).not.toContain(quotedSecret);
+    expect(redacted).toContain("--trace keep-repeated-escaped");
+    expect(redacted).toContain("--mode keep-repeated-quoted");
+  }
+});
+
 test("attached logical values redact every fragment and retain later options", () => {
   for (const lineEnding of ["\n", "\r\n", "\r"]) {
     const secrets = [
@@ -876,7 +996,7 @@ test("numeric-ending pending tokens do not promote punctuation fragments to opti
   for (const lineEnding of ["\n", "\r\n", "\r"]) {
     for (const [index, boundary] of boundaries.entries()) {
       lines.push(
-        `provider --api-key first-${index}9\\${lineEnding}tail${boundary}--client-key continued-second-${index}-secret --trace keep-continued-numeric-${index}`,
+        `provider --api-key first-${index}9\\${lineEnding}tail${boundary}--client-key keep-continued-following-${index} --trace keep-continued-numeric-${index}`,
       );
     }
   }
@@ -888,7 +1008,7 @@ test("numeric-ending pending tokens do not promote punctuation fragments to opti
       expect(redacted).toContain(`keep-${kind}-following-${index}`);
       expect(redacted).toContain(`--trace keep-${kind}-numeric-${index}`);
     }
-    expect(redacted).not.toContain(`continued-second-${index}-secret`);
+    expect(redacted).toContain(`keep-continued-following-${index}`);
     expect(redacted).toContain(`--trace keep-continued-numeric-${index}`);
   }
 });
@@ -2076,6 +2196,24 @@ test("command-text option redaction stays bounded on multi-megabyte captured out
   expect(redacted).not.toContain("command-scaling-secret-29999");
   expect(redacted).toContain("--verbose keep-command-0");
   expect(redacted).toContain("--verbose keep-command-29999");
+  expect(elapsedMs).toBeLessThan(1_500);
+});
+
+test("dense active continuation suffixes remain linear and fully redacted", () => {
+  const continuation =
+    `tail${"/--label=opaque".repeat(36_000)}` +
+    "/--label=terminal-active-continuation-secret";
+  const input =
+    `provider --api-key seed\\\n${continuation} ` +
+    "--trace keep-dense-active-continuation";
+  expect(input.length).toBeGreaterThan(512 * 1024);
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("terminal-active-continuation-secret");
+  expect(redacted).toContain("--trace keep-dense-active-continuation");
   expect(elapsedMs).toBeLessThan(1_500);
 });
 

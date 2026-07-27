@@ -511,6 +511,59 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch active logical values do not expose continuation suffixes", () => {
+    const p = profile("codex");
+
+    for (const [lineEndingIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+      const cases = [
+        {
+          output:
+            `provider --api-key seed\\${lineEnding}` +
+            `tail/--label=prelaunch-active-${lineEndingIndex}-suffix-secret ` +
+            "--trace keep-prelaunch-active-escaped",
+          secrets: [`prelaunch-active-${lineEndingIndex}-suffix-secret`],
+          retained: "--trace keep-prelaunch-active-escaped",
+        },
+        {
+          output:
+            `provider --client-key="seed${lineEnding}tail"/-- ` +
+            `--master-key=prelaunch-active-${lineEndingIndex}-following-secret ` +
+            "--mode keep-prelaunch-active-quoted",
+          secrets: [`prelaunch-active-${lineEndingIndex}-following-secret`],
+          retained: "--mode keep-prelaunch-active-quoted",
+        },
+        {
+          output:
+            `provider -kseed\\${lineEnding}` +
+            `tail((/|<－－label:prelaunch-active-${lineEndingIndex}-layered-secret>)) ` +
+            "--color keep-prelaunch-active-short",
+          secrets: [`prelaunch-active-${lineEndingIndex}-layered-secret`],
+          retained: "--color keep-prelaunch-active-short",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message, sample.output).toContain("[REDACTED]");
+        for (const secret of sample.secrets) {
+          expect(message, sample.output).not.toContain(secret);
+        }
+        expect(message, sample.output).toContain(sample.retained);
+      }
+    }
+  });
+
   test("prelaunch redacts attached multiline values without swallowing later options", () => {
     const p = profile("codex");
 

@@ -183,13 +183,17 @@ without consuming the next safe token. While a separate value is pending, the
 complete physical token is classified before embedded punctuation. Unless the
 whole token is proven option syntax, it is redacted as one bound value and the
 next whitespace-separated token remains unchanged. An open quote or odd
-trailing backslash keeps the logical value redacted across later physical fragments. A
+trailing backslash activates one carried logical-value scanner across later
+physical fragments. While active, it redacts through quote closure and every
+adjacent non-whitespace suffix without treating punctuation, complete bare
+options, sensitive-looking options, or exact `--` text as fresh syntax. Option
+classification resumes only after that logical token reaches whitespace. A
 blank physical line or an explicit
 `status`, `message`, `stack`, or `detail` record ends the pending command
 record, including an active quote or backslash continuation; this explicit
 record boundary takes precedence over incomplete shell syntax so sensitive
 state cannot carry into independent diagnostics. When no separate value is
-pending, options may begin after the package's safe punctuation boundaries
+pending or active, options may begin after the package's safe punctuation boundaries
 (`:`, `=`, `|`, `/`, `<`, `>`, brackets, parentheses,
 commas, and semicolons), while embedded word, URL, email, and arithmetic forms
 remain ordinary text. Balanced punctuation inside structured URL/email values

@@ -962,25 +962,6 @@ function isExplicitCommandRecordBoundary(
   return EXPLICIT_DIAGNOSTIC_RECORD_PATTERN.test(line);
 }
 
-function findUnescapedQuote(
-  value: string,
-  start: number,
-  end: number,
-  quote: "'" | '"',
-): number | undefined {
-  let backslashes = 0;
-  for (let index = start; index < end; index++) {
-    const char = value[index]!;
-    if (char === "\\") {
-      backslashes++;
-      continue;
-    }
-    if (char === quote && backslashes % 2 === 0) return index;
-    backslashes = 0;
-  }
-  return undefined;
-}
-
 function isEscapedAt(value: string, index: number): boolean {
   let backslashes = 0;
   for (
@@ -1006,37 +987,6 @@ function isInsideCommandQuote(value: string, index: number): boolean {
     else if (quote === char) quote = undefined;
   }
   return quote !== undefined;
-}
-
-function hasSubstantiveCommandValue(value: string): boolean {
-  return /[^\s'"\\()[\]{}<>:;=|/,]/u.test(value);
-}
-
-function commandValueOptionSplit(
-  token: CommandToken,
-  raw: string,
-): { valueEnd: number; optionStart: number } | undefined {
-  const view = commandOptionView(token.decoded, true, false);
-  if (!view) return undefined;
-  const candidateEnd = token.decoded.length - view.suffix.length;
-  const candidate = token.decoded.slice(view.prefix.length, candidateEnd);
-  if (!candidate) return undefined;
-
-  const optionOffset = raw.lastIndexOf(candidate);
-  if (optionOffset <= 0) return undefined;
-  const boundaryOffset = optionOffset - 1;
-  if (
-    !EMBEDDED_OPTION_BOUNDARIES.has(raw[boundaryOffset]!) ||
-    isEscapedAt(raw, boundaryOffset) ||
-    isInsideCommandQuote(raw, boundaryOffset) ||
-    !hasSubstantiveCommandValue(raw.slice(0, boundaryOffset))
-  ) {
-    return undefined;
-  }
-  return {
-    valueEnd: token.start + boundaryOffset,
-    optionStart: token.start + optionOffset,
-  };
 }
 
 function outerQuotedParts(
@@ -1075,6 +1025,69 @@ function replaceCommandValue(raw: string, syntaxProtected = false): string {
     : "[REDACTED]";
 }
 
+interface CommandValueContinuation {
+  quote?: "'" | '"';
+  escaped: boolean;
+  crossedLine: boolean;
+}
+
+/**
+ * Continue one already-bound sensitive logical value. Once continuation state
+ * exists, every character through the next unquoted whitespace belongs to that
+ * value: punctuation, option-shaped fragments, and exact `--` text are data,
+ * not fresh option syntax. Quote and trailing-escape state are carried across
+ * physical lines, while the caller retains authority over explicit record
+ * boundaries.
+ */
+function scanCommandValueContinuation(
+  value: string,
+  start: number,
+  lineEnd: number,
+  continuation: CommandValueContinuation,
+): {
+  end: number;
+  quote?: "'" | '"';
+  trailingEscape: boolean;
+} {
+  let quote = continuation.quote;
+  let index = start;
+
+  while (index < lineEnd) {
+    const char = value[index]!;
+    if (!quote && (char === " " || char === "\t")) break;
+
+    if (char === "\\") {
+      if (index + 1 < lineEnd) {
+        index += 2;
+        continue;
+      }
+      index++;
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      if (!quote) quote = char;
+      else if (quote === char) quote = undefined;
+    }
+    index++;
+  }
+
+  let trailingBackslashes = 0;
+  for (
+    let cursor = index - 1;
+    cursor >= start && value[cursor] === "\\";
+    cursor--
+  ) {
+    trailingBackslashes++;
+  }
+
+  return {
+    end: index,
+    quote,
+    trailingEscape: trailingBackslashes % 2 === 1,
+  };
+}
+
 /**
  * Redact credential options embedded in captured command output. The scanner
  * is single-pass and shares option classification with `redactArgv`. A
@@ -1092,13 +1105,7 @@ function redactCommandTokens(value: string): string {
   let redactNext = false;
   let pendingCrossedLine = false;
   let endOfOptions = false;
-  let valueContinuation:
-    | {
-        quote?: "'" | '"';
-        escaped: boolean;
-        crossedLine: boolean;
-      }
-    | undefined;
+  let valueContinuation: CommandValueContinuation | undefined;
 
   while (lineStart < value.length) {
     const lineEnd = physicalLineEnd(value, lineStart);
@@ -1131,39 +1138,26 @@ function redactCommandTokens(value: string): string {
       ) {
         tokenCursor++;
       }
-      if (tokenCursor < lineEnd && valueContinuation.quote) {
-        const close = findUnescapedQuote(
+      if (tokenCursor < lineEnd) {
+        const fragment = scanCommandValueContinuation(
           value,
           tokenCursor,
           lineEnd,
-          valueContinuation.quote,
+          valueContinuation,
         );
-        const continuationEnd = close === undefined ? lineEnd : close + 1;
         parts.push(
           value.slice(outputCursor, tokenCursor),
           "[REDACTED]",
         );
-        outputCursor = continuationEnd;
-        if (close === undefined) {
-          tokenCursor = lineEnd;
-        } else {
-          valueContinuation = undefined;
-          tokenCursor = continuationEnd;
-        }
-      } else if (tokenCursor < lineEnd) {
-        const token = scanCommandToken(value, tokenCursor, lineEnd, false);
-        const raw = value.slice(token.start, token.end);
-        const split = commandValueOptionSplit(token, raw);
-        const redactionEnd = split?.valueEnd ?? token.end;
-        parts.push(
-          value.slice(outputCursor, token.start),
-          "[REDACTED]",
-        );
-        outputCursor = redactionEnd;
-        valueContinuation = !split && token.trailingEscape
-          ? { escaped: true, crossedLine: false }
+        outputCursor = fragment.end;
+        valueContinuation = fragment.quote || fragment.trailingEscape
+          ? {
+              quote: fragment.quote,
+              escaped: fragment.trailingEscape,
+              crossedLine: false,
+            }
           : undefined;
-        tokenCursor = split?.optionStart ?? token.end;
+        tokenCursor = fragment.end;
       }
     }
 
