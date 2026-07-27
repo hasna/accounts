@@ -379,6 +379,48 @@ test("argument redaction keeps credential-shaped opaque tokens bound to pending 
   }
 });
 
+test("argument redaction honors exact end-of-options markers in ordinary and pending states", () => {
+  const afterOrdinaryMarker = [
+    "provider",
+    "--",
+    "--api-key",
+    "keep-positional-api-value",
+    "--client-key=keep-positional-attached-value",
+    "-k",
+    "keep-positional-short-value",
+  ];
+  expect(redactArgv(afterOrdinaryMarker)).toEqual(afterOrdinaryMarker);
+
+  const afterPendingMarker = [
+    "provider",
+    "--api-key",
+    "--",
+    "--client-key",
+    "keep-pending-marker-client-value",
+    "--api-key=keep-pending-marker-attached-value",
+    "-vk",
+    "keep-pending-marker-short-value",
+  ];
+  expect(redactArgv(afterPendingMarker)).toEqual(afterPendingMarker);
+});
+
+test("argument end-of-options preservation stays linear across large positional payloads", () => {
+  const positional = Array.from(
+    { length: 200_000 },
+    (_, index) => index % 2 === 0
+      ? `--api-key=keep-positional-${index}`
+      : `-k-keep-positional-${index}`,
+  );
+  const input = ["provider", "--api-key", "--", ...positional];
+
+  const startedAt = performance.now();
+  const redacted = redactArgv(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).toEqual(input);
+  expect(elapsedMs).toBeLessThan(1_500);
+});
+
 test("command-text chained sensitive options preserve pending state across line endings", () => {
   for (const lineEnding of ["\n", "\r\n", "\r"]) {
     const secret = `command-chained-secret-${lineEnding.length}`;
@@ -396,6 +438,95 @@ test("command-text chained sensitive options preserve pending state across line 
     expect(redacted).toContain("--client-key");
     expect(redacted).toContain("status=keep-command-chain-status");
   }
+});
+
+test("command-text pending options keep opaque dash-leading values bound across syntax variants", () => {
+  const separators = [" ", "\n", "\r\n", "\r"];
+  const variants = [
+    (secret: string) => `--label/client-key/${secret}`,
+    (secret: string) => `"--label/client-key/${secret}"`,
+    (secret: string) => `\\--label/client-key/${secret}`,
+    (secret: string) => `－label/client-key/${secret}`,
+    (secret: string) => `(--label/client-key/${secret})`,
+    (secret: string) => `|--label/client-key/${secret}`,
+  ];
+
+  for (const [separatorIndex, separator] of separators.entries()) {
+    for (const [variantIndex, render] of variants.entries()) {
+      const secret = `opaque-command-bound-${separatorIndex}-${variantIndex}`;
+      const retained = `status=keep-opaque-command-${separatorIndex}-${variantIndex}`;
+      const input = `provider --api-key${separator}${render(secret)} ${retained}`;
+      const redacted = redactText(input);
+
+      expect(redacted, input).not.toContain(secret);
+      expect(redacted, input).toContain("[REDACTED]");
+      expect(redacted, input).toContain(retained);
+    }
+  }
+});
+
+test("command-text attached option-looking values redact in place without swallowing safe tokens", () => {
+  const cases = [
+    {
+      input: "provider --api-key=--client-key status=keep-attached-equals",
+      secret: "--client-key",
+      retained: "status=keep-attached-equals",
+      syntax: "--api-key=[REDACTED]",
+    },
+    {
+      input: "provider --api-key:--client-key status=keep-attached-colon",
+      secret: "--client-key",
+      retained: "status=keep-attached-colon",
+      syntax: "--api-key:[REDACTED]",
+    },
+    {
+      input: 'provider --api-key="--client-key" status=keep-attached-quoted',
+      secret: "--client-key",
+      retained: "status=keep-attached-quoted",
+      syntax: "--api-key=[REDACTED]",
+    },
+    {
+      input: "provider --api-key=－client-key status=keep-attached-unicode",
+      secret: "－client-key",
+      retained: "status=keep-attached-unicode",
+      syntax: "--api-key=[REDACTED]",
+    },
+    {
+      input:
+        "diagnostic|--api-key=--client-key|--trace keep-attached-punctuation",
+      secret: "--client-key",
+      retained: "|--trace keep-attached-punctuation",
+      syntax: "--api-key=[REDACTED]",
+    },
+    {
+      input:
+        "diagnostic/--api-key:--client-key/--trace keep-attached-slash",
+      secret: "--client-key",
+      retained: "/--trace keep-attached-slash",
+      syntax: "--api-key:[REDACTED]",
+    },
+  ];
+
+  for (const sample of cases) {
+    const redacted = redactText(sample.input);
+    expect(redacted, sample.input).not.toContain(sample.secret);
+    expect(redacted, sample.input).toContain(sample.syntax);
+    expect(redacted, sample.input).toContain(sample.retained);
+  }
+});
+
+test("pending opaque dash-leading command values stay linear with dense separators", () => {
+  const secret = `--label=${"opaque=".repeat(90_000)}terminal-hidden-value`;
+  const input = `provider --api-key ${secret} status=keep-dense-opaque`;
+  expect(input.length).toBeGreaterThan(512 * 1024);
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("terminal-hidden-value");
+  expect(redacted).toContain("status=keep-dense-opaque");
+  expect(elapsedMs).toBeLessThan(1_500);
 });
 
 test("command-text redaction shares argv option grammar across quoting and boundaries", () => {

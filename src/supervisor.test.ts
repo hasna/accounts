@@ -424,6 +424,13 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     "--api-key",
     `-x=client-key=${secrets[16]}`,
     "keep-after-opaque-bound-value",
+    "--api-key",
+    "--",
+    "--client-key",
+    "keep-supervisor-positional-client-value",
+    "--api-key=keep-supervisor-positional-attached-value",
+    "-k",
+    "keep-supervisor-positional-short-value",
   ];
   const previousFakeLog = process.env.FAKE_LOG;
   process.env.FAKE_LOG = logPath;
@@ -448,6 +455,9 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     });
     for (const secret of initialSecrets) expect(initialPublic).not.toContain(secret);
     expect(initialPublic).toContain("keep-after-opaque-bound-value");
+    expect(initialPublic).toContain("keep-supervisor-positional-client-value");
+    expect(initialPublic).toContain("--api-key=keep-supervisor-positional-attached-value");
+    expect(initialPublic).toContain("keep-supervisor-positional-short-value");
 
     const response = await sendSupervisorRequest("credentialgrammar", {
       type: "switch_profile",
@@ -457,6 +467,9 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     });
     const responseJson = JSON.stringify(response);
     for (const secret of switchedSecrets) expect(responseJson).not.toContain(secret);
+    expect(responseJson).toContain("keep-supervisor-positional-client-value");
+    expect(responseJson).toContain("--api-key=keep-supervisor-positional-attached-value");
+    expect(responseJson).toContain("keep-supervisor-positional-short-value");
     await waitFor(() =>
       readLog(logPath).find((entry) =>
         switchedSecrets.every((secret) => entry.args.some((arg) => arg.includes(secret))),
@@ -469,6 +482,9 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     });
     for (const secret of switchedSecrets) expect(switchedPublic).not.toContain(secret);
     expect(switchedPublic).toContain("keep-after-opaque-bound-value");
+    expect(switchedPublic).toContain("keep-supervisor-positional-client-value");
+    expect(switchedPublic).toContain("--api-key=keep-supervisor-positional-attached-value");
+    expect(switchedPublic).toContain("keep-supervisor-positional-short-value");
 
     await sendSupervisorRequest("credentialgrammar", { type: "stop" });
     expect(await running).toBe(0);

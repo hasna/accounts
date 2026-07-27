@@ -169,13 +169,18 @@ syntactically bare credential option appears while a prior option is still
 awaiting a value, the new option is redacted as syntax and becomes the pending
 option instead of being consumed as the earlier value. Credential-shaped
 fragments inside opaque or non-option dash-leading argv items remain bound
-values. The same
+values. An exact `--` marker ends argv option interpretation in ordinary or
+pending state, and later positional arguments remain unchanged as positional
+values in the public command and rendered handoff. The same
 bounded, quote-aware option scanner redacts command-shaped values embedded in
 captured stdout, stderr, and error strings. A separate credential option keeps
 one pending value across LF, CRLF, or bare CR and consumes the next syntactic
-value; quoting or escaping keeps dash-leading text bound as that value. An
-open quote or odd trailing backslash keeps the logical value redacted across
-later physical fragments. An unquoted next option remains a new option. A
+value; quoting, escaping, or opaque non-bare syntax keeps dash-leading text
+bound as that value. Only a complete bare option or a complete sensitive
+attached form replaces pending state. Attached values that resemble options,
+including `--api-key=--client-key` and its colon form, are redacted in place
+without consuming the next safe token. An open quote or odd trailing backslash
+keeps the logical value redacted across later physical fragments. A
 blank physical line or an explicit
 `status`, `message`, `stack`, or `detail` record ends the pending command
 record, including an active quote or backslash continuation; this explicit

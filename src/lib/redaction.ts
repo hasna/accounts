@@ -803,6 +803,24 @@ interface CommandToken {
   trailingEscape: boolean;
 }
 
+function completeCommandOptionView(
+  token: CommandToken,
+): CommandOptionView | undefined {
+  if (token.quoted || token.escaped) return undefined;
+
+  const view = commandOptionView(token.decoded, true);
+  if (!view) return undefined;
+  const candidateEnd = token.decoded.length - view.suffix.length;
+  const candidate = normalizeCommandToken(
+    token.decoded.slice(view.prefix.length, candidateEnd),
+  );
+  if (view.endOfOptions) return candidate === "--" ? view : undefined;
+  if (isBareCommandOption(candidate)) return view;
+  return credentialOption(candidate, true)?.kind === "attached"
+    ? view
+    : undefined;
+}
+
 function scanCommandToken(
   value: string,
   start: number,
@@ -817,6 +835,7 @@ function scanCommandToken(
   let optionDecodedStart = normalizeCommandToken(value[start] ?? "").startsWith("-")
     ? 0
     : undefined;
+  let optionSeparatorSeen = false;
   let sensitiveAttachedSeen = false;
   const segment = commandSegmentContext();
 
@@ -828,9 +847,21 @@ function scanCommandToken(
       EMBEDDED_OPTION_BOUNDARIES.has(char) &&
       normalizeCommandToken(value[index + 1] ?? "").startsWith("-") &&
       !isStructuredCommandSegment(segment);
+    const isOptionSeparator =
+      !quote &&
+      optionDecodedStart !== undefined &&
+      (char === "=" || char === ":");
+    const startsSensitiveAttachedValue =
+      isOptionSeparator &&
+      !optionSeparatorSeen &&
+      credentialOption(
+          `${decoded.slice(optionDecodedStart)}${char}`,
+          true,
+        )?.kind === "attached";
     if (
       startsEmbeddedOption &&
       index > start &&
+      !startsSensitiveAttachedValue &&
       (
         !protectArithmetic ||
         sensitiveAttachedSeen ||
@@ -889,17 +920,8 @@ function scanCommandToken(
         continue;
       }
     }
-    if (
-      !quote &&
-      optionDecodedStart !== undefined &&
-      (char === "=" || char === ":") &&
-      credentialOption(
-          `${decoded.slice(optionDecodedStart)}${char}`,
-          true,
-        )?.kind === "attached"
-    ) {
-      sensitiveAttachedSeen = true;
-    }
+    if (startsSensitiveAttachedValue) sensitiveAttachedSeen = true;
+    if (isOptionSeparator) optionSeparatorSeen = true;
     decoded += char;
     observeCommandSegmentChar(
       segment,
@@ -907,7 +929,10 @@ function scanCommandToken(
       value[index + 1],
       value[index + 2],
     );
-    if (optionStartsAfterBoundary) optionDecodedStart = decoded.length;
+    if (optionStartsAfterBoundary) {
+      optionDecodedStart = decoded.length;
+      optionSeparatorSeen = false;
+    }
     index++;
   }
 
@@ -1165,7 +1190,7 @@ function redactCommandTokens(value: string): string {
         : undefined;
       const nextOptionView =
         redactNext
-          ? commandOptionView(item.decoded, true)
+          ? completeCommandOptionView(item)
           : undefined;
 
       if (redactNext) {
@@ -1193,11 +1218,7 @@ function redactCommandTokens(value: string): string {
           tokenCursor = split.optionStart;
           continue;
         }
-        if (
-          !item.quoted &&
-          !item.escaped &&
-          (nextOptionView || normalizeCommandToken(item.decoded).startsWith("-"))
-        ) {
+        if (nextOptionView) {
           redactNext = false;
         } else {
           parts.push(
@@ -1339,7 +1360,18 @@ function redactCommandText(value: string): string {
 export function redactArgv(argv: string[]): string[] {
   const redacted: string[] = [];
   let redactNext = false;
+  let endOfOptions = false;
   for (const arg of argv) {
+    if (endOfOptions) {
+      redacted.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      redacted.push(arg);
+      redactNext = false;
+      endOfOptions = true;
+      continue;
+    }
     if (redactNext) {
       const chainedOption = credentialOption(arg, true);
       if (chainedOption?.kind === "attached") {

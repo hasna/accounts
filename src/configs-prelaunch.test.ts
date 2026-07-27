@@ -402,6 +402,66 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch command redaction keeps opaque and attached option-looking values private", () => {
+    const p = profile("codex");
+    const cases: Array<{
+      output: string;
+      secret: string;
+      retained: string;
+    }> = [];
+
+    for (const [lineIndex, lineEnding] of [" ", "\n", "\r\n", "\r"].entries()) {
+      for (const [variantIndex, value] of [
+        `--label/client-key/prelaunch-hidden-${lineIndex}-0`,
+        `"--label/client-key/prelaunch-hidden-${lineIndex}-1"`,
+        `\\--label/client-key/prelaunch-hidden-${lineIndex}-2`,
+        `－label/client-key/prelaunch-hidden-${lineIndex}-3`,
+        `(--label/client-key/prelaunch-hidden-${lineIndex}-4)`,
+        `|--label/client-key/prelaunch-hidden-${lineIndex}-5`,
+      ].entries()) {
+        cases.push({
+          output:
+            `provider --api-key${lineEnding}${value} ` +
+            `status=keep-prelaunch-opaque-${lineIndex}-${variantIndex}`,
+          secret: `prelaunch-hidden-${lineIndex}-${variantIndex}`,
+          retained: `status=keep-prelaunch-opaque-${lineIndex}-${variantIndex}`,
+        });
+      }
+    }
+    cases.push(
+      {
+        output:
+          "provider --api-key=--client-key status=keep-prelaunch-attached-equals",
+        secret: "--client-key",
+        retained: "status=keep-prelaunch-attached-equals",
+      },
+      {
+        output:
+          "provider --api-key:--client-key status=keep-prelaunch-attached-colon",
+        secret: "--client-key",
+        retained: "status=keep-prelaunch-attached-colon",
+      },
+    );
+
+    for (const sample of cases) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(sample.output),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message, sample.output).toContain("[REDACTED]");
+      expect(message, sample.output).not.toContain(sample.secret);
+      expect(message, sample.output).toContain(sample.retained);
+    }
+  });
+
   test("prelaunch command redaction covers logical values continued across lines", () => {
     const p = profile("codex");
 

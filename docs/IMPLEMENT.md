@@ -108,13 +108,19 @@ forms of the short option. A syntactically bare credential option encountered
 while a prior option is awaiting a separate value is classified as new syntax:
 an attached value is redacted immediately, while a separate-value option takes
 over the pending state. Credential-shaped fragments inside opaque or
-non-option dash-leading argv items remain the prior option's value. Captured
+non-option dash-leading argv items remain the prior option's value. An exact
+`--` ends argv option interpretation even while a credential option is
+pending, and every later positional item is preserved verbatim for public
+command and command-line fidelity. Captured
 command text uses that same policy through
 a quote-aware, forward-only token scanner that emits physical-newline and
 quoted/escaped-origin metadata. A separate option's single pending value
 survives LF, CRLF, or bare CR and consumes the next syntactic value; quoted or
-escaped dash-leading text remains the value, while an unquoted genuine option
-starts a new option. Open quotes and odd trailing backslashes preserve
+escaped dash-leading text remains the value. Opaque dash-leading text remains
+bound too: only a complete bare option or a complete sensitive attached form
+can replace pending state. Attached credential values that themselves resemble
+options are redacted in place before punctuation splitting, so the next safe
+token remains visible. Open quotes and odd trailing backslashes preserve
 fail-closed redaction across later physical fragments inside one command
 record. Blank physical lines and explicit `status`, `message`, `stack`, or
 `detail` records take precedence over incomplete shell syntax and terminate

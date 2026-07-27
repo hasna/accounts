@@ -63,6 +63,13 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
           "--api-key",
           "-x=client-key=mcp-opaque-bound-secret",
           "keep-after-opaque-bound-value",
+          "--api-key",
+          "--",
+          "--client-key",
+          "keep-mcp-positional-client-value",
+          "--api-key=keep-mcp-positional-attached-value",
+          "-k",
+          "keep-mcp-positional-short-value",
         ],
       },
     });
@@ -86,6 +93,13 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
       "--api-key",
       "[REDACTED]",
       "keep-after-opaque-bound-value",
+      "--api-key",
+      "--",
+      "--client-key",
+      "keep-mcp-positional-client-value",
+      "--api-key=keep-mcp-positional-attached-value",
+      "-k",
+      "keep-mcp-positional-short-value",
     ]);
     expect(output.commandLine).toContain(
       "'--api-key' '--client-key' '[REDACTED]'",
@@ -93,6 +107,12 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
     expect(output.commandLine).toContain("'-k' '-vk' '[REDACTED]'");
     expect(output.commandLine).toContain(
       "'--api-key' '[REDACTED]' 'keep-after-opaque-bound-value'",
+    );
+    expect(output.commandLine).toContain(
+      "'--api-key' '--' '--client-key' 'keep-mcp-positional-client-value'",
+    );
+    expect(output.commandLine).toContain(
+      "'--api-key=keep-mcp-positional-attached-value' '-k' 'keep-mcp-positional-short-value'",
     );
   } finally {
     await client.close();

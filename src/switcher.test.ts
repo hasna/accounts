@@ -16,7 +16,7 @@ import {
 import { liveClaudePaths, profileKeychainSnapshot, profileOAuthSnapshot } from "./lib/claude-layout.js";
 import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook.js";
 import { resolvePickMode } from "./lib/pick.js";
-import { switchProfile } from "./lib/switch.js";
+import { publicSwitchResult, switchProfile } from "./lib/switch.js";
 import { controlledProbeEnv, profileEnv, providerLaunchEnv } from "./lib/env.js";
 import { loadStore } from "./storage.js";
 import { addCustomTool, getTool } from "./lib/tools.js";
@@ -207,6 +207,41 @@ test("profileEnv clears Claude API auth environment variables", async () => {
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe("");
   expect(env.CLAUDE_CODE_API_KEY_HELPER).toBe("");
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("public switch projection preserves positional arguments after exact end-of-options", async () => {
+  addProfile({ name: "marker", tool: "codex" });
+  const internal = await switchProfile("marker", {
+    tool: "codex",
+    mode: "active",
+    args: [
+      "--api-key",
+      "--",
+      "--client-key",
+      "keep-public-positional-client-value",
+      "--api-key=keep-public-positional-attached-value",
+      "-k",
+      "keep-public-positional-short-value",
+    ],
+  });
+
+  const output = publicSwitchResult(internal);
+
+  expect(output.command.slice(-7)).toEqual([
+    "--api-key",
+    "--",
+    "--client-key",
+    "keep-public-positional-client-value",
+    "--api-key=keep-public-positional-attached-value",
+    "-k",
+    "keep-public-positional-short-value",
+  ]);
+  expect(output.commandLine).toContain(
+    "'--api-key' '--' '--client-key' 'keep-public-positional-client-value'",
+  );
+  expect(output.commandLine).toContain(
+    "'--api-key=keep-public-positional-attached-value' '-k' 'keep-public-positional-short-value'",
+  );
 });
 
 test("launch environment policy is case-insensitive and preserves same-binding routing", () => {
