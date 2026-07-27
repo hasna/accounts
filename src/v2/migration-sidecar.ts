@@ -548,6 +548,8 @@ function normalizeMigrationPlanInput(input: MigrationPlanInput): MigrationPlanIn
             ? {
                 ...observation.root,
                 realPath: resolve(observation.root.realPath),
+                device: canonicalDecimal(observation.root.device),
+                inode: canonicalDecimal(observation.root.inode),
               }
             : observation.root,
         sessionReferenceDigests: [...observation.sessionReferenceDigests].sort(),
@@ -728,12 +730,14 @@ function deriveMigrationQuarantineReasons(
     );
   }
   if (observation.root.state === "verified") {
-    const rootKey = verifiedRootKey(observation.root);
+    const canonicalPath = resolve(observation.root.realPath);
+    const physicalIdentity = verifiedRootDeviceInodeKey(observation.root);
     if (
       observations.filter(
         (candidate) =>
           candidate.root.state === "verified" &&
-          verifiedRootKey(candidate.root) === rootKey,
+          (resolve(candidate.root.realPath) === canonicalPath ||
+            verifiedRootDeviceInodeKey(candidate.root) === physicalIdentity),
       ).length > 1
     ) {
       reasons.add("duplicate_verified_root");
@@ -745,15 +749,14 @@ function deriveMigrationQuarantineReasons(
   return [...reasons].sort();
 }
 
-function verifiedRootKey(
+function verifiedRootDeviceInodeKey(
   root: z.infer<typeof verifiedRootObservationSchema>,
-): MigrationDigest {
-  return hashCanonical({
-    realPath: root.realPath,
-    device: root.device,
-    inode: root.inode,
-    digest: root.digest,
-  });
+): string {
+  return `${canonicalDecimal(root.device)}\0${canonicalDecimal(root.inode)}`;
+}
+
+function canonicalDecimal(value: string): string {
+  return BigInt(value).toString(10);
 }
 
 function defaultIdFactory(kind: MigrationIdKind, seed: string): string {
@@ -1152,34 +1155,15 @@ export type MigrationSidecar = Readonly<z.infer<typeof migrationSidecarSchema>>;
 
 export function createMigrationSidecar(planInput: MigrationPlan): MigrationSidecar {
   const plan = migrationPlanSchema.parse(planInput);
-  let sidecar = withSidecarIntegrity({
+  return withSidecarIntegrity({
     schemaVersion: 1,
     plan,
     state: "planned",
-    aliasJournal: [],
+    aliasJournal: canonicalGenesisAliasJournal(plan),
     gateReceipts: [],
     backfillReceipts: [],
     transitionJournal: [],
   });
-  for (const record of plan.records) {
-    for (const alias of record.historicalAliases) {
-      sidecar = appendMigrationAlias(sidecar, {
-        kind: "legacy_account",
-        alias,
-        sourceKey: record.sourceKey,
-        targetId: record.target.accountId,
-      });
-    }
-    for (const alias of record.historicalSessionAliases) {
-      sidecar = appendMigrationAlias(sidecar, {
-        kind: "session_ref",
-        alias,
-        sourceKey: record.sourceKey,
-        targetId: record.target.bindingId,
-      });
-    }
-  }
-  return sidecar;
 }
 
 export function appendMigrationAlias(
@@ -1187,8 +1171,55 @@ export function appendMigrationAlias(
   aliasInput: MigrationAliasInput,
 ): MigrationSidecar {
   const sidecar = parseSidecar(sidecarInput);
+  const aliasJournal = appendAliasToJournal(
+    sidecar.plan,
+    sidecar.aliasJournal,
+    aliasInput,
+  );
+  if (aliasJournal === sidecar.aliasJournal) return sidecar;
+  return withSidecarIntegrity({
+    schemaVersion: 1,
+    plan: sidecar.plan,
+    state: sidecar.state,
+    aliasJournal,
+    gateReceipts: sidecar.gateReceipts,
+    backfillReceipts: sidecar.backfillReceipts,
+    transitionJournal: sidecar.transitionJournal,
+  });
+}
+
+function canonicalGenesisAliasJournal(
+  plan: MigrationPlan,
+): MigrationSidecar["aliasJournal"] {
+  let entries: MigrationSidecar["aliasJournal"] = [];
+  for (const record of plan.records) {
+    for (const alias of record.historicalAliases) {
+      entries = appendAliasToJournal(plan, entries, {
+        kind: "legacy_account",
+        alias,
+        sourceKey: record.sourceKey,
+        targetId: record.target.accountId,
+      });
+    }
+    for (const alias of record.historicalSessionAliases) {
+      entries = appendAliasToJournal(plan, entries, {
+        kind: "session_ref",
+        alias,
+        sourceKey: record.sourceKey,
+        targetId: record.target.bindingId,
+      });
+    }
+  }
+  return entries;
+}
+
+function appendAliasToJournal(
+  plan: MigrationPlan,
+  entries: MigrationSidecar["aliasJournal"],
+  aliasInput: MigrationAliasInput,
+): MigrationSidecar["aliasJournal"] {
   const alias = migrationAliasInputSchema.parse(aliasInput);
-  const record = sidecar.plan.records.find(
+  const record = plan.records.find(
     (candidate) => candidate.sourceKey === alias.sourceKey,
   );
   if (!record) {
@@ -1203,37 +1234,29 @@ export function appendMigrationAlias(
       `migration alias "${alias.alias}" does not target its frozen immutable identity`,
     );
   }
-  const existing = sidecar.aliasJournal.find(
+  const existing = entries.find(
     (entry) => entry.kind === alias.kind && entry.alias === alias.alias,
   );
   if (existing) {
     if (existing.sourceKey === alias.sourceKey && existing.targetId === alias.targetId) {
-      return sidecar;
+      return entries;
     }
     throw new MigrationConflictError(
       `migration alias "${alias.alias}" already targets a different immutable identity`,
     );
   }
-  const previousDigest = sidecar.aliasJournal.at(-1)?.digest ?? null;
+  const previousDigest = entries.at(-1)?.digest ?? null;
   const entry = migrationAliasEntrySchema.parse({
     ...alias,
-    sequence: sidecar.aliasJournal.length + 1,
+    sequence: entries.length + 1,
     previousDigest,
     digest: hashCanonical({
       ...alias,
-      sequence: sidecar.aliasJournal.length + 1,
+      sequence: entries.length + 1,
       previousDigest,
     }),
   });
-  return withSidecarIntegrity({
-    schemaVersion: 1,
-    plan: sidecar.plan,
-    state: sidecar.state,
-    aliasJournal: [...sidecar.aliasJournal, entry],
-    gateReceipts: sidecar.gateReceipts,
-    backfillReceipts: sidecar.backfillReceipts,
-    transitionJournal: sidecar.transitionJournal,
-  });
+  return [...entries, entry];
 }
 
 const stateRank: Record<MigrationState, number> = {
@@ -1384,11 +1407,38 @@ function parseSidecar(value: unknown): MigrationSidecar {
     throw new MigrationDriftError("migration sidecar integrity digest mismatch");
   }
   validateAliasJournal(sidecar.plan, sidecar.aliasJournal);
-  validateTransitionReceipts(sidecar);
+  const canonicalAliasCount = validateCanonicalGenesisAliasPrefix(
+    sidecar.plan,
+    sidecar.aliasJournal,
+  );
+  validateTransitionReceipts(sidecar, canonicalAliasCount);
   return deepFreeze(sidecar);
 }
 
-function validateTransitionReceipts(sidecar: MigrationSidecar): void {
+function validateCanonicalGenesisAliasPrefix(
+  plan: MigrationPlan,
+  entries: readonly MigrationAliasEntry[],
+): number {
+  const canonical = canonicalGenesisAliasJournal(plan);
+  if (entries.length < canonical.length) {
+    throw new MigrationDriftError(
+      "migration alias journal omits its canonical genesis alias prefix",
+    );
+  }
+  for (const [index, entry] of canonical.entries()) {
+    if (hashCanonical(entries[index]) !== hashCanonical(entry)) {
+      throw new MigrationDriftError(
+        "migration alias journal changed its canonical genesis alias prefix",
+      );
+    }
+  }
+  return canonical.length;
+}
+
+function validateTransitionReceipts(
+  sidecar: MigrationSidecar,
+  canonicalAliasCount: number,
+): void {
   for (const [index, receipt] of sidecar.gateReceipts.entries()) {
     validateGateReceipt(sidecar.plan, receipt);
     if (receipt.sequence !== index + 1) {
@@ -1443,14 +1493,17 @@ function validateTransitionReceipts(sidecar: MigrationSidecar): void {
       `migration state "${sidecar.state}" lacks its required ${requiredReceipt} history`,
     );
   }
-  validatePredecessorTransitionChain(sidecar);
+  validatePredecessorTransitionChain(sidecar, canonicalAliasCount);
 }
 
-function validatePredecessorTransitionChain(sidecar: MigrationSidecar): void {
+function validatePredecessorTransitionChain(
+  sidecar: MigrationSidecar,
+  canonicalAliasCount: number,
+): void {
   let expectedState: MigrationState = "planned";
   let expectedGateReceiptCount = 0;
   let expectedBackfillReceiptCount = 0;
-  let minimumAliasJournalLength = 0;
+  let minimumAliasJournalLength = canonicalAliasCount;
   let previousDigest: MigrationDigest | null = null;
 
   for (const [index, entry] of sidecar.transitionJournal.entries()) {

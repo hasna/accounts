@@ -38,10 +38,16 @@ filesystem identity, input digests, allocated IDs, and quarantine evidence.
 
 Unsafe roots, unresolved catalog skips, duplicate legacy identities, the same
 mutable name observed across runtimes, and distinct legacy identities resolving
-to the same canonicalized verified real path/device/inode/digest are
-quarantined. Lexical path aliases such as `directory/../root` cannot evade the
-physical-root collision check. A partial backfill may include only records
-marked `ready`; final cutover remains blocked while any quarantine exists.
+to either the same canonicalized verified real path or the same canonicalized
+device/inode identity are quarantined. Device and inode strings are normalized
+as decimal integers, so leading-zero aliases cannot evade the physical-root
+check. A shared canonical path with contradictory device, inode, or digest
+evidence also fails closed, as does one device/inode identity with conflicting
+path or digest evidence. Equal content digests alone do not conflate otherwise
+distinct roots. Lexical path aliases such as `directory/../root` cannot evade
+the path equivalence class, and hard-link aliases cannot evade the device/inode
+equivalence class. A partial backfill may include only records marked `ready`;
+final cutover remains blocked while any quarantine exists.
 
 Historical account aliases target the frozen account ID. Historical session
 aliases target the frozen machine-binding ID. The alias journal is append-only,
@@ -122,9 +128,13 @@ first crash-recovery intent.
 installed exact successor or completes a WAL transition only from its exact
 predecessor after rechecking immutable alias, receipt, and transition-journal
 history. A genesis WAL may install only the exact canonical `planned` sidecar
-derived from the frozen plan. A lock owned by a live process is preserved; a
-valid lock naming a dead process is removed before repair retries. Ambiguous
-drift preserves the WAL and fails closed.
+derived from the frozen plan. Every parsed state must retain the complete
+canonical plan-required alias journal as an immutable prefix, and every
+reconstructed transition predecessor must include that same alias-bearing
+genesis. Rehashing a later state after deleting historical aliases therefore
+fails closed. A lock owned by a live process is preserved; a valid lock naming
+a dead process is removed before repair retries. Ambiguous drift preserves the
+WAL and fails closed.
 
 ## Compatibility fixture
 

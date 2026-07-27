@@ -337,6 +337,167 @@ describe("v2 migration plan", () => {
     ]);
   });
 
+  test.each([
+    {
+      label: "hard-link aliases with different canonical paths",
+      left: {
+        path: "/profiles/hardlink-a",
+        realPath: "/profiles/hardlink-a",
+        device: "7",
+        inode: "42",
+        digest: digest("hard-link-shared-root"),
+      },
+      right: {
+        path: "/profiles/hardlink-b",
+        realPath: "/profiles/hardlink-b",
+        device: "7",
+        inode: "42",
+        digest: digest("hard-link-shared-root"),
+      },
+    },
+    {
+      label: "one canonical path with contradictory inode metadata",
+      left: {
+        path: "/profiles/shared",
+        realPath: "/profiles/shared",
+        device: "7",
+        inode: "42",
+        digest: digest("shared-root"),
+      },
+      right: {
+        path: "/profiles/shared",
+        realPath: "/profiles/shared",
+        device: "7",
+        inode: "43",
+        digest: digest("shared-root"),
+      },
+    },
+    {
+      label: "one canonical path with contradictory content digests",
+      left: {
+        path: "/profiles/shared",
+        realPath: "/profiles/shared",
+        device: "7",
+        inode: "42",
+        digest: digest("shared-root-left"),
+      },
+      right: {
+        path: "/profiles/shared",
+        realPath: "/profiles/shared",
+        device: "7",
+        inode: "42",
+        digest: digest("shared-root-right"),
+      },
+    },
+    {
+      label: "one device-inode identity with contradictory content digests",
+      left: {
+        path: "/profiles/hardlink-a",
+        realPath: "/profiles/hardlink-a",
+        device: "7",
+        inode: "42",
+        digest: digest("hard-link-left"),
+      },
+      right: {
+        path: "/profiles/hardlink-b",
+        realPath: "/profiles/hardlink-b",
+        device: "7",
+        inode: "42",
+        digest: digest("hard-link-right"),
+      },
+    },
+  ])("quarantines $label", ({ left, right }) => {
+    const metadata = {
+      state: "verified" as const,
+      entryCount: 12,
+      byteCount: 2048,
+    };
+    const plan = buildPlan([
+      safeObservation("alice", "claude", {
+        root: { ...metadata, ...left },
+      }),
+      safeObservation("bob", "claude", {
+        inputDigest: digest(`physical-conflict-${left.path}-${right.inode}`),
+        root: { ...metadata, ...right },
+      }),
+    ]);
+
+    expect(plan.records.map((record) => record.disposition)).toEqual([
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+    ]);
+    expect(plan.records.every((record) => record.binding === undefined)).toBe(true);
+  });
+
+  test("canonicalizes numeric device and inode aliases before physical-root quarantine", () => {
+    const metadata = {
+      state: "verified" as const,
+      entryCount: 12,
+      byteCount: 2048,
+      digest: digest("numeric-identity-shared-root"),
+    };
+    const plan = buildPlan([
+      safeObservation("alice", "claude", {
+        root: {
+          ...metadata,
+          path: "/profiles/numeric-a",
+          realPath: "/profiles/numeric-a",
+          device: "1",
+          inode: "2",
+        },
+      }),
+      safeObservation("bob", "claude", {
+        inputDigest: digest("numeric-identity-bob"),
+        root: {
+          ...metadata,
+          path: "/profiles/numeric-b",
+          realPath: "/profiles/numeric-b",
+          device: "01",
+          inode: "002",
+        },
+      }),
+    ]);
+
+    expect(
+      plan.records.map((record) =>
+        record.root.state === "verified"
+          ? [record.root.device, record.root.inode]
+          : null,
+      ),
+    ).toEqual([
+      ["1", "2"],
+      ["1", "2"],
+    ]);
+    expect(plan.records.map((record) => record.disposition)).toEqual([
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+    ]);
+  });
+
+  test("does not conflate equal content digests without a path or device-inode identity match", () => {
+    const sharedDigest = digest("same-content-distinct-roots");
+    const plan = buildPlan([
+      safeObservation("alice", "claude", {
+        root: {
+          ...safeObservation("alice").root,
+          digest: sharedDigest,
+        },
+      }),
+      safeObservation("bob", "claude", {
+        inputDigest: digest("same-content-bob"),
+        root: {
+          ...safeObservation("bob").root,
+          digest: sharedDigest,
+        },
+      }),
+    ]);
+
+    expect(plan.records.map((record) => record.disposition)).toEqual([
+      { state: "ready" },
+      { state: "ready" },
+    ]);
+  });
+
   test("fails duplicate source observations rather than silently overwriting", () => {
     expect(() => buildPlan([safeObservation("alice"), safeObservation("alice")])).toThrow(
       "duplicate legacy source key",
@@ -1217,6 +1378,71 @@ describe("durable sidecar WAL and repair", () => {
     expect(() => store.repair()).toThrow("canonical planned genesis");
     expect(store.load()).toBeNull();
     expect(existsSync(walPath)).toBe(true);
+  });
+
+  test("rejects loaded states that omit canonical genesis aliases after rehashing the predecessor chain", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const initial = createMigrationSidecar(buildPlan());
+    const legitimate = transitionMigrationSidecar(initial, "final_ready", {
+      gateEvidence: passingEvidence(initial.plan),
+    });
+
+    const {
+      integrityDigest: _initialIntegrityDigest,
+      ...initialCore
+    } = initial;
+    const aliaslessGenesisCore = {
+      ...initialCore,
+      aliasJournal: [],
+    };
+    const aliaslessGenesis = {
+      ...aliaslessGenesisCore,
+      integrityDigest: canonicalDigest(aliaslessGenesisCore),
+    } as MigrationSidecar;
+
+    const { digest: _gateDigest, ...gateCore } = legitimate.gateReceipts[0]!;
+    const forgedGateCore = {
+      ...gateCore,
+      sourceIntegrityDigest: aliaslessGenesis.integrityDigest,
+    };
+    const forgedGate = {
+      ...forgedGateCore,
+      digest: canonicalDigest(forgedGateCore),
+    };
+    const { digest: _transitionDigest, ...transitionCore } =
+      legitimate.transitionJournal[0]!;
+    const forgedTransitionCore = {
+      ...transitionCore,
+      sourceIntegrityDigest: aliaslessGenesis.integrityDigest,
+      sourceAliasJournalLength: 0,
+    };
+    const forgedTransition = {
+      ...forgedTransitionCore,
+      digest: canonicalDigest(forgedTransitionCore),
+    };
+    const {
+      integrityDigest: _legitimateIntegrityDigest,
+      ...legitimateCore
+    } = legitimate;
+    const forgedCore = {
+      ...legitimateCore,
+      aliasJournal: [],
+      gateReceipts: [forgedGate],
+      transitionJournal: [forgedTransition],
+    };
+    const forged = {
+      ...forgedCore,
+      integrityDigest: canonicalDigest(forgedCore),
+    } as MigrationSidecar;
+    writeFileSync(sidecarPath, `${JSON.stringify(forged, null, 2)}\n`, {
+      mode: 0o600,
+    });
+
+    expect(() => store.load()).toThrow("canonical genesis alias");
   });
 
   test("rejects a valid-integrity readiness successor with no durable gate receipt", () => {
