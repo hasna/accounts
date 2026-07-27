@@ -2,12 +2,14 @@ import {
   accountIdSchema,
   accountSchema,
   accountV2ListSchema,
+  assertAccountCreationTransition,
   assertAccountLookupIdentity,
   assertAccountRenameTransition,
   assertEntityScope,
+  assertRuntimeRegistrationTransition,
   assertRuntimeLookupIdentity,
-  assertSameAccountIdentity,
-  assertSameRuntimeIdentity,
+  assertUniqueAccountIds,
+  assertUniqueRuntimeIds,
   parseAccountRename,
   toAccountRenameRequest,
   RegistryConflictError,
@@ -54,6 +56,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     const body = await this.request(scope, "/accounts", { method: "GET" });
     const accounts = accountV2ListSchema.parse(body).accounts;
     for (const account of accounts) assertEntityScope(scope, account);
+    assertUniqueAccountIds(accounts);
     return accounts;
   }
 
@@ -81,7 +84,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     });
     const created = accountSchema.parse(body);
     assertEntityScope(scope, created);
-    assertSameAccountIdentity(account, created);
+    assertAccountCreationTransition(account, created);
     return created;
   }
 
@@ -117,6 +120,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     const body = await this.request(scope, "/runtimes", { method: "GET" });
     const runtimes = runtimeV2ListSchema.parse(body).runtimes;
     for (const runtime of runtimes) assertEntityScope(scope, runtime);
+    assertUniqueRuntimeIds(runtimes);
     return runtimes;
   }
 
@@ -144,7 +148,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     });
     const created = runtimeSchema.parse(body);
     assertEntityScope(scope, created);
-    assertSameRuntimeIdentity(runtime, created);
+    assertRuntimeRegistrationTransition(runtime, created);
     return created;
   }
 

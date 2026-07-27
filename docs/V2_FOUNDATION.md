@@ -25,7 +25,10 @@ Every v2 timestamp uses one canonical wire/storage representation:
 offset aliases, and invalid calendar instants are rejected rather than
 normalized. This matches the millisecond precision preserved by JavaScript
 `Date` and PostgreSQL driver values, so exact values survive a round trip and
-lexical ordering is also chronological ordering.
+lexical ordering is also chronological ordering. Every account and runtime
+also requires `updatedAt >= createdAt`; an impossible chronology is rejected
+at local, HTTP, and PostgreSQL ingress before it can be preserved by a later
+rename.
 
 `AccountsRegistry` is the only v2 domain port. The in-memory local adapter is a
 test double, while the HTTP and PostgreSQL adapters are structural foundations
@@ -42,7 +45,11 @@ fresh frozen view. Duplicate scoped IDs in local constructor seeds fail instead
 of overwriting earlier entities. The HTTP adapter also treats responses as
 untrusted: exact lookups must return the requested identity, and rename
 responses must apply the requested new name and an advancing requested
-timestamp without changing any other account field.
+timestamp without changing any other account field. HTTP and PostgreSQL create
+and runtime-registration responses must reproduce every requested field
+exactly, including mutable display fields and timestamps. Scoped list responses
+must contain one unambiguous entity per opaque ID; identical and conflicting
+duplicates are both rejected.
 
 Local, HTTP, and PostgreSQL rename operations share that same transition
 invariant: the requested name must differ, the requested timestamp must
@@ -50,9 +57,9 @@ advance, and the accepted result must apply both without changing ID, scope,
 runtime association, email, creation time, or any other non-target field.
 PostgreSQL exact lookups and write
 responses additionally require an exact zero-or-one or one-row result as
-appropriate. Creates, runtime registrations, and renames validate returned
-identity inside transactions so a malformed response or count mismatch rolls
-back instead of committing partially trusted state.
+appropriate. Creates, runtime registrations, and renames validate the complete
+requested transition inside transactions so a malformed response or count
+mismatch rolls back instead of committing partially trusted state.
 
 The future v2 HTTP rename route must enforce optimistic concurrency. The
 foundation client pre-reads the account, sends that exact canonical

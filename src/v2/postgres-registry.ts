@@ -6,13 +6,15 @@ import type { QueryResultRow } from "pg";
 import {
   accountIdSchema,
   accountSchema,
+  assertAccountCreationTransition,
   assertAccountLookupIdentity,
   assertAccountRenameRequest,
   assertAccountRenameTransition,
   assertEntityScope,
+  assertRuntimeRegistrationTransition,
   assertRuntimeLookupIdentity,
-  assertSameAccountIdentity,
-  assertSameRuntimeIdentity,
+  assertUniqueAccountIds,
+  assertUniqueRuntimeIds,
   parseAccountRenameInput,
   RegistryConflictError,
   RegistryNotFoundError,
@@ -65,11 +67,13 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
        ORDER BY name, account_id`,
       [scope.tenantId, scope.scopeId],
     );
-    return rows.map((row) => {
+    const accounts = rows.map((row) => {
       const account = toAccount(row);
       assertEntityScope(scope, account);
       return account;
     });
+    assertUniqueAccountIds(accounts);
+    return accounts;
   }
 
   async getAccount(scopeInput: RegistryScope, accountIdInput: AccountId): Promise<Account | null> {
@@ -113,7 +117,7 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
         );
         const created = toAccount(requiredExactRow(result, "account creation"));
         assertEntityScope(scope, created);
-        assertSameAccountIdentity(account, created);
+        assertAccountCreationTransition(account, created);
         return created;
       });
     } catch (error) {
@@ -188,11 +192,13 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
        ORDER BY key, runtime_id`,
       [scope.tenantId, scope.scopeId],
     );
-    return rows.map((row) => {
+    const runtimes = rows.map((row) => {
       const runtime = toRuntime(row);
       assertEntityScope(scope, runtime);
       return runtime;
     });
+    assertUniqueRuntimeIds(runtimes);
+    return runtimes;
   }
 
   async getRuntime(scopeInput: RegistryScope, runtimeIdInput: RuntimeId): Promise<Runtime | null> {
@@ -235,7 +241,7 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
         );
         const created = toRuntime(requiredExactRow(result, "runtime registration"));
         assertEntityScope(scope, created);
-        assertSameRuntimeIdentity(runtime, created);
+        assertRuntimeRegistrationTransition(runtime, created);
         return created;
       });
     } catch (error) {

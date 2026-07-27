@@ -473,7 +473,7 @@ describe("AccountsRegistry structural adapter foundation", () => {
     [
       "older timestamp",
       { name: "renamed", updatedAt: "2026-07-27T09:00:00.000Z" },
-      /advance/,
+      /advance|precede/,
     ],
     ["invalid timestamp", { name: "renamed", updatedAt: "not-a-timestamp" }, /timestamp|datetime/],
     [

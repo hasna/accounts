@@ -229,8 +229,11 @@ describe("PostgreSQL exact-row identity and rollback boundaries", () => {
     ["id", { account_id: "account_00000000002" }],
     ["runtime", { runtime_id: "runtime_00000000002" }],
     ["createdAt", { created_at: OLDER }],
+    ["name", { name: "mutated-name" }],
+    ["email", { email: "mutated@example.test" }],
+    ["updatedAt", { updated_at: LATER }],
   ])("createAccount rejects wrong returned %s and rolls back", async (_label, patch) => {
-    const input = account();
+    const input = accountSchema.parse({ ...account(), email: "input@example.test" });
     const harness = postgresHarness({
       tamper: (operation, row) =>
         operation === "createAccount" ? { ...row, ...patch } : row,
@@ -345,6 +348,9 @@ describe("PostgreSQL exact-row identity and rollback boundaries", () => {
   test.each([
     ["id", { runtime_id: "runtime_00000000002" }],
     ["createdAt", { created_at: OLDER }],
+    ["key", { key: "codex" }],
+    ["label", { label: "Mutated runtime" }],
+    ["updatedAt", { updated_at: LATER }],
   ])("registerRuntime rejects wrong returned %s and rolls back", async (_label, patch) => {
     const input = runtime();
     const harness = postgresHarness({
@@ -399,6 +405,190 @@ describe("PostgreSQL exact-row identity and rollback boundaries", () => {
       }
     },
   );
+});
+
+describe("HTTP create and registration response fidelity", () => {
+  test.each([
+    ["name", { name: "mutated-name" }],
+    ["email", { email: "mutated@example.test" }],
+    ["updatedAt", { updatedAt: LATER }],
+  ])("createAccount rejects a response with mutated %s", async (_label, patch) => {
+    const input = accountSchema.parse({ ...account(), email: "input@example.test" });
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async () => response({ ...input, ...patch })) as typeof fetch,
+    });
+
+    await expect(registry.createAccount(scope, input)).rejects.toThrow(/identity|creation/i);
+  });
+
+  test.each([
+    ["key", { key: "codex" }],
+    ["label", { label: "Mutated runtime" }],
+    ["updatedAt", { updatedAt: LATER }],
+  ])("registerRuntime rejects a response with mutated %s", async (_label, patch) => {
+    const input = runtime();
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async () => response({ ...input, ...patch })) as typeof fetch,
+    });
+
+    await expect(registry.registerRuntime(scope, input)).rejects.toThrow(
+      /identity|registration/i,
+    );
+  });
+});
+
+describe("list identity uniqueness", () => {
+  const accountValue = account();
+  const runtimeValue = runtime();
+
+  test.each([
+    ["identical accounts", "accounts", [accountValue, accountValue], /duplicate/i],
+    [
+      "conflicting accounts",
+      "accounts",
+      [accountValue, { ...accountValue, name: "conflicting-name" }],
+      /duplicate/i,
+    ],
+    [
+      "cross-scope accounts",
+      "accounts",
+      [accountValue, { ...accountValue, ...otherScope }],
+      /does not belong/i,
+    ],
+    ["identical runtimes", "runtimes", [runtimeValue, runtimeValue], /duplicate/i],
+    [
+      "conflicting runtimes",
+      "runtimes",
+      [runtimeValue, { ...runtimeValue, label: "Conflicting runtime" }],
+      /duplicate/i,
+    ],
+    [
+      "cross-scope runtimes",
+      "runtimes",
+      [runtimeValue, { ...runtimeValue, ...otherScope }],
+      /does not belong/i,
+    ],
+  ])("HTTP rejects %s", async (_label, entity, values, error) => {
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async () => response({ [entity]: values })) as typeof fetch,
+    });
+    const action =
+      entity === "accounts"
+        ? registry.listAccounts(scope)
+        : registry.listRuntimes(scope);
+
+    await expect(action).rejects.toThrow(error);
+  });
+
+  test.each([
+    ["identical accounts", "listAccounts", (row: Record<string, unknown>) => ({ ...row }), /duplicate/i],
+    [
+      "conflicting accounts",
+      "listAccounts",
+      (row: Record<string, unknown>) => ({ ...row, name: "conflicting-name" }),
+      /duplicate/i,
+    ],
+    [
+      "cross-scope accounts",
+      "listAccounts",
+      (row: Record<string, unknown>) => ({
+        ...row,
+        tenant_id: otherScope.tenantId,
+        scope_id: otherScope.scopeId,
+      }),
+      /does not belong/i,
+    ],
+    ["identical runtimes", "listRuntimes", (row: Record<string, unknown>) => ({ ...row }), /duplicate/i],
+    [
+      "conflicting runtimes",
+      "listRuntimes",
+      (row: Record<string, unknown>) => ({ ...row, label: "Conflicting runtime" }),
+      /duplicate/i,
+    ],
+    [
+      "cross-scope runtimes",
+      "listRuntimes",
+      (row: Record<string, unknown>) => ({
+        ...row,
+        tenant_id: otherScope.tenantId,
+        scope_id: otherScope.scopeId,
+      }),
+      /does not belong/i,
+    ],
+  ])("PostgreSQL rejects %s", async (_label, operation, duplicate, error) => {
+    const harness = postgresHarness({
+      accounts: [accountValue],
+      runtimes: [runtimeValue],
+      resultOverride: (seenOperation, result) => {
+        if (seenOperation !== operation || !result.rows[0]) return result;
+        return {
+          rows: [result.rows[0], duplicate(result.rows[0])],
+          rowCount: 2,
+        };
+      },
+    });
+    const action =
+      operation === "listAccounts"
+        ? harness.registry.listAccounts(scope)
+        : harness.registry.listRuntimes(scope);
+
+    await expect(action).rejects.toThrow(error);
+  });
+});
+
+describe("chronological entity invariants", () => {
+  const impossible = {
+    ...account(),
+    createdAt: LATER,
+    updatedAt: NOW,
+  } as Account;
+
+  test("local rejects an impossible account before rename state can be preserved", () => {
+    expect(() => new LocalAccountsRegistry({ accounts: [impossible] })).toThrow(
+      /createdAt|updatedAt|chronolog/i,
+    );
+  });
+
+  test("HTTP rejects an impossible rename pre-read before POST", async () => {
+    const methods: string[] = [];
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async (_input, init) => {
+        methods.push(init?.method ?? "GET");
+        return response(impossible);
+      }) as typeof fetch,
+    });
+
+    await expect(
+      registry.renameAccount(scope, impossible.id, "renamed", LATER),
+    ).rejects.toThrow(/createdAt|updatedAt|chronolog/i);
+    expect(methods).toEqual(["GET"]);
+  });
+
+  test("PostgreSQL rejects an impossible rename pre-read and rolls back", async () => {
+    const before = account();
+    const harness = postgresHarness({
+      accounts: [before],
+      tamper: (operation, row) =>
+        operation === "renameRead"
+          ? { ...row, created_at: LATER, updated_at: NOW }
+          : row,
+    });
+
+    await expect(
+      harness.registry.renameAccount(scope, before.id, "renamed", LATER),
+    ).rejects.toThrow(/createdAt|updatedAt|chronolog/i);
+    expect(harness.account(before.id)).toEqual(before);
+    expect(harness.operations.filter((operation) => operation === "renameAccount")).toEqual([]);
+    expect(harness.rollbacks()).toBe(1);
+  });
 });
 
 type PostgresOperation =

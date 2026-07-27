@@ -73,33 +73,47 @@ export const renameAccountRequestSchema = renameAccountInputSchema
  * Cloud-safe account identity. Authentication, machine paths and selection
  * pointers cannot be represented by this schema.
  */
+const accountShape = {
+  id: accountIdSchema,
+  tenantId: tenantIdSchema,
+  scopeId: scopeIdSchema,
+  name: profileNameSchema,
+  runtimeId: runtimeIdSchema,
+  email: z.string().email().optional(),
+  createdAt: timestampSchema,
+  updatedAt: timestampSchema,
+} as const;
+
 export const accountSchema = z
-  .object({
-    id: accountIdSchema,
-    tenantId: tenantIdSchema,
-    scopeId: scopeIdSchema,
-    name: profileNameSchema,
-    runtimeId: runtimeIdSchema,
-    email: z.string().email().optional(),
-    createdAt: timestampSchema,
-    updatedAt: timestampSchema,
-  })
-  .strict();
+  .object(accountShape)
+  .strict()
+  .superRefine(assertChronologicalEntity);
+const accountSerializerSchema = z
+  .object(accountShape)
+  .strip()
+  .superRefine(assertChronologicalEntity);
 
 export type Account = Readonly<z.infer<typeof accountSchema>>;
 
 /** Package-known executable integration, scoped exactly like accounts. */
+const runtimeShape = {
+  id: runtimeIdSchema,
+  tenantId: tenantIdSchema,
+  scopeId: scopeIdSchema,
+  key: profileNameSchema,
+  label: z.string().min(1).max(128),
+  createdAt: timestampSchema,
+  updatedAt: timestampSchema,
+} as const;
+
 export const runtimeSchema = z
-  .object({
-    id: runtimeIdSchema,
-    tenantId: tenantIdSchema,
-    scopeId: scopeIdSchema,
-    key: profileNameSchema,
-    label: z.string().min(1).max(128),
-    createdAt: timestampSchema,
-    updatedAt: timestampSchema,
-  })
-  .strict();
+  .object(runtimeShape)
+  .strict()
+  .superRefine(assertChronologicalEntity);
+const runtimeSerializerSchema = z
+  .object(runtimeShape)
+  .strip()
+  .superRefine(assertChronologicalEntity);
 
 export type Runtime = Readonly<z.infer<typeof runtimeSchema>>;
 
@@ -119,11 +133,11 @@ export type RenameAccountInput = Readonly<z.infer<typeof renameAccountInputSchem
 export type RenameAccountRequest = Readonly<z.infer<typeof renameAccountRequestSchema>>;
 
 export function toAccountV2Dto(value: Account & object): AccountV2Dto {
-  return accountSchema.strip().parse(value);
+  return accountSerializerSchema.parse(value);
 }
 
 export function toRuntimeV2Dto(value: Runtime & object): RuntimeV2Dto {
-  return runtimeSchema.strip().parse(value);
+  return runtimeSerializerSchema.parse(value);
 }
 
 export function assertEntityScope(
@@ -237,6 +251,43 @@ export function assertSameRuntimeIdentity(expected: Runtime, actual: Runtime): v
   }
 }
 
+export function assertAccountCreationTransition(expected: Account, actual: Account): void {
+  assertSameAccountIdentity(expected, actual);
+  if (
+    actual.name !== expected.name ||
+    actual.email !== expected.email ||
+    actual.updatedAt !== expected.updatedAt
+  ) {
+    throw new RegistryConflictError(
+      "v2 registry account creation response changed requested identity or fields",
+    );
+  }
+}
+
+export function assertRuntimeRegistrationTransition(
+  expected: Runtime,
+  actual: Runtime,
+): void {
+  assertSameRuntimeIdentity(expected, actual);
+  if (
+    actual.key !== expected.key ||
+    actual.label !== expected.label ||
+    actual.updatedAt !== expected.updatedAt
+  ) {
+    throw new RegistryConflictError(
+      "v2 registry runtime registration response changed requested identity or fields",
+    );
+  }
+}
+
+export function assertUniqueAccountIds(values: readonly Account[]): void {
+  assertUniqueEntityIds("account", values);
+}
+
+export function assertUniqueRuntimeIds(values: readonly Runtime[]): void {
+  assertUniqueEntityIds("runtime", values);
+}
+
 export function assertAccountLookupIdentity(expectedId: AccountId, actual: Account): void {
   if (actual.id !== expectedId) {
     throw new RegistryConflictError(
@@ -255,6 +306,34 @@ export function assertRuntimeLookupIdentity(expectedId: RuntimeId, actual: Runti
 
 function timestampAdvances(current: string, next: string): boolean {
   return next > current;
+}
+
+function assertChronologicalEntity(
+  value: { createdAt: string; updatedAt: string },
+  context: z.RefinementCtx,
+): void {
+  if (value.updatedAt < value.createdAt) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["updatedAt"],
+      message: "updatedAt must not precede createdAt",
+    });
+  }
+}
+
+function assertUniqueEntityIds(
+  kind: "account" | "runtime",
+  values: readonly { id: string }[],
+): void {
+  const ids = new Set<string>();
+  for (const value of values) {
+    if (ids.has(value.id)) {
+      throw new RegistryConflictError(
+        `v2 registry ${kind} list contains duplicate scoped id "${value.id}"`,
+      );
+    }
+    ids.add(value.id);
+  }
 }
 
 export class RegistryScopeError extends Error {

@@ -63,6 +63,25 @@ describe("v2 domain boundary", () => {
     expect(value.updatedAt).toBe(NOW);
   });
 
+  test.each([
+    ["account", accountSchema, { ...account(), createdAt: "2026-07-27T11:00:00.000Z" }],
+    [
+      "runtime",
+      runtimeSchema,
+      {
+        id: runtimeId,
+        tenantId,
+        scopeId,
+        key: "claude",
+        label: "Claude Code",
+        createdAt: "2026-07-27T11:00:00.000Z",
+        updatedAt: NOW,
+      },
+    ],
+  ])("rejects %s entities whose updatedAt precedes createdAt", (_label, schema, value) => {
+    expect(schema.safeParse(value).success).toBe(false);
+  });
+
   test("uses opaque identity fields and excludes machine authentication from Account/Runtime", () => {
     expect(accountSchema.safeParse({ ...account(), id: "work" }).success).toBe(false);
     expect(
