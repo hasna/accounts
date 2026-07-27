@@ -13,6 +13,7 @@ export {
 export {
   addCustomTool,
   getTool,
+  ensureProfileForLogin,
   listTools,
   loadStore,
   removeCustomTool,
@@ -54,7 +55,7 @@ export type { AddOptions, RemoveOptions, UpdateOptions, ProfileMetadata, Profile
 export { resolveStore } from "./lib/store.js";
 export type { AccountsStore, CurrentEntry, RemoveResult } from "./lib/store.js";
 export { applyProfile, appliedProfile, appliedProfileName } from "./lib/apply.js";
-export { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
+export { importProfile } from "./lib/import-profile.js";
 export type { ImportOptions } from "./lib/import-profile.js";
 export {
   detectToolAvailability,

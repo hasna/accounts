@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   addCustomTool,
   addProfile,
+  ensureProfileForLogin,
   listProfiles,
   listTools,
   loadStore,
@@ -120,6 +121,99 @@ describe("root synchronous compatibility exports", () => {
     Object.assign(process.env, env);
     expect(() => listProfiles()).toThrow(error);
     expect(existsSync(join(home, "accounts.json"))).toBe(false);
+  });
+
+  test.each([
+    ["default local", {}],
+    [
+      "explicit local",
+      {
+        HASNA_ACCOUNTS_MODE: "local",
+      },
+    ],
+    [
+      "explicit local with retained hosted URL and key",
+      {
+        HASNA_ACCOUNTS_MODE: "local",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+    ],
+    [
+      "implicit local with only a hosted URL",
+      {
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+      },
+    ],
+    [
+      "implicit local with only a hosted key",
+      {
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+    ],
+  ])("ensureProfileForLogin preserves the documented v1 local boundary for %s", (_label, env) => {
+    Object.assign(process.env, env);
+    const profile = ensureProfileForLogin("login-local");
+    expect(profile).toMatchObject({ name: "login-local", tool: "claude" });
+    expect(existsSync(join(home, "accounts.json"))).toBe(true);
+    expect(existsSync(join(home, "profiles"))).toBe(true);
+  });
+
+  test.each([
+    [
+      "implicit hosted URL and key",
+      {
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+      /local-only compatibility/,
+    ],
+    [
+      "explicit cloud with URL and key",
+      {
+        HASNA_ACCOUNTS_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+      /local-only compatibility/,
+    ],
+    [
+      "explicit self-hosted with URL and key",
+      {
+        HASNA_ACCOUNTS_MODE: "self_hosted",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+      /local-only compatibility/,
+    ],
+    [
+      "incomplete explicit cloud",
+      {
+        HASNA_ACCOUNTS_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+      },
+      /requires HASNA_ACCOUNTS_API_KEY/,
+    ],
+    [
+      "incomplete explicit self-hosted",
+      {
+        HASNA_ACCOUNTS_MODE: "self_hosted",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+      /requires HASNA_ACCOUNTS_API_URL/,
+    ],
+    [
+      "invalid explicit mode",
+      {
+        HASNA_ACCOUNTS_MODE: "typo",
+      },
+      /invalid accounts storage mode/,
+    ],
+  ])("ensureProfileForLogin fails closed without local writes for %s", (_label, env, error) => {
+    Object.assign(process.env, env);
+    expect(() => ensureProfileForLogin("must-not-write")).toThrow(error);
+    expect(existsSync(join(home, "accounts.json"))).toBe(false);
+    expect(existsSync(join(home, "profiles"))).toBe(false);
   });
 });
 

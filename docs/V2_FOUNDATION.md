@@ -64,9 +64,11 @@ mismatch rolls back instead of committing partially trusted state.
 The future v2 HTTP rename route must enforce optimistic concurrency. The
 foundation client pre-reads the account, sends that exact canonical
 `updatedAt` as both `expectedUpdatedAt` in the strict request body and
-`If-Match`, and treats a stale response as a conflict. Fixture coverage proves
-the contract and stale-request behavior only; this PR does not add or claim a
-production v2 route.
+`If-Match`, and treats both HTTP `409 Conflict` and `412 Precondition Failed`
+as a typed `RegistryConflictError`. The HTTP status is retained on the error,
+while untrusted response details are not copied into its message or cause.
+Fixture coverage proves the contract and stale-request behavior only; this PR
+does not add or claim a production v2 route.
 
 The HTTP and PostgreSQL adapters are contract-first foundations for the later
 wire/schema migration slice. Both constrain every operation by tenant and
@@ -77,5 +79,7 @@ may retain those legacy fields only inside its isolated compatibility contract.
 
 Synchronous profile functions exported from the package root are now explicit
 local-only compatibility. They preserve local behavior, but fail before local
-I/O whenever hosted/self-hosted authority is configured. Async v1 callers use
-`resolveStore()`; new callers use `@hasna/accounts/v2`.
+I/O whenever hosted/self-hosted authority is configured. The deprecated
+`ensureProfileForLogin` root export uses that same canonical authority resolver,
+including `HASNA_ACCOUNTS_MODE`, rather than maintaining a separate mode policy.
+Async v1 callers use `resolveStore()`; new callers use `@hasna/accounts/v2`.

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { PoolQueryClient } from "../generated/storage-kit/index.js";
 import {
   accountSchema,
+  RegistryConflictError,
   registryScopeSchema,
   runtimeSchema,
   type Account,
@@ -312,6 +313,33 @@ describe("AccountsRegistry structural adapter foundation", () => {
       updatedAt: "2026-07-27T10:30:00.000Z",
     });
   });
+
+  test.each([409, 412])(
+    "HTTP rename maps stale status %i to a safe typed conflict",
+    async (status) => {
+      const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
+      const registry = new HttpAccountsRegistry({
+        baseUrl: "https://accounts.example.test",
+        apiKey: "fixture-authorization",
+        fetchImpl: (async (_input, init) =>
+          (init?.method ?? "GET") === "GET"
+            ? response(before)
+            : response({ error: "fixture-sensitive-remote-detail" }, status)) as typeof fetch,
+      });
+
+      const error = await registry
+        .renameAccount(scopeA, before.id, "renamed", LATER)
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(RegistryConflictError);
+      expect(error).toMatchObject({
+        name: "RegistryConflictError",
+        message: "v2 registry conflict",
+        status,
+      });
+      expect((error as Error).message).not.toContain("fixture-sensitive-remote-detail");
+      expect((error as Error).cause).toBeUndefined();
+    },
+  );
 
   test("HTTP rename rejects an email mutation in the response", async () => {
     const before = accountSchema.parse({

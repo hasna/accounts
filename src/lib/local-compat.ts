@@ -13,6 +13,7 @@ import {
 import { resolveAccountsCloud } from "./cloud-accounts.js";
 import {
   addCustomTool as localAddCustomTool,
+  DEFAULT_TOOL,
   getTool as localGetTool,
   listTools as localListTools,
   removeCustomTool as localRemoveCustomTool,
@@ -77,6 +78,26 @@ export function removeCustomTool(id: string): void {
 export function listProfiles(toolId?: string): Profile[] {
   assertRootCompatibilityIsLocal();
   return localListProfiles(toolId);
+}
+
+/**
+ * @deprecated Local-only synchronous compatibility shim. New callers should
+ * use prepareLogin(), whose async Store path also supports cloud custom tools.
+ */
+export function ensureProfileForLogin(name: string, toolId = DEFAULT_TOOL): Profile {
+  assertRootCompatibilityIsLocal();
+  const existing = localFindProfile(name, toolId);
+  if (existing) {
+    localLockProfileTool(existing.name, existing.tool);
+    return existing;
+  }
+  const profile = localAddProfile({
+    name,
+    tool: toolId,
+    description: "created for login",
+  });
+  localLockProfileTool(profile.name, profile.tool);
+  return profile;
 }
 
 export function findProfile(name: string, toolId?: string): Profile | undefined {

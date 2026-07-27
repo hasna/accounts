@@ -177,7 +177,9 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     });
     if (options.allowNotFound && response.status === 404) return null;
     if (!response.ok) {
-      if (response.status === 409) throw new RegistryConflictError("v2 registry conflict");
+      if (response.status === 409 || response.status === 412) {
+        throw new RegistryConflictError("v2 registry conflict", response.status);
+      }
       if (response.status === 404) throw new RegistryNotFoundError("v2 registry entity was not found");
       throw new Error(`v2 accounts registry request failed with status ${response.status}`);
     }
