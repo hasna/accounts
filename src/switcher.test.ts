@@ -19,7 +19,7 @@ import { resolvePickMode } from "./lib/pick.js";
 import { switchProfile } from "./lib/switch.js";
 import { controlledProbeEnv, profileEnv, providerLaunchEnv } from "./lib/env.js";
 import { loadStore } from "./storage.js";
-import { getTool } from "./lib/tools.js";
+import { addCustomTool, getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -448,7 +448,7 @@ test("switchProfile applies Claude and returns a continue handoff command", asyn
   expect(result.restartRequired).toBe(true);
   expect(result.command).toEqual(["claude", "--continue"]);
   expect(result.commandLine).not.toContain("CLAUDE_CONFIG_DIR=");
-  expect(result.commandLine).toContain('ANTHROPIC_API_KEY=""');
+  expect(result.commandLine).toContain("ANTHROPIC_API_KEY=''");
   expect(result.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   expect(result.env.ANTHROPIC_API_KEY).toBe("");
   expect(appliedProfile("claude")?.name).toBe("switcher");
@@ -500,6 +500,72 @@ test("switchProfile launches Codex App with isolated app state", async () => {
   expect(result.commandLine).toContain("--user-data-dir=");
   expect(currentProfile("codex-app")?.name).toBe("desktop");
   expect(appliedProfile("codex-app")).toBeUndefined();
+});
+
+test("switch handoff safely preserves hostile profile and extra env bytes", async () => {
+  const markerProfileDollar = join(home, "switch-profile-dollar-marker");
+  const markerProfileBacktick = join(home, "switch-profile-backtick-marker");
+  const markerExtraDollar = join(home, "switch-extra-dollar-marker");
+  const markerExtraBacktick = join(home, "switch-extra-backtick-marker");
+  const observation = join(home, "switch-observation");
+  const provider = join(home, "-switch-provider");
+  const hostileDir = join(
+    home,
+    `-leading "double" 'single'\nline\\backslash $DOLLAR ` +
+      `$(touch switch-profile-dollar-marker) \`touch switch-profile-backtick-marker\``,
+  );
+  const extraTemplate =
+    `-extra "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch switch-extra-dollar-marker) \`touch switch-extra-backtick-marker\`::{profileDir}`;
+  const expectedExtra = extraTemplate.replaceAll("{profileDir}", hostileDir);
+
+  writeFileSync(
+    provider,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n---EXTRA---\\n%s' "$HOSTILE_HOME" "$EXTRA_VALUE" > "$OBSERVATION_PATH"`,
+    ].join("\n"),
+  );
+  chmodSync(provider, 0o755);
+  addCustomTool({
+    id: "hostile-handoff",
+    label: "Hostile Handoff",
+    envVar: "HOSTILE_HOME",
+    extraEnv: { EXTRA_VALUE: extraTemplate },
+    defaultDir: join(home, "hostile-default"),
+    bin: "-switch-provider",
+  });
+  addProfile({ name: "hostile", tool: "hostile-handoff", dir: hostileDir });
+
+  const switched = await switchProfile("hostile", { tool: "hostile-handoff", mode: "active" });
+  const result = spawnSync("/bin/sh", ["-s"], {
+    cwd: home,
+    encoding: "utf8",
+    input: [
+      "HOSTILE_HOME=parent-value",
+      switched.commandLine,
+      'printf %s "$HOSTILE_HOME"',
+    ].join("\n"),
+    env: {
+      ...process.env,
+      DOLLAR: "expanded-by-shell",
+      OBSERVATION_PATH: observation,
+      PATH: `${home}:${process.env.PATH ?? ""}`,
+    },
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(existsSync(observation), result.stderr).toBe(true);
+  expect(readFileSync(observation, "utf8")).toBe(`${hostileDir}\n---EXTRA---\n${expectedExtra}`);
+  expect(result.stdout).toBe("parent-value");
+  for (const marker of [
+    markerProfileDollar,
+    markerProfileBacktick,
+    markerExtraDollar,
+    markerExtraBacktick,
+  ]) {
+    expect(existsSync(marker)).toBe(false);
+  }
 });
 
 test("switchProfile puts Codex dangerous permissions before the resume subcommand", async () => {

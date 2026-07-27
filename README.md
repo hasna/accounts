@@ -118,8 +118,12 @@ selected profile's isolated `CODEX_HOME` and Electron user data directory.
 
 `accounts use` alone does **not** change Cursor — run `accounts apply` for IDE auth.
 
-A child process cannot change your parent shell — use `eval "$(accounts env …)"` or the
+A child process cannot change your parent shell — from a POSIX shell
+(sh/bash/zsh), use `eval "$(accounts env …)"`, or use the
 [shell hook](docs/hook.md) (terminal `claude` only, not IDE extensions).
+Other shells should use `accounts launch`; fish/nushell users may also use
+`accounts shell` when `SHELL` identifies that shell. Accounts does not
+currently emit fish, nushell, or PowerShell assignment syntax.
 
 ### Request-debug environment policy
 
@@ -131,6 +135,12 @@ non-launch `accounts switch` commands and the optional `claude()` shell hook
 use `env -u` for the same keys. The hook changes only the provider child, not
 the parent shell. This also prevents a custom tool's profile environment from
 restoring those controls.
+
+Printed POSIX handoffs validate every environment-variable name, single-quote
+every value and command word without expansion, and place an explicit `env --`
+option boundary before assignments. Profile directories and custom `extraEnv`
+values therefore retain spaces, quotes, newlines, backslashes, dollars,
+backticks, and leading hyphens as data rather than shell syntax.
 
 Accounts otherwise preserves the caller's same-binding environment, including
 `PATH`, proxy and TLS settings, Bedrock/Vertex selection, and AWS/Google SDK
@@ -290,7 +300,7 @@ per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CL
 | `accounts current` | Active profile per tool (with applied hint). |
 | `accounts active [tool]` | Print active profile name (scripting). |
 | `accounts applied [tool]` | Print applied profile name (scripting). |
-| `accounts env [name]` | Print one or more `export ...` lines for the profile. Use `--tool` only when ambiguous or when no name is passed. |
+| `accounts env [name]` | Print POSIX sh/bash/zsh `export ...` lines for the profile. Use `--tool` only when ambiguous or when no name is passed. |
 | `accounts launch <name>` | Launch tool once with profile env. Supports `--permissions <preset>`. |
 | `accounts run <tool> [args...]` | Run a tool under the supervisor so MCP/CLI can switch and restart it. Supports `--permissions <preset>`. |
 | `accounts supervisor status [tool]` | Show running supervisors. |

@@ -1,4 +1,5 @@
 import type { Profile, ToolDef } from "../types.js";
+import { AccountsError } from "../types.js";
 import { CLAUDE_API_AUTH_ENV_KEYS, sanitizeClaudeProfileApiSettings } from "./claude-auth.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
@@ -18,6 +19,7 @@ export const UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEYS = [
 const UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEY_SET = new Set(
   UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEYS.map((name) => name.toLowerCase()),
 );
+const PORTABLE_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function isUnsafeProviderRequestDebugEnvKey(name: string): boolean {
   return UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEY_SET.has(name.toLowerCase());
@@ -36,6 +38,31 @@ function requestDebugUnsetKeys(parentEnv: NodeJS.ProcessEnv = process.env): stri
     if (isUnsafeProviderRequestDebugEnvKey(name) && !keys.includes(name)) keys.push(name);
   }
   return keys;
+}
+
+function assertPortableEnvName(name: string): void {
+  if (!PORTABLE_ENV_NAME_PATTERN.test(name)) {
+    throw new AccountsError(`invalid environment variable name "${name}" for POSIX shell handoff`);
+  }
+}
+
+/**
+ * Serialize one POSIX shell word without expansion. Single quotes preserve
+ * spaces, newlines, backslashes, dollars, backticks, and leading hyphens; the
+ * close/quoted-quote/reopen sequence handles embedded single quotes.
+ */
+export function quotePosixShellWord(value: string): string {
+  if (value.includes("\0")) {
+    throw new AccountsError("POSIX shell handoffs cannot represent NUL bytes");
+  }
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function shellEnvEntries(env: Record<string, string>): Array<[string, string]> {
+  return Object.entries(env).map(([name, value]) => {
+    assertPortableEnvName(name);
+    return [name, value];
+  });
 }
 
 function renderTemplate(value: string, profile: Profile): string {
@@ -88,12 +115,16 @@ export function formatEnvAssignments(
   env: Record<string, string>,
   parentEnv: NodeJS.ProcessEnv = process.env,
 ): string {
-  const sanitized = removeUnsafeProviderRequestDebugEnv({ ...env });
-  const unset = requestDebugUnsetKeys(parentEnv).flatMap((name) => ["-u", name]);
+  const sanitized = removeUnsafeProviderRequestDebugEnv({ ...env }) as Record<string, string>;
+  const unset = requestDebugUnsetKeys(parentEnv).flatMap((name) => {
+    assertPortableEnvName(name);
+    return ["-u", name];
+  });
   return [
     "env",
     ...unset,
-    ...Object.entries(sanitized).map(([name, value]) => `${name}=${JSON.stringify(value)}`),
+    "--",
+    ...shellEnvEntries(sanitized).map(([name, value]) => `${name}=${quotePosixShellWord(value)}`),
   ].join(" ");
 }
 
@@ -101,9 +132,11 @@ export function formatExportLines(
   env: Record<string, string>,
   parentEnv: NodeJS.ProcessEnv = process.env,
 ): string {
-  const sanitized = removeUnsafeProviderRequestDebugEnv({ ...env });
+  const sanitized = removeUnsafeProviderRequestDebugEnv({ ...env }) as Record<string, string>;
+  const unsetKeys = requestDebugUnsetKeys(parentEnv);
+  for (const name of unsetKeys) assertPortableEnvName(name);
   return [
-    `unset ${requestDebugUnsetKeys(parentEnv).join(" ")}`,
-    ...Object.entries(sanitized).map(([name, value]) => `export ${name}=${JSON.stringify(value)}`),
+    `unset ${unsetKeys.join(" ")}`,
+    ...shellEnvEntries(sanitized).map(([name, value]) => `export ${name}=${quotePosixShellWord(value)}`),
   ].join("\n");
 }

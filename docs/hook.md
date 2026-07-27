@@ -49,6 +49,7 @@ If apply fails, the hook prints a warning and still starts Claude. For debugging
 | Hook sourced but `accounts` not on `PATH` | Install `@hasna/accounts` globally or add to PATH before sourcing |
 | `ACCOUNTS_HOME` differs between hook install and daily shell | Use the same env in shell startup as when you run `accounts` |
 | Active profile has no auth snapshot | Run `accounts login` + `accounts detect` before relying on auto-apply |
-| fish / nushell | Hook is bash-oriented; use `accounts apply` or `eval "$(accounts env …)"` instead |
+| fish / nushell | Hook and generated `accounts env` output are POSIX-oriented; use `accounts apply`, `accounts launch`, or `accounts shell` instead |
+| PowerShell | Generated shell syntax is not supported; use `accounts apply` or `accounts launch` |
 
 See [IMPLEMENT.md](./IMPLEMENT.md) for the active vs applied model.

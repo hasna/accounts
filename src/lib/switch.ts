@@ -2,7 +2,13 @@ import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
-import { claudeApiAuthClearingEnv, formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
+import {
+  claudeApiAuthClearingEnv,
+  formatEnvAssignments,
+  formatExportLines,
+  profileEnv,
+  quotePosixShellWord,
+} from "./env.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
@@ -31,13 +37,8 @@ export interface SwitchResult {
   message: string;
 }
 
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_./:=@+-]+$/.test(value)) return value;
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
 function commandLine(env: Record<string, string>, command: string[]): string {
-  return `${formatEnvAssignments(env)} ${command.map(shellQuote).join(" ")}`.trim();
+  return `${formatEnvAssignments(env)} ${command.map(quotePosixShellWord).join(" ")}`.trim();
 }
 
 function commandFor(profile: Profile, tool: ToolDef, opts: SwitchOptions): string[] {

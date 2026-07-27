@@ -55,6 +55,16 @@ output instead of using an Accounts-owned spawn. The optional bash/zsh
 `claude()` hook uses the same child-only `env -u` boundary: it preserves the
 parent shell and every other inherited environment variable.
 
+Generated handoffs target POSIX sh/bash/zsh syntax. `src/lib/env.ts` rejects
+non-portable variable names, quotes every value as a non-expanding POSIX word,
+and inserts `env --` before assignments so a leading-hyphen provider binary
+cannot be parsed as an `env` option. Embedded quotes, newlines, backslashes,
+dollars, and backticks remain literal. Tool schemas validate `extraEnv` keys
+at registration/load time, while the renderer validates again at the execution
+boundary for defense in depth. fish, nushell, and PowerShell output is not
+claimed; use an Accounts-owned launch there (or `accounts shell` for
+fish/nushell when `SHELL` identifies that shell).
+
 Do not broaden that list without evidence that another control dumps provider
 requests. `PATH`, proxy/TLS configuration, Bedrock/Vertex selection, and
 AWS/Google SDK settings are intentionally preserved as part of the caller's

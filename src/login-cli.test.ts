@@ -395,6 +395,98 @@ test("generated env and pick --env handoffs unset request debugging before provi
   expectSafeProviderObservation();
 });
 
+test("env, pick --env, and switch preserve hostile profile and extra env bytes", () => {
+  const toolBin = join(binDir, "-hostile-handoff-tool");
+  const markerDollar = join(home, "cli-dollar-marker");
+  const markerBacktick = join(home, "cli-backtick-marker");
+  const hostileDir =
+    `${home}/-leading "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch cli-dollar-marker) \`touch cli-backtick-marker\``;
+  const extraTemplate =
+    `-extra "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch cli-dollar-marker) \`touch cli-backtick-marker\`::{profileDir}`;
+  const expectedExtra = extraTemplate.replaceAll("{profileDir}", hostileDir);
+  writeFileSync(
+    toolBin,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n---EXTRA---\\n%s' "$HOSTILE_HOME" "$EXTRA_VALUE" > "$OBSERVATION_PATH"`,
+    ].join("\n"),
+  );
+  chmodSync(toolBin, 0o755);
+  addFakeLoginTool("hostile-handoff", "Hostile Handoff", "HOSTILE_HOME", "-hostile-handoff-tool");
+  expect(runCli("add", "acct", "--tool", "hostile-handoff").status).toBe(0);
+
+  const storePath = join(home, "accounts.json");
+  const store = JSON.parse(readFileSync(storePath, "utf8")) as {
+    profiles: Array<{ name: string; tool: string; dir: string }>;
+    tools: Array<{ id: string; extraEnv?: Record<string, string> }>;
+  };
+  store.profiles.find((entry) => entry.name === "acct" && entry.tool === "hostile-handoff")!.dir = hostileDir;
+  store.tools.find((entry) => entry.id === "hostile-handoff")!.extraEnv = { EXTRA_VALUE: extraTemplate };
+  writeFileSync(storePath, JSON.stringify(store));
+
+  const extractExports = (stdout: string): string => {
+    const start = stdout.indexOf("unset BUN_CONFIG_VERBOSE_FETCH");
+    expect(start).toBeGreaterThanOrEqual(0);
+    return stdout.slice(start).trimEnd();
+  };
+  const evaluateExports = (script: string, observation: string) =>
+    spawnSync("/bin/sh", ["-s"], {
+      cwd: home,
+      encoding: "utf8",
+      input: `${script}\nprintf '%s\\n---EXTRA---\\n%s' "$HOSTILE_HOME" "$EXTRA_VALUE" > "$OBSERVATION_PATH"`,
+      env: {
+        ...process.env,
+        DOLLAR: "expanded-by-shell",
+        OBSERVATION_PATH: observation,
+      },
+    });
+
+  const generated = runCliWith(["env", "acct", "--tool", "hostile-handoff"]);
+  expect(generated.status, generated.stderr).toBe(0);
+  const envObservation = join(home, "env-observation");
+  const evaluatedEnv = evaluateExports(extractExports(generated.stdout), envObservation);
+  expect(evaluatedEnv.status, evaluatedEnv.stderr).toBe(0);
+  expect(readFileSync(envObservation, "utf8")).toBe(`${hostileDir}\n---EXTRA---\n${expectedExtra}`);
+
+  const picked = runCliWith(["pick", "--tool", "hostile-handoff", "--env"], { input: "1\n" });
+  expect(picked.status, picked.stderr).toBe(0);
+  const pickObservation = join(home, "pick-observation");
+  const evaluatedPick = evaluateExports(extractExports(picked.stdout), pickObservation);
+  expect(evaluatedPick.status, evaluatedPick.stderr).toBe(0);
+  expect(readFileSync(pickObservation, "utf8")).toBe(`${hostileDir}\n---EXTRA---\n${expectedExtra}`);
+
+  const switched = runCliWith(["switch", "acct", "--tool", "hostile-handoff", "--mode", "active"]);
+  expect(switched.status, switched.stderr).toBe(0);
+  const commandStart = switched.stdout.indexOf("restart command: ");
+  const commandEnd = switched.stdout.indexOf("\n  Exit the current agent session", commandStart);
+  expect(commandStart).toBeGreaterThanOrEqual(0);
+  expect(commandEnd).toBeGreaterThan(commandStart);
+  const commandLine = switched.stdout.slice(commandStart + "restart command: ".length, commandEnd);
+  const switchObservation = join(home, "switch-observation");
+  const evaluatedSwitch = spawnSync("/bin/sh", ["-s"], {
+    cwd: home,
+    encoding: "utf8",
+    input: [
+      "HOSTILE_HOME=parent-value",
+      commandLine,
+      'printf %s "$HOSTILE_HOME"',
+    ].join("\n"),
+    env: {
+      ...process.env,
+      DOLLAR: "expanded-by-shell",
+      OBSERVATION_PATH: switchObservation,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    },
+  });
+  expect(evaluatedSwitch.status, evaluatedSwitch.stderr).toBe(0);
+  expect(evaluatedSwitch.stdout).toBe("parent-value");
+  expect(readFileSync(switchObservation, "utf8")).toBe(`${hostileDir}\n---EXTRA---\n${expectedExtra}`);
+  expect(existsSync(markerDollar)).toBe(false);
+  expect(existsSync(markerBacktick)).toBe(false);
+});
+
 test("non-launch switch handoff command unsets request debugging before provider execution", () => {
   writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
   addFakeLoginTool();

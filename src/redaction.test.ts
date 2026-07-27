@@ -141,3 +141,83 @@ test("sensitive header matching handles safe delimiters without broad prose reda
   expect(redacted).toContain("authorization-mode = public-capability-name");
   expect(redacted).toContain("Set-Cookie documentation: independent prose");
 });
+
+test("closing brackets and braces inside sensitive values are fully redacted", () => {
+  const input = [
+    "Cookie: session=cookie-secret]cookie-suffix}; theme=night",
+    "Authorization: Custom auth-secret]auth-suffix}",
+    "Set-Cookie: session=set-cookie-secret]set-cookie-suffix}; Path=/",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "cookie-secret",
+    "cookie-suffix",
+    "auth-secret",
+    "auth-suffix",
+    "set-cookie-secret",
+    "set-cookie-suffix",
+    "Path=/",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(3);
+});
+
+test("indented diagnostics and adjacent headers are not mistaken for folded secrets", () => {
+  const input = [
+    "Authorization: AWS4-HMAC-SHA256 Credential=folded-access/20260727/us-east-1/bedrock/aws4_request,",
+    "  SignedHeaders=content-type;host;x-amz-date,",
+    "  Signature=folded-signature",
+    "  status=403 request-id=keep-indented-diagnostic",
+    "  X-Request-ID: keep-adjacent-header",
+    "",
+    "Cookie: session=folded-cookie;",
+    "  theme=night;",
+    "  csrf=folded-csrf",
+    "  status=429 retry-after=keep-cookie-diagnostic",
+    "message=keep-unindented-diagnostic",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "folded-access",
+    "SignedHeaders",
+    "folded-signature",
+    "folded-cookie",
+    "folded-csrf",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const retained of [
+    "status=403 request-id=keep-indented-diagnostic",
+    "X-Request-ID: keep-adjacent-header",
+    "status=429 retry-after=keep-cookie-diagnostic",
+    "message=keep-unindented-diagnostic",
+  ]) {
+    expect(redacted).toContain(retained);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(2);
+});
+
+test("blank, quoted, and adjacent serialized boundaries retain non-sensitive data", () => {
+  const input = [
+    'Cookie: "quoted-secret]with-brace}"',
+    "  status=200 keep-after-quoted",
+    "",
+    '{"Authorization":"serialized-secret]with-brace}","status":401,"message":"keep-serialized"}',
+    "X-Diagnostic: keep-final-header",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  expect(redacted).not.toContain("quoted-secret");
+  expect(redacted).not.toContain("serialized-secret");
+  expect(redacted).toContain("status=200 keep-after-quoted");
+  expect(redacted).toContain('"status":401');
+  expect(redacted).toContain('"message":"keep-serialized"');
+  expect(redacted).toContain("X-Diagnostic: keep-final-header");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(2);
+});
