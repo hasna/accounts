@@ -148,11 +148,19 @@ derivation, and ready-record receipt checks all use that same tuple.
 Every runtime ID maps to exactly one canonical definition across every plan
 record, including quarantined records, and one canonical definition maps back
 to one runtime ID. Multiple records may legitimately share both the same
-definition and runtime ID. Rehashing a plan after changing a label, changing
-case, or introducing a noncanonical Unicode or whitespace variant therefore
-fails before disposition filtering or backfill. The crosswalk retains source
-authority, authority ID, legacy tool/name, and the frozen account, runtime, and
-binding IDs.
+definition and runtime ID. Divergent definitions for one shared runtime ID
+fail before disposition filtering or backfill, including case differences.
+Noncanonical Unicode or whitespace encodings fail schema validation.
+
+The standalone plan, input, and sidecar hashes are unkeyed integrity evidence,
+not authentication of the plan's semantic origin. A globally self-consistent
+runtime remap can satisfy standalone schema and sidecar creation when every
+affected record and digest is recomputed. Detecting that rewrite requires an
+independently trusted original frozen census and comparison through
+`buildMigrationPlan(originalInput, { existingPlan: candidatePlan })`; the
+candidate plan's hashes alone are not a trust anchor. The crosswalk retains
+source authority, authority ID, legacy tool/name, and the frozen account,
+runtime, and binding IDs.
 
 ## Durable file contract and repair
 

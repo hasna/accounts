@@ -965,6 +965,50 @@ describe("v2 migration plan", () => {
     },
   );
 
+  test("requires a trusted original census to detect a fully rehashed self-consistent runtime remap", () => {
+    const observations = [
+      safeObservation("alice"),
+      safeObservation("bob", "claude", {
+        inputDigest: digest("runtime-self-consistent-remap-bob"),
+      }),
+    ];
+    const plan = buildPlan(observations);
+    const remappedLabel = "Claude Code Remapped";
+    expect(new Set(plan.records.map((record) => record.target.runtimeId)).size).toBe(1);
+    expect(plan.records.every((record) => record.runtimeLabel === "Claude Code")).toBe(
+      true,
+    );
+    const remappedPlan = rehashPlanWithRecords(
+      plan,
+      plan.records.map((record) => ({
+        ...record,
+        runtimeLabel: remappedLabel,
+      })) as MigrationPlan["records"],
+    );
+
+    expect(
+      remappedPlan.records.every(
+        (record) => record.runtimeLabel === remappedLabel,
+      ),
+    ).toBe(true);
+    expect(remappedPlan.inputDigest).not.toBe(plan.inputDigest);
+    expect(remappedPlan.idempotencyKey).not.toBe(plan.idempotencyKey);
+    expect(remappedPlan.planDigest).not.toBe(plan.planDigest);
+    expect(migrationPlanSchema.parse(remappedPlan)).toEqual(remappedPlan);
+    expect(createMigrationSidecar(remappedPlan).plan).toEqual(remappedPlan);
+
+    const trustedCensusError = captureError(() =>
+      buildMigrationPlan(planInput(observations), {
+        idFactory: stableId,
+        existingPlan: remappedPlan,
+      }),
+    );
+    expect(trustedCensusError.code).toBe(
+      "migration_frozen_input_digest_changed",
+    );
+    expect(JSON.stringify(trustedCensusError)).not.toContain(remappedLabel);
+  });
+
   test.each([
     ["case", "claude code"],
     ["noncanonical whitespace", "Claude  Code"],
