@@ -174,15 +174,19 @@ root, so a release cannot silently accept a changed live trust document.
 
 All release tags share the single `hasna-accounts-npm-release` concurrency
 group. Later tags queue behind earlier tags rather than running concurrently.
-The promotion gate still reads npm live: a candidate may advance `latest` only
-when its SemVer precedence is greater than the current target, or may continue
-as an exact idempotent retry when the version strings are identical. Downgrades,
-stale reordered candidates, prereleases, invalid versions, and versions that
-differ only in build metadata fail closed. Every decision uses both the complete
+The promotion gate requests each mutable full-package snapshot from the
+canonical npm registry with npm's `write=true` origin intent and a unique,
+non-secret per-read cache key. It never authorizes a decision from the ordinary
+cacheable package URL. A candidate may advance `latest` only when its SemVer
+precedence is greater than the current target, or may continue as an exact
+idempotent retry when the version strings are identical. Downgrades, stale
+reordered candidates, prereleases, invalid versions, and versions that differ
+only in build metadata fail closed. Every decision uses both the complete
 registry version set and all dist-tags, requires the candidate to be the unique
-highest stable version, and reads that exact snapshot again immediately before
-mutation. If the snapshot changes, the command reevaluates or aborts instead of
-using the stale decision.
+highest stable version, and issues another uniquely keyed origin-intent request
+immediately before mutation. If the snapshot changes, the command reevaluates
+or aborts instead of using the stale decision. Immutable exact-version metadata
+and tarball reads retain their canonical versioned URLs.
 
 npm does not provide a conditional compare-and-swap operation for dist-tags, so
 the repository concurrency group cannot make external publishers atomic with
@@ -197,14 +201,17 @@ consume the only opportunity to repair `latest` after a newer stable version is
 observed. A non-converging publisher race or failed compensation fails loudly
 with the last observed target and error state and requires operator recovery.
 This is forward repair, not transactional rollback or an atomicity guarantee.
-No script can prevent a new external mutation after its final successful read.
-The staged and promoted verification passes therefore reread the complete
-package metadata after the slow tarball download, exact install, signature
-audit, cryptographic check, and semantic check. Every package reread validates
-the exact package name on every version manifest and requires every dist-tag to
-target a complete present version before revalidating the phase-specific tags
-and, for the promoted phase, the final monotonic state. Release operators must
-still not publish or move this package's dist-tags concurrently.
+No script can prevent a new external mutation after its final successful read,
+and `write=true` does not create registry, replica, or CDN atomicity. The
+observable guarantee is limited to the response returned by each uniquely
+cache-bypassed origin-intent request. The staged and promoted verification
+passes therefore issue a new request for complete package metadata after the
+slow tarball download, exact install, signature audit, cryptographic check, and
+semantic check. Every package reread validates the exact package name on every
+version manifest and requires every dist-tag to target a complete present
+version before revalidating the phase-specific tags and, for the promoted
+phase, the final monotonic state. Release operators must still not publish or
+move this package's dist-tags concurrently.
 
 Before publication, the workflow requires:
 
@@ -276,9 +283,11 @@ version discovered after mutation is restored as `latest` and the older
 candidate run fails as superseded. The final job repeats the registry,
 provenance, signature, install, CLI, and dist-tag checks in the promoted state,
 then performs a fresh terminal package-metadata read after all slow checks.
-That last read must still show exact quarantine and intended-tag agreement and
-the candidate as the unique highest stable version before the workflow reports
-success.
+That last read is a new uniquely keyed origin-intent request and must still show
+exact quarantine and intended-tag agreement and the candidate as the unique
+highest stable version before the workflow reports success. This is an
+observable last-read check, not a claim that npm's replicas or a later external
+writer are serialized with the workflow.
 
 The promotion command can forward-compensate a newer stable version that it
 observes in its immediate post-mutation reads because that command has the

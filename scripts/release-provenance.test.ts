@@ -23,8 +23,10 @@ import {
   assertPromotionSnapshotUnchanged,
   assertPromotionVersion,
   assertTrustedPublishEnvironment,
+  createOriginPackumentReader,
   expectedSigstoreIdentity,
   extractVerifiedAttestations,
+  originIntentPackumentUrl,
   packagePurl,
   parseRetryOptions,
   promoteLatestMonotonically,
@@ -597,6 +599,327 @@ test("final promotion verification requires the full monotonic registry state", 
     candidate,
     registryPackage("0.2.12", ["0.2.12", candidate.version]),
   )).toThrow("latest is 0.2.12");
+});
+
+test("builds a scoped origin-intent packument URL without losing existing query state", () => {
+  const base = new URL(
+    "https://registry.npmjs.org/%40hasna%2Faccounts?existing=a%2Fb&write=false",
+  );
+  const url = originIntentPackumentUrl(base, "deterministic-read-1");
+  expect(url.origin).toBe("https://registry.npmjs.org");
+  expect(url.pathname).toBe("/%40hasna%2Faccounts");
+  expect(url.searchParams.get("existing")).toBe("a/b");
+  expect(url.href).toContain("existing=a%2Fb");
+  expect(url.searchParams.get("write")).toBe("true");
+  expect(url.searchParams.getAll("write")).toEqual(["true"]);
+  expect(url.searchParams.get("_hasna_origin_read")).toBe("deterministic-read-1");
+  expect(url.username).toBe("");
+  expect(url.password).toBe("");
+  expect(url.hash).toBe("");
+
+  for (const unsafe of [
+    "https://registry.npmjs.org/%40hasna%2Faccounts/0.3.0",
+    "https://registry.npmjs.org/%40hasna%2Faccounts/-/accounts-0.3.0.tgz",
+    "https://registry.npmjs.org/%40hasna%2Faccounts#fragment",
+    "https://user:password@registry.npmjs.org/%40hasna%2Faccounts",
+    "https://registry.npmjs.org/%40hasna%2Faccounts?authToken=must-not-enter-a-url",
+    "https://example.invalid/%40hasna%2Faccounts",
+  ]) {
+    expect(() => originIntentPackumentUrl(new URL(unsafe), "deterministic-read-2"))
+      .toThrow("origin-intent packument");
+  }
+  for (const unsafeNonce of ["", "contains space", "query&injection", "x".repeat(129)]) {
+    expect(() => originIntentPackumentUrl(base, unsafeNonce))
+      .toThrow("origin read nonce");
+  }
+});
+
+test("uses a distinct origin-intent URL at every promotion and compensation read seam", async () => {
+  const responses = [
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+    registryPackage("0.4.0", ["0.2.12", candidate.version, "0.4.0"]),
+  ];
+  const urls: URL[] = [];
+  let nonce = 0;
+  const readPackage = createOriginPackumentReader(candidate.name, {
+    nonce: () => `promotion-seam-${++nonce}`,
+    fetcher: async (url, init) => {
+      urls.push(new URL(url));
+      expect(init.redirect).toBe("error");
+      expect(new Headers(init.headers).get("accept")).toBe("application/json");
+      expect(init.signal).toBeDefined();
+      const next = responses.shift();
+      if (!next) throw new Error("unexpected origin read");
+      return Response.json(next);
+    },
+  });
+  const writes: string[] = [];
+
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage,
+    setLatest: async (version) => {
+      writes.push(version);
+    },
+  })).rejects.toThrow("superseded by newer stable 0.4.0");
+
+  expect(writes).toEqual([candidate.version, "0.4.0"]);
+  expect(responses).toHaveLength(0);
+  expect(urls).toHaveLength(4);
+  expect(new Set(urls.map((url) => url.href)).size).toBe(urls.length);
+  expect(urls.map((url) => url.searchParams.get("_hasna_origin_read"))).toEqual([
+    "promotion-seam-1",
+    "promotion-seam-2",
+    "promotion-seam-3",
+    "promotion-seam-4",
+  ]);
+  for (const url of urls) {
+    expect(url.searchParams.get("write")).toBe("true");
+    expect(url.username).toBe("");
+    expect(url.password).toBe("");
+  }
+});
+
+test("uses distinct origin-intent initial and terminal reads for staged and promoted verification", async () => {
+  const packageJson = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
+  const tarball = archive([
+    tarEntry("package/package.json", packageJson.length, "0", packageJson),
+    tarEntry("package/dist/cli.js", 3, "0", Buffer.from("cli")),
+  ]);
+  const value: ReleaseCandidate = {
+    ...candidate,
+    size: tarball.length,
+    shasum: createHash("sha1").update(tarball).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+    fileCount: 2,
+    unpackedBytes: packageJson.length + 3,
+  };
+  const urls: URL[] = [];
+  let nonce = 0;
+  const readPackageMetadata = createOriginPackumentReader(value.name, {
+    nonce: () => `verification-seam-${++nonce}`,
+    fetcher: async (url) => {
+      const parsed = new URL(url);
+      urls.push(parsed);
+      const phase = urls.length <= 2 ? "staged" : "promoted";
+      return Response.json(registryPackage(
+        phase === "staged" ? "0.2.12" : value.version,
+        ["0.2.12", value.version],
+        value,
+      ));
+    },
+  });
+
+  for (const phase of ["staged", "promoted"] as const) {
+    await expect(verifyRegistryReleaseAttempt(value, phase, {
+      readVersionMetadata: async () => registryVersionMetadata(value),
+      readPackageMetadata,
+      readTarball: async () => tarball,
+      verifyConsumer: () => attestations(),
+      verifyCryptographically: async () => {},
+      verifySemantically: () => {},
+    })).resolves.toBeUndefined();
+  }
+
+  expect(urls).toHaveLength(4);
+  expect(new Set(urls.map((url) => url.href)).size).toBe(urls.length);
+  expect(urls.map((url) => url.searchParams.get("_hasna_origin_read"))).toEqual([
+    "verification-seam-1",
+    "verification-seam-2",
+    "verification-seam-3",
+    "verification-seam-4",
+  ]);
+  expect(urls.every((url) => url.searchParams.get("write") === "true")).toBe(true);
+});
+
+test("never authorizes cached idempotence when origin-intent reads reveal a newer stable at any promotion seam", async () => {
+  const cached = registryPackage(
+    candidate.version,
+    ["0.2.12", candidate.version],
+  );
+  const oldOrigin = registryPackage(
+    "0.2.12",
+    ["0.2.12", candidate.version],
+  );
+  const newerOrigin = registryPackage(
+    "0.4.0",
+    ["0.2.12", candidate.version, "0.4.0"],
+  );
+  const candidateBeforeCompensation = registryPackage(
+    candidate.version,
+    ["0.2.12", candidate.version, "0.4.0"],
+  );
+  const scenarios = [
+    {
+      label: "initial",
+      responses: [newerOrigin],
+      writes: [],
+      error: "superseded before promotion by 0.4.0",
+    },
+    {
+      label: "pre-write",
+      responses: [oldOrigin, newerOrigin],
+      writes: [],
+      error: "superseded before promotion by 0.4.0",
+    },
+    {
+      label: "post-write-and-compensation",
+      responses: [
+        oldOrigin,
+        oldOrigin,
+        candidateBeforeCompensation,
+        newerOrigin,
+      ],
+      writes: [candidate.version, "0.4.0"],
+      error: "superseded by newer stable 0.4.0",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const originResponses = [...scenario.responses];
+    const urls: URL[] = [];
+    let nonce = 0;
+    const readPackage = createOriginPackumentReader(candidate.name, {
+      nonce: () => `${scenario.label}-${++nonce}`,
+      fetcher: async (url) => {
+        const parsed = new URL(url);
+        urls.push(parsed);
+        const originIntent = parsed.searchParams.get("write") === "true" &&
+          parsed.searchParams.has("_hasna_origin_read");
+        return Response.json(originIntent ? originResponses.shift()! : cached);
+      },
+    });
+    const writes: string[] = [];
+
+    await expect(promoteLatestMonotonically(candidate, {
+      readPackage,
+      setLatest: async (version) => {
+        writes.push(version);
+      },
+    })).rejects.toThrow(scenario.error);
+
+    expect(writes).toEqual(scenario.writes);
+    expect(originResponses).toHaveLength(0);
+    expect(urls).toHaveLength(scenario.responses.length);
+    expect(new Set(urls.map((url) => url.href)).size).toBe(urls.length);
+    expect(urls.every((url) => url.searchParams.get("write") === "true")).toBe(true);
+  }
+});
+
+test("terminal promoted verification cannot succeed from a permanently stale plain URL", async () => {
+  const packageJson = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
+  const tarball = archive([
+    tarEntry("package/package.json", packageJson.length, "0", packageJson),
+    tarEntry("package/dist/cli.js", 3, "0", Buffer.from("cli")),
+  ]);
+  const value: ReleaseCandidate = {
+    ...candidate,
+    size: tarball.length,
+    shasum: createHash("sha1").update(tarball).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+    fileCount: 2,
+    unpackedBytes: packageJson.length + 3,
+  };
+  const cached = registryPackage(
+    value.version,
+    ["0.2.12", value.version],
+    value,
+  );
+  const originResponses = [
+    cached,
+    registryPackage(
+      value.version,
+      ["0.2.12", value.version, "0.4.0"],
+      value,
+    ),
+  ];
+  const urls: URL[] = [];
+  let nonce = 0;
+  const readPackageMetadata = createOriginPackumentReader(value.name, {
+    nonce: () => `terminal-stale-cache-${++nonce}`,
+    fetcher: async (url) => {
+      const parsed = new URL(url);
+      urls.push(parsed);
+      const originIntent = parsed.searchParams.get("write") === "true" &&
+        parsed.searchParams.has("_hasna_origin_read");
+      return Response.json(originIntent ? originResponses.shift()! : cached);
+    },
+  });
+
+  await expect(verifyRegistryReleaseAttempt(value, "promoted", {
+    readVersionMetadata: async () => registryVersionMetadata(value),
+    readPackageMetadata,
+    readTarball: async () => tarball,
+    verifyConsumer: () => attestations(),
+    verifyCryptographically: async () => {},
+    verifySemantically: () => {},
+  })).rejects.toThrow("highest stable is 0.4.0");
+
+  expect(originResponses).toHaveLength(0);
+  expect(urls).toHaveLength(2);
+  expect(new Set(urls.map((url) => url.href)).size).toBe(2);
+  expect(urls.every((url) => url.searchParams.get("write") === "true")).toBe(true);
+});
+
+test("fails closed when an injected origin-read nonce is reused", async () => {
+  const reader = createOriginPackumentReader(candidate.name, {
+    nonce: () => "deterministic-reused-nonce",
+    fetcher: async () => Response.json(
+      registryPackage(candidate.version, ["0.2.12", candidate.version]),
+    ),
+  });
+  await expect(reader()).resolves.toEqual(
+    registryPackage(candidate.version, ["0.2.12", candidate.version]),
+  );
+  await expect(reader()).rejects.toThrow("origin read nonce was reused");
+});
+
+test("rejects redirects and keeps origin-read query data out of errors", async () => {
+  const observed: Array<{ url: URL; init: RequestInit }> = [];
+  const reader = createOriginPackumentReader(candidate.name, {
+    nonce: () => "redirect-probe-nonce",
+    fetcher: async (url, init) => {
+      observed.push({ url: new URL(url), init });
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://example.invalid/credential-leak" },
+      });
+    },
+  });
+
+  let message = "";
+  try {
+    await reader();
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  expect(message).toBe(
+    "GET https://registry.npmjs.org/%40hasna%2Faccounts returned 302",
+  );
+  expect(message).not.toContain("redirect-probe-nonce");
+  expect(message).not.toContain("example.invalid");
+  expect(observed).toHaveLength(1);
+  expect(observed[0]!.init.redirect).toBe("error");
+  expect(observed[0]!.url.searchParams.get("write")).toBe("true");
+  expect(observed[0]!.url.username).toBe("");
+  expect(observed[0]!.url.password).toBe("");
+
+  const oversized = createOriginPackumentReader(candidate.name, {
+    nonce: () => "oversized-origin-response",
+    fetcher: async () => new Response("{}", {
+      headers: { "content-length": String(MAX_JSON_BYTES + 1) },
+    }),
+  });
+  await expect(oversized()).rejects.toThrow(`response exceeds ${MAX_JSON_BYTES} bytes`);
 });
 
 test("derives an exact monotonic promotion snapshot from full registry versions and tags", () => {
@@ -1666,8 +1989,27 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(workflow).not.toContain("bun-version: latest");
   expect(workflow).not.toContain('node-version: "24.x"');
   expect(promotionImplementation).toContain("promoteLatestMonotonically(value");
-  expect(promotionImplementation).toContain("readPackage:");
+  expect(promotionImplementation).toContain("readPackage,");
   expect(promotionImplementation).toContain("setLatest:");
+  expect(implementation).not.toContain("fetchJson(packageUrl(value.name))");
+  expect(implementation.match(/createOriginPackumentReader\(value\.name\)/g))
+    .toHaveLength(2);
+  const verificationImplementation = implementation.slice(
+    implementation.indexOf("async function verifyRegistryRelease("),
+    implementation.indexOf("async function promoteDistTag("),
+  );
+  expect(
+    verificationImplementation.indexOf(
+      "const readPackageMetadata = createOriginPackumentReader(value.name);",
+    ),
+  ).toBeLessThan(verificationImplementation.indexOf("for (let attempt = 1;"));
+  expect(verificationImplementation).toContain("readPackageMetadata,");
+  expect(implementation).toContain(
+    "readVersionMetadata: () => fetchJson(packageUrl(value.name, value.version))",
+  );
+  expect(implementation).toContain(
+    "readTarball: (url) => fetchLimited(url, MAX_TARBALL_BYTES)",
+  );
 });
 
 test("package lifecycle rejects direct publication outside the preserved-artifact wrapper", () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -130,6 +130,16 @@ export interface RegistryPromotionSnapshot {
 export interface PromotionRegistry {
   readPackage: () => Promise<unknown>;
   setLatest: (version: string) => Promise<void>;
+}
+
+export type OriginPackumentFetcher = (
+  url: URL,
+  init: RequestInit,
+) => Promise<Response>;
+
+export interface OriginPackumentReaderOptions {
+  nonce?: () => string;
+  fetcher?: OriginPackumentFetcher;
 }
 
 export interface RegistryReleaseAttemptOperations {
@@ -909,8 +919,9 @@ async function fetchLimited(
   url: URL,
   maxBytes: number,
   headers: Record<string, string> = {},
+  fetcher: OriginPackumentFetcher = (input, init) => fetch(input, init),
 ): Promise<Buffer> {
-  const response = await fetch(url, {
+  const response = await fetcher(url, {
     headers,
     redirect: "error",
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -923,8 +934,14 @@ async function fetchJson(
   url: URL,
   maxBytes = MAX_JSON_BYTES,
   headers: Record<string, string> = {},
+  fetcher?: OriginPackumentFetcher,
 ): Promise<unknown> {
-  const bytes = await fetchLimited(url, maxBytes, { accept: "application/json", ...headers });
+  const bytes = await fetchLimited(
+    url,
+    maxBytes,
+    { accept: "application/json", ...headers },
+    fetcher,
+  );
   return JSON.parse(bytes.toString("utf8")) as unknown;
 }
 
@@ -1130,6 +1147,65 @@ function verifyCandidateArtifact(value: ReleaseCandidate): Buffer {
 
 function packageUrl(name: string, version = ""): URL {
   return new URL(`${REGISTRY}/${encodeURIComponent(name)}${version ? `/${encodeURIComponent(version)}` : ""}`);
+}
+
+export function originIntentPackumentUrl(input: URL, nonce: string): URL {
+  let decodedPath = "";
+  try {
+    decodedPath = decodeURIComponent(input.pathname);
+  } catch {
+    throw new Error("origin-intent packument URL has malformed encoding");
+  }
+  const segments = decodedPath.split("/").filter(Boolean);
+  const packageSegment = /^[a-z0-9][a-z0-9._~-]*$/;
+  const isUnscoped = segments.length === 1 && packageSegment.test(segments[0]!);
+  const isScoped = segments.length === 2 &&
+    segments[0]!.startsWith("@") &&
+    packageSegment.test(segments[0]!.slice(1)) &&
+    packageSegment.test(segments[1]!);
+  check(
+    input.origin === REGISTRY &&
+      !input.username &&
+      !input.password &&
+      !input.hash &&
+      (isUnscoped || isScoped),
+    "origin-intent packument URL must target full npm package metadata",
+  );
+  check(
+    ![...input.searchParams.keys()].some((key) =>
+      /auth|credential|password|secret|token/i.test(key)
+    ),
+    "origin-intent packument URL must not contain credential query parameters",
+  );
+  check(
+    /^[A-Za-z0-9._~-]{1,128}$/.test(nonce),
+    "origin read nonce must be 1-128 URL-safe non-secret characters",
+  );
+  const url = new URL(input);
+  url.searchParams.set("write", "true");
+  url.searchParams.set("_hasna_origin_read", nonce);
+  return url;
+}
+
+export function createOriginPackumentReader(
+  name: string,
+  options: OriginPackumentReaderOptions = {},
+): () => Promise<unknown> {
+  const nonce = options.nonce ?? randomUUID;
+  const fetcher = options.fetcher;
+  const base = packageUrl(name);
+  const observedNonces = new Set<string>();
+  return async () => {
+    const nextNonce = nonce();
+    check(!observedNonces.has(nextNonce), "origin read nonce was reused");
+    observedNonces.add(nextNonce);
+    return fetchJson(
+      originIntentPackumentUrl(base, nextNonce),
+      MAX_JSON_BYTES,
+      {},
+      fetcher,
+    );
+  };
 }
 
 async function ensureUnpublished(value: ReleaseCandidate): Promise<void> {
@@ -1825,11 +1901,12 @@ async function verifyRegistryRelease(
   delayMs: number,
 ): Promise<void> {
   let failure: unknown;
+  const readPackageMetadata = createOriginPackumentReader(value.name);
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       await verifyRegistryReleaseAttempt(value, phase, {
         readVersionMetadata: () => fetchJson(packageUrl(value.name, value.version)),
-        readPackageMetadata: () => fetchJson(packageUrl(value.name)),
+        readPackageMetadata,
         readTarball: (url) => fetchLimited(url, MAX_TARBALL_BYTES),
         verifyConsumer: () => verifyExactInstallAndAttestations(value),
         verifyCryptographically: (bundles) =>
@@ -1859,8 +1936,9 @@ async function promoteDistTag(
   assertGitContext(root, manifest, env);
   assertCandidateContext(value, manifest, env);
   verifyCandidateArtifact(value);
+  const readPackage = createOriginPackumentReader(value.name);
   const result = await promoteLatestMonotonically(value, {
-    readPackage: () => fetchJson(packageUrl(value.name)),
+    readPackage,
     setLatest: async (version) => {
       run("npm", [
         "dist-tag", "add", `${value.name}@${version}`, value.intendedTag,
