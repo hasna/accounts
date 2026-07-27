@@ -365,6 +365,10 @@ test("sensitive folds accept leading separators and padding-only credential tail
     " ==",
     "Proxy-Authorization: Basic cGFkZGVkLXByb3h5",
     "\t==",
+    "Cookie: padded=cGFkZGVkLWNvb2tpZQ",
+    " ==",
+    "Set-Cookie: padded=cGFkZGVkLXNldC1jb29raWU",
+    "\t==; SameSite=Lax",
     "status=200 keep-final-boundary",
   ].join("\n");
 
@@ -383,6 +387,9 @@ test("sensitive folds accept leading separators and padding-only credential tail
     "Path=/",
     "cGFkZGVkLWF1dGg",
     "cGFkZGVkLXByb3h5",
+    "cGFkZGVkLWNvb2tpZQ",
+    "cGFkZGVkLXNldC1jb29raWU",
+    "SameSite=Lax",
     "==",
   ]) {
     expect(redacted).not.toContain(secret);
@@ -396,7 +403,7 @@ test("sensitive folds accept leading separators and padding-only credential tail
   ]) {
     expect(redacted).toContain(retained);
   }
-  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(6);
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(8);
 });
 
 test("cookie folds terminate before generic compact and spaced diagnostic assignments", () => {
