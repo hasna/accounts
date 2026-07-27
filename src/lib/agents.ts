@@ -35,7 +35,7 @@ export interface ProcessInfo {
   configDir?: string;
 }
 
-export type ProcessScanner = () => ProcessInfo[];
+export type ProcessScanner = (toolId: string) => ProcessInfo[];
 
 function isProjectedRecord(value: unknown): value is AgentEntry {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -58,8 +58,10 @@ function projectProcessInfo(value: unknown): ProcessInfo[] {
     if (
       typeof pid !== "number" ||
       !Number.isSafeInteger(pid) ||
+      pid <= 0 ||
       typeof ppid !== "number" ||
       !Number.isSafeInteger(ppid) ||
+      ppid < 0 ||
       typeof command !== "string"
     ) {
       return [];
@@ -71,6 +73,16 @@ function projectProcessInfo(value: unknown): ProcessInfo[] {
       ...(typeof configDir === "string" ? { configDir } : {}),
     }];
   });
+}
+
+function isProviderAgentEntry(entry: AgentEntry): boolean {
+  if (entry.kind !== "background" && entry.kind !== "interactive") return false;
+  if (!Object.hasOwn(entry, "pid")) return true;
+  return (
+    typeof entry.pid === "number" &&
+    Number.isSafeInteger(entry.pid) &&
+    entry.pid > 0
+  );
 }
 
 function scriptExecutable(): string {
@@ -283,7 +295,9 @@ export function listAgentsAcrossProfiles(opts: ListAgentsOptions = {}): ProfileA
     const parsed = extractJsonArray(result.raw);
     if (!parsed) return { ...base, error: "could not parse agents output" };
 
-    const publicAgents = projectAgentEntries(parsed);
+    const publicAgents = projectAgentEntries(parsed).filter(
+      isProviderAgentEntry,
+    );
     for (const a of publicAgents) {
       if (typeof a.pid === "number") reported.add(a.pid);
     }
@@ -298,7 +312,7 @@ export function listAgentsAcrossProfiles(opts: ListAgentsOptions = {}): ProfileA
   // rather than silently dropped. Skipped when filtering to one profile.
   if (!opts.profile) {
     const scanner = opts.processScanner ?? scanToolProcesses;
-    const scanned = projectProcessInfo(scanner());
+    const scanned = projectProcessInfo(scanner(toolId));
     if (scanned.length > 0) {
       const untracked = scanned.filter(
         (p) =>

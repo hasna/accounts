@@ -300,6 +300,62 @@ test("backgroundOnly does not leak interactive sessions into (untracked)", () =>
   expect(results.some((r) => r.profile === "(untracked)")).toBe(false);
 });
 
+test("process scanning is bound to the requested tool id", () => {
+  addProfile({ name: "codexer", tool: "codex" });
+  let observedTool: unknown;
+  const processScanner = function () {
+    observedTool = arguments[0];
+    return [];
+  };
+
+  listAgentsAcrossProfiles({
+    profiles: listProfiles(),
+    tool: "codex",
+    runner: () => ({ ok: true, raw: "[]" }),
+    processScanner,
+  });
+
+  expect(observedTool).toBe("codex");
+});
+
+test("malformed provider PIDs cannot suppress real untracked processes", () => {
+  addProfile({ name: "acct1", tool: "claude" });
+  const results = listAgentsAcrossProfiles({
+    profiles: listProfiles(),
+    runner: () => ({
+      ok: true,
+      raw: JSON.stringify([
+        { kind: "unknown", pid: 321, state: "working" },
+        { kind: "background", pid: -1, state: "working" },
+        { kind: "interactive", pid: Number.MAX_SAFE_INTEGER + 1, state: "working" },
+      ]),
+    }),
+    processScanner: () => [
+      { pid: -2, ppid: 1, command: "claude invalid-negative-pid" },
+      {
+        pid: Number.MAX_SAFE_INTEGER + 1,
+        ppid: 1,
+        command: "claude invalid-unsafe-pid",
+      },
+      { pid: 654, ppid: -1, command: "claude invalid-negative-ppid" },
+      {
+        pid: 321,
+        ppid: 1,
+        command: "claude --resume real-untracked",
+      },
+    ],
+  });
+
+  expect(results[0]?.agents).toEqual([]);
+  expect(results.find((result) => result.profile === "(untracked)")?.agents).toEqual([
+    {
+      kind: "process",
+      pid: 321,
+      command: "claude --resume real-untracked",
+    },
+  ]);
+});
+
 test("provider agent projection is getter-free, proxy-safe, cycle-safe, and recursively redacted", () => {
   let getterCount = 0;
   let proxyTrapCount = 0;
@@ -477,7 +533,7 @@ test.skipIf(process.platform === "win32")("accounts agents JSON and human output
       kind: "background",
       pid: 77,
       sessionId: "session-safe",
-      state: "working",
+      state: { phase: "working" },
       name: "provider --api-key agent-human-name-secret --trace keep-agent-human-name",
       cwd: "/safe --client-key=agent-human-cwd-secret --mode keep-agent-human-cwd",
       token: "agent-json-token-secret",

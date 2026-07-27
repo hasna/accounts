@@ -2545,6 +2545,48 @@ test("unterminated command quotes recover later standalone credential syntax", (
   }
 });
 
+test("nested unterminated quotes cannot hide later credential syntax", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const cases = [
+      {
+        input:
+          `provider "outer 'inner --api-key nested-double-single-secret ` +
+          "--trace keep-nested-double-single",
+        secret: "nested-double-single-secret",
+        retained: "keep-nested-double-single",
+      },
+      {
+        input:
+          `provider 'outer "inner --client-key=nested-single-double-secret` +
+          "|--mode keep-nested-single-double",
+        secret: "nested-single-double-secret",
+        retained: "keep-nested-single-double",
+      },
+      {
+        input:
+          String.raw`provider "outer \'inner --credentials nested-escaped-opposite-secret ` +
+          "--debug keep-nested-escaped-opposite",
+        secret: "nested-escaped-opposite-secret",
+        retained: "keep-nested-escaped-opposite",
+      },
+      {
+        input:
+          `provider "outer 'inner tail\\${lineEnding}` +
+          "diagnostic/--service-auth nested-continued-secret " +
+          "--color keep-nested-continued",
+        secret: "nested-continued-secret",
+        retained: "keep-nested-continued",
+      },
+    ];
+
+    for (const sample of cases) {
+      const redacted = redactText(sample.input);
+      expect(redacted, sample.input).not.toContain(sample.secret);
+      expect(redacted, sample.input).toContain(sample.retained);
+    }
+  }
+});
+
 test("unterminated quote recovery preserves valid quoted, escaped, and exact-sentinel data", () => {
   const inputs = [
     'provider "unterminated diagnostic \'--api-key\' quoted-benign --trace keep-valid-quoted',

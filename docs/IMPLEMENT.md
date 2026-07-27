@@ -152,9 +152,10 @@ inside a structured URL/email value does not end that context, while a closing
 outer wrapper or quote resumes option parsing. Explicit unquoted `--` still
 ends options for that physical command record only when it is the complete raw
 standalone ASCII token and is not part of a pending or active sensitive value.
-If a captured physical line ends with an unmatched syntactic quote, a bounded
-literal-syntax recovery pass inspects the remainder after that opener so later
-standalone credential options cannot be hidden inside malformed output.
+If a captured physical line ends with unmatched nested syntactic quotes, a
+bounded sequence of literal-syntax recovery passes inspects each remainder
+after an opener so later standalone credential options cannot be hidden inside
+malformed output. Exhausting that bound fails closed for the remaining suffix.
 Quoted or escaped option-looking data remains data during recovery, and an
 exact raw ASCII `--` retains its ordinary end-of-options meaning.
 Prelaunch stderr and stdout are line-bounded and passed through the scanner as
@@ -180,7 +181,10 @@ payloads.
 projection to parsed provider agent records and scanned process records before
 either JSON serialization or human rendering. Nested strings and untracked
 process command lines are redacted; accessors, proxies, cycles, non-record
-entries, and unsafe object shapes cannot cross that output boundary.
+entries, and unsafe object shapes cannot cross that output boundary. Provider
+records are limited to known agent kinds, malformed PIDs are discarded before
+process accounting, process scans are bound to the requested tool, and human
+rendering reads only validated scalar fields without coercing provider values.
 
 Supervisor arguments remain raw only in memory long enough to spawn the
 provider child. State files, legacy-state reads, switch responses, and

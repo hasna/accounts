@@ -814,6 +814,8 @@ interface CommandToken {
   trailingEscape: boolean;
 }
 
+const MAX_UNTERMINATED_COMMAND_QUOTE_RECOVERIES = 8;
+
 function completeCommandOptionView(
   token: CommandToken,
 ): CommandOptionView | undefined {
@@ -847,6 +849,7 @@ function scanCommandToken(
   lineEnd: number,
   protectArithmetic = true,
   splitEmbeddedOptions = true,
+  escapedQuotesOpen = true,
 ): CommandToken {
   let decoded = "";
   let quote: "'" | '"' | undefined;
@@ -901,6 +904,17 @@ function scanCommandToken(
         const escapedChar = value[index + 1]!;
         quoted ||= escapedChar === "'" || escapedChar === '"';
         if (escapedChar === "'" || escapedChar === '"') {
+          if (!escapedQuotesOpen) {
+            decoded += escapedChar;
+            observeCommandSegmentChar(
+              segment,
+              escapedChar,
+              value[index + 2],
+              value[index + 3],
+            );
+            index += 2;
+            continue;
+          }
           if (!quote) {
             quote = escapedChar;
             quoteStart = index + 1;
@@ -1137,7 +1151,7 @@ function scanCommandValueContinuation(
 function redactCommandTokens(
   value: string,
   allowEndOfOptions = true,
-  recoverUnterminatedQuotes = true,
+  remainingQuoteRecoveries = MAX_UNTERMINATED_COMMAND_QUOTE_RECOVERIES,
   literalOptionSyntax = false,
 ): string {
   const parts: string[] = [];
@@ -1217,6 +1231,7 @@ function redactCommandTokens(
         lineEnd,
         !redactNext,
         !redactNext,
+        !literalOptionSyntax,
       );
       const raw = value.slice(item.start, item.end);
       const exactEndOfOptions =
@@ -1311,7 +1326,6 @@ function redactCommandTokens(
           redactNext = true;
         }
       } else if (
-        recoverUnterminatedQuotes &&
         !endOfOptions &&
         item.openQuote &&
         item.openQuoteStart !== undefined &&
@@ -1319,12 +1333,15 @@ function redactCommandTokens(
       ) {
         const recoveryStart = item.openQuoteStart + 1;
         const suffix = value.slice(recoveryStart, item.end);
-        const recovered = redactCommandTokens(
-          suffix,
-          allowEndOfOptions,
-          false,
-          true,
-        );
+        const recovered =
+          remainingQuoteRecoveries > 0
+            ? redactCommandTokens(
+                suffix,
+                allowEndOfOptions,
+                remainingQuoteRecoveries - 1,
+                true,
+              )
+            : "[REDACTED]";
         if (recovered !== suffix) {
           parts.push(
             value.slice(outputCursor, recoveryStart),
