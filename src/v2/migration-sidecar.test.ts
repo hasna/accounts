@@ -299,6 +299,44 @@ describe("v2 migration plan", () => {
     expect(plan.records.every((record) => record.binding === undefined)).toBe(true);
   });
 
+  test("canonicalizes verified root aliases before duplicate physical-root quarantine", () => {
+    const sharedIdentity = {
+      device: "7",
+      inode: "42",
+      entryCount: 12,
+      byteCount: 2048,
+      digest: digest("canonical-shared-root"),
+    };
+    const plan = buildPlan([
+      safeObservation("alice", "claude", {
+        root: {
+          state: "verified",
+          path: "/profiles/shared",
+          realPath: "/profiles/shared",
+          ...sharedIdentity,
+        },
+      }),
+      safeObservation("bob", "claude", {
+        inputDigest: digest("canonical-shared-root-bob"),
+        root: {
+          state: "verified",
+          path: "/profiles/dir/../shared",
+          realPath: "/profiles/dir/../shared",
+          ...sharedIdentity,
+        },
+      }),
+    ]);
+
+    expect(plan.records.map((record) => record.root)).toEqual([
+      expect.objectContaining({ realPath: "/profiles/shared" }),
+      expect.objectContaining({ realPath: "/profiles/shared" }),
+    ]);
+    expect(plan.records.map((record) => record.disposition)).toEqual([
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+      { state: "quarantined", reasons: ["duplicate_verified_root"] },
+    ]);
+  });
+
   test("fails duplicate source observations rather than silently overwriting", () => {
     expect(() => buildPlan([safeObservation("alice"), safeObservation("alice")])).toThrow(
       "duplicate legacy source key",
@@ -319,6 +357,12 @@ describe("v2 migration plan", () => {
           kind === "account" ? "account_duplicate0000" : stableId(kind, seed),
       }),
     ).toThrow("duplicate account id");
+
+    expect(() =>
+      buildMigrationPlan(planInput([safeObservation("alice")]), {
+        idFactory: () => "shared_identifier_000000000001",
+      }),
+    ).toThrow("globally unique across entity kinds");
 
     expect(() =>
       buildMigrationPlan(
@@ -588,6 +632,23 @@ describe("backup, gates, aliases, and cutover states", () => {
         reasons: expect.arrayContaining([reason]),
       });
     }
+
+    expect(
+      evaluateMigrationGates(
+        plan,
+        {
+          ...base,
+          backupRestore: {
+            ...base.backupRestore,
+            restoredAt: "2026-07-27T11:59:59.999Z",
+          },
+        },
+        "partial",
+      ),
+    ).toMatchObject({
+      ready: false,
+      reasons: expect.arrayContaining(["restore_before_plan_creation"]),
+    });
   });
 
   test("journals aliases with a digest chain and exact idempotent replay", () => {
@@ -711,6 +772,45 @@ describe("backup, gates, aliases, and cutover states", () => {
         gateEvidence: passingEvidence(quarantined.plan),
       }),
     ).toThrow("unresolved_quarantine");
+  });
+
+  test("rejects a receipt copied from an unrelated predecessor even after checksums are recomputed", () => {
+    const initial = createMigrationSidecar(buildPlan());
+    const firstPredecessor = appendMigrationAlias(initial, {
+      kind: "legacy_account",
+      alias: "legacy:claude:first-predecessor",
+      sourceKey: initial.plan.records[0]!.sourceKey,
+      targetId: initial.plan.records[0]!.target.accountId,
+    });
+    const secondPredecessor = appendMigrationAlias(initial, {
+      kind: "legacy_account",
+      alias: "legacy:claude:second-predecessor",
+      sourceKey: initial.plan.records[0]!.sourceKey,
+      targetId: initial.plan.records[0]!.target.accountId,
+    });
+    const firstReady = transitionMigrationSidecar(firstPredecessor, "partial_ready", {
+      gateEvidence: passingEvidence(initial.plan),
+    });
+    const secondReady = transitionMigrationSidecar(secondPredecessor, "partial_ready", {
+      gateEvidence: passingEvidence(initial.plan),
+    });
+    const {
+      integrityDigest: _integrityDigest,
+      gateReceipts: _gateReceipts,
+      ...firstCore
+    } = firstReady;
+    const forgedCore = {
+      ...firstCore,
+      gateReceipts: secondReady.gateReceipts,
+    };
+    const forged = {
+      ...forgedCore,
+      integrityDigest: canonicalDigest(forgedCore),
+    } as MigrationSidecar;
+
+    expect(() =>
+      transitionMigrationSidecar(forged, "partial_ready"),
+    ).toThrow("predecessor transition chain");
   });
 });
 
@@ -843,6 +943,21 @@ describe("scoped transactional backfill hooks", () => {
   test("validates port outcomes inside the transaction before a receipt can be issued", async () => {
     const port = new RecordingBackfillPort();
     port.transactionImpl.invalidResultAt = "account";
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+
+    await expect(applyScopedBackfill(sidecar, port)).rejects.toThrow();
+    expect(port.committed).toBe(false);
+    expect(port.rolledBack).toBe(true);
+  });
+
+  test("validates the epoch result before the transaction callback can commit", async () => {
+    const port = new RecordingBackfillPort();
+    port.transactionImpl.invalidResultAt = "epoch";
     const plan = buildPlan();
     const sidecar = transitionMigrationSidecar(
       createMigrationSidecar(plan),
@@ -1033,6 +1148,75 @@ describe("durable sidecar WAL and repair", () => {
     expect(() => competing.install(second)).toThrow("pending migration WAL");
     expect(readFileSync(`${sidecarPath}.wal`, "utf8")).toBe(walBefore);
     expect(competing.repair()).toEqual(first);
+  });
+
+  test("rejects a WAL successor that truncates immutable alias history", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    const walPath = `${sidecarPath}.wal`;
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const initial = createMigrationSidecar(buildPlan());
+    store.install(initial);
+    const current = appendMigrationAlias(initial, {
+      kind: "legacy_account",
+      alias: "legacy:claude:durable-before-crash",
+      sourceKey: initial.plan.records[0]!.sourceKey,
+      targetId: initial.plan.records[0]!.target.accountId,
+    });
+    store.install(current, { expectedPreviousDigest: initial.integrityDigest });
+    const truncatedSuccessor = transitionMigrationSidecar(initial, "partial_ready", {
+      gateEvidence: passingEvidence(initial.plan),
+    });
+    writeFileSync(
+      walPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        planId: initial.plan.id,
+        idempotencyKey: initial.plan.idempotencyKey,
+        previousDigest: current.integrityDigest,
+        nextDigest: truncatedSuccessor.integrityDigest,
+        nextSidecar: truncatedSuccessor,
+      }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    expect(() => store.repair()).toThrow("alias journal may not be truncated");
+    expect(store.load()).toEqual(current);
+    expect(existsSync(walPath)).toBe(true);
+  });
+
+  test("rejects a noncanonical planned genesis from a WAL", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    const walPath = `${sidecarPath}.wal`;
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const initial = createMigrationSidecar(buildPlan());
+    const noncanonicalGenesis = appendMigrationAlias(initial, {
+      kind: "legacy_account",
+      alias: "legacy:claude:before-genesis",
+      sourceKey: initial.plan.records[0]!.sourceKey,
+      targetId: initial.plan.records[0]!.target.accountId,
+    });
+    writeFileSync(
+      walPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        planId: initial.plan.id,
+        idempotencyKey: initial.plan.idempotencyKey,
+        previousDigest: null,
+        nextDigest: noncanonicalGenesis.integrityDigest,
+        nextSidecar: noncanonicalGenesis,
+      }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    expect(() => store.repair()).toThrow("canonical planned genesis");
+    expect(store.load()).toBeNull();
+    expect(existsSync(walPath)).toBe(true);
   });
 
   test("rejects a valid-integrity readiness successor with no durable gate receipt", () => {

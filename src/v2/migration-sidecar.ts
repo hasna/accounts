@@ -367,6 +367,25 @@ export const migrationPlanSchema = z
     const accountIds = new Set<string>();
     const bindingIds = new Set<string>();
     const runtimeTools = new Map<string, string>();
+    const identifierKinds = new Map<string, MigrationIdKind>();
+    const claimIdentifier = (
+      value: string,
+      kind: MigrationIdKind,
+      path: (string | number)[],
+    ) => {
+      const existingKind = identifierKinds.get(value);
+      if (existingKind && existingKind !== kind) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path,
+          message:
+            "migration identifiers must be globally unique across entity kinds",
+        });
+      } else {
+        identifierKinds.set(value, kind);
+      }
+    };
+    claimIdentifier(plan.id, "plan", ["id"]);
     for (const [index, record] of plan.records.entries()) {
       if (
         index > 0 &&
@@ -392,6 +411,21 @@ export const migrationPlanSchema = z
         }
         values.add(value);
       }
+      claimIdentifier(
+        record.target.accountId,
+        "account",
+        ["records", index, "target", "accountId"],
+      );
+      claimIdentifier(
+        record.target.runtimeId,
+        "runtime",
+        ["records", index, "target", "runtimeId"],
+      );
+      claimIdentifier(
+        record.target.bindingId,
+        "binding",
+        ["records", index, "target", "bindingId"],
+      );
       const runtimeTool = runtimeTools.get(record.target.runtimeId);
       if (runtimeTool && runtimeTool !== record.source.tool) {
         context.addIssue({
@@ -509,6 +543,13 @@ function normalizeMigrationPlanInput(input: MigrationPlanInput): MigrationPlanIn
     observations: input.observations
       .map((observation) => ({
         ...observation,
+        root:
+          observation.root.state === "verified"
+            ? {
+                ...observation.root,
+                realPath: resolve(observation.root.realPath),
+              }
+            : observation.root,
         sessionReferenceDigests: [...observation.sessionReferenceDigests].sort(),
         catalogSkipDigests: [...observation.catalogSkipDigests].sort(),
         historicalAliases: [...observation.historicalAliases].sort(),
@@ -882,12 +923,14 @@ const migrationGateEvidenceSchema = z
 
 export type MigrationGateEvidence = Readonly<z.infer<typeof migrationGateEvidenceSchema>>;
 export type MigrationGateIntent = "partial" | "final";
-export type MigrationState =
-  | "planned"
-  | "partial_ready"
-  | "partial_applied"
-  | "final_ready"
-  | "final_applied";
+const migrationStateSchema = z.enum([
+  "planned",
+  "partial_ready",
+  "partial_applied",
+  "final_ready",
+  "final_applied",
+]);
+export type MigrationState = z.infer<typeof migrationStateSchema>;
 
 export interface MigrationGateResult {
   intent: MigrationGateIntent;
@@ -1014,6 +1057,9 @@ export function evaluateMigrationGates(
   if (backup.restoredAt > plan.cutoverEpoch) {
     reasons.add("restore_after_cutover_epoch");
   }
+  if (backup.restoredAt < plan.createdAt) {
+    reasons.add("restore_before_plan_creation");
+  }
 
   const quarantined = plan.records.some(
     (record) => record.disposition.state === "quarantined",
@@ -1060,20 +1106,39 @@ const migrationAliasEntrySchema = migrationAliasInputSchema
 
 export type MigrationAliasEntry = Readonly<z.infer<typeof migrationAliasEntrySchema>>;
 
+const migrationTransitionEntryCoreSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    sequence: z.number().int().positive().safe(),
+    previousDigest: migrationDigestSchema.nullable(),
+    sourceState: migrationStateSchema,
+    targetState: migrationStateSchema,
+    sourceIntegrityDigest: migrationDigestSchema,
+    sourceAliasJournalLength: z.number().int().nonnegative().safe(),
+    sourceGateReceiptCount: z.number().int().nonnegative().safe(),
+    sourceBackfillReceiptCount: z.number().int().nonnegative().safe(),
+  })
+  .strict();
+
+const migrationTransitionEntrySchema = migrationTransitionEntryCoreSchema
+  .extend({
+    digest: migrationDigestSchema,
+  })
+  .strict();
+
+export type MigrationTransitionEntry = Readonly<
+  z.infer<typeof migrationTransitionEntrySchema>
+>;
+
 const migrationSidecarCoreSchema = z
   .object({
     schemaVersion: z.literal(1),
     plan: migrationPlanSchema,
-    state: z.enum([
-      "planned",
-      "partial_ready",
-      "partial_applied",
-      "final_ready",
-      "final_applied",
-    ]),
+    state: migrationStateSchema,
     aliasJournal: z.array(migrationAliasEntrySchema),
     gateReceipts: z.array(migrationGateReceiptSchema),
     backfillReceipts: z.array(migrationBackfillReceiptSchema),
+    transitionJournal: z.array(migrationTransitionEntrySchema),
   })
   .strict();
 
@@ -1094,6 +1159,7 @@ export function createMigrationSidecar(planInput: MigrationPlan): MigrationSidec
     aliasJournal: [],
     gateReceipts: [],
     backfillReceipts: [],
+    transitionJournal: [],
   });
   for (const record of plan.records) {
     for (const alias of record.historicalAliases) {
@@ -1166,6 +1232,7 @@ export function appendMigrationAlias(
     aliasJournal: [...sidecar.aliasJournal, entry],
     gateReceipts: sidecar.gateReceipts,
     backfillReceipts: sidecar.backfillReceipts,
+    transitionJournal: sidecar.transitionJournal,
   });
 }
 
@@ -1271,6 +1338,21 @@ export function transitionMigrationSidecar(
       "cannot enter final migration state with unresolved quarantine",
     );
   }
+  const transitionCore = migrationTransitionEntryCoreSchema.parse({
+    schemaVersion: 1,
+    sequence: sidecar.transitionJournal.length + 1,
+    previousDigest: sidecar.transitionJournal.at(-1)?.digest ?? null,
+    sourceState: sidecar.state,
+    targetState: target,
+    sourceIntegrityDigest: sidecar.integrityDigest,
+    sourceAliasJournalLength: sidecar.aliasJournal.length,
+    sourceGateReceiptCount: sidecar.gateReceipts.length,
+    sourceBackfillReceiptCount: sidecar.backfillReceipts.length,
+  });
+  const transition = migrationTransitionEntrySchema.parse({
+    ...transitionCore,
+    digest: hashCanonical(transitionCore),
+  });
   return withSidecarIntegrity({
     schemaVersion: 1,
     plan: sidecar.plan,
@@ -1278,6 +1360,7 @@ export function transitionMigrationSidecar(
     aliasJournal: sidecar.aliasJournal,
     gateReceipts,
     backfillReceipts,
+    transitionJournal: [...sidecar.transitionJournal, transition],
   });
 }
 
@@ -1358,6 +1441,98 @@ function validateTransitionReceipts(sidecar: MigrationSidecar): void {
           : "durable backfill receipt";
     throw new MigrationDriftError(
       `migration state "${sidecar.state}" lacks its required ${requiredReceipt} history`,
+    );
+  }
+  validatePredecessorTransitionChain(sidecar);
+}
+
+function validatePredecessorTransitionChain(sidecar: MigrationSidecar): void {
+  let expectedState: MigrationState = "planned";
+  let expectedGateReceiptCount = 0;
+  let expectedBackfillReceiptCount = 0;
+  let minimumAliasJournalLength = 0;
+  let previousDigest: MigrationDigest | null = null;
+
+  for (const [index, entry] of sidecar.transitionJournal.entries()) {
+    const { digest, ...coreValue } = entry;
+    const core = migrationTransitionEntryCoreSchema.parse(coreValue);
+    const sourceCore = migrationSidecarCoreSchema.parse({
+      schemaVersion: 1,
+      plan: sidecar.plan,
+      state: entry.sourceState,
+      aliasJournal: sidecar.aliasJournal.slice(
+        0,
+        entry.sourceAliasJournalLength,
+      ),
+      gateReceipts: sidecar.gateReceipts.slice(
+        0,
+        entry.sourceGateReceiptCount,
+      ),
+      backfillReceipts: sidecar.backfillReceipts.slice(
+        0,
+        entry.sourceBackfillReceiptCount,
+      ),
+      transitionJournal: sidecar.transitionJournal.slice(0, index),
+    });
+    const structurallyValid =
+      entry.sequence === index + 1 &&
+      entry.previousDigest === previousDigest &&
+      entry.digest === hashCanonical(core) &&
+      entry.sourceState === expectedState &&
+      allowedTransitions[entry.sourceState].includes(entry.targetState) &&
+      entry.sourceAliasJournalLength >= minimumAliasJournalLength &&
+      entry.sourceAliasJournalLength <= sidecar.aliasJournal.length &&
+      entry.sourceGateReceiptCount === expectedGateReceiptCount &&
+      entry.sourceBackfillReceiptCount === expectedBackfillReceiptCount &&
+      entry.sourceIntegrityDigest === hashCanonical(sourceCore);
+    if (!structurallyValid) {
+      throw new MigrationDriftError(
+        "migration receipt predecessor transition chain is invalid",
+      );
+    }
+
+    if (entry.targetState === "partial_ready" || entry.targetState === "final_ready") {
+      const receipt = sidecar.gateReceipts[expectedGateReceiptCount];
+      if (
+        !receipt ||
+        receipt.sourceIntegrityDigest !== entry.sourceIntegrityDigest ||
+        receipt.targetState !== entry.targetState
+      ) {
+        throw new MigrationDriftError(
+          "migration receipt predecessor transition chain is invalid",
+        );
+      }
+      expectedGateReceiptCount += 1;
+    } else {
+      const receipt = sidecar.backfillReceipts[expectedBackfillReceiptCount];
+      const expectedReadyState =
+        entry.targetState === "partial_applied"
+          ? "partial_ready"
+          : "final_ready";
+      if (
+        !receipt ||
+        receipt.sourceIntegrityDigest !== entry.sourceIntegrityDigest ||
+        receipt.readyState !== expectedReadyState
+      ) {
+        throw new MigrationDriftError(
+          "migration receipt predecessor transition chain is invalid",
+        );
+      }
+      expectedBackfillReceiptCount += 1;
+    }
+
+    expectedState = entry.targetState;
+    minimumAliasJournalLength = entry.sourceAliasJournalLength;
+    previousDigest = entry.digest;
+  }
+
+  if (
+    expectedState !== sidecar.state ||
+    expectedGateReceiptCount !== sidecar.gateReceipts.length ||
+    expectedBackfillReceiptCount !== sidecar.backfillReceipts.length
+  ) {
+    throw new MigrationDriftError(
+      "migration receipt predecessor transition chain is invalid",
     );
   }
 }
@@ -1557,12 +1732,14 @@ export async function applyScopedBackfill(
         await transaction.ensureCrosswalk(deepFreeze(crosswalk)),
       );
     }
-    counts.epoch = await transaction.recordEpoch({
-      planId: sidecar.plan.id,
-      idempotencyKey: sidecar.plan.idempotencyKey,
-      cutoverEpoch: sidecar.plan.cutoverEpoch,
-    });
-    return deepFreeze(counts);
+    counts.epoch = ensureResultSchema.parse(
+      await transaction.recordEpoch({
+        planId: sidecar.plan.id,
+        idempotencyKey: sidecar.plan.idempotencyKey,
+        cutoverEpoch: sidecar.plan.cutoverEpoch,
+      }),
+    );
+    return deepFreeze(migrationBackfillCountsSchema.parse(counts));
   });
 
   const receiptCore = migrationBackfillReceiptCoreSchema.parse({
@@ -1803,6 +1980,7 @@ export class MigrationSidecarStore {
           "the first durable migration sidecar state must be planned",
         );
       }
+      if (!current) assertCanonicalPlannedGenesis(sidecar);
       if (current && expectedPreviousDigest === undefined) {
         throw new MigrationConflictError(
           "updating a migration sidecar requires its expected previous integrity digest",
@@ -1850,6 +2028,9 @@ export class MigrationSidecarStore {
       if (!existsSync(this.walPath)) return this.load();
 
       const wal = this.readWal(this.walPath);
+      if (wal.previousDigest === null) {
+        assertCanonicalPlannedGenesis(wal.nextSidecar);
+      }
       let current: MigrationSidecar | null;
       try {
         current = this.load();
@@ -1866,6 +2047,17 @@ export class MigrationSidecarStore {
         (current === null && wal.previousDigest === null) ||
         current?.integrityDigest === wal.previousDigest
       ) {
+        if (current) {
+          if (
+            hashCanonical(current.plan) !==
+            hashCanonical(wal.nextSidecar.plan)
+          ) {
+            throw new MigrationConflictError(
+              "migration WAL successor belongs to a different frozen plan",
+            );
+          }
+          assertSidecarSuccessor(current, wal.nextSidecar);
+        }
         this.writeSidecar(wal.nextSidecar, { allowFailureInjection: false });
         this.finishWal({ allowFailureInjection: false });
         return wal.nextSidecar;
@@ -2068,16 +2260,36 @@ function assertSidecarSuccessor(
     next.backfillReceipts,
     "migration backfill receipt history is immutable",
   );
+  assertReceiptPrefix(
+    current.transitionJournal,
+    next.transitionJournal,
+    "migration transition journal history is immutable",
+  );
   if (current.state === next.state) {
     if (
       next.gateReceipts.length !== current.gateReceipts.length ||
-      next.backfillReceipts.length !== current.backfillReceipts.length
+      next.backfillReceipts.length !== current.backfillReceipts.length ||
+      next.transitionJournal.length !== current.transitionJournal.length
     ) {
       throw new MigrationConflictError(
         "receipt journals may advance only with their matching state transition",
       );
     }
     return;
+  }
+  const transition = next.transitionJournal.at(-1);
+  if (
+    next.transitionJournal.length !== current.transitionJournal.length + 1 ||
+    transition?.sourceState !== current.state ||
+    transition.targetState !== next.state ||
+    transition.sourceIntegrityDigest !== current.integrityDigest ||
+    transition.sourceAliasJournalLength !== current.aliasJournal.length ||
+    transition.sourceGateReceiptCount !== current.gateReceipts.length ||
+    transition.sourceBackfillReceiptCount !== current.backfillReceipts.length
+  ) {
+    throw new MigrationConflictError(
+      `durable transition journal must bind ${current.state} -> ${next.state}`,
+    );
   }
   if (next.state === "partial_ready" || next.state === "final_ready") {
     const receipt = next.gateReceipts.at(-1);
@@ -2104,6 +2316,18 @@ function assertSidecarSuccessor(
   ) {
     throw new MigrationConflictError(
       `durable backfill receipt must bind ${current.state} -> ${next.state}`,
+    );
+  }
+}
+
+function assertCanonicalPlannedGenesis(sidecar: MigrationSidecar): void {
+  const canonical = createMigrationSidecar(sidecar.plan);
+  if (
+    sidecar.state !== "planned" ||
+    hashCanonical(sidecar) !== hashCanonical(canonical)
+  ) {
+    throw new MigrationConflictError(
+      "the first durable migration sidecar must be the canonical planned genesis",
     );
   }
 }

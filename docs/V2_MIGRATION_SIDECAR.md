@@ -38,9 +38,10 @@ filesystem identity, input digests, allocated IDs, and quarantine evidence.
 
 Unsafe roots, unresolved catalog skips, duplicate legacy identities, the same
 mutable name observed across runtimes, and distinct legacy identities resolving
-to the same verified real path/device/inode/digest are quarantined. A partial
-backfill may include only records marked `ready`; final cutover remains blocked
-while any quarantine exists.
+to the same canonicalized verified real path/device/inode/digest are
+quarantined. Lexical path aliases such as `directory/../root` cannot evade the
+physical-root collision check. A partial backfill may include only records
+marked `ready`; final cutover remains blocked while any quarantine exists.
 
 Historical account aliases target the frozen account ID. Historical session
 aliases target the frozen machine-binding ID. The alias journal is append-only,
@@ -58,7 +59,7 @@ The preflight gate requires:
 - no unresolved catalog skips;
 - an encrypted, mode `0600`, complete backup manifest;
 - database point-in-time recovery and a restore drill completed no later than
-  the shared cutover epoch; and
+  the shared cutover epoch and no earlier than plan creation; and
 - the exact plan ID, idempotency key, and cutover epoch.
 
 The explicit state sequence is:
@@ -69,22 +70,27 @@ planned -> partial_ready -> partial_applied -> final_ready -> final_applied
 
 `planned -> final_ready` is permitted only when no record is quarantined.
 Entering either readiness state requires current evidence evaluated against the
-frozen plan. The accepted evidence is written into an integrity-protected gate
-receipt bound to the exact predecessor sidecar. Entering either applied state
-requires the committed, scope-bound receipt returned by `applyScopedBackfill`;
-that receipt covers the plan, idempotency key, scope, exact ready predecessor,
-ready-record digest, transaction counts, and epoch result. Backward and skipped
-transitions fail. These states are contracts only; this foundation does not make
-a production cutover decision.
+frozen plan. The accepted evidence is written into a checksum-protected gate
+receipt bound to the exact predecessor sidecar through a bounded, digest-chained
+transition journal. Entering either applied state requires the committed,
+scope-bound receipt returned by `applyScopedBackfill`; that receipt covers the
+plan, idempotency key, scope, exact ready predecessor, ready-record digest,
+transaction counts, and epoch result. The unkeyed SHA-256 digests provide
+tamper evidence and deterministic drift detection only; they are not signatures,
+authentication, authorization, or proof that a writer is trusted. File
+permissions, writer locking, compare-and-swap, and deployment authority remain
+separate controls. Backward and skipped transitions fail. These states are
+contracts only; this foundation does not make a production cutover decision.
 
 ## Transactional backfill hook
 
 `applyScopedBackfill` exposes one tenant/scope transaction callback. It ensures
 ready runtimes, accounts, legacy-to-v2 crosswalks, and the shared cutover epoch
 inside that transaction. The storage port owns commit and rollback. Only after
-the transaction resolves does the function return the receipt required for the
-matching `*_applied` transition. No PostgreSQL schema, migration file, or HTTP
-route is added by this sidecar.
+every runtime, account, crosswalk, and epoch result is validated inside the
+transaction does the function return the receipt required for the matching
+`*_applied` transition. No PostgreSQL schema, migration file, or HTTP route is
+added by this sidecar.
 
 Runtime definitions must be identical for every record sharing a runtime ID.
 The crosswalk retains source authority, authority ID, legacy tool/name, and the
@@ -114,9 +120,11 @@ first crash-recovery intent.
 
 `repair()` is idempotent at every durable boundary. It adopts an already
 installed exact successor or completes a WAL transition only from its exact
-predecessor. A lock owned by a live process is preserved; a valid lock naming a
-dead process is removed before repair retries. Ambiguous drift preserves the
-WAL and fails closed.
+predecessor after rechecking immutable alias, receipt, and transition-journal
+history. A genesis WAL may install only the exact canonical `planned` sidecar
+derived from the frozen plan. A lock owned by a live process is preserved; a
+valid lock naming a dead process is removed before repair retries. Ambiguous
+drift preserves the WAL and fails closed.
 
 ## Compatibility fixture
 

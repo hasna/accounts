@@ -103,6 +103,7 @@ export type {
   MigrationSidecarInstallOptions,
   MigrationSidecarStoreOptions,
   MigrationState,
+  MigrationTransitionEntry,
   RedactedMigrationPlan,
   RedactedMigrationRecord,
   ScopedBackfillAccount,
