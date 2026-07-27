@@ -131,7 +131,9 @@ anything.
 A child process cannot change your parent shell — use `eval "$(accounts env …)"` or the
 [shell hook](docs/hook.md) (terminal `claude` only, not IDE extensions).
 
-Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
+Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md). The additive v2
+migration preflight and durability contract is documented in
+[docs/V2_MIGRATION_SIDECAR.md](docs/V2_MIGRATION_SIDECAR.md).
 
 ## What is isolated, and what is shared
 

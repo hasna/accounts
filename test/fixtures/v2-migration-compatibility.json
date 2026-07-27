@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "client": "old",
+      "server": "old",
+      "result": "v1_unchanged",
+      "writes": "v1_only"
+    },
+    {
+      "client": "old",
+      "server": "transition",
+      "result": "v1_projection",
+      "writes": "v1_only"
+    },
+    {
+      "client": "transition",
+      "server": "old",
+      "result": "preflight_only",
+      "writes": "none"
+    },
+    {
+      "client": "transition",
+      "server": "transition",
+      "result": "sidecar_backfill",
+      "writes": "journaled_v2"
+    },
+    {
+      "client": "new",
+      "server": "old",
+      "result": "upgrade_required",
+      "writes": "none"
+    },
+    {
+      "client": "new",
+      "server": "transition",
+      "result": "requires_final_cutover",
+      "writes": "none"
+    },
+    {
+      "client": "new",
+      "server": "new",
+      "result": "v2",
+      "writes": "v2_only"
+    }
+  ]
+}
