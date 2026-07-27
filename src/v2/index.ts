@@ -30,6 +30,7 @@ export type {
   Runtime,
   RuntimeId,
   RuntimeV2Dto,
+  ScopeRef,
   ScopeId,
   TenantId,
 } from "./domain.js";

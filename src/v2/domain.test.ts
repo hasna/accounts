@@ -23,7 +23,6 @@ function account(): Account {
     name: "work",
     runtimeId,
     email: "work@example.test",
-    metadata: { identity_hint: "sanitized" },
     createdAt: NOW,
     updatedAt: NOW,
   });
@@ -55,6 +54,13 @@ describe("v2 domain boundary", () => {
   test("strict wire DTOs reject local fields while serialization omits them", () => {
     const composite = {
       ...account(),
+      metadata: {
+        rootPath: "/machine/private/nested-root",
+        credentialRef: "vault:nested-item",
+        authentication: "authenticated",
+        current: true,
+        applied: true,
+      },
       dir: "/machine/private/root",
       rootPath: "/machine/private/root",
       credentialRef: "vault:item",
@@ -74,6 +80,7 @@ describe("v2 domain boundary", () => {
       "authentication",
       "current",
       "applied",
+      "metadata",
     ]) {
       expect(forbidden in dto).toBe(false);
     }
@@ -105,10 +112,12 @@ describe("v2 domain boundary", () => {
       authentication: "needs_login",
       generation: 7,
     });
-    const machineOne = new MachineBindingOverlay(first.machineId, [first]);
-    const machineTwo = new MachineBindingOverlay(second.machineId, [second]);
-    machineOne.setCurrent(first.runtimeId, first.id);
-    machineOne.setApplied(first.runtimeId, first.id);
+    const machineOne = new MachineBindingOverlay(first.machineId);
+    const machineTwo = new MachineBindingOverlay(second.machineId);
+    machineOne.put(scope, first);
+    machineTwo.put(scope, second);
+    machineOne.setCurrent(scope, first.runtimeId, first.id);
+    machineOne.setApplied(scope, first.runtimeId, first.id);
 
     expect(machineOne.forAccount(scope, first.accountId)[0]?.rootPath).toBe(
       "/machines/one/accounts/work",
@@ -116,12 +125,64 @@ describe("v2 domain boundary", () => {
     expect(machineTwo.forAccount(scope, second.accountId)[0]?.rootPath).toBe(
       "/machines/two/accounts/work",
     );
-    expect(machineOne.current(first.runtimeId)?.id).toBe(first.id);
-    expect(machineTwo.current(second.runtimeId)).toBeNull();
-    expect(machineOne.applied(first.runtimeId)?.id).toBe(first.id);
-    expect(machineTwo.applied(second.runtimeId)).toBeNull();
-    expect(machineOne.get(first.id)?.authentication).toBe("authenticated");
-    expect(machineTwo.get(second.id)?.authentication).toBe("needs_login");
+    expect(machineOne.current(scope, first.runtimeId)?.id).toBe(first.id);
+    expect(machineTwo.current(scope, second.runtimeId)).toBeNull();
+    expect(machineOne.applied(scope, first.runtimeId)?.id).toBe(first.id);
+    expect(machineTwo.applied(scope, second.runtimeId)).toBeNull();
+    expect(machineOne.get(scope, first.id)?.authentication).toBe("authenticated");
+    expect(machineTwo.get(scope, second.id)?.authentication).toBe("needs_login");
     expect(toAccountV2Dto(account())).toEqual(account());
+  });
+
+  test("identical binding, account and runtime ids remain isolated across scopes", () => {
+    const firstScope = registryScopeSchema.parse({ tenantId, scopeId });
+    const secondScope = registryScopeSchema.parse({
+      tenantId: "tenant_000000000002",
+      scopeId: "scope_000000000002",
+    });
+    const shared = {
+      id: "binding_00000000001",
+      accountId,
+      runtimeId,
+      machineId: "machine_00000000001",
+      credentialRef: "vault:shared-reference",
+    } as const;
+    const first = machineBindingSchema.parse({
+      ...shared,
+      ...firstScope,
+      rootPath: "/machines/shared/tenant-one",
+      authentication: "authenticated",
+      generation: 1,
+    });
+    const second = machineBindingSchema.parse({
+      ...shared,
+      ...secondScope,
+      rootPath: "/machines/shared/tenant-two",
+      authentication: "needs_login",
+      generation: 2,
+    });
+    const overlay = new MachineBindingOverlay(first.machineId);
+    overlay.put(firstScope, first);
+    overlay.put(secondScope, second);
+
+    overlay.setCurrent(firstScope, first.runtimeId, first.id);
+    overlay.setCurrent(secondScope, second.runtimeId, second.id);
+    overlay.setApplied(firstScope, first.runtimeId, first.id);
+
+    expect(overlay.get(firstScope, first.id)?.rootPath).toBe("/machines/shared/tenant-one");
+    expect(overlay.get(secondScope, second.id)?.rootPath).toBe("/machines/shared/tenant-two");
+    expect(overlay.current(firstScope, first.runtimeId)?.rootPath).toBe(
+      "/machines/shared/tenant-one",
+    );
+    expect(overlay.current(secondScope, second.runtimeId)?.rootPath).toBe(
+      "/machines/shared/tenant-two",
+    );
+    expect(overlay.applied(firstScope, first.runtimeId)?.id).toBe(first.id);
+    expect(overlay.applied(secondScope, second.runtimeId)).toBeNull();
+    expect(() => overlay.put(firstScope, second)).toThrow(/does not belong/);
+
+    overlay.put(firstScope, { ...first, generation: 3 });
+    expect(overlay.get(firstScope, first.id)?.generation).toBe(3);
+    expect(overlay.get(secondScope, second.id)?.generation).toBe(2);
   });
 });

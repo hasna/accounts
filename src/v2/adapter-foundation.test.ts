@@ -52,7 +52,7 @@ interface AdapterFixture {
   evidence: () => readonly string[];
 }
 
-describe("AccountsRegistry adapter contract", () => {
+describe("AccountsRegistry structural adapter foundation", () => {
   for (const fixture of fixtures()) {
     test(`${fixture.name} preserves the same scoped create/read/rename behavior`, async () => {
       const runtimeA = runtime(scopeA, "01");
@@ -118,6 +118,25 @@ describe("AccountsRegistry adapter contract", () => {
     for (const statement of postgres.evidence()) {
       expect(statement).toContain("tenant_id");
       expect(statement).toContain("scope_id");
+      expect(statement).not.toMatch(/\bmetadata\b/);
+    }
+  });
+
+  test("all adapters reject metadata envelopes before local, HTTP or PostgreSQL serialization", async () => {
+    const unsafeAccount = {
+      ...account(scopeA, "account_00000000001", runtime(scopeA, "01").id),
+      metadata: {
+        rootPath: "/machine/private/nested-root",
+        credentialRef: "vault:nested-item",
+        authentication: "authenticated",
+        current: true,
+        applied: true,
+      },
+    } as unknown as Account;
+
+    for (const fixture of fixtures()) {
+      await expect(fixture.registry.createAccount(scopeA, unsafeAccount)).rejects.toThrow();
+      expect(fixture.evidence()).toEqual([]);
     }
   });
 
@@ -133,6 +152,71 @@ describe("AccountsRegistry adapter contract", () => {
       fetchImpl: (async () => response({ accounts: [foreign] })) as typeof fetch,
     });
     await expect(registry.listAccounts(scopeA)).rejects.toThrow(/does not belong/);
+  });
+
+  test.each([
+    [
+      "scope",
+      account(scopeB, "account_00000000001", runtime(scopeB, "01").id),
+      /does not belong/,
+    ],
+    [
+      "id",
+      account(scopeA, "account_00000000002", runtime(scopeA, "01").id),
+      /identity/,
+    ],
+  ])("HTTP rename rejects a pre-read with the wrong %s before mutation", async (_label, before, error) => {
+    const methods: string[] = [];
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async (_input, init) => {
+        const method = init?.method ?? "GET";
+        methods.push(method);
+        if (method === "GET") return response(before);
+        return response({ ...before, name: "renamed", updatedAt: LATER });
+      }) as typeof fetch,
+    });
+
+    await expect(
+      registry.renameAccount(scopeA, "account_00000000001" as Account["id"], "renamed", LATER),
+    ).rejects.toThrow(error);
+    expect(methods).toEqual(["GET"]);
+  });
+
+  test.each([
+    [
+      "scope",
+      account(scopeB, "account_00000000001", runtime(scopeB, "01").id),
+      /does not belong/,
+    ],
+    [
+      "id",
+      account(scopeA, "account_00000000002", runtime(scopeA, "01").id),
+      /identity/,
+    ],
+    [
+      "runtime",
+      account(scopeA, "account_00000000001", runtime(scopeA, "02").id),
+      /identity/,
+    ],
+  ])("HTTP rename rejects a response that changes immutable %s", async (_label, after, error) => {
+    const before = account(scopeA, "account_00000000001", runtime(scopeA, "01").id);
+    const methods: string[] = [];
+    const registry = new HttpAccountsRegistry({
+      baseUrl: "https://accounts.example.test",
+      apiKey: "fixture-authorization",
+      fetchImpl: (async (_input, init) => {
+        const method = init?.method ?? "GET";
+        methods.push(method);
+        return method === "GET"
+          ? response(before)
+          : response({ ...after, name: "renamed", updatedAt: LATER });
+      }) as typeof fetch,
+    });
+
+    await expect(registry.renameAccount(scopeA, before.id, "renamed", LATER)).rejects.toThrow(error);
+    expect(methods).toEqual(["GET", "POST"]);
   });
 
   test("Postgres validates rename input before issuing a mutation", async () => {
@@ -282,9 +366,8 @@ function postgresFixture(): AdapterFixture {
           name: params[3],
           runtime_id: params[4],
           email: params[5],
-          metadata: params[6],
-          created_at: params[7],
-          updated_at: params[8],
+          created_at: params[6],
+          updated_at: params[7],
         };
         accounts.set(itemKey, row);
         return row;

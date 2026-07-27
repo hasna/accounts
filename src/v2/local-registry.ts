@@ -22,11 +22,12 @@ export interface LocalRegistrySeed {
 }
 
 /**
- * Machine-local adapter over an isolated v2 state object.
+ * In-memory structural test double over an isolated v2 state object.
  *
- * It intentionally neither reads nor rewrites accounts.json. The migration
- * slice can hydrate/persist snapshots without coupling the domain port to a
- * premature sidecar format.
+ * It intentionally neither reads nor rewrites accounts.json and does not
+ * represent production local-storage parity. A later migration slice can
+ * hydrate/persist snapshots without coupling the domain port to a premature
+ * sidecar format.
  */
 export class LocalAccountsRegistry implements AccountsRegistry {
   private readonly accounts = new Map<string, Account>();

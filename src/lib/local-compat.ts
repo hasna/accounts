@@ -10,6 +10,7 @@ import {
   loadStore as localLoadStore,
   saveStore as localSaveStore,
 } from "../storage.js";
+import { resolveAccountsCloud } from "./cloud-accounts.js";
 import {
   addCustomTool as localAddCustomTool,
   getTool as localGetTool,
@@ -34,24 +35,9 @@ import {
   type UpdateOptions,
 } from "./profiles.js";
 
-const HOSTED_MODES = new Set(["cloud", "self_hosted", "self-hosted"]);
-
 export function assertRootCompatibilityIsLocal(env: NodeJS.ProcessEnv = process.env): void {
-  const mode = (
-    env.HASNA_ACCOUNTS_STORAGE_MODE ||
-    env.ACCOUNTS_STORAGE_MODE ||
-    env.HASNA_ACCOUNTS_MODE ||
-    ""
-  )
-    .trim()
-    .toLowerCase();
-  const apiConfigured = [
-    env.HASNA_ACCOUNTS_API_URL,
-    env.ACCOUNTS_API_URL,
-    env.HASNA_ACCOUNTS_API_KEY,
-    env.ACCOUNTS_API_KEY,
-  ].some((value) => Boolean(value?.trim()));
-  if (HOSTED_MODES.has(mode) || apiConfigured) {
+  const authority = resolveAccountsCloud(env);
+  if (authority.transport === "cloud-http") {
     throw new AccountsError(
       "synchronous @hasna/accounts registry exports are local-only compatibility and are unavailable when hosted authority is configured; use resolveStore() or @hasna/accounts/v2",
     );

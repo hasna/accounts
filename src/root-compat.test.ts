@@ -45,8 +45,10 @@ describe("root synchronous compatibility exports", () => {
     }
   });
 
-  test("preserves synchronous behavior with explicit local authority", () => {
+  test("explicit local authority wins over retained hosted URL and key", () => {
     process.env.HASNA_ACCOUNTS_STORAGE_MODE = "local";
+    process.env.HASNA_ACCOUNTS_API_URL = "https://accounts.example.test";
+    process.env.HASNA_ACCOUNTS_API_KEY = "fixture-authority";
     expect(loadStore().version).toBe(1);
     expect(listTools().some((tool) => tool.id === "claude")).toBe(true);
     expect(listProfiles()).toEqual([]);
@@ -54,14 +56,32 @@ describe("root synchronous compatibility exports", () => {
     expect(listProfiles().map((profile) => profile.name)).toEqual(["local-only"]);
   });
 
+  test("an incomplete retained hosted configuration resolves to local authority", () => {
+    process.env.HASNA_ACCOUNTS_API_URL = "https://accounts.example.test";
+    expect(loadStore().version).toBe(1);
+    expect(addProfile({ name: "still-local", tool: "claude" }).name).toBe("still-local");
+  });
+
   test.each([
-    ["cloud mode", { HASNA_ACCOUNTS_STORAGE_MODE: "cloud" }],
-    ["self-hosted mode", { HASNA_ACCOUNTS_STORAGE_MODE: "self_hosted" }],
-    ["partial hosted URL", { HASNA_ACCOUNTS_API_URL: "https://accounts.example.test" }],
     [
-      "explicit local with hosted configuration",
+      "implicit hosted URL and key",
       {
-        HASNA_ACCOUNTS_STORAGE_MODE: "local",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+    ],
+    [
+      "cloud mode",
+      {
+        HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+    ],
+    [
+      "self-hosted mode",
+      {
+        HASNA_ACCOUNTS_STORAGE_MODE: "self_hosted",
         HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
         HASNA_ACCOUNTS_API_KEY: "fixture-authority",
       },
@@ -84,6 +104,22 @@ describe("root synchronous compatibility exports", () => {
     ).toThrow(/local-only compatibility/);
     expect(existsSync(join(home, "accounts.json"))).toBe(false);
     expect(existsSync(join(home, "profiles"))).toBe(false);
+  });
+
+  test.each([
+    [
+      "incomplete explicit cloud",
+      {
+        HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+      },
+      /requires HASNA_ACCOUNTS_API_KEY/,
+    ],
+    ["unknown mode", { HASNA_ACCOUNTS_STORAGE_MODE: "typo" }, /invalid accounts storage mode/],
+  ])("propagates canonical resolver errors for %s", (_label, env, error) => {
+    Object.assign(process.env, env);
+    expect(() => listProfiles()).toThrow(error);
+    expect(existsSync(join(home, "accounts.json"))).toBe(false);
   });
 });
 

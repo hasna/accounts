@@ -24,7 +24,6 @@ interface AccountRow {
   name: string;
   runtime_id: string;
   email: string | null;
-  metadata: unknown;
   created_at: string | Date;
   updated_at: string | Date;
 }
@@ -50,7 +49,7 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
   async listAccounts(scopeInput: RegistryScope): Promise<readonly Account[]> {
     const scope = registryScopeSchema.parse(scopeInput);
     const rows = await this.client.many<AccountRow>(
-      `SELECT account_id, tenant_id, scope_id, name, runtime_id, email, metadata, created_at, updated_at
+      `SELECT account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at
        FROM accounts_v2
        WHERE tenant_id = $1 AND scope_id = $2
        ORDER BY name, account_id`,
@@ -67,7 +66,7 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
     const row = await this.client.get<AccountRow>(
-      `SELECT account_id, tenant_id, scope_id, name, runtime_id, email, metadata, created_at, updated_at
+      `SELECT account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at
        FROM accounts_v2
        WHERE tenant_id = $1 AND scope_id = $2 AND account_id = $3`,
       [scope.tenantId, scope.scopeId, accountId],
@@ -85,9 +84,9 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
     try {
       const row = await this.client.one<AccountRow>(
         `INSERT INTO accounts_v2
-           (account_id, tenant_id, scope_id, name, runtime_id, email, metadata, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
-         RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, metadata, created_at, updated_at`,
+           (account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at`,
         [
           account.id,
           scope.tenantId,
@@ -95,7 +94,6 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
           account.name,
           account.runtimeId,
           account.email ?? null,
-          JSON.stringify(account.metadata ?? {}),
           account.createdAt,
           account.updatedAt,
         ],
@@ -124,7 +122,7 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
       `UPDATE accounts_v2
        SET name = $4, updated_at = $5
        WHERE tenant_id = $1 AND scope_id = $2 AND account_id = $3
-       RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, metadata, created_at, updated_at`,
+       RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at`,
       [scope.tenantId, scope.scopeId, accountId, rename.name, rename.updatedAt],
     );
     if (!row) throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
@@ -204,7 +202,6 @@ function toAccount(row: AccountRow): Account {
     name: row.name,
     runtimeId: row.runtime_id,
     ...(row.email === null ? {} : { email: row.email }),
-    metadata: parseMetadata(row.metadata),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   });
@@ -224,15 +221,6 @@ function toRuntime(row: RuntimeRow): Runtime {
 
 function iso(value: string | Date): string {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
-}
-
-function parseMetadata(value: unknown): unknown {
-  if (typeof value !== "string") return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return {};
-  }
 }
 
 function isUniqueViolation(error: unknown): boolean {

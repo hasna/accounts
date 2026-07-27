@@ -10,16 +10,20 @@ Authentication is deliberately absent from `Account`: it belongs to a
 machine-local `MachineBinding`, together with the physical root, opaque
 credential reference, and local current/applied pointers.
 
-`AccountsRegistry` is the only v2 domain port. The local, HTTP, and PostgreSQL
-adapters implement the same async create/read/rename behavior. Name uniqueness
-and runtime-association enforcement are intentionally deferred until the
-tenant-backfill and collision gates are complete.
+`AccountsRegistry` is the only v2 domain port. The in-memory local adapter is a
+test double, while the HTTP and PostgreSQL adapters are structural foundations
+for future routes and tables. Their fixture tests check contract shape and
+scope propagation only; they do not establish behavior or operational parity
+with real HTTP or PostgreSQL backends. Name uniqueness and runtime-association
+enforcement are intentionally deferred until the tenant-backfill and collision
+gates are complete.
 
 The HTTP and PostgreSQL adapters are contract-first foundations for the later
 wire/schema migration slice. Both constrain every operation by tenant and
-scope. V2 DTOs reject or strip machine paths, credentials, authentication, and
-current/applied state. The existing v1 API may retain those legacy fields only
-inside its isolated compatibility contract.
+scope. V2 DTOs omit arbitrary account metadata and reject or strip machine
+paths, credential references, authentication, and current/applied state,
+including those fields nested inside a metadata envelope. The existing v1 API
+may retain those legacy fields only inside its isolated compatibility contract.
 
 Synchronous profile functions exported from the package root are now explicit
 local-only compatibility. They preserve local behavior, but fail before local

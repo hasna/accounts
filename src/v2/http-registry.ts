@@ -26,6 +26,10 @@ export interface HttpAccountsRegistryOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * Structural client foundation for future v2 HTTP routes. The repository does
+ * not activate those routes yet, and fixture coverage is not backend parity.
+ */
 export class HttpAccountsRegistry implements AccountsRegistry {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -57,6 +61,9 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     if (body === null) return null;
     const account = accountSchema.parse(body);
     assertEntityScope(scope, account);
+    if (account.id !== accountId) {
+      throw new RegistryConflictError("v2 registry returned a different account identity for lookup");
+    }
     return account;
   }
 
@@ -83,15 +90,17 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
     const rename = renameAccountInputSchema.parse({ name: nameInput, updatedAt });
+    const current = await this.getAccount(scope, accountId);
+    if (!current) {
+      throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
+    }
     const body = await this.request(scope, `/accounts/${encodeURIComponent(accountId)}/rename`, {
       method: "POST",
       body: rename,
     });
     const renamed = accountSchema.parse(body);
     assertEntityScope(scope, renamed);
-    if (renamed.id !== accountId) {
-      throw new RegistryConflictError("v2 registry returned a different account identity after rename");
-    }
+    assertSameAccountIdentity(current, renamed);
     return renamed;
   }
 

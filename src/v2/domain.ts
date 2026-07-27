@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { metadataSchema, profileNameSchema } from "../types.js";
+import { profileNameSchema } from "../types.js";
 
 const opaqueId = (label: string) =>
   z
@@ -30,6 +30,7 @@ export const registryScopeSchema = z
   .strict();
 
 export type RegistryScope = Readonly<z.infer<typeof registryScopeSchema>>;
+export type ScopeRef = RegistryScope;
 
 const timestampSchema = z.string().datetime();
 export const renameAccountInputSchema = z
@@ -51,7 +52,6 @@ export const accountSchema = z
     name: profileNameSchema,
     runtimeId: runtimeIdSchema,
     email: z.string().email().optional(),
-    metadata: metadataSchema.optional(),
     createdAt: timestampSchema,
     updatedAt: timestampSchema,
   })

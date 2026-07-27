@@ -2,14 +2,16 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import {
   accountIdSchema,
+  assertEntityScope,
   bindingIdSchema,
   machineIdSchema,
   registryScopeSchema,
   runtimeIdSchema,
   type AccountId,
   type BindingId,
-  type RegistryScope,
+  type MachineId,
   type RuntimeId,
+  type ScopeRef,
 } from "./domain.js";
 
 export const bindingAuthenticationSchema = z.enum([
@@ -42,20 +44,24 @@ export type BindingAuthentication = z.infer<typeof bindingAuthenticationSchema>;
  * cloud authority through AccountsRegistry.
  */
 export class MachineBindingOverlay {
-  private readonly bindings = new Map<BindingId, MachineBinding>();
-  private readonly currentByRuntime = new Map<RuntimeId, BindingId>();
-  private readonly appliedByRuntime = new Map<RuntimeId, BindingId>();
+  readonly machineId: MachineId;
+  private readonly bindings = new Map<string, MachineBinding>();
+  private readonly currentByRuntime = new Map<string, BindingId>();
+  private readonly appliedByRuntime = new Map<string, BindingId>();
 
-  constructor(readonly machineId: MachineBinding["machineId"], seed: readonly MachineBinding[] = []) {
-    for (const binding of seed) this.put(binding);
+  constructor(machineIdInput: MachineBinding["machineId"]) {
+    this.machineId = machineIdSchema.parse(machineIdInput);
   }
 
-  put(input: MachineBinding): MachineBinding {
+  put(scopeInput: ScopeRef, input: MachineBinding): MachineBinding {
+    const scope = registryScopeSchema.parse(scopeInput);
     const binding = machineBindingSchema.parse(input);
+    assertEntityScope(scope, binding);
     if (binding.machineId !== this.machineId) {
       throw new Error("machine binding belongs to a different machine");
     }
-    const existing = this.bindings.get(binding.id);
+    const bindingKey = scopedKey(scope, binding.id);
+    const existing = this.bindings.get(bindingKey);
     if (
       existing &&
       (existing.accountId !== binding.accountId ||
@@ -65,16 +71,19 @@ export class MachineBindingOverlay {
     ) {
       throw new Error("binding identity fields are immutable");
     }
-    this.bindings.set(binding.id, binding);
+    this.bindings.set(bindingKey, binding);
     return binding;
   }
 
-  get(bindingId: BindingId): MachineBinding | null {
-    return this.bindings.get(bindingId) ?? null;
+  get(scopeInput: ScopeRef, bindingIdInput: BindingId): MachineBinding | null {
+    const scope = registryScopeSchema.parse(scopeInput);
+    const bindingId = bindingIdSchema.parse(bindingIdInput);
+    return this.bindings.get(scopedKey(scope, bindingId)) ?? null;
   }
 
-  forAccount(scopeInput: RegistryScope, accountId: AccountId): readonly MachineBinding[] {
+  forAccount(scopeInput: ScopeRef, accountIdInput: AccountId): readonly MachineBinding[] {
     const scope = registryScopeSchema.parse(scopeInput);
+    const accountId = accountIdSchema.parse(accountIdInput);
     return [...this.bindings.values()].filter(
       (binding) =>
         binding.tenantId === scope.tenantId &&
@@ -83,31 +92,47 @@ export class MachineBindingOverlay {
     );
   }
 
-  setCurrent(runtimeId: RuntimeId, bindingId: BindingId): void {
-    const binding = this.requireRuntimeBinding(runtimeId, bindingId);
-    this.currentByRuntime.set(runtimeId, binding.id);
+  setCurrent(scopeInput: ScopeRef, runtimeIdInput: RuntimeId, bindingIdInput: BindingId): void {
+    const scope = registryScopeSchema.parse(scopeInput);
+    const binding = this.requireRuntimeBinding(scope, runtimeIdInput, bindingIdInput);
+    this.currentByRuntime.set(scopedKey(scope, binding.runtimeId), binding.id);
   }
 
-  setApplied(runtimeId: RuntimeId, bindingId: BindingId): void {
-    const binding = this.requireRuntimeBinding(runtimeId, bindingId);
-    this.appliedByRuntime.set(runtimeId, binding.id);
+  setApplied(scopeInput: ScopeRef, runtimeIdInput: RuntimeId, bindingIdInput: BindingId): void {
+    const scope = registryScopeSchema.parse(scopeInput);
+    const binding = this.requireRuntimeBinding(scope, runtimeIdInput, bindingIdInput);
+    this.appliedByRuntime.set(scopedKey(scope, binding.runtimeId), binding.id);
   }
 
-  current(runtimeId: RuntimeId): MachineBinding | null {
-    const bindingId = this.currentByRuntime.get(runtimeId);
-    return bindingId ? this.get(bindingId) : null;
+  current(scopeInput: ScopeRef, runtimeIdInput: RuntimeId): MachineBinding | null {
+    const scope = registryScopeSchema.parse(scopeInput);
+    const runtimeId = runtimeIdSchema.parse(runtimeIdInput);
+    const bindingId = this.currentByRuntime.get(scopedKey(scope, runtimeId));
+    return bindingId ? this.get(scope, bindingId) : null;
   }
 
-  applied(runtimeId: RuntimeId): MachineBinding | null {
-    const bindingId = this.appliedByRuntime.get(runtimeId);
-    return bindingId ? this.get(bindingId) : null;
+  applied(scopeInput: ScopeRef, runtimeIdInput: RuntimeId): MachineBinding | null {
+    const scope = registryScopeSchema.parse(scopeInput);
+    const runtimeId = runtimeIdSchema.parse(runtimeIdInput);
+    const bindingId = this.appliedByRuntime.get(scopedKey(scope, runtimeId));
+    return bindingId ? this.get(scope, bindingId) : null;
   }
 
-  private requireRuntimeBinding(runtimeId: RuntimeId, bindingId: BindingId): MachineBinding {
-    const binding = this.bindings.get(bindingId);
+  private requireRuntimeBinding(
+    scope: ScopeRef,
+    runtimeIdInput: RuntimeId,
+    bindingIdInput: BindingId,
+  ): MachineBinding {
+    const runtimeId = runtimeIdSchema.parse(runtimeIdInput);
+    const bindingId = bindingIdSchema.parse(bindingIdInput);
+    const binding = this.bindings.get(scopedKey(scope, bindingId));
     if (!binding || binding.runtimeId !== runtimeId) {
-      throw new Error("binding is not registered for this runtime on this machine");
+      throw new Error("binding is not registered for this runtime and scope on this machine");
     }
     return binding;
   }
+}
+
+function scopedKey(scope: ScopeRef, id: string): string {
+  return `${scope.tenantId}\0${scope.scopeId}\0${id}`;
 }
