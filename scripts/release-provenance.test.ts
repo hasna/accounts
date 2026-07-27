@@ -7,6 +7,7 @@ import {
   MAX_ARCHIVE_ENTRY_BYTES,
   MAX_ARCHIVE_UNPACKED_BYTES,
   MAX_JSON_BYTES,
+  MAX_PROMOTION_ATTEMPTS,
   MAX_TARBALL_BYTES,
   PUBLISH_PREDICATE,
   PROVENANCE_PREDICATE,
@@ -16,6 +17,7 @@ import {
   RELEASE_WORKFLOW,
   assertDeterministicPacks,
   assertExactCliVersion,
+  assertFinalMonotonicPromotion,
   assertFinalPromotionVersion,
   assertGitEvidence,
   assertPromotionSnapshotUnchanged,
@@ -25,7 +27,9 @@ import {
   extractVerifiedAttestations,
   packagePurl,
   parseRetryOptions,
+  promoteLatestMonotonically,
   readLimited,
+  registryPromotionSnapshot,
   releaseTag,
   repositorySlug,
   stagingDistTag,
@@ -70,10 +74,18 @@ const candidate: ReleaseCandidate = {
 function attestation(
   predicateType: string,
   predicate: Record<string, unknown>,
-  options: { subject?: string; signed?: boolean } = {},
+  options: {
+    subject?: string;
+    signed?: boolean;
+    payloadType?: string;
+    statementType?: string;
+    omitStatementType?: boolean;
+  } = {},
 ) {
   const payload = {
-    _type: "https://in-toto.io/Statement/v1",
+    ...(options.omitStatementType
+      ? {}
+      : { _type: options.statementType ?? "https://in-toto.io/Statement/v1" }),
     subject: [{
       name: options.subject ?? packagePurl(candidate.name, candidate.version),
       digest: { sha512: digest.toString("hex") },
@@ -91,7 +103,7 @@ function attestation(
       },
       dsseEnvelope: {
         payload: Buffer.from(JSON.stringify(payload)).toString("base64"),
-        payloadType: "application/vnd.in-toto+json",
+        payloadType: options.payloadType ?? "application/vnd.in-toto+json",
         signatures: options.signed === false ? [] : [{ sig: "synthetic-after-npm-audit-fixture" }],
       },
     },
@@ -106,6 +118,9 @@ function attestations(options: {
   subject?: string;
   signed?: boolean;
   publishName?: string;
+  payloadType?: string;
+  statementType?: string;
+  omitStatementType?: boolean;
 } = {}) {
   return [
     attestation(PUBLISH_PREDICATE, {
@@ -126,6 +141,23 @@ function attestations(options: {
       },
     }, options),
   ];
+}
+
+function registryPackage(
+  latest: string | undefined,
+  versions: string[],
+  value: ReleaseCandidate = candidate,
+  extraTags: Record<string, string> = {},
+): Record<string, unknown> {
+  return {
+    name: value.name,
+    "dist-tags": {
+      [value.stagingTag]: value.version,
+      ...extraTags,
+      ...(latest === undefined ? {} : { latest }),
+    },
+    versions: Object.fromEntries(versions.map((version) => [version, { version }])),
+  };
 }
 
 function auditResult(bundles = attestations()) {
@@ -529,6 +561,313 @@ test("fails closed when registry latest changes immediately before mutation", ()
     .toThrow("changed immediately before promotion");
 });
 
+test("final promotion verification requires the full monotonic registry state", () => {
+  expect(() => assertFinalMonotonicPromotion(
+    candidate,
+    registryPackage(candidate.version, ["0.2.12", candidate.version]),
+  )).not.toThrow();
+  expect(() => assertFinalMonotonicPromotion(
+    candidate,
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+  )).toThrow("highest stable is 0.4.0");
+  expect(() => assertFinalMonotonicPromotion(
+    candidate,
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+  )).toThrow("latest is 0.2.12");
+});
+
+test("derives an exact monotonic promotion snapshot from full registry versions and tags", () => {
+  expect(registryPromotionSnapshot(
+    registryPackage("0.2.12", ["0.2.11", "0.2.12", candidate.version]),
+  )).toEqual({
+    latest: "0.2.12",
+    versions: ["0.2.11", "0.2.12", candidate.version],
+    distTags: [
+      ["latest", "0.2.12"],
+      [candidate.stagingTag, candidate.version],
+    ],
+    highestStable: candidate.version,
+  });
+  expect(() => registryPromotionSnapshot(
+    registryPackage("0.2.12", ["0.2.12", "not-semver", candidate.version]),
+  )).toThrow("registry version not-semver is not canonical SemVer");
+  expect(() => registryPromotionSnapshot(
+    registryPackage("0.2.12", ["0.2.12", candidate.version, `${candidate.version}+other`]),
+  )).toThrow("ambiguous highest stable versions");
+  expect(() => registryPromotionSnapshot({
+    ...registryPackage("9.9.9", ["0.2.12", candidate.version]),
+  })).toThrow("registry dist-tag latest target 9.9.9 is absent from registry versions");
+  expect(() => registryPromotionSnapshot(
+    registryPackage("0.3.0-beta.1", ["0.3.0-beta.1", candidate.version]),
+  )).toThrow("registry latest 0.3.0-beta.1 must not be a prerelease");
+  expect(() => registryPromotionSnapshot(
+    registryPackage("0.2.12", ["0.2.12", candidate.version], candidate, {
+      legacy: "9.9.9",
+    }),
+  )).toThrow("registry dist-tag legacy target 9.9.9 is absent");
+  expect(registryPromotionSnapshot(
+    registryPackage(
+      "0.2.0",
+      ["0.1.0+one", "0.1.0+two", "0.2.0", candidate.version],
+    ),
+  ).highestStable).toBe(candidate.version);
+});
+
+test("compensates when a newer stable release appears after the final pre-mutation read", async () => {
+  const reads = [
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+    registryPackage("0.4.0", ["0.2.12", candidate.version, "0.4.0"]),
+  ];
+  const writes: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      const next = reads.shift();
+      if (!next) throw new Error("unexpected registry read");
+      return next;
+    },
+    setLatest: async (version) => {
+      writes.push(version);
+    },
+  })).rejects.toThrow("superseded by newer stable 0.4.0");
+  expect(writes).toEqual([candidate.version, "0.4.0"]);
+  expect(reads).toHaveLength(0);
+});
+
+test("handles races at every promotion and compensation seam without accepting a stale latest", async () => {
+  const beforeMutationWrites: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: (() => {
+      const reads = [
+        registryPackage("0.2.12", ["0.2.12", candidate.version]),
+        registryPackage("0.4.0", ["0.2.12", candidate.version, "0.4.0"]),
+      ];
+      return async () => reads.shift()!;
+    })(),
+    setLatest: async (version) => {
+      beforeMutationWrites.push(version);
+    },
+  })).rejects.toThrow("superseded before promotion");
+  expect(beforeMutationWrites).toEqual([]);
+
+  const externalPromotionWrites: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: (() => {
+      const reads = [
+        registryPackage("0.2.12", ["0.2.12", candidate.version]),
+        registryPackage("0.2.12", ["0.2.12", candidate.version]),
+        registryPackage("0.4.0", ["0.2.12", candidate.version, "0.4.0"]),
+      ];
+      return async () => reads.shift()!;
+    })(),
+    setLatest: async (version) => {
+      externalPromotionWrites.push(version);
+    },
+  })).rejects.toThrow("superseded by newer stable 0.4.0");
+  expect(externalPromotionWrites).toEqual([candidate.version]);
+
+  const compensationWrites: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: (() => {
+      const reads = [
+        registryPackage("0.2.12", ["0.2.12", candidate.version]),
+        registryPackage("0.2.12", ["0.2.12", candidate.version]),
+        registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+        registryPackage("0.4.0", ["0.2.12", candidate.version, "0.4.0", "0.5.0"]),
+        registryPackage("0.5.0", ["0.2.12", candidate.version, "0.4.0", "0.5.0"]),
+      ];
+      return async () => reads.shift()!;
+    })(),
+    setLatest: async (version) => {
+      compensationWrites.push(version);
+    },
+  })).rejects.toThrow("superseded by newer stable 0.5.0");
+  expect(compensationWrites).toEqual([candidate.version, "0.4.0", "0.5.0"]);
+});
+
+test("bounds ever-advancing promotion races and reports failed compensation", async () => {
+  let generation = 4;
+  let latest = "0.2.12";
+  let reads = 0;
+  const writes: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      reads++;
+      if (reads <= 2) {
+        return registryPackage(latest, ["0.2.12", candidate.version]);
+      }
+      const newer = `0.${generation++}.0`;
+      return registryPackage(
+        latest,
+        [...new Set(["0.2.12", candidate.version, latest, newer])],
+      );
+    },
+    setLatest: async (version) => {
+      writes.push(version);
+      latest = version;
+    },
+  }, 3)).rejects.toThrow("could not restore monotonic latest");
+  expect(writes.length).toBeLessThanOrEqual(3);
+
+  const rollbackReads = [
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+  ];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      const next = rollbackReads.shift();
+      if (!next) return registryPackage(
+        candidate.version,
+        ["0.2.12", candidate.version, "0.4.0"],
+      );
+      return next;
+    },
+    setLatest: async (version) => {
+      if (version === "0.4.0") throw new Error("simulated dist-tag failure");
+    },
+  }, 2)).rejects.toThrow("could not restore monotonic latest 0.4.0");
+});
+
+test("handles absent, idempotent, overwritten, malformed, and registry-error promotion states", async () => {
+  const absentWrites: string[] = [];
+  let absentRead = 0;
+  expect(await promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      absentRead++;
+      return registryPackage(
+        absentRead < 3 ? undefined : candidate.version,
+        [candidate.version],
+      );
+    },
+    setLatest: async (version) => {
+      absentWrites.push(version);
+    },
+  })).toBe("promoted");
+  expect(absentWrites).toEqual([candidate.version]);
+
+  const idempotentWrites: string[] = [];
+  expect(await promoteLatestMonotonically(candidate, {
+    readPackage: async () =>
+      registryPackage(candidate.version, ["0.2.12", candidate.version]),
+    setLatest: async (version) => {
+      idempotentWrites.push(version);
+    },
+  })).toBe("idempotent");
+  expect(idempotentWrites).toEqual([]);
+
+  let overwrittenRead = 0;
+  const overwrittenWrites: string[] = [];
+  expect(await promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      overwrittenRead++;
+      return registryPackage(
+        overwrittenRead <= 4 ? "0.2.12" : candidate.version,
+        ["0.2.12", candidate.version],
+      );
+    },
+    setLatest: async (version) => {
+      overwrittenWrites.push(version);
+    },
+  })).toBe("promoted");
+  expect(overwrittenWrites).toEqual([candidate.version, candidate.version]);
+
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      throw new Error("simulated registry read error");
+    },
+    setLatest: async () => {},
+  })).rejects.toThrow("simulated registry read error");
+
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => ({
+      ...registryPackage("0.2.12", ["0.2.12", candidate.version]),
+      name: "@hasna/other",
+    }),
+    setLatest: async () => {},
+  })).rejects.toThrow("registry package identity");
+
+  let appliedDespiteErrorRead = 0;
+  expect(await promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      appliedDespiteErrorRead++;
+      return registryPackage(
+        appliedDespiteErrorRead < 3 ? "0.2.12" : candidate.version,
+        ["0.2.12", candidate.version],
+      );
+    },
+    setLatest: async () => {
+      throw new Error("ambiguous transport failure after registry commit");
+    },
+  })).toBe("promoted");
+
+  let failedMutationReads = 0;
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      failedMutationReads++;
+      return registryPackage("0.2.12", ["0.2.12", candidate.version]);
+    },
+    setLatest: async () => {
+      throw new Error("registry rejected mutation");
+    },
+  }, 2)).rejects.toThrow("last dist-tag error: registry rejected mutation");
+  expect(failedMutationReads).toBeGreaterThanOrEqual(3);
+
+  let fullTagSnapshotRead = 0;
+  const fullTagSnapshotWrites: string[] = [];
+  expect(await promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      fullTagSnapshotRead++;
+      return registryPackage(
+        fullTagSnapshotRead < 4 ? "0.2.12" : candidate.version,
+        ["0.2.11", "0.2.12", candidate.version],
+        candidate,
+        { legacy: fullTagSnapshotRead === 1 ? "0.2.11" : "0.2.12" },
+      );
+    },
+    setLatest: async (version) => {
+      fullTagSnapshotWrites.push(version);
+    },
+  })).toBe("promoted");
+  expect(fullTagSnapshotWrites).toEqual([candidate.version]);
+  expect(fullTagSnapshotRead).toBe(4);
+
+  const prereleaseCandidate = {
+    ...candidate,
+    version: "0.3.0-beta.1",
+    stagingTag: stagingDistTag("0.3.0-beta.1"),
+  };
+  await expect(promoteLatestMonotonically(prereleaseCandidate, {
+    readPackage: async () =>
+      registryPackage(
+        "0.2.12",
+        ["0.2.12", prereleaseCandidate.version],
+        prereleaseCandidate,
+      ),
+    setLatest: async () => {},
+  })).rejects.toThrow("prerelease");
+
+  const buildCandidate = {
+    ...candidate,
+    version: `${candidate.version}+build.2`,
+    stagingTag: stagingDistTag(`${candidate.version}+build.2`),
+  };
+  await expect(promoteLatestMonotonically(buildCandidate, {
+    readPackage: async () =>
+      registryPackage(
+        "0.2.12",
+        ["0.2.12", `${candidate.version}+build.1`, buildCandidate.version],
+        buildCandidate,
+      ),
+    setLatest: async () => {},
+  })).rejects.toThrow("ambiguous highest stable versions");
+  expect(MAX_PROMOTION_ATTEMPTS).toBeGreaterThanOrEqual(4);
+  expect(MAX_PROMOTION_ATTEMPTS).toBeLessThanOrEqual(8);
+});
+
 test("pins the exact Fulcio workflow SAN and OIDC issuer for cryptographic verification", async () => {
   const policy = expectedSigstoreIdentity(candidate);
   expect(policy).toEqual({
@@ -707,6 +1046,62 @@ test("binds audited attestations to exact subject, workflow, repository, tag, an
     candidate,
     extractVerifiedAttestations(candidate, auditResult(attestations({ publishName: "@hasna/other" }))),
   )).toThrow("publish attestation");
+  const missingPayloadType = attestations();
+  delete (missingPayloadType[0]!.bundle.dsseEnvelope as {
+    payloadType?: string;
+  }).payloadType;
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(missingPayloadType)),
+  )).toThrow("DSSE payloadType");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({ payloadType: "text/plain" }))),
+  )).toThrow("DSSE payloadType");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({ payloadType: "Application/Vnd.In-Toto+Json" }))),
+  )).toThrow("DSSE payloadType");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({
+      payloadType: "application/vnd.in-toto+json ",
+    }))),
+  )).toThrow("DSSE payloadType");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({
+      payloadType: "application/vnd.in-toto+json\u00a0",
+    }))),
+  )).toThrow("DSSE payloadType");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({ omitStatementType: true }))),
+  )).toThrow("in-toto statement type");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({ statementType: "https://in-toto.io/Statement/v0.1" }))),
+  )).toThrow("in-toto statement type");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({
+      statementType: "https://in-toto.io/Statement/v1 ",
+    }))),
+  )).toThrow("in-toto statement type");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations({
+      statementType: "https://in-toto.io/statement/v1",
+    }))),
+  )).toThrow("in-toto statement type");
+  const malformedStatement = attestations();
+  malformedStatement[0]!.bundle.dsseEnvelope.payload = Buffer
+    .from("{not-json")
+    .toString("base64");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(malformedStatement)),
+  )).toThrow();
 });
 
 test("requires exact gitHead in the preserved and downloaded tarball manifest", () => {
@@ -882,10 +1277,9 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(workflow).not.toMatch(/uses:\s+\S+@v\d/);
   expect(workflow).not.toContain("bun-version: latest");
   expect(workflow).not.toContain('node-version: "24.x"');
-  expect(
-    promotionImplementation.match(/await fetchJson\(packageUrl\(value\.name\)\)/g),
-  ).toHaveLength(3);
-  expect(promotionImplementation).toContain("assertPromotionSnapshotUnchanged(");
+  expect(promotionImplementation).toContain("promoteLatestMonotonically(value");
+  expect(promotionImplementation).toContain("readPackage:");
+  expect(promotionImplementation).toContain("setLatest:");
 });
 
 test("package lifecycle rejects direct publication outside the preserved-artifact wrapper", () => {

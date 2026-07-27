@@ -39,6 +39,7 @@ export const MAX_TARBALL_BYTES = 32 * 1024 * 1024;
 export const MAX_ARCHIVE_ENTRIES = 512;
 export const MAX_ARCHIVE_ENTRY_BYTES = 16 * 1024 * 1024;
 export const MAX_ARCHIVE_UNPACKED_BYTES = 64 * 1024 * 1024;
+export const MAX_PROMOTION_ATTEMPTS = 6;
 export const FETCH_TIMEOUT_MS = 15_000;
 export const COMMAND_TIMEOUT_MS = 180_000;
 
@@ -52,6 +53,8 @@ const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_TAR_STREAM_BYTES =
   MAX_ARCHIVE_UNPACKED_BYTES + MAX_ARCHIVE_ENTRIES * 1024 + 1024 * 1024;
 const SIGSTORE_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
+const DSSE_IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json";
+const IN_TOTO_STATEMENT_V1 = "https://in-toto.io/Statement/v1";
 
 interface SigstoreVerifyOptions {
   certificateIdentityURI: string;
@@ -116,6 +119,18 @@ export interface GitEvidence {
 
 export type RegistryPhase = "staged" | "promoted";
 type RecordValue = Record<string, unknown>;
+
+export interface RegistryPromotionSnapshot {
+  latest?: string;
+  versions: string[];
+  distTags: Array<[name: string, version: string]>;
+  highestStable?: string;
+}
+
+export interface PromotionRegistry {
+  readPackage: () => Promise<unknown>;
+  setLatest: (version: string) => Promise<void>;
+}
 
 export interface ArchiveSummary {
   fileCount: number;
@@ -1267,6 +1282,10 @@ function auditedStatement(item: unknown, value: ReleaseCandidate): RecordValue {
   const bundle = record(attestation.bundle, "Sigstore bundle");
   const envelope = record(bundle.dsseEnvelope, "DSSE envelope");
   check(Array.isArray(envelope.signatures) && envelope.signatures.length > 0, "unsigned DSSE bundle is forbidden");
+  check(
+    envelope.payloadType === DSSE_IN_TOTO_PAYLOAD_TYPE,
+    `DSSE payloadType must be exactly ${DSSE_IN_TOTO_PAYLOAD_TYPE}`,
+  );
   const material = record(bundle.verificationMaterial, "Sigstore verification material");
   check(
     Array.isArray(material.tlogEntries) && material.tlogEntries.length === 1,
@@ -1278,6 +1297,10 @@ function auditedStatement(item: unknown, value: ReleaseCandidate): RecordValue {
   const decoded = record(
     JSON.parse(decodeBase64(envelope.payload, "DSSE payload").toString("utf8")),
     "in-toto statement",
+  );
+  check(
+    decoded._type === IN_TOTO_STATEMENT_V1,
+    `in-toto statement type must be exactly ${IN_TOTO_STATEMENT_V1}`,
   );
   check(decoded.predicateType === predicateType, "attestation predicate types disagree");
   const subjects = decoded.subject;
@@ -1416,11 +1439,263 @@ export function assertFinalPromotionVersion(
   );
 }
 
-function latestDistTag(input: unknown): string | undefined {
+function compareRegistryVersions(left: string, right: string): number {
+  return compare(left, right) || left.localeCompare(right);
+}
+
+function isCanonicalRegistryVersion(version: string): boolean {
+  return valid(version) !== null &&
+    /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+      .test(version);
+}
+
+export function registryPromotionSnapshot(input: unknown): RegistryPromotionSnapshot {
+  const metadata = record(input, "registry package metadata");
+  const tags = record(metadata["dist-tags"], "registry dist-tags");
+  const versionsRecord = record(metadata.versions, "registry versions");
+  const versions = Object.keys(versionsRecord);
+  for (const version of versions) {
+    check(isCanonicalRegistryVersion(version), `registry version ${version} is not canonical SemVer`);
+    const manifest = record(versionsRecord[version], `registry version ${version}`);
+    check(
+      manifest.version === version,
+      `registry version ${version} manifest identity disagrees`,
+    );
+  }
+  versions.sort(compareRegistryVersions);
+
+  const distTags = Object.entries(tags).map(([name, value]) => {
+    check(typeof value === "string", `registry dist-tag ${name} must be a string`);
+    check(
+      isCanonicalRegistryVersion(value),
+      `registry dist-tag ${name} target ${value} is not canonical SemVer`,
+    );
+    check(
+      versions.includes(value),
+      `registry dist-tag ${name} target ${value} is absent from registry versions`,
+    );
+    return [name, value] as [string, string];
+  }).sort(([left], [right]) => left.localeCompare(right));
+
+  const latest = distTags.find(([name]) => name === "latest")?.[1];
+  if (latest !== undefined) {
+    check(prerelease(latest) === null, `registry latest ${latest} must not be a prerelease`);
+  }
+
+  const stableVersions = versions.filter((version) => prerelease(version) === null);
+  let highestStable: string | undefined;
+  for (const version of stableVersions) {
+    if (highestStable === undefined || compare(version, highestStable) > 0) {
+      highestStable = version;
+    }
+  }
+  if (highestStable !== undefined) {
+    const equivalentHighest = stableVersions.filter(
+      (version) => compare(version, highestStable!) === 0,
+    );
+    check(
+      equivalentHighest.length === 1,
+      `ambiguous highest stable versions ${equivalentHighest.join(", ")}`,
+    );
+  }
+  return { latest, versions, distTags, highestStable };
+}
+
+function promotionSnapshotEqual(
+  left: RegistryPromotionSnapshot,
+  right: RegistryPromotionSnapshot,
+): boolean {
+  return left.latest === right.latest &&
+    left.highestStable === right.highestStable &&
+    left.versions.length === right.versions.length &&
+    left.versions.every((version, index) => version === right.versions[index]) &&
+    left.distTags.length === right.distTags.length &&
+    left.distTags.every(([name, version], index) =>
+      name === right.distTags[index]?.[0] && version === right.distTags[index]?.[1]
+    );
+}
+
+function candidatePromotionState(
+  value: ReleaseCandidate,
+  snapshot: RegistryPromotionSnapshot,
+): "advance" | "idempotent" | "superseded" {
+  check(valid(value.version) !== null, `candidate ${value.version} is not valid SemVer`);
+  check(
+    prerelease(value.version) === null,
+    `refusing prerelease ${value.version} promotion to latest`,
+  );
+  check(
+    snapshot.versions.includes(value.version),
+    `candidate ${value.version} is absent from registry versions`,
+  );
+  const highest = snapshot.highestStable;
+  check(highest !== undefined, "registry has no stable version");
+  const highestComparison = compare(value.version, highest);
+  if (highestComparison < 0) return "superseded";
+  check(
+    highestComparison !== 0 || highest === value.version,
+    `${value.version} has ambiguous semantic precedence with registry version ${highest}`,
+  );
+  if (snapshot.latest === undefined) return "advance";
+  if (snapshot.latest === value.version) return "idempotent";
+  const latestComparison = compare(value.version, snapshot.latest);
+  if (latestComparison < 0) return "superseded";
+  check(
+    latestComparison !== 0,
+    `${value.version} does not advance semantic precedence over registry latest ${snapshot.latest}`,
+  );
+  return "advance";
+}
+
+function candidateStagingTag(value: ReleaseCandidate, input: unknown): void {
   const tags = record(record(input, "registry package metadata")["dist-tags"], "registry dist-tags");
-  const latest = tags.latest;
-  check(latest === undefined || typeof latest === "string", "registry latest must be a string");
-  return latest;
+  check(
+    tags[value.stagingTag] === value.version,
+    `${value.stagingTag} does not point to ${value.version}`,
+  );
+}
+
+function promotionSnapshotForCandidate(
+  value: ReleaseCandidate,
+  input: unknown,
+): RegistryPromotionSnapshot {
+  const metadata = record(input, "registry package metadata");
+  check(metadata.name === value.name, `registry package identity must be ${value.name}`);
+  candidateStagingTag(value, metadata);
+  return registryPromotionSnapshot(metadata);
+}
+
+async function readPromotionSnapshot(
+  value: ReleaseCandidate,
+  registry: PromotionRegistry,
+): Promise<RegistryPromotionSnapshot> {
+  return promotionSnapshotForCandidate(value, await registry.readPackage());
+}
+
+export function assertFinalMonotonicPromotion(
+  value: ReleaseCandidate,
+  input: unknown,
+): void {
+  const snapshot = promotionSnapshotForCandidate(value, input);
+  check(
+    candidatePromotionState(value, snapshot) === "idempotent",
+    `registry is not in the final monotonic state for ${value.version}; ` +
+      `latest is ${snapshot.latest ?? "<absent>"} and highest stable is ` +
+      `${snapshot.highestStable ?? "<absent>"}`,
+  );
+}
+
+async function failSupersededAfterCompensation(
+  value: ReleaseCandidate,
+  registry: PromotionRegistry,
+  initial: RegistryPromotionSnapshot,
+  mutationBudget: { remaining: number },
+): Promise<never> {
+  let snapshot = initial;
+  let lastMutationFailure: unknown;
+  while (true) {
+    const target = snapshot.highestStable;
+    check(
+      target !== undefined && compare(target, value.version) > 0,
+      `candidate ${value.version} is not superseded by a newer stable version`,
+    );
+    if (snapshot.latest === target) {
+      throw new Error(
+        `candidate ${value.version} was superseded by newer stable ${target}; ` +
+          `registry latest was restored to ${target}`,
+      );
+    }
+    if (mutationBudget.remaining === 0) {
+      const detail = lastMutationFailure instanceof Error
+        ? `; last dist-tag error: ${lastMutationFailure.message}`
+        : "";
+      throw new Error(
+        `could not restore monotonic latest ${target} within the promotion mutation budget${detail}`,
+      );
+    }
+    mutationBudget.remaining--;
+    try {
+      await registry.setLatest(target);
+      lastMutationFailure = undefined;
+    } catch (error) {
+      lastMutationFailure = error;
+    }
+    snapshot = await readPromotionSnapshot(value, registry);
+  }
+}
+
+export async function promoteLatestMonotonically(
+  value: ReleaseCandidate,
+  registry: PromotionRegistry,
+  maxAttempts = MAX_PROMOTION_ATTEMPTS,
+): Promise<"promoted" | "idempotent"> {
+  check(
+    Number.isInteger(maxAttempts) && maxAttempts > 0 && maxAttempts <= 8,
+    "promotion attempts must be between 1 and 8",
+  );
+  const mutationBudget = { remaining: maxAttempts };
+  let expected = await readPromotionSnapshot(value, registry);
+  let state = candidatePromotionState(value, expected);
+  if (state === "superseded") {
+    if (expected.latest === value.version) {
+      return failSupersededAfterCompensation(value, registry, expected, mutationBudget);
+    }
+    throw new Error(
+      `candidate ${value.version} was superseded before promotion by ` +
+        `${expected.highestStable ?? "<unknown>"}`,
+    );
+  }
+  if (state === "idempotent") return "idempotent";
+
+  let lastMutationFailure: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const immediatelyBeforeMutation = await readPromotionSnapshot(value, registry);
+    if (!promotionSnapshotEqual(expected, immediatelyBeforeMutation)) {
+      state = candidatePromotionState(value, immediatelyBeforeMutation);
+      if (state === "superseded") {
+        if (immediatelyBeforeMutation.latest === value.version) {
+          return failSupersededAfterCompensation(
+            value,
+            registry,
+            immediatelyBeforeMutation,
+            mutationBudget,
+          );
+        }
+        throw new Error(
+          `candidate ${value.version} was superseded before promotion by ` +
+            `${immediatelyBeforeMutation.highestStable ?? "<unknown>"}`,
+        );
+      }
+      if (state === "idempotent") return "idempotent";
+      expected = immediatelyBeforeMutation;
+      continue;
+    }
+
+    if (mutationBudget.remaining === 0) break;
+    mutationBudget.remaining--;
+    try {
+      await registry.setLatest(value.version);
+      lastMutationFailure = undefined;
+    } catch (error) {
+      lastMutationFailure = error;
+    }
+
+    const after = await readPromotionSnapshot(value, registry);
+    state = candidatePromotionState(value, after);
+    if (state === "superseded") {
+      return failSupersededAfterCompensation(value, registry, after, mutationBudget);
+    }
+    if (after.latest === value.version) return "promoted";
+    expected = after;
+  }
+
+  const failure = lastMutationFailure instanceof Error
+    ? `; last dist-tag error: ${lastMutationFailure.message}`
+    : "";
+  throw new Error(
+    `promotion did not converge within ${maxAttempts} attempts; ` +
+      `last observed latest was ${expected.latest ?? "<absent>"}${failure}`,
+  );
 }
 
 export function extractVerifiedAttestations(
@@ -1504,7 +1779,7 @@ async function verifyRegistryRelease(
       const packageMetadata = await fetchJson(packageUrl(value.name));
       verifyDistTags(value, packageMetadata, phase);
       if (phase === "promoted") {
-        assertFinalPromotionVersion(value.version, latestDistTag(packageMetadata));
+        assertFinalMonotonicPromotion(value, packageMetadata);
       }
       verifyDownloadedTarball(value, await fetchLimited(urls.tarballUrl, MAX_TARBALL_BYTES));
       const auditedBundles = verifyExactInstallAndAttestations(value);
@@ -1533,26 +1808,20 @@ async function promoteDistTag(
   assertGitContext(root, manifest, env);
   assertCandidateContext(value, manifest, env);
   verifyCandidateArtifact(value);
-  const before = await fetchJson(packageUrl(value.name));
-  const observedLatest = latestDistTag(before);
-  const promotion = assertPromotionVersion(value.version, observedLatest);
-  if (promotion === "advance") {
-    verifyDistTags(value, before, "staged");
-    const immediatelyBeforeMutation = await fetchJson(packageUrl(value.name));
-    verifyDistTags(value, immediatelyBeforeMutation, "staged");
-    assertPromotionSnapshotUnchanged(
-      observedLatest,
-      latestDistTag(immediatelyBeforeMutation),
-    );
-    run("npm", [
-      "dist-tag", "add", `${value.name}@${value.version}`, value.intendedTag,
-      "--registry", REGISTRY,
-    ], root);
-  }
-  const after = await fetchJson(packageUrl(value.name));
-  verifyDistTags(value, after, "promoted");
-  assertFinalPromotionVersion(value.version, latestDistTag(after));
-  console.log(`promoted ${value.name}@${value.version} to ${value.intendedTag}`);
+  const result = await promoteLatestMonotonically(value, {
+    readPackage: () => fetchJson(packageUrl(value.name)),
+    setLatest: async (version) => {
+      run("npm", [
+        "dist-tag", "add", `${value.name}@${version}`, value.intendedTag,
+        "--registry", REGISTRY,
+      ], root);
+    },
+  });
+  console.log(
+    result === "idempotent"
+      ? `${value.name}@${value.version} was already the monotonic ${value.intendedTag}`
+      : `promoted ${value.name}@${value.version} to monotonic ${value.intendedTag}`,
+  );
 }
 
 function option(args: string[], name: string, fallback?: string): string {

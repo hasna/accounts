@@ -175,12 +175,24 @@ The promotion gate still reads npm live: a candidate may advance `latest` only
 when its SemVer precedence is greater than the current target, or may continue
 as an exact idempotent retry when the version strings are identical. Downgrades,
 stale reordered candidates, prereleases, invalid versions, and versions that
-differ only in build metadata fail closed. Immediately before any `dist-tag`
-mutation, the promotion command reads the package metadata a second time and
-requires the exact `latest` snapshot it previously evaluated. This closes
-intervening external-publisher changes that are outside the repository workflow
-concurrency lock. The final verification repeats the comparison and requires
-exact equality, so a later registry change also invalidates the run.
+differ only in build metadata fail closed. Every decision uses both the complete
+registry version set and all dist-tags, requires the candidate to be the unique
+highest stable version, and reads that exact snapshot again immediately before
+mutation. If the snapshot changes, the command reevaluates or aborts instead of
+using the stale decision.
+
+npm does not provide a conditional compare-and-swap operation for dist-tags, so
+the repository concurrency group cannot make external publishers atomic with
+this workflow. After every mutation, the command rereads the complete registry
+state. If a newer stable version appeared in the mutation seam while the
+candidate became `latest`, it uses the same scoped credential to move `latest`
+forward to the newest unique stable version, verifies the result, and fails the
+candidate run as superseded. An external overwrite back to an older tag is
+retried. Mutation and compensation attempts are bounded; a non-converging
+publisher race or failed compensation fails loudly with the last observed
+target and error state and requires operator recovery. No script can prevent a
+new external mutation after its final successful read, so release operators
+must not publish or move this package's dist-tags concurrently.
 
 Before publication, the workflow requires:
 
@@ -233,9 +245,11 @@ Before the intended dist-tag moves, the workflow requires:
   `https://github.com/hasna/accounts/.github/workflows/release.yml@refs/tags/npm/accounts/vX.Y.Z`,
   and exact OIDC issuer `https://token.actions.githubusercontent.com`;
 - only after that cryptographic identity check succeeds are the exact DSSE
-  statements parsed and required to bind the package purl and digest, npm
-  registry publish claim, `hasna/accounts`, `release.yml`, release tag, and
-  commit.
+  statements parsed; each envelope must use the exact payload type
+  `application/vnd.in-toto+json`, each decoded statement must use exact
+  `_type` `https://in-toto.io/Statement/v1`, and the statements must bind the
+  package purl and digest, npm registry publish claim, `hasna/accounts`,
+  `release.yml`, release tag, and commit.
 
 Network responses, command runtimes, retry budgets, decoded JSON, compressed
 tarball size, individual archive entries, total unpacked bytes, and archive
@@ -245,8 +259,10 @@ subjects, or any semantic disagreement fail closed.
 
 After those checks, the promotion step moves the intended dist-tag (normally
 `latest`) to the exact candidate and verifies that it agrees with the quarantine
-tag. The final job repeats the registry, provenance, signature, install, CLI,
-and dist-tag checks in the promoted state.
+tag and remains the unique highest stable registry version. A newer stable
+version discovered after mutation is restored as `latest` and the older
+candidate run fails as superseded. The final job repeats the registry,
+provenance, signature, install, CLI, and dist-tag checks in the promoted state.
 
 ## Install and rollback
 
