@@ -238,6 +238,133 @@ describe("v2 migration plan", () => {
     expect(rerun).toEqual(plan);
   });
 
+  test("freezes one canonical unique alias representation across input, plan, and genesis", () => {
+    const observation = safeObservation("alice", "claude", {
+      historicalAliases: [
+        "legacy:claude:alice-z",
+        "legacy:claude:alice-a",
+        "legacy:claude:cafe\u0301",
+      ],
+      historicalSessionAliases: [
+        "session:claude:alice-z",
+        "session:claude:alice-a",
+      ],
+    });
+    const plan = buildPlan([observation]);
+    const canonicallyEquivalentPlan = buildPlan([
+      {
+        ...observation,
+        historicalAliases: [
+          "legacy:claude:café",
+          "legacy:claude:alice-a",
+          "legacy:claude:alice-z",
+        ],
+      },
+    ]);
+
+    expect(canonicallyEquivalentPlan).toEqual(plan);
+    expect(plan.records[0]?.historicalAliases).toEqual([
+      "legacy:claude:alice-a",
+      "legacy:claude:alice-z",
+      "legacy:claude:café",
+    ]);
+    expect(plan.records[0]?.historicalSessionAliases).toEqual([
+      "session:claude:alice-a",
+      "session:claude:alice-z",
+    ]);
+    expect(createMigrationSidecar(plan).aliasJournal.map((entry) => entry.alias)).toEqual([
+      "legacy:claude:alice-a",
+      "legacy:claude:alice-z",
+      "legacy:claude:café",
+      "session:claude:alice-a",
+      "session:claude:alice-z",
+    ]);
+
+    const forgedRecord = {
+      ...plan.records[0]!,
+      historicalAliases: [...plan.records[0]!.historicalAliases].reverse(),
+    };
+    const { planDigest: _planDigest, ...planCore } = plan;
+    const forgedCore = {
+      ...planCore,
+      records: [forgedRecord],
+    };
+    const forgedPlan = {
+      ...forgedCore,
+      planDigest: canonicalDigest(forgedCore),
+    } as MigrationPlan;
+    const duplicateRecord = {
+      ...plan.records[0]!,
+      historicalAliases: [
+        plan.records[0]!.historicalAliases[0]!,
+        plan.records[0]!.historicalAliases[0]!,
+      ],
+    };
+    const duplicateCore = {
+      ...planCore,
+      records: [duplicateRecord],
+    };
+    const duplicatePlan = {
+      ...duplicateCore,
+      planDigest: canonicalDigest(duplicateCore),
+    };
+
+    expect(migrationPlanSchema.safeParse(forgedPlan).success).toBe(false);
+    expect(migrationPlanSchema.safeParse(duplicatePlan).success).toBe(false);
+    expect(() =>
+      buildMigrationPlan(planInput([observation]), {
+        idFactory: stableId,
+        existingPlan: forgedPlan,
+      }),
+    ).toThrow("canonical");
+  });
+
+  test("rejects duplicate aliases before digest allocation and across plan records", () => {
+    expect(() =>
+      buildPlan([
+        safeObservation("alice", "claude", {
+          historicalAliases: [
+            "legacy:claude:alice",
+            "legacy:claude:alice",
+          ],
+        }),
+      ]),
+    ).toThrow("duplicate historical alias");
+
+    expect(() =>
+      buildPlan([
+        safeObservation("alice", "claude", {
+          historicalAliases: [
+            "legacy:claude:cafe\u0301",
+            "legacy:claude:café",
+          ],
+        }),
+      ]),
+    ).toThrow("duplicate historical alias");
+
+    expect(() =>
+      buildPlan([
+        safeObservation("alice", "claude", {
+          historicalAliases: ["legacy:shared-account-alias"],
+        }),
+        safeObservation("bob", "codex", {
+          historicalAliases: ["legacy:shared-account-alias"],
+        }),
+      ]),
+    ).toThrow("duplicate legacy account alias");
+
+    expect(() =>
+      buildPlan([
+        safeObservation("alice", "claude", {
+          historicalSessionAliases: ["session:shared-alias"],
+        }),
+        safeObservation("bob", "codex", {
+          historicalSessionAliases: ["session:shared-alias"],
+        }),
+      ]),
+    ).toThrow("duplicate session alias");
+  });
+
   test("rejects changed input when reusing a frozen plan idempotency boundary", () => {
     const plan = buildPlan();
     expect(() =>
@@ -654,7 +781,9 @@ describe("v2 migration plan", () => {
 
   test("redacts paths and aliases while retaining counts, digests, and conflict evidence", () => {
     const plan = buildPlan([
-      safeObservation("alice"),
+      safeObservation("alice", "credential-token-runtime", {
+        runtimeLabel: "Bearer synthetic credential marker",
+      }),
       safeObservation("missing", "codex", {
         root: {
           state: "unsafe",
@@ -666,17 +795,43 @@ describe("v2 migration plan", () => {
     ]);
     const redacted = redactMigrationPlan(plan);
     const encoded = JSON.stringify(redacted);
+    const sensitiveRecord = redacted.records.find(
+      (record) =>
+        record.source.toolDigest === digest("credential-token-runtime"),
+    );
+    const unsafeRecord = redacted.records.find(
+      (record) => record.root.state === "unsafe",
+    );
 
     expect(encoded).not.toContain("/profiles/");
     expect(encoded).not.toContain("/secret/");
     expect(encoded).not.toContain("alice");
     expect(encoded).not.toContain("legacy:claude:alice");
     expect(encoded).not.toContain("credential");
-    expect(redacted.records[0]?.root?.byteCount).toBe(2048);
-    expect(redacted.records[0]?.root?.digest).toBe(digest("root-claude-alice"));
-    expect(redacted.records[0]?.historicalAliasDigests).toHaveLength(1);
-    expect(redacted.records[0]?.historicalSessionAliasDigests).toHaveLength(1);
-    expect(redacted.records[1]?.root).toMatchObject({
+    expect(encoded).not.toContain("Bearer synthetic credential marker");
+    expect(encoded).not.toContain("Codex CLI");
+    expect(
+      redacted.records.every(
+        (record) =>
+          !("runtimeLabel" in record) &&
+          !("tool" in record.source),
+      ),
+    ).toBe(true);
+    expect(sensitiveRecord?.source).not.toHaveProperty("tool");
+    expect(sensitiveRecord).not.toHaveProperty("runtimeLabel");
+    expect(sensitiveRecord?.source.toolDigest).toBe(
+      digest("credential-token-runtime"),
+    );
+    expect(sensitiveRecord?.runtimeLabelDigest).toBe(
+      digest("Bearer synthetic credential marker"),
+    );
+    expect(sensitiveRecord?.root?.byteCount).toBe(2048);
+    expect(sensitiveRecord?.root?.digest).toBe(
+      digest("root-credential-token-runtime-alice"),
+    );
+    expect(sensitiveRecord?.historicalAliasDigests).toHaveLength(1);
+    expect(sensitiveRecord?.historicalSessionAliasDigests).toHaveLength(1);
+    expect(unsafeRecord?.root).toMatchObject({
       state: "unsafe",
       code: "missing",
       pathDigest: digest("missing-path"),
@@ -849,6 +1004,12 @@ describe("backup, gates, aliases, and cutover states", () => {
         targetId: initial.plan.records[0]!.target.accountId,
       }),
     ).toThrow("does not target its frozen immutable identity");
+    expect(() =>
+      appendMigrationAlias(once, {
+        ...alias,
+        alias: "legacy:claude:cafe\u0301",
+      }),
+    ).toThrow("canonical Unicode NFC");
   });
 
   test("enforces durable gate and scope-bound backfill receipts across cutover states", async () => {

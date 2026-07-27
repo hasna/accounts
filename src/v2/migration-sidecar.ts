@@ -58,6 +58,50 @@ const aliasSchema = z
   .min(1)
   .max(512)
   .regex(SAFE_TEXT_PATTERN, "alias contains invalid control characters");
+const canonicalAliasSchema = aliasSchema.refine(
+  (alias) => alias === canonicalAlias(alias),
+  "alias must use canonical Unicode NFC form",
+);
+
+function aliasArraySchema(label: string, requireCanonicalOrder: boolean) {
+  const valueSchema = requireCanonicalOrder ? canonicalAliasSchema : aliasSchema;
+  return z.array(valueSchema).superRefine((aliases, context) => {
+    const seen = new Set<string>();
+    for (const [index, alias] of aliases.entries()) {
+      const canonical = canonicalAlias(alias);
+      if (seen.has(canonical)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: `duplicate ${label}`,
+        });
+      }
+      seen.add(canonical);
+      if (
+        requireCanonicalOrder &&
+        index > 0 &&
+        compareCanonicalText(aliases[index - 1]!, alias) >= 0
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: `${label}s must use canonical order`,
+        });
+      }
+    }
+  });
+}
+
+const historicalAliasInputSchema = aliasArraySchema("historical alias", false);
+const historicalSessionAliasInputSchema = aliasArraySchema(
+  "historical session alias",
+  false,
+);
+const canonicalHistoricalAliasSchema = aliasArraySchema("historical alias", true);
+const canonicalHistoricalSessionAliasSchema = aliasArraySchema(
+  "historical session alias",
+  true,
+);
 
 const verifiedRootObservationSchema = z
   .object({
@@ -138,8 +182,8 @@ export const legacyProfileObservationSchema = z
     pointers: pointerObservationSchema,
     sessionReferenceDigests: z.array(migrationDigestSchema),
     catalogSkipDigests: z.array(migrationDigestSchema),
-    historicalAliases: z.array(aliasSchema),
-    historicalSessionAliases: z.array(aliasSchema),
+    historicalAliases: historicalAliasInputSchema,
+    historicalSessionAliases: historicalSessionAliasInputSchema,
   })
   .strict();
 
@@ -264,8 +308,8 @@ const migrationRecordSchema = z
     pointers: pointerObservationSchema,
     sessionReferenceDigests: z.array(migrationDigestSchema),
     catalogSkipDigests: z.array(migrationDigestSchema),
-    historicalAliases: z.array(aliasSchema),
-    historicalSessionAliases: z.array(aliasSchema),
+    historicalAliases: canonicalHistoricalAliasSchema,
+    historicalSessionAliases: canonicalHistoricalSessionAliasSchema,
     binding: machineBindingSchema.optional(),
     disposition: z.discriminatedUnion("state", [
       readyDispositionSchema,
@@ -366,6 +410,8 @@ export const migrationPlanSchema = z
     const sourceKeys = new Set<string>();
     const accountIds = new Set<string>();
     const bindingIds = new Set<string>();
+    const legacyAccountAliases = new Set<string>();
+    const sessionAliases = new Set<string>();
     const runtimeTools = new Map<string, string>();
     const identifierKinds = new Map<string, MigrationIdKind>();
     const claimIdentifier = (
@@ -435,6 +481,31 @@ export const migrationPlanSchema = z
         });
       }
       runtimeTools.set(record.target.runtimeId, record.source.tool);
+      for (const [aliases, claims, label, path] of [
+        [
+          record.historicalAliases,
+          legacyAccountAliases,
+          "legacy account alias",
+          "historicalAliases",
+        ],
+        [
+          record.historicalSessionAliases,
+          sessionAliases,
+          "session alias",
+          "historicalSessionAliases",
+        ],
+      ] as const) {
+        for (const [aliasIndex, alias] of aliases.entries()) {
+          if (claims.has(alias)) {
+            context.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["records", index, path, aliasIndex],
+              message: `migration plan contains duplicate ${label}`,
+            });
+          }
+          claims.add(alias);
+        }
+      }
       if (
         record.binding &&
         (record.binding.tenantId !== plan.scope.tenantId ||
@@ -554,8 +625,12 @@ function normalizeMigrationPlanInput(input: MigrationPlanInput): MigrationPlanIn
             : observation.root,
         sessionReferenceDigests: [...observation.sessionReferenceDigests].sort(),
         catalogSkipDigests: [...observation.catalogSkipDigests].sort(),
-        historicalAliases: [...observation.historicalAliases].sort(),
-        historicalSessionAliases: [...observation.historicalSessionAliases].sort(),
+        historicalAliases: observation.historicalAliases
+          .map(canonicalAlias)
+          .sort(compareCanonicalText),
+        historicalSessionAliases: observation.historicalSessionAliases
+          .map(canonicalAlias)
+          .sort(compareCanonicalText),
       }))
       .sort((left, right) => sourceKey(left).localeCompare(sourceKey(right))),
   };
@@ -572,6 +647,17 @@ export function buildMigrationPlan(
     if (existing.inputDigest !== inputDigest) {
       throw new MigrationDriftError(
         `migration input digest changed for frozen plan "${existing.id}"`,
+      );
+    }
+    const existingInput = normalizeMigrationPlanInput(
+      migrationPlanInputFromPlan(existing),
+    );
+    if (
+      JSON.stringify(canonicalize(existingInput)) !==
+      JSON.stringify(canonicalize(input))
+    ) {
+      throw new MigrationDriftError(
+        `migration canonical frozen input changed for plan "${existing.id}"`,
       );
     }
     return deepFreeze(structuredClone(existing));
@@ -657,8 +743,12 @@ export function buildMigrationPlan(
       pointers: observation.pointers,
       sessionReferenceDigests: [...observation.sessionReferenceDigests].sort(),
       catalogSkipDigests: [...observation.catalogSkipDigests].sort(),
-      historicalAliases: [...observation.historicalAliases].sort(),
-      historicalSessionAliases: [...observation.historicalSessionAliases].sort(),
+      historicalAliases: [...observation.historicalAliases].sort(
+        compareCanonicalText,
+      ),
+      historicalSessionAliases: [...observation.historicalSessionAliases].sort(
+        compareCanonicalText,
+      ),
       ...(binding ? { binding } : {}),
       disposition,
     });
@@ -759,6 +849,14 @@ function canonicalDecimal(value: string): string {
   return BigInt(value).toString(10);
 }
 
+function compareCanonicalText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function canonicalAlias(value: string): string {
+  return value.normalize("NFC");
+}
+
 function defaultIdFactory(kind: MigrationIdKind, seed: string): string {
   return `${kind}_${createHash("sha256")
     .update(`accounts-v2-migration:${kind}:${seed}`)
@@ -794,10 +892,10 @@ export interface RedactedMigrationRecord {
   source: {
     authority: z.infer<typeof sourceAuthoritySchema>;
     authorityIdDigest: MigrationDigest;
-    tool: string;
+    toolDigest: MigrationDigest;
     nameDigest: MigrationDigest;
   };
-  runtimeLabel: string;
+  runtimeLabelDigest: MigrationDigest;
   inputDigest: MigrationDigest;
   target: MigrationRecord["target"];
   root:
@@ -860,10 +958,10 @@ export function redactMigrationPlan(planInput: MigrationPlan): RedactedMigration
       source: {
         authority: record.source.authority,
         authorityIdDigest: hashText(record.source.authorityId),
-        tool: record.source.tool,
+        toolDigest: hashText(record.source.tool),
         nameDigest: hashText(record.source.name),
       },
-      runtimeLabel: record.runtimeLabel,
+      runtimeLabelDigest: hashText(record.runtimeLabel),
       inputDigest: record.inputDigest,
       target: record.target,
       root:
@@ -1091,7 +1189,7 @@ function hasAllRequiredArtifacts(values: readonly string[]): boolean {
 const migrationAliasInputSchema = z
   .object({
     kind: z.enum(["legacy_account", "session_ref"]),
-    alias: aliasSchema,
+    alias: canonicalAliasSchema,
     sourceKey: legacyKeySchema,
     targetId: migrationOpaqueIdSchema,
   })
@@ -1192,6 +1290,13 @@ function canonicalGenesisAliasJournal(
   plan: MigrationPlan,
 ): MigrationSidecar["aliasJournal"] {
   let entries: MigrationSidecar["aliasJournal"] = [];
+  const expectedAliasCount = plan.records.reduce(
+    (count, record) =>
+      count +
+      record.historicalAliases.length +
+      record.historicalSessionAliases.length,
+    0,
+  );
   for (const record of plan.records) {
     for (const alias of record.historicalAliases) {
       entries = appendAliasToJournal(plan, entries, {
@@ -1209,6 +1314,11 @@ function canonicalGenesisAliasJournal(
         targetId: record.target.bindingId,
       });
     }
+  }
+  if (entries.length !== expectedAliasCount) {
+    throw new MigrationDriftError(
+      "migration plan aliases do not exactly correspond to canonical genesis",
+    );
   }
   return entries;
 }

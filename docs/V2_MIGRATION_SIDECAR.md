@@ -30,9 +30,11 @@ is namespaced by tenant and scope so identical legacy coordinates in different
 scopes cannot collide. Legacy records are not grouped, renamed, or physically
 relocated.
 
-The redacted census view hashes machine IDs, authority IDs, profile names,
-paths, unsafe-root reasons, source keys, and aliases while retaining counts,
-filesystem identity, input digests, allocated IDs, and quarantine evidence.
+The redacted census view hashes machine IDs, authority IDs, runtime tool keys,
+runtime labels, profile names, paths, unsafe-root reasons, source keys, and
+aliases while retaining only schema-owned enums, counts, filesystem identity,
+input digests, allocated opaque IDs, and quarantine evidence. Arbitrary census
+text is never emitted verbatim by the redacted view.
 
 ## Conflict quarantine and aliases
 
@@ -53,6 +55,14 @@ Historical account aliases target the frozen account ID. Historical session
 aliases target the frozen machine-binding ID. The alias journal is append-only,
 sequence-numbered, and digest-chained. Replaying the exact same alias is
 idempotent; changing its source or target fails closed.
+
+Every alias is normalized to Unicode NFC before the frozen input digest and ID
+allocation. Duplicate aliases, including canonically equivalent Unicode forms,
+are rejected before allocation. Plan records store one strictly ordered unique
+representation, aliases are globally unique within each alias kind, and the
+canonical genesis journal must contain exactly the plan-declared aliases in
+that order. Reordering a stored plan and recomputing its unkeyed digest cannot
+change the accepted genesis.
 
 ## Gates and cutover states
 
