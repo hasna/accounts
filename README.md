@@ -164,11 +164,12 @@ persisted state, restart responses, legacy state reads, and text/JSON status
 surfaces store or return argument-aware redacted command arrays. Long options
 using `=`, `:`, or a following value and the supported short `-k` forms share
 that policy. Combined short clusters ending in `k` and compatibility-normalized
-Unicode dash/letter forms are treated as credential options too. If a new
-credential option appears while a prior option is still awaiting a value, the
-new option is redacted as syntax and becomes the pending option instead of
-being consumed as the earlier value; non-option dash-leading argv items remain
-bound values. The same
+Unicode dash/letter forms are treated as credential options too. If a
+syntactically bare credential option appears while a prior option is still
+awaiting a value, the new option is redacted as syntax and becomes the pending
+option instead of being consumed as the earlier value. Credential-shaped
+fragments inside opaque or non-option dash-leading argv items remain bound
+values. The same
 bounded, quote-aware option scanner redacts command-shaped values embedded in
 captured stdout, stderr, and error strings. A separate credential option keeps
 one pending value across LF, CRLF, or bare CR and consumes the next syntactic

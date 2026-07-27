@@ -592,7 +592,7 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
   expect(runCli("add", "acct", "--tool", "argv-grammar").status).toBe(0);
 
   const secrets = Array.from(
-    { length: 17 },
+    { length: 18 },
     (_, index) => `actual-switch-credential-${index}`,
   );
   const credentialArgs = [
@@ -627,6 +627,9 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     "-k",
     "-vk",
     secrets[16]!,
+    "--api-key",
+    `-x=client-key=${secrets[17]}`,
+    "keep-after-opaque-bound-value",
   ];
 
   for (const surfaceArgs of [
@@ -649,6 +652,7 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
       expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
     }
     expect(result.stdout).toContain("[REDACTED]");
+    expect(result.stdout).toContain("keep-after-opaque-bound-value");
     if (surfaceArgs.includes("--json")) {
       const output = JSON.parse(result.stdout) as {
         command: string[];
@@ -661,6 +665,8 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
       expect(output.command.filter((arg) => arg === "[REDACTED]").length).toBeGreaterThanOrEqual(8);
       expect(output.commandLine).toContain("'--api-key' '--client-key' '[REDACTED]'");
       expect(output.commandLine).toContain("'-k' '-vk' '[REDACTED]'");
+      expect(output.command).toContain("keep-after-opaque-bound-value");
+      expect(output.commandLine).toContain("'keep-after-opaque-bound-value'");
     }
   }
 

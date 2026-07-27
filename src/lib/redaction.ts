@@ -430,6 +430,10 @@ function normalizeCommandToken(value: string): string {
     );
 }
 
+function isBareCommandOption(value: string): boolean {
+  return /^--?[A-Za-z0-9_.-]+$/.test(value);
+}
+
 function credentialOption(
   value: string,
   requireOptionPrefix = false,
@@ -440,6 +444,10 @@ function credentialOption(
   const separator = normalized.search(/[=:]/);
   if (
     separator > 0 &&
+    (
+      !requireOptionPrefix ||
+      isBareCommandOption(normalized.slice(0, separator))
+    ) &&
     isSensitiveCredentialKey(normalized.slice(0, separator))
   ) {
     return {
@@ -463,6 +471,12 @@ function credentialOption(
         };
   }
 
+  if (
+    requireOptionPrefix &&
+    !isBareCommandOption(normalized)
+  ) {
+    return undefined;
+  }
   return isSensitiveCredentialKey(normalized)
     ? { kind: "separate", redactedToken: normalized }
     : undefined;

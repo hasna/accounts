@@ -104,11 +104,12 @@ and single-quoted keys in malformed serialized fragments use the same
 fail-closed record boundary. Argument redaction handles credential-bearing long
 options separated by `=`, `:`, or the next argv item, the supported `-k value`
 and `-kvalue` forms, combined clusters ending in `k`, and Unicode compatibility
-forms of the short option. A credential option encountered while a prior
-option is awaiting a separate value is classified as new syntax: an attached
-value is redacted immediately, while a separate-value option takes over the
-pending state. Non-option dash-leading argv items remain the prior option's
-value. Captured command text uses that same policy through
+forms of the short option. A syntactically bare credential option encountered
+while a prior option is awaiting a separate value is classified as new syntax:
+an attached value is redacted immediately, while a separate-value option takes
+over the pending state. Credential-shaped fragments inside opaque or
+non-option dash-leading argv items remain the prior option's value. Captured
+command text uses that same policy through
 a quote-aware, forward-only token scanner that emits physical-newline and
 quoted/escaped-origin metadata. A separate option's single pending value
 survives LF, CRLF, or bare CR and consumes the next syntactic value; quoted or

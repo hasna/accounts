@@ -355,6 +355,30 @@ test("argument redaction reclassifies chained sensitive options while awaiting a
   ]);
 });
 
+test("argument redaction keeps credential-shaped opaque tokens bound to pending options", () => {
+  for (const value of [
+    "-x=client-key=opaque-bound-secret",
+    "--label/client-key/opaque-bound-secret",
+    "-x<client-key<opaque-bound-secret",
+    "--wrapper{client-key:opaque-bound-secret}",
+    "－x=client-key=opaque-bound-secret",
+  ]) {
+    expect(
+      redactArgv([
+        "provider",
+        "--api-key",
+        value,
+        "keep-after-opaque-bound-value",
+      ]),
+    ).toEqual([
+      "provider",
+      "--api-key",
+      "[REDACTED]",
+      "keep-after-opaque-bound-value",
+    ]);
+  }
+});
+
 test("command-text chained sensitive options preserve pending state across line endings", () => {
   for (const lineEnding of ["\n", "\r\n", "\r"]) {
     const secret = `command-chained-secret-${lineEnding.length}`;

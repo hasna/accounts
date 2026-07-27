@@ -383,11 +383,11 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
   const one = addProfile({ name: "one", tool: "credentialgrammar" });
   const two = addProfile({ name: "two", tool: "credentialgrammar" });
   const initialSecrets = Array.from(
-    { length: 16 },
+    { length: 17 },
     (_, index) => `supervisor-initial-credential-${index}`,
   );
   const switchedSecrets = Array.from(
-    { length: 16 },
+    { length: 17 },
     (_, index) => `supervisor-switched-credential-${index}`,
   );
   const credentialArgs = (secrets: string[]) => [
@@ -421,6 +421,9 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     "-k",
     "-vk",
     secrets[15]!,
+    "--api-key",
+    `-x=client-key=${secrets[16]}`,
+    "keep-after-opaque-bound-value",
   ];
   const previousFakeLog = process.env.FAKE_LOG;
   process.env.FAKE_LOG = logPath;
@@ -444,6 +447,7 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
       read: readSupervisorState("credentialgrammar"),
     });
     for (const secret of initialSecrets) expect(initialPublic).not.toContain(secret);
+    expect(initialPublic).toContain("keep-after-opaque-bound-value");
 
     const response = await sendSupervisorRequest("credentialgrammar", {
       type: "switch_profile",
@@ -464,6 +468,7 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
       read: readSupervisorState("credentialgrammar"),
     });
     for (const secret of switchedSecrets) expect(switchedPublic).not.toContain(secret);
+    expect(switchedPublic).toContain("keep-after-opaque-bound-value");
 
     await sendSupervisorRequest("credentialgrammar", { type: "stop" });
     expect(await running).toBe(0);
