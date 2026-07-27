@@ -93,6 +93,24 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+const MAX_AGENT_JSON_NESTING = 32_768;
+const MAX_AGENT_JSON_FALLBACK_CANDIDATES = 32;
+const MAX_AGENT_JSON_CANDIDATE_BYTES = 1024 * 1024;
+
+function parseAgentArrayCandidate(
+  text: string,
+  start: number,
+  end: number,
+): unknown[] | undefined {
+  if (end - start > MAX_AGENT_JSON_CANDIDATE_BYTES) return undefined;
+  try {
+    const parsed = JSON.parse(text.slice(start, end)) as unknown;
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Extract the first top-level JSON array from output that may be wrapped in
  * pty/ANSI noise (`claude agents --json` only works on a TTY, so we run it
@@ -100,35 +118,58 @@ function shellQuote(value: string): string {
  */
 export function extractJsonArray(raw: string): unknown[] | undefined {
   const text = raw.replace(/\r/g, "");
-  for (let start = text.indexOf("["); start !== -1; start = text.indexOf("[", start + 1)) {
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start; i < text.length; i++) {
-      const ch = text[i];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch === "\\") escaped = true;
-        else if (ch === '"') inString = false;
-        continue;
+  const starts: number[] = [];
+  let fallbacks: Array<[number, number]> = [];
+  let inString = false;
+  let escaped = false;
+
+  const parseFallbacks = (): unknown[] | undefined => {
+    fallbacks.sort((left, right) => left[0] - right[0]);
+    for (const [start, end] of fallbacks) {
+      const parsed = parseAgentArrayCandidate(text, start, end);
+      if (parsed) return parsed;
+    }
+    return undefined;
+  };
+
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]!;
+    if (starts.length > 0 && inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (starts.length > 0 && char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "[") {
+      if (text[index - 1] === "\u001b") continue;
+      if (starts.length >= MAX_AGENT_JSON_NESTING) {
+        starts.length = 0;
+        fallbacks = [];
+        inString = false;
+        escaped = false;
       }
-      if (ch === '"') inString = true;
-      else if (ch === "[") depth++;
-      else if (ch === "]") {
-        depth--;
-        if (depth === 0) {
-          try {
-            const parsed = JSON.parse(text.slice(start, i + 1)) as unknown;
-            if (Array.isArray(parsed)) return parsed;
-          } catch {
-            /* not valid JSON from this bracket — try the next candidate */
-          }
-          break;
-        }
-      }
+      starts.push(index);
+      continue;
+    }
+    if (char !== "]" || starts.length === 0) continue;
+
+    const start = starts.pop()!;
+    if (starts.length === 0) {
+      const parsed = parseAgentArrayCandidate(text, start, index + 1);
+      if (parsed) return parsed;
+      const fallback = parseFallbacks();
+      if (fallback) return fallback;
+      fallbacks = [];
+    } else if (fallbacks.length < MAX_AGENT_JSON_FALLBACK_CANDIDATES) {
+      fallbacks.push([start, index + 1]);
     }
   }
-  return undefined;
+
+  return parseFallbacks();
 }
 
 /**
@@ -177,7 +218,8 @@ export function runClaudeAgentsJson(profile: ProfileLike, timeoutMs = 20_000): A
 export function isToolSessionCommand(command: string, bin: string): boolean {
   const argv = command.trim().split(/\s+/);
   if (argv.length === 0) return false;
-  const base = (p: string) => p.split("/").pop() ?? p;
+  const base = (p: string) => p.replaceAll("\\", "/").split("/").pop() ?? p;
+  const binName = base(bin);
 
   let head = argv[0] ?? "";
   let rest = argv.slice(1);
@@ -187,8 +229,9 @@ export function isToolSessionCommand(command: string, bin: string): boolean {
     rest = rest.slice(1);
   }
   // versioned native builds live under .../<bin>/versions/<semver>
-  const isVersionedBuild = head.includes(`/${bin}/versions/`);
-  if (base(head) !== bin && !isVersionedBuild) return false;
+  const normalizedHead = head.replaceAll("\\", "/");
+  const isVersionedBuild = normalizedHead.includes(`/${binName}/versions/`);
+  if (base(head) !== binName && !isVersionedBuild) return false;
 
   if (rest[0] === "agents") return false; // our own listing call
   const joined = rest.join(" ");

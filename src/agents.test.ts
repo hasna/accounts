@@ -46,6 +46,21 @@ test("extractJsonArray returns undefined when no array present", () => {
   expect(extractJsonArray("error: something broke")).toBeUndefined();
 });
 
+test("extractJsonArray recovers a bounded inner candidate from malformed wrapper noise", () => {
+  expect(
+    extractJsonArray('noise [broken wrapper [{"pid":7,"kind":"background"}] tail'),
+  ).toEqual([{ pid: 7, kind: "background" }]);
+});
+
+test("extractJsonArray stays linear on dense malformed bracket noise", () => {
+  const input = "[".repeat(40_000);
+  const startedAt = performance.now();
+  expect(extractJsonArray(input)).toBeUndefined();
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(elapsedMs).toBeLessThan(500);
+});
+
 test("listAgentsAcrossProfiles aggregates agents per claude profile", () => {
   addProfile({ name: "acct1", tool: "claude", email: "one@example.com" });
   addProfile({ name: "acct2", tool: "claude", email: "two@example.com" });
@@ -282,6 +297,20 @@ test("isToolSessionCommand matches real session processes and rejects helpers", 
   }
 });
 
+test("isToolSessionCommand matches absolute tool bins and interpreter wrappers", () => {
+  const customBin = "/opt/acme/bin/custom-agent";
+  for (const command of [
+    `${customBin} --resume abc`,
+    `node ${customBin} --resume abc`,
+    `bun ${customBin} --resume abc`,
+  ]) {
+    expect(isToolSessionCommand(command, customBin), command).toBe(true);
+  }
+
+  const codexAppBin = "/Applications/Codex.app/Contents/MacOS/Codex";
+  expect(isToolSessionCommand(`${codexAppBin} --user-data-dir=/safe`, codexAppBin)).toBe(true);
+});
+
 test("backgroundOnly does not leak interactive sessions into (untracked)", () => {
   addProfile({ name: "acct1", tool: "claude" });
   const runner: AgentsRunner = () => ({
@@ -431,6 +460,31 @@ test("provider agent projection is getter-free, proxy-safe, cycle-safe, and recu
   expect(serialized).not.toContain("agent-throwing-getter-secret");
   expect(serialized).toContain("keep-agent-message");
   expect(serialized).toContain("keep-agent-array");
+});
+
+test("provider agent projection bounds deeply nested records without recursion", () => {
+  const root: Record<string, unknown> = {
+    kind: "background",
+    pid: 42,
+    state: "working",
+  };
+  let cursor = root;
+  for (let depth = 0; depth < 22_000; depth++) {
+    const next = Object.create(null) as Record<string, unknown>;
+    cursor.nested = next;
+    cursor = next;
+  }
+  cursor.message =
+    "provider --api-key unreachable-deep-secret --trace keep-deep-agent";
+
+  let projected: ReturnType<typeof projectAgentEntries> | undefined;
+  expect(() => {
+    projected = projectAgentEntries([root]);
+  }).not.toThrow();
+
+  const serialized = JSON.stringify(projected);
+  expect(serialized).toContain("[TRUNCATED]");
+  expect(serialized).not.toContain("unreachable-deep-secret");
 });
 
 test("agents library projections redact provider payloads and untracked process command lines", () => {
@@ -591,4 +645,58 @@ test.skipIf(process.platform === "win32")("accounts agents JSON and human output
   expect(humanResult.stdout).toContain("keep-agent-human-name");
   expect(humanResult.stdout).toContain("keep-agent-human-cwd");
   expect(jsonResult.stdout).toContain("keep-agent-json-message");
+});
+
+test.skipIf(process.platform === "win32")("accounts agents bounds deeply nested provider JSON in both output modes", () => {
+  const executable = join(home, "deep-agent-provider");
+  writeFileSync(
+    executable,
+    [
+      "#!/usr/bin/env bun",
+      "const depth = 22_000;",
+      "const payload = '[{\"kind\":\"background\",\"pid\":88,\"state\":\"working\",\"metadata\":' + '{\"nested\":'.repeat(depth) + '\"leaf\"' + '}'.repeat(depth) + '}]';",
+      "process.stdout.write(payload);",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(executable, 0o755);
+  addCustomTool({
+    id: "deep-agent-provider",
+    label: "Deep Agent Provider",
+    envVar: "DEEP_AGENT_HOME",
+    defaultDir: join(home, "deep-agent-default"),
+    bin: executable,
+  });
+  addProfile({ name: "deep", tool: "deep-agent-provider" });
+
+  const run = (json: boolean) =>
+    spawnSync(
+      process.execPath,
+      [
+        "run",
+        "src/cli.ts",
+        "agents",
+        "--tool",
+        "deep-agent-provider",
+        ...(json ? ["--json"] : []),
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ACCOUNTS_HOME: home,
+          NO_COLOR: "1",
+        },
+      },
+    );
+
+  const jsonResult = run(true);
+  const humanResult = run(false);
+  for (const result of [jsonResult, humanResult]) {
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain("Maximum call stack size exceeded");
+  }
+  expect(jsonResult.stdout).toContain("[TRUNCATED]");
+  expect(humanResult.stdout).toContain("working");
 });

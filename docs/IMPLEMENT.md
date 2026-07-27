@@ -185,6 +185,12 @@ entries, and unsafe object shapes cannot cross that output boundary. Provider
 records are limited to known agent kinds, malformed PIDs are discarded before
 process accounting, process scans are bound to the requested tool, and human
 rendering reads only validated scalar fields without coercing provider values.
+Configured absolute executable paths are normalized to their basename only at
+the process-matching seam, including direct and Node/Bun-wrapped processes.
+Provider projection is iterative and bounded by explicit depth, object, and
+entry limits; truncated branches use a deterministic `[TRUNCATED]` marker.
+Pseudo-TTY JSON extraction scans input once, bounds nesting, candidate size,
+and fallback attempts, and never retries from every opening bracket.
 
 Supervisor arguments remain raw only in memory long enough to spawn the
 provider child. State files, legacy-state reads, switch responses, and

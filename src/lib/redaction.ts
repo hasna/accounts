@@ -904,7 +904,9 @@ function scanCommandToken(
         const escapedChar = value[index + 1]!;
         quoted ||= escapedChar === "'" || escapedChar === '"';
         if (escapedChar === "'" || escapedChar === '"') {
-          if (!escapedQuotesOpen) {
+          const escapedQuoteStartsSensitiveValue =
+            !quote && credentialOption(decoded, true) !== undefined;
+          if (!escapedQuotesOpen && !escapedQuoteStartsSensitiveValue) {
             decoded += escapedChar;
             observeCommandSegmentChar(
               segment,
@@ -1231,7 +1233,7 @@ function redactCommandTokens(
         lineEnd,
         !redactNext,
         !redactNext,
-        !literalOptionSyntax,
+        redactNext && !literalOptionSyntax,
       );
       const raw = value.slice(item.start, item.end);
       const exactEndOfOptions =
@@ -1468,88 +1470,175 @@ export function redactArgv(argv: string[]): string[] {
 }
 
 const POLLUTION_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const PUBLIC_VALUE_TRUNCATED = "[TRUNCATED]";
+const PUBLIC_VALUE_TRUNCATED_KEY = "[TRUNCATED]";
+const MAX_PUBLIC_VALUE_DEPTH = 64;
+const MAX_PUBLIC_VALUE_OBJECTS = 10_000;
+const MAX_PUBLIC_VALUE_ENTRIES = 10_000;
 
-function publicValue(
-  value: unknown,
-  seen: WeakSet<object>,
-): unknown {
-  if (typeof value === "string") return redactText(value);
-  if (
-    value === null ||
-    typeof value === "boolean" ||
-    (typeof value === "number" && Number.isFinite(value))
-  ) {
-    return value;
-  }
-  if (typeof value !== "object") return null;
-  if (utilTypes.isProxy(value) || seen.has(value)) return null;
+interface PublicValueFrame {
+  value: unknown;
+  depth: number;
+  assign: (projected: unknown) => void;
+}
 
-  const isArray = Array.isArray(value);
-  let prototype: object | null;
-  let descriptors: PropertyDescriptorMap;
-  try {
-    prototype = Object.getPrototypeOf(value);
-    if (
-      (!isArray && prototype !== Object.prototype && prototype !== null) ||
-      (isArray && prototype !== Array.prototype)
-    ) {
-      return null;
+function publicValue(value: unknown): unknown {
+  const root: { value: unknown } = { value: null };
+  const seen = new WeakSet<object>();
+  const stack: PublicValueFrame[] = [{
+    value,
+    depth: 0,
+    assign: (projected) => {
+      root.value = projected;
+    },
+  }];
+  let objectCount = 0;
+
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    const current = frame.value;
+    if (typeof current === "string") {
+      frame.assign(redactText(current));
+      continue;
     }
-    descriptors = Object.getOwnPropertyDescriptors(value);
-  } catch {
-    return null;
-  }
-
-  seen.add(value);
-  if (isArray) {
-    const length = descriptors["length"]?.value;
     if (
-      typeof length !== "number" ||
-      !Number.isSafeInteger(length) ||
-      length < 0
+      current === null ||
+      typeof current === "boolean" ||
+      (typeof current === "number" && Number.isFinite(current))
     ) {
-      return null;
+      frame.assign(current);
+      continue;
     }
-    const result: unknown[] = [];
-    result.length = length;
+    if (typeof current !== "object") {
+      frame.assign(null);
+      continue;
+    }
+    if (
+      frame.depth >= MAX_PUBLIC_VALUE_DEPTH ||
+      objectCount >= MAX_PUBLIC_VALUE_OBJECTS
+    ) {
+      frame.assign(PUBLIC_VALUE_TRUNCATED);
+      continue;
+    }
+    if (utilTypes.isProxy(current) || seen.has(current)) {
+      frame.assign(null);
+      continue;
+    }
+
+    const isArray = Array.isArray(current);
+    let prototype: object | null;
+    let descriptors: PropertyDescriptorMap;
+    try {
+      prototype = Object.getPrototypeOf(current);
+      if (
+        (!isArray && prototype !== Object.prototype && prototype !== null) ||
+        (isArray && prototype !== Array.prototype)
+      ) {
+        frame.assign(null);
+        continue;
+      }
+      descriptors = Object.getOwnPropertyDescriptors(current);
+    } catch {
+      frame.assign(null);
+      continue;
+    }
+
+    seen.add(current);
+    objectCount++;
+    if (isArray) {
+      const length = descriptors["length"]?.value;
+      if (
+        typeof length !== "number" ||
+        !Number.isSafeInteger(length) ||
+        length < 0
+      ) {
+        frame.assign(null);
+        continue;
+      }
+      const boundedLength = Math.min(length, MAX_PUBLIC_VALUE_ENTRIES);
+      const result: unknown[] = [];
+      result.length = boundedLength + (length > boundedLength ? 1 : 0);
+      if (length > boundedLength) {
+        result[boundedLength] = PUBLIC_VALUE_TRUNCATED;
+      }
+      frame.assign(result);
+
+      const children: Array<[number, unknown]> = [];
+      for (const key of Object.keys(descriptors)) {
+        const descriptor = descriptors[key]!;
+        const numeric = Number(key);
+        if (
+          !descriptor.enumerable ||
+          !("value" in descriptor) ||
+          !Number.isSafeInteger(numeric) ||
+          numeric < 0 ||
+          String(numeric) !== key ||
+          numeric >= boundedLength
+        ) {
+          continue;
+        }
+        children.push([numeric, descriptor.value]);
+      }
+      for (let index = children.length - 1; index >= 0; index--) {
+        const [numeric, nested] = children[index]!;
+        stack.push({
+          value: nested,
+          depth: frame.depth + 1,
+          assign: (projected) => {
+            result[numeric] = projected;
+          },
+        });
+      }
+      continue;
+    }
+
+    const result: Record<string, unknown> = Object.create(null);
+    frame.assign(result);
+    const children: Array<[string, unknown]> = [];
+    let entryCount = 0;
+    let entriesTruncated = false;
     for (const key of Object.keys(descriptors)) {
       const descriptor = descriptors[key]!;
-      const numeric = Number(key);
       if (
+        POLLUTION_KEYS.has(key) ||
         !descriptor.enumerable ||
-        !("value" in descriptor) ||
-        !Number.isSafeInteger(numeric) ||
-        numeric < 0 ||
-        String(numeric) !== key ||
-        numeric >= length
+        !("value" in descriptor)
       ) {
         continue;
       }
-      result[numeric] = publicValue(descriptor.value, seen);
+      if (entryCount >= MAX_PUBLIC_VALUE_ENTRIES) {
+        entriesTruncated = true;
+        break;
+      }
+      entryCount++;
+      if (isSensitiveCredentialKey(key)) {
+        result[key] = "[REDACTED]";
+      } else {
+        result[key] = null;
+        children.push([key, descriptor.value]);
+      }
     }
-    return result;
+    if (entriesTruncated) {
+      result[PUBLIC_VALUE_TRUNCATED_KEY] = true;
+    }
+    for (let index = children.length - 1; index >= 0; index--) {
+      const [key, nested] = children[index]!;
+      stack.push({
+        value: nested,
+        depth: frame.depth + 1,
+        assign: (projected) => {
+          result[key] = projected;
+        },
+      });
+    }
   }
 
-  const result: Record<string, unknown> = Object.create(null);
-  for (const key of Object.keys(descriptors)) {
-    const descriptor = descriptors[key]!;
-    if (
-      POLLUTION_KEYS.has(key) ||
-      !descriptor.enumerable ||
-      !("value" in descriptor)
-    ) {
-      continue;
-    }
-    result[key] = isSensitiveCredentialKey(key)
-      ? "[REDACTED]"
-      : publicValue(descriptor.value, seen);
-  }
-  return result;
+  return root.value;
 }
 
 /** Redact credential-bearing keys and nested string diagnostics in public data. */
 export function redactPublicValue(value: unknown): unknown {
-  return publicValue(value, new WeakSet());
+  return publicValue(value);
 }
 
 /** Redact environment values by both semantic key and embedded diagnostic form. */

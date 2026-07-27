@@ -2587,6 +2587,40 @@ test("nested unterminated quotes cannot hide later credential syntax", () => {
   }
 });
 
+test("escaped top-level unmatched quotes cannot hide later credential syntax", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const cases = [
+      {
+        input:
+          String.raw`provider \"diagnostic --api-key escaped-double-secret ` +
+          `--trace keep-escaped-double${lineEnding}`,
+        secret: "escaped-double-secret",
+        retained: "keep-escaped-double",
+      },
+      {
+        input:
+          String.raw`provider \'diagnostic --client-key=escaped-single-secret` +
+          `|--mode keep-escaped-single${lineEnding}`,
+        secret: "escaped-single-secret",
+        retained: "keep-escaped-single",
+      },
+      {
+        input:
+          String.raw`provider \"diagnostic/--credentials escaped-punctuation-secret ` +
+          `--debug keep-escaped-punctuation${lineEnding}`,
+        secret: "escaped-punctuation-secret",
+        retained: "keep-escaped-punctuation",
+      },
+    ];
+
+    for (const sample of cases) {
+      const redacted = redactText(sample.input);
+      expect(redacted, sample.input).not.toContain(sample.secret);
+      expect(redacted, sample.input).toContain(sample.retained);
+    }
+  }
+});
+
 test("unterminated quote recovery preserves valid quoted, escaped, and exact-sentinel data", () => {
   const inputs = [
     'provider "unterminated diagnostic \'--api-key\' quoted-benign --trace keep-valid-quoted',
