@@ -52,7 +52,11 @@ function writeFakeTool(binName: string, envVar: string, toolName = binName, exit
     [
       "#!/bin/sh",
       `home="\${${envVar}:-}"`,
-      `printf '{"tool":"${toolName}","args":"%s","home":"%s"}\\n' "$*" "$home" >> "$FAKE_LOGIN_LOG"`,
+      'request_debug=""',
+      '[ "${BUN_CONFIG_VERBOSE_FETCH+x}" = x ] && request_debug="${request_debug}BUN_CONFIG_VERBOSE_FETCH,"',
+      '[ "${NODE_DEBUG+x}" = x ] && request_debug="${request_debug}NODE_DEBUG,"',
+      '[ "${NODE_DEBUG_NATIVE+x}" = x ] && request_debug="${request_debug}NODE_DEBUG_NATIVE,"',
+      `printf '{"tool":"${toolName}","args":"%s","home":"%s","requestDebug":"%s","path":"%s","httpsProxy":"%s","tlsCert":"%s","bedrock":"%s","vertex":"%s","awsProfile":"%s","googleCredentials":"%s"}\\n' "$*" "$home" "$request_debug" "$PATH" "\${HTTPS_PROXY:-}" "\${NODE_EXTRA_CA_CERTS:-}" "\${CLAUDE_CODE_USE_BEDROCK:-}" "\${CLAUDE_CODE_USE_VERTEX:-}" "\${AWS_PROFILE:-}" "\${GOOGLE_APPLICATION_CREDENTIALS:-}" >> "$FAKE_LOGIN_LOG"`,
       'if [ -n "${BUN_CONFIG_VERBOSE_FETCH:-}${NODE_DEBUG:-}${NODE_DEBUG_NATIVE:-}" ] && [ -n "${FAKE_DEBUG_CREDENTIAL:-}" ]; then',
       '  printf "Authorization: Bearer %s\\n" "$FAKE_DEBUG_CREDENTIAL"',
       '  printf "x-api-key=%s\\n" "$FAKE_DEBUG_CREDENTIAL" >&2',
@@ -136,22 +140,21 @@ function writeClaudeAuth(profileDir: string, email: string) {
 }
 
 function addFakeLoginTool(id = "fake-login", label = "Fake Login", envVar = "FAKE_LOGIN_HOME", bin = "fake-login-tool") {
-  expect(
-    runCli(
-      "tools",
-      "add",
-      id,
-      "--label",
-      label,
-      "--env-var",
-      envVar,
-      "--bin",
-      bin,
-      "--login-arg",
-      "auth",
-      "login",
-    ).status,
-  ).toBe(0);
+  const result = runCli(
+    "tools",
+    "add",
+    id,
+    "--label",
+    label,
+    "--env-var",
+    envVar,
+    "--bin",
+    bin,
+    "--login-arg",
+    "auth",
+    "login",
+  );
+  expect(result.status, result.stderr).toBe(0);
 }
 
 function readLogEntries() {
@@ -160,7 +163,78 @@ function readLogEntries() {
     .trim()
     .split("\n")
     .filter(Boolean)
-    .map((line) => JSON.parse(line) as { tool: string; args: string; home: string });
+    .map((line) => JSON.parse(line) as {
+      tool: string;
+      args: string;
+      home: string;
+      requestDebug: string;
+      path: string;
+      httpsProxy: string;
+      tlsCert: string;
+      bedrock: string;
+      vertex: string;
+      awsProfile: string;
+      googleCredentials: string;
+    });
+}
+
+const handoffEnvironment = {
+  BUN_CONFIG_VERBOSE_FETCH: "1",
+  NODE_DEBUG: "http,http2",
+  NODE_DEBUG_NATIVE: "http",
+  HTTPS_PROXY: "http://proxy.example.test:8443",
+  NODE_EXTRA_CA_CERTS: "/profiles/work/ca.pem",
+  CLAUDE_CODE_USE_BEDROCK: "1",
+  CLAUDE_CODE_USE_VERTEX: "1",
+  AWS_PROFILE: "work",
+  GOOGLE_APPLICATION_CREDENTIALS: "/profiles/work/google.json",
+};
+
+function expectSafeProviderObservation() {
+  const observation = readLogEntries().at(-1);
+  expect(observation).toBeTruthy();
+  expect(observation?.requestDebug).toBe("");
+  expect(observation).toMatchObject({
+    httpsProxy: handoffEnvironment.HTTPS_PROXY,
+    tlsCert: handoffEnvironment.NODE_EXTRA_CA_CERTS,
+    bedrock: handoffEnvironment.CLAUDE_CODE_USE_BEDROCK,
+    vertex: handoffEnvironment.CLAUDE_CODE_USE_VERTEX,
+    awsProfile: handoffEnvironment.AWS_PROFILE,
+    googleCredentials: handoffEnvironment.GOOGLE_APPLICATION_CREDENTIALS,
+  });
+  expect(observation?.path).toContain(binDir);
+}
+
+function executeGeneratedHandoff(lines: string) {
+  return spawnSync(
+    "/bin/sh",
+    ["-c", `${lines}\nfake-login-tool observe`],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ...handoffEnvironment,
+        FAKE_LOGIN_LOG: logPath,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+    },
+  );
+}
+
+function executeHandoffCommand(commandLine: string) {
+  return spawnSync(
+    "/bin/sh",
+    ["-c", commandLine],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ...handoffEnvironment,
+        FAKE_LOGIN_LOG: logPath,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+    },
+  );
 }
 
 function readStore() {
@@ -287,6 +361,71 @@ test("env syncs Claude profile credentials into keychain before printing exports
   expect(keychainLog).toContain("add-generic-password");
   expect(keychainPayload).toContain("account=acct");
   expect(keychainPayload).toContain("acct@example.com-access-token");
+});
+
+test("generated env and pick --env handoffs unset request debugging before provider execution", () => {
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  addFakeLoginTool();
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+
+  const generated = runCliWith(["env", "acct", "--tool", "fake-login"], {
+    env: handoffEnvironment,
+  });
+  expect(generated.status).toBe(0);
+  const generatedLines = generated.stdout
+    .split("\n")
+    .filter((line) => line.startsWith("unset ") || line.startsWith("export "))
+    .join("\n");
+  expect(generatedLines).toContain("unset BUN_CONFIG_VERBOSE_FETCH NODE_DEBUG NODE_DEBUG_NATIVE");
+  expect(executeGeneratedHandoff(generatedLines).status).toBe(0);
+  expectSafeProviderObservation();
+
+  rmSync(logPath, { force: true });
+  const picked = runCliWith(["pick", "--tool", "fake-login", "--env"], {
+    input: "1\n",
+    env: handoffEnvironment,
+  });
+  expect(picked.status).toBe(0);
+  const pickedLines = picked.stdout
+    .split("\n")
+    .filter((line) => line.startsWith("unset ") || line.startsWith("export "))
+    .join("\n");
+  expect(pickedLines).toContain("unset BUN_CONFIG_VERBOSE_FETCH NODE_DEBUG NODE_DEBUG_NATIVE");
+  expect(executeGeneratedHandoff(pickedLines).status).toBe(0);
+  expectSafeProviderObservation();
+});
+
+test("non-launch switch handoff command unsets request debugging before provider execution", () => {
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  addFakeLoginTool();
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+
+  const switched = runCliWith(
+    ["switch", "acct", "--tool", "fake-login", "--mode", "active"],
+    { env: handoffEnvironment },
+  );
+  expect(switched.status).toBe(0);
+  const commandLine = switched.stdout.match(/restart command: (.+)/)?.[1];
+  expect(commandLine).toContain("env -u BUN_CONFIG_VERBOSE_FETCH -u NODE_DEBUG -u NODE_DEBUG_NATIVE");
+  expect(executeHandoffCommand(commandLine ?? "").status).toBe(0);
+  expectSafeProviderObservation();
+});
+
+test("accounts shell removes request debugging while preserving same-binding environment", () => {
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  addFakeLoginTool();
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+
+  const shell = runCliWith(["shell", "acct", "--tool", "fake-login"], {
+    env: {
+      ...handoffEnvironment,
+      SHELL: join(binDir, "fake-login-tool"),
+    },
+  });
+
+  expect(shell.status).toBe(0);
+  expect(shell.stdout).toContain("env -u BUN_CONFIG_VERBOSE_FETCH -u NODE_DEBUG -u NODE_DEBUG_NATIVE");
+  expectSafeProviderObservation();
 });
 
 test("login infers and locks the tool for an existing unambiguous profile", () => {

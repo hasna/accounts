@@ -994,7 +994,7 @@ program
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(shell, ["-i"], {
         stdio: "inherit",
-        env: { ...process.env, ...env, ACCOUNTS_ACTIVE: profile.name },
+        env: providerLaunchEnv(process.env, env, { ACCOUNTS_ACTIVE: profile.name }),
       });
       process.exit(res.status ?? 0);
     }),

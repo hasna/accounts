@@ -44,6 +44,21 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 | `src/lib/hook.ts` | `claude-hook.sh` generator |
 | `src/cli.ts` | Commander CLI |
 
+## Request-debug boundary
+
+`src/lib/env.ts` owns a deliberately narrow three-key policy:
+`BUN_CONFIG_VERBOSE_FETCH`, `NODE_DEBUG`, and `NODE_DEBUG_NATIVE` are removed
+case-insensitively after all provider env overlays. Generated export handoffs
+explicitly `unset` them, and generated command handoffs use `env -u`, so an
+inherited value cannot survive merely because the caller executes printed
+output instead of using an Accounts-owned spawn.
+
+Do not broaden that list without evidence that another control dumps provider
+requests. `PATH`, proxy/TLS configuration, Bedrock/Vertex selection, and
+AWS/Google SDK settings are intentionally preserved as part of the caller's
+existing trust binding. Provider flags/config, edited handoff commands, and
+other caller-selected diagnostics remain residual caller-trusted controls.
+
 ## Apply safety
 
 - Refuse apply when the profile has no auth snapshot and no oauth in the profile dir.

@@ -121,6 +121,22 @@ selected profile's isolated `CODEX_HOME` and Electron user data directory.
 A child process cannot change your parent shell — use `eval "$(accounts env …)"` or the
 [shell hook](docs/hook.md) (terminal `claude` only, not IDE extensions).
 
+### Request-debug environment policy
+
+Credential-bearing launches, probes, subshells, and generated handoffs
+intentionally remove exactly three request-dump controls:
+`BUN_CONFIG_VERBOSE_FETCH`, `NODE_DEBUG`, and `NODE_DEBUG_NATIVE`.
+`accounts env` and `accounts pick --env` print an `unset` before their exports;
+non-launch `accounts switch` commands use `env -u` for the same keys. This also
+prevents a custom tool's profile environment from restoring those controls.
+
+Accounts otherwise preserves the caller's same-binding environment, including
+`PATH`, proxy and TLS settings, Bedrock/Vertex selection, and AWS/Google SDK
+configuration. Those settings, provider-specific flags/config files, and any
+other logging controls remain caller-trusted: Accounts does not claim to
+sanitize arbitrary provider configuration or a command the caller edits after
+generation.
+
 Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 
 ## What is isolated, and what is shared
@@ -442,7 +458,7 @@ Claude process, and restarts it with the selected profile. Claude uses
 
 If the agent was not started through `accounts run`, MCP falls back to the safe
 handoff behavior and returns a command such as:
-`CLAUDE_CONFIG_DIR=... claude --continue`.
+`env -u BUN_CONFIG_VERBOSE_FETCH -u NODE_DEBUG -u NODE_DEBUG_NATIVE CLAUDE_CONFIG_DIR=... claude --continue`.
 
 Human equivalent:
 

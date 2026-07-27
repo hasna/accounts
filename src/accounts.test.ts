@@ -147,6 +147,31 @@ test("profileEnv renders extra per-tool environment templates", () => {
   expect(formatExportLines(env)).toContain("export OPENCODE_CONFIG_DIR=");
 });
 
+test("profileEnv cannot restore request-debug keys from custom tool settings", () => {
+  const tool = addCustomTool({
+    id: "debug-overlay",
+    label: "Debug Overlay",
+    envVar: "DEBUG_OVERLAY_HOME",
+    extraEnv: {
+      BUN_CONFIG_VERBOSE_FETCH: "1",
+      node_debug: "http,http2",
+      Node_Debug_Native: "http",
+      KEEP_ME: "ordinary-setting",
+    },
+    defaultDir: join(home, "debug-overlay-default"),
+    bin: "debug-overlay",
+  });
+  const profile = addProfile({ name: "ops", tool: tool.id });
+
+  const env = profileEnv(profile, tool);
+
+  expect(Object.keys(env).filter((name) =>
+    ["bun_config_verbose_fetch", "node_debug", "node_debug_native"].includes(name.toLowerCase())
+  )).toEqual([]);
+  expect(env.KEEP_ME).toBe("ordinary-setting");
+  expect(env.DEBUG_OVERLAY_HOME).toBe(profile.dir);
+});
+
 test("claude profile env isolates Telegram channel state", () => {
   const p = addProfile({ name: "telegram", tool: "claude" });
   const env = profileEnv(p, getTool("claude"));
