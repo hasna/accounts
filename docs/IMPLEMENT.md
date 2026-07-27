@@ -73,21 +73,23 @@ other caller-selected diagnostics remain residual caller-trusted controls.
 
 `src/lib/redaction.ts` applies a separate output boundary to controlled launch
 and prelaunch diagnostics. Its sensitive-header scanner tracks quote, escape,
-separator, and record state in one forward pass. It does not use an
-authorization-parameter allowlist: arbitrary extension parameters and cookie
-names remain inside a folded credential record. Open quotes and ambiguous
-indented continuations fail closed. A new header, an unambiguous structured
-diagnostic record, or an explicit `status`, `message`, `stack`, or `detail`
-record after a syntactically complete non-separated value ends the record.
-Unknown assignment names, diagnostic-looking names after an empty value or
-dangling credential separator, separator-only folds, and serialized-looking
-malformed tails remain sensitive. A properly quoted sensitive value terminates
-at its closing quote; a comma followed by field-like text is not trusted as a
-record boundary for an unquoted or malformed credential. Controlled prelaunch
-stderr and stdout are separated by a record boundary before line bounding and
-redaction. This keeps supported independent records visible without rescanning
-the accumulated header prefix, fusing process streams, or exposing malformed
-folds.
+separator, blank-fold, and record state with linear forward scanning. The same
+record scanner handles generic credential keys such as `x-api-key`,
+`client-secret`, and token fields, rather than redacting only a first token. It
+does not use an authorization-parameter allowlist: arbitrary extension
+parameters and cookie names remain inside a folded credential record. Open
+quotes and ambiguous indented continuations fail closed. A new header, an
+unambiguous structured diagnostic record, or an explicit `status`, `message`,
+`stack`, or `detail` record after a syntactically complete non-separated value
+ends the record. Unknown assignment names, whitespace-only folds,
+diagnostic-looking names after an empty value or dangling credential separator,
+separator-only folds, raw quoted tails, and serialized-looking malformed tails
+remain sensitive. A quoted value terminates at its closing quote only when its
+quoted key and following sibling form a structural serialized-field boundary;
+raw comma or semicolon tails are not trusted. Controlled prelaunch stderr and
+stdout are separated by a record boundary before line bounding and redaction.
+This keeps provably independent records visible without repeated suffix scans,
+fusing process streams, or exposing malformed folds.
 
 ## Apply safety
 

@@ -327,6 +327,99 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("controlled prelaunch errors fail closed on hostile folded credential records", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const cases: Array<{ output: string; secret: string }> = [];
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      for (const header of [
+        "Authorization",
+        "Proxy-Authorization",
+        "Cookie",
+        "Set-Cookie",
+      ]) {
+        const label = header.toLowerCase().replaceAll("-", "_");
+        cases.push(
+          {
+            output: [
+              `${header}: seed=${label}_seed`,
+              " \t",
+              ` ${label}_blank_fold_fragment`,
+            ].join(lineEnding),
+            secret: `${label}_blank_fold_fragment`,
+          },
+          {
+            output: `${header}: "${label}_quoted", extension=${label}_quoted_tail`,
+            secret: `${label}_quoted_tail`,
+          },
+        );
+      }
+    }
+    cases.push({
+      output: 'x-api-key: "generic_quoted_\\"fragment", suffix=generic_quoted_tail',
+      secret: "generic_quoted_tail",
+    });
+
+    try {
+      expect(cases).toHaveLength(25);
+      for (const hostile of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stderr: Buffer.from(hostile.output),
+              stdout: Buffer.from(""),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(hostile.secret);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("prelaunch bounding preserves stream order without exposing truncated folds", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const truncatedSecret = "controlled-truncated-fold-fragment";
+    const orderedSecret = "controlled-ordered-header-fragment";
+
+    try {
+      for (const runner of [
+        () => ({
+          status: 2,
+          stderr: Buffer.from(`Authorization: Bearer ${orderedSecret}`),
+          stdout: Buffer.from("status=418 keep-stdout-record"),
+        }),
+        () => ({
+          status: 2,
+          stderr: Buffer.from("diagnostic-one\ndiagnostic-two"),
+          stdout: Buffer.from(
+            `Authorization: seed=bounded-seed,\n \t\n ${truncatedSecret}`,
+          ),
+        }),
+      ]) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), { runner });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(orderedSecret);
+        expect(message).not.toContain(truncatedSecret);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
   test("fails closed when apply succeeds without a fresh manifest unless bypassed", () => {
     resetHome();
     try {

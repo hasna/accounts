@@ -772,3 +772,193 @@ test("properly quoted serialized values retain adjacent non-sensitive fields", (
     expect(redacted).toContain(`"message":"keep-${label}"`);
   }
 });
+
+test("whitespace-only folds keep sensitive header records fail closed", () => {
+  const headers = [
+    "Authorization",
+    "Proxy-Authorization",
+    "Cookie",
+    "Set-Cookie",
+  ];
+
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    for (const header of headers) {
+      const label = header.toLowerCase().replaceAll("-", "_");
+      const cases = [
+        [
+          `${header}: seed=${label}_complete_seed`,
+          " \t",
+          ` ${label}_complete_fragment`,
+          "status=418 keep-complete-boundary",
+        ],
+        [
+          `${header}:`,
+          "\t ",
+          ` ${label}_empty_fragment`,
+          "status=418 keep-empty-boundary",
+        ],
+        [
+          `${header}: seed=${label}_dangling_seed,`,
+          "  ",
+          ` stack=Error:${label}_dangling_fragment`,
+          "status=418 keep-dangling-boundary",
+        ],
+        [
+          `${header}: seed=${label}_separator_seed,`,
+          " ,\t",
+          ` detail=${label}_separator_fragment`,
+          "status=418 keep-separator-boundary",
+        ],
+      ];
+
+      for (const lines of cases) {
+        const redacted = redactText(lines.join(lineEnding));
+        for (const secret of [
+          `${label}_complete_fragment`,
+          `${label}_empty_fragment`,
+          `${label}_dangling_fragment`,
+          `${label}_separator_fragment`,
+        ]) {
+          expect(redacted).not.toContain(secret);
+        }
+        expect(redacted).toContain("status=418 keep-");
+      }
+    }
+  }
+});
+
+test("raw quoted sensitive headers redact escaped and unescaped same-line tails", () => {
+  for (const header of [
+    "Authorization",
+    "Proxy-Authorization",
+    "Cookie",
+    "Set-Cookie",
+  ]) {
+    const label = header.toLowerCase().replaceAll("-", "_");
+    for (const quote of ['"', "'"]) {
+      for (const separator of [",", ";"]) {
+        for (const escaped of [false, true]) {
+          const credential = escaped
+            ? quote === '"'
+              ? `${label}_quoted_\\"fragment`
+              : `${label}_quoted_\\'fragment`
+            : `${label}_quoted_fragment`;
+          const input = [
+            `${header}: ${quote}${credential}${quote}${separator} extension=${label}_tail_fragment`,
+            "status=418 keep-raw-quoted-boundary",
+          ].join("\n");
+          const redacted = redactText(input);
+
+          expect(redacted).not.toContain(`${label}_quoted_`);
+          expect(redacted).not.toContain(`${label}_tail_fragment`);
+          expect(redacted).toContain("status=418 keep-raw-quoted-boundary");
+        }
+      }
+    }
+  }
+});
+
+test("generic credential fields redact folded and escaped raw records", () => {
+  for (const field of [
+    "x-api-key",
+    "x-goog-api-key",
+    "client-secret",
+    "auth-token",
+  ]) {
+    const label = field.replaceAll("-", "_");
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      const cases = [
+        [
+          `${field}: ${label}_first_fragment`,
+          ` ${label}_folded_fragment`,
+          "status=418 keep-generic-fold-boundary",
+        ],
+        [
+          `${field}:`,
+          "\t",
+          ` ${label}_empty_fragment`,
+          "status=418 keep-generic-empty-boundary",
+        ],
+        [
+          `${field}: "${label}_quoted_\\"fragment", suffix=${label}_quoted_tail`,
+          "status=418 keep-generic-quoted-boundary",
+        ],
+      ];
+
+      for (const lines of cases) {
+        const redacted = redactText(lines.join(lineEnding));
+        for (const secret of [
+          `${label}_first_fragment`,
+          `${label}_folded_fragment`,
+          `${label}_empty_fragment`,
+          `${label}_quoted_`,
+          `${label}_quoted_tail`,
+        ]) {
+          expect(redacted).not.toContain(secret);
+        }
+        expect(redacted).toContain("status=418 keep-generic-");
+      }
+    }
+  }
+});
+
+test("properly serialized generic credential fields retain independent siblings", () => {
+  for (const field of [
+    "x-api-key",
+    "x-goog-api-key",
+    "client-secret",
+    "auth-token",
+  ]) {
+    const label = field.replaceAll("-", "_");
+    const input = `{"${field}":"${label}_serialized_fragment","status":418,"message":"keep-${label}"}`;
+    const redacted = redactText(input);
+
+    expect(redacted).not.toContain(`${label}_serialized_fragment`);
+    expect(redacted).toContain('"status":418');
+    expect(redacted).toContain(`"message":"keep-${label}"`);
+  }
+});
+
+test("folded redaction scaling stays linear across newline styles and multi-megabyte inputs", () => {
+  const lineCounts = [3_000, 12_000, 50_000];
+
+  for (const lineEnding of ["\n", "\r"]) {
+    const inputs = lineCounts.map((lineCount) => {
+      const folded = Array.from(
+        { length: lineCount },
+        (_, index) => ` extension-${index}=credential-fragment-${index},`,
+      );
+      return [
+        "Authorization: Custom seed=credential-seed,",
+        ...folded,
+        " final-extension=credential-tail",
+        "status=429 keep-after-scaling-record",
+      ].join(lineEnding);
+    });
+
+    expect(inputs[2]!.length).toBeGreaterThan(2 * 1024 * 1024);
+    redactText(inputs[0]!);
+    const elapsed: number[] = [];
+    for (const [sizeIndex, input] of inputs.entries()) {
+      const samples: number[] = [];
+      let redacted = "";
+      for (let run = 0; run < 3; run++) {
+        const startedAt = performance.now();
+        redacted = redactText(input);
+        samples.push(performance.now() - startedAt);
+      }
+      elapsed.push(Math.min(...samples));
+
+      expect(redacted).not.toContain("credential-seed");
+      expect(redacted).not.toContain(
+        `credential-fragment-${lineCounts[sizeIndex]! - 1}`,
+      );
+      expect(redacted).not.toContain("credential-tail");
+      expect(redacted).toContain("status=429 keep-after-scaling-record");
+    }
+
+    expect(elapsed[0]!).toBeLessThan(200);
+    expect(elapsed[1]!).toBeLessThan(400);
+    expect(elapsed[2]!).toBeLessThan(800);
+  }
+});
