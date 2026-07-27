@@ -154,16 +154,20 @@ so dot-, space-, separator-, and camel-case forms such as `oauth.key`,
 `oauth key`, `oauth_token`, `consumerSecret`, `sessionKey`, and
 `webhookCredential`, plus stemmed forms such as `credentials`,
 `secret-key`, `service-account-key`, `auth-header`, `service-auth`, and
-`bearer`,
-receive the same treatment without matching benign names such as
-`tokenBucket` or `passwordless`. Valid JSON is redacted recursively after
+`bearer`, receive the same treatment. Any distinct normalized `key` token is
+sensitive, including `encryption-key`, `client-key`, and `access-key-id`,
+without matching unsplit words such as `keyboard`, `keynote`, or `monkey`.
+Valid JSON is redacted recursively after
 decoding escaped keys, while malformed serialized fragments remain
 fail-closed. Supervisor child arguments stay raw only for the immediate spawn;
 persisted state, restart responses, legacy state reads, and text/JSON status
 surfaces store or return argument-aware redacted command arrays. Long options
 using `=`, `:`, or a following value and the supported short `-k` forms share
 that policy. Combined short clusters ending in `k` and compatibility-normalized
-Unicode dash/letter forms are treated as credential options too.
+Unicode dash/letter forms are treated as credential options too. The same
+bounded, quote-aware option scanner redacts command-shaped values embedded in
+captured stdout, stderr, and error strings while retaining later options,
+independent diagnostics, newline boundaries, and explicit `--` boundaries.
 
 Switch output is an explicit `hasna.accounts.switch-output/v1` DTO. It exposes
 only bounded profile/tool identifiers, status booleans, a redacted command and
@@ -174,7 +178,9 @@ tool labels are represented as the opaque `Custom tool` label on switch and
 supervisor output. Raw arguments and environment values remain available only
 to the immediate provider spawn. Legacy prelaunch state is projected through
 its explicit schema rather than recursively copying unknown fields, and public
-recursive redaction uses prototype-safe objects.
+recursive redaction uses null-prototype objects populated only from own
+enumerable data descriptors. Accessors, inherited fields, pollution keys,
+proxies, and non-plain objects are not evaluated or copied.
 
 Unix supervisor directories, state files, and sockets are owner-only (`0700`,
 `0600`, and `0600`). Accounts refuses symlinked `ACCOUNTS_HOME` or supervisor

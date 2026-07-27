@@ -306,6 +306,55 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch captured command text redacts credential options without erasing diagnostics", () => {
+    const p = profile("codex");
+    const cases = [
+      {
+        output: "provider --api-key prelaunch-api-secret --verbose keep-api-diagnostic",
+        secret: "prelaunch-api-secret",
+        retained: "--verbose keep-api-diagnostic",
+      },
+      {
+        output: 'provider "--secret-key=prelaunch-secret-key-secret" status=keep-secret-key-status',
+        secret: "prelaunch-secret-key-secret",
+        retained: "status=keep-secret-key-status",
+      },
+      {
+        output: "provider --service-auth 'prelaunch service auth secret' --mode keep-service-mode",
+        secret: "prelaunch service auth secret",
+        retained: "--mode keep-service-mode",
+      },
+      {
+        output: "provider --credentials prelaunch-credentials\\ escaped --trace keep-credentials-trace",
+        secret: "prelaunch-credentials escaped",
+        retained: "--trace keep-credentials-trace",
+      },
+      {
+        output: "provider -k prelaunch-short-secret --color keep-short-color",
+        secret: "prelaunch-short-secret",
+        retained: "--color keep-short-color",
+      },
+    ];
+
+    for (const sample of cases) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(sample.output),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain(sample.secret);
+      expect(message).toContain(sample.retained);
+    }
+  });
+
   test("controlled prelaunch errors redact credential-shaped headers", () => {
     resetHome();
     const p = profileInHome("codex");

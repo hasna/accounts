@@ -88,6 +88,10 @@ test("semantic credential-key normalization covers separator and camel-case vari
     "service-auth",
     "bearer",
     "credentials",
+    "encryption-key",
+    "master-key",
+    "client-key",
+    "aws-access-key-id",
   ];
   const benign = [
     "oauth_scope",
@@ -103,10 +107,47 @@ test("semantic credential-key normalization covers separator and camel-case vari
     "credential-provider",
     "service-account",
     "authorization-policy",
+    "keyboard",
+    "keynote",
+    "monkey",
+    "hockey",
+    "turkey",
   ];
 
   for (const key of sensitive) expect(isSensitiveCredentialKey(key), key).toBe(true);
   for (const key of benign) expect(isSensitiveCredentialKey(key), key).toBe(false);
+
+  const generatedQualifiers = [
+    "backup",
+    "cache",
+    "custom",
+    "database",
+    "device",
+    "encryption",
+    "ephemeral",
+    "identity",
+    "integration",
+    "master",
+    "organization",
+    "project",
+    "provider",
+    "recovery",
+    "runtime",
+    "tenant",
+    "workspace",
+  ];
+  for (const qualifier of generatedQualifiers) {
+    for (const key of [
+      `${qualifier}-key`,
+      `${qualifier}_key`,
+      `${qualifier} key`,
+      `${qualifier}Key`,
+      `key-${qualifier}`,
+      `${qualifier}-key-id`,
+    ]) {
+      expect(isSensitiveCredentialKey(key), key).toBe(true);
+    }
+  }
 
   const rawSecrets = sensitive.map((key, index) => `${key}=normalized-raw-${index}`);
   const jsonSecrets = Object.fromEntries(
@@ -262,6 +303,84 @@ test("argument redaction fails closed on combined and Unicode credential short o
   expect(redacted.at(-1)).toBe("keep-bearer-mode");
 });
 
+test("command-text redaction shares argv option grammar across quoting and boundaries", () => {
+  const secrets = [
+    "command-api-secret",
+    "command-secret-key-secret",
+    "command-service-auth secret",
+    "command-credentials escaped",
+    "command-short-secret",
+    "command-cluster-secret",
+    "command-attached-cluster-secret",
+    "command-encryption-secret",
+    "command-master-secret",
+    "command-client-secret",
+    "command-access-key-id-secret",
+    "command-repeated-api-secret",
+    "command-repeated-client-secret",
+    "command-wrapped-secret",
+    "command-punctuation-secret",
+    "command escaped quoted secret",
+    "command-attached-punctuation-secret",
+    "command-escaped-semicolon-secret",
+    "command-quoted-semicolon-secret",
+  ];
+  const input = [
+    `provider --api-key ${secrets[0]} --verbose keep-verbose`,
+    `provider "--secret-key=${secrets[1]}" status=keep-quoted-status`,
+    `provider --service-auth '${secrets[2]}' --mode keep-mode`,
+    `provider --credentials command-credentials\\ escaped --trace keep-trace`,
+    `provider -k ${secrets[4]} --color keep-color`,
+    `provider -vk ${secrets[5]} --diagnostic keep-cluster-diagnostic`,
+    `provider -vvk${secrets[6]} --format keep-format`,
+    `provider --encryption-key "${secrets[7]}" --keep encryption-diagnostic`,
+    `provider --master-key=${secrets[8]} --keep master-diagnostic`,
+    `provider --client-key:${secrets[9]} --keep client-diagnostic`,
+    `provider --aws-access-key-id ${secrets[10]} --region keep-region`,
+    `provider --api-key ${secrets[11]} --client-key ${secrets[12]} --keep repeated-diagnostic`,
+    `cmd="provider --api-key ${secrets[13]} --verbose keep-wrapped-diagnostic"`,
+    `error:--api-key ${secrets[14]} --verbose keep-punctuation-diagnostic`,
+    `cmd='provider --client-key \\"${secrets[15]}\\" --mode keep-escaped-quote-mode'`,
+    `error:--master-key=${secrets[16]};status=keep-attached-punctuation`,
+    `provider --api-key=${secrets[17]}\\;escaped-tail-marker --keep escaped-semicolon-diagnostic`,
+    `provider --client-key="${secrets[18]};quoted-tail-marker" --keep quoted-semicolon-diagnostic`,
+    "provider --api-key --verbose keep-missing-value",
+    "provider -- --api-key keep-after-end-of-options",
+    "status=418 keep-final-command-diagnostic",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of secrets) expect(redacted).not.toContain(secret);
+  for (const retained of [
+    "--verbose keep-verbose",
+    "status=keep-quoted-status",
+    "--mode keep-mode",
+    "--trace keep-trace",
+    "--color keep-color",
+    "--diagnostic keep-cluster-diagnostic",
+    "--format keep-format",
+    "--keep encryption-diagnostic",
+    "--keep master-diagnostic",
+    "--keep client-diagnostic",
+    "--region keep-region",
+    "--keep repeated-diagnostic",
+    "--verbose keep-wrapped-diagnostic",
+    "--verbose keep-punctuation-diagnostic",
+    "--mode keep-escaped-quote-mode",
+    "status=keep-attached-punctuation",
+    "--keep escaped-semicolon-diagnostic",
+    "--keep quoted-semicolon-diagnostic",
+    "--api-key --verbose keep-missing-value",
+    "-- --api-key keep-after-end-of-options",
+    "status=418 keep-final-command-diagnostic",
+  ]) {
+    expect(redacted).toContain(retained);
+  }
+  expect(redacted).not.toContain("escaped-tail-marker");
+  expect(redacted).not.toContain("quoted-tail-marker");
+});
+
 test("recursive public redaction uses prototype-safe objects", () => {
   const input = JSON.parse(
     '{"safe":"kept","__proto__":{"secret-key":"prototype-secret"},"nested":{"constructor":{"credentials":"nested-secret"}}}',
@@ -274,6 +393,90 @@ test("recursive public redaction uses prototype-safe objects", () => {
   expect(JSON.stringify(redacted)).not.toContain("prototype-secret");
   expect(JSON.stringify(redacted)).not.toContain("nested-secret");
   expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+});
+
+test("recursive public redaction never evaluates accessors or proxy traps", () => {
+  let getterCount = 0;
+  let proxyTrapCount = 0;
+  const nested = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(nested, {
+    safe: {
+      value: "keep-data-value",
+      enumerable: true,
+    },
+    "secret-key": {
+      value: "descriptor-secret",
+      enumerable: true,
+    },
+    marker: {
+      get() {
+        getterCount++;
+        return "getter-secret-marker";
+      },
+      enumerable: true,
+    },
+    __proto__: {
+      value: { credentials: "prototype-data-secret" },
+      enumerable: true,
+    },
+    constructor: {
+      value: { credentials: "constructor-data-secret" },
+      enumerable: true,
+    },
+  });
+  const array: unknown[] = [];
+  Object.defineProperties(array, {
+    0: {
+      get() {
+        getterCount++;
+        return "array-getter-secret";
+      },
+      enumerable: true,
+    },
+    1: {
+      value: nested,
+      enumerable: true,
+    },
+  });
+  const proxy = new Proxy(
+    { safe: "proxy-data" },
+    {
+      ownKeys(target) {
+        proxyTrapCount++;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        proxyTrapCount++;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      getPrototypeOf(target) {
+        proxyTrapCount++;
+        return Reflect.getPrototypeOf(target);
+      },
+    },
+  );
+  const input = {
+    ordinary: nested,
+    array,
+    proxy,
+  };
+
+  const redacted = redactPublicValue(input) as Record<string, unknown>;
+  const serialized = JSON.stringify(redacted);
+
+  expect(getterCount).toBe(0);
+  expect(proxyTrapCount).toBe(0);
+  expect(serialized).not.toContain("getter-secret-marker");
+  expect(serialized).not.toContain("array-getter-secret");
+  expect(serialized).not.toContain("descriptor-secret");
+  expect(serialized).not.toContain("prototype-data-secret");
+  expect(serialized).not.toContain("constructor-data-secret");
+  expect(serialized).not.toContain("proxy-data");
+  expect(serialized).toContain("keep-data-value");
+  expect(Object.getPrototypeOf(redacted)).toBeNull();
+  expect(Object.getPrototypeOf(redacted["ordinary"])).toBeNull();
+  expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+  expect(JSON.parse(serialized).ordinary.safe).toBe("keep-data-value");
 });
 
 test("dot, space, escaped, and single-quoted credential keys fail closed", () => {
@@ -1232,4 +1435,24 @@ test("folded redaction scaling stays linear across newline styles and multi-mega
     expect(elapsed[1]!).toBeLessThan(400);
     expect(elapsed[2]!).toBeLessThan(800);
   }
+});
+
+test("command-text option redaction stays bounded on multi-megabyte captured output", () => {
+  const lines = Array.from(
+    { length: 30_000 },
+    (_, index) =>
+      `provider --api-key "command-scaling-secret-${index}" --verbose keep-command-${index}`,
+  );
+  const input = lines.join("\n");
+  expect(input.length).toBeGreaterThan(2 * 1024 * 1024);
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("command-scaling-secret-0");
+  expect(redacted).not.toContain("command-scaling-secret-29999");
+  expect(redacted).toContain("--verbose keep-command-0");
+  expect(redacted).toContain("--verbose keep-command-29999");
+  expect(elapsedMs).toBeLessThan(1_500);
 });

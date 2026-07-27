@@ -94,13 +94,21 @@ Credential-key classification is centralized and normalizes separators and
 camel case, including dot and space boundaries, before applying stemmed
 terminal semantic tokens. This includes `credentials`, `secret-key`,
 `service-account-key`, `auth-header`, `service-auth`, and `bearer` without
-turning benign suffixes such as `credential-provider` into credentials. Valid
+turning benign suffixes such as `credential-provider` into credentials. Any
+distinct normalized `key` token is sensitive regardless of qualifier or
+position, covering `encryption-key`, `master-key`, `client-key`, and
+`access-key-id` without matching unsplit words such as `keyboard`, `keynote`,
+`monkey`, `hockey`, or `turkey`. Valid
 JSON documents are walked recursively after JSON key escape decoding; escaped
 and single-quoted keys in malformed serialized fragments use the same
 fail-closed record boundary. Argument redaction handles credential-bearing long
 options separated by `=`, `:`, or the next argv item, the supported `-k value`
 and `-kvalue` forms, combined clusters ending in `k`, and Unicode compatibility
-forms of the short option.
+forms of the short option. Captured command text uses that same policy through
+a line-bounded, quote-aware, forward-only scanner. It handles quoted and
+escaped values, repeated and missing values, punctuation-wrapped options,
+newline resets, and explicit `--` boundaries while preserving unrelated
+diagnostic text.
 
 `src/lib/switch.ts` separates the internal `SwitchResult`, which may contain
 raw launch material, from the explicit public
@@ -111,9 +119,12 @@ profiles, and complete tool definitions remain internal. The supervisor client
 also projects socket responses rather than trusting unknown fields, and legacy
 state parsing constructs the current schema field by field instead of spreading
 persisted data. Nested prelaunch state has its own explicit allowlist, recursive
-redaction allocates null-prototype objects, and caller-defined tool labels are
+redaction allocates null-prototype objects from own enumerable data descriptors
+only, and caller-defined tool labels are
 represented by an opaque `Custom tool` label rather than reflected into public
-switch or supervisor messages.
+switch or supervisor messages. Accessors, inherited fields, pollution keys,
+proxies, and non-plain objects are rejected or omitted without evaluating their
+payloads.
 
 Supervisor arguments remain raw only in memory long enough to spawn the
 provider child. State files, legacy-state reads, switch responses, and

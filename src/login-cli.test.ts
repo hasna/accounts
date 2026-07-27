@@ -592,7 +592,7 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
   expect(runCli("add", "acct", "--tool", "argv-grammar").status).toBe(0);
 
   const secrets = Array.from(
-    { length: 11 },
+    { length: 15 },
     (_, index) => `actual-switch-credential-${index}`,
   );
   const credentialArgs = [
@@ -615,6 +615,12 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     "−k",
     secrets[9]!,
     `-vk${secrets[10]}`,
+    "--encryption-key",
+    secrets[11]!,
+    `--master-key=${secrets[12]}`,
+    `--client-key:${secrets[13]}`,
+    "--aws-access-key-id",
+    secrets[14]!,
   ];
 
   for (const surfaceArgs of [
