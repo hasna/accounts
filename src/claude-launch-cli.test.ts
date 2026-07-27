@@ -16,6 +16,7 @@ import {
   prepareWindowsBatchCommand,
   redactArgv,
   redactText,
+  resolveExecutable,
 } from "./lib/claude-launch.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -352,6 +353,62 @@ describe("Claude launch planning", () => {
     });
     expect(() => planClaudeLaunch(getTool("codex"), ["Prompt"], { headless: true })).toThrow(/only with --tool claude/);
   });
+});
+
+test("PATH resolution skips entries execvp would skip", () => {
+  if (process.platform === "win32") return;
+  const shadow = mkdtempSync(join(tmpdir(), "accounts-claude-shadow-"));
+  const real = mkdtempSync(join(tmpdir(), "accounts-claude-real-"));
+  const empty = mkdtempSync(join(tmpdir(), "accounts-claude-empty-"));
+  try {
+    const executable = join(real, "claude");
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+
+    // A stale shim left without the executable bit.
+    const unreadable = join(shadow, "claude");
+    writeFileSync(unreadable, "#!/bin/sh\nexit 0\n");
+    chmodSync(unreadable, 0o644);
+    const path = `${shadow}${delimiter}${real}`;
+    expect(resolveExecutable("claude", { PATH: path })).toBe(executable);
+
+    // A directory named `claude` sitting earlier on PATH.
+    rmSync(unreadable, { force: true });
+    mkdirSync(join(shadow, "claude"));
+    expect(resolveExecutable("claude", { PATH: path })).toBe(executable);
+
+    // Nothing runnable anywhere: leave the bare name for execvp to report.
+    expect(resolveExecutable("claude", { PATH: `${shadow}${delimiter}${empty}` })).toBe("claude");
+  } finally {
+    for (const dir of [shadow, real, empty]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("launch skips a non-executable claude shadowing PATH", () => {
+  if (process.platform === "win32") return;
+  addProfile("acct");
+  const shadow = mkdtempSync(join(tmpdir(), "accounts-claude-shadow-cli-"));
+  try {
+    const unreadable = join(shadow, "claude");
+    writeFileSync(unreadable, "#!/bin/sh\nexit 0\n");
+    chmodSync(unreadable, 0o644);
+    const inheritedPath = Object.entries(process.env)
+      .find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
+    const result = runCli(
+      ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "Shadowed prompt"],
+      {
+        cwd: launchCwd,
+        env: { PATH: `${shadow}${delimiter}${binDir}${delimiter}${inheritedPath}` },
+      },
+    );
+    expectStatus(result, 0);
+    expect(claudeEntries()[0]).toMatchObject({
+      args: ["-p", "Shadowed prompt"],
+      cwd: launchCwd,
+    });
+  } finally {
+    rmSync(shadow, { recursive: true, force: true });
+  }
 });
 
 test("Windows batch commands escape shell metacharacters before serialization", () => {

@@ -1,6 +1,15 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants as fsConstants,
+  openSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, extname, isAbsolute, join } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
@@ -299,6 +308,22 @@ function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefi
   return key ? env[key] : undefined;
 }
 
+/**
+ * PATH entries that merely exist are not what execvp would run: a directory
+ * named `claude`, or a stale shim left without the executable bit, is skipped
+ * by the kernel and must be skipped here too, or a previously working launch
+ * turns into EACCES.
+ */
+function isExecutableFile(candidate: string): boolean {
+  try {
+    if (!statSync(candidate, { throwIfNoEntry: false })?.isFile()) return false;
+    accessSync(candidate, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function resolveExecutable(bin: string, env: NodeJS.ProcessEnv): string {
   if (isAbsolute(bin) || /[\\/]/.test(bin)) return bin;
   const extensions =
@@ -314,10 +339,10 @@ export function resolveExecutable(bin: string, env: NodeJS.ProcessEnv): string {
     if (!directory) continue;
     for (const extension of extensions) {
       const candidate = join(directory, `${bin}${extension.toLowerCase()}`);
-      if (existsSync(candidate)) return candidate;
+      if (isExecutableFile(candidate)) return candidate;
       if (process.platform === "win32") {
         const upperCandidate = join(directory, `${bin}${extension.toUpperCase()}`);
-        if (existsSync(upperCandidate)) return upperCandidate;
+        if (isExecutableFile(upperCandidate)) return upperCandidate;
       }
     }
   }

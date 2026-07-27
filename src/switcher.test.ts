@@ -209,6 +209,49 @@ test("profileEnv clears Claude API auth environment variables", async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("profileEnv leaves unrelated cloud SDK configuration alone", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "env-blast-"));
+  writeOAuth(dir, "blast@example.com");
+  addProfile({ name: "envblast", dir });
+  ensureProfileAuthSnapshot(dir, getTool("claude"));
+
+  const env = profileEnv(getProfile("envblast", "claude"), getTool("claude"));
+
+  // `accounts env`, `shell`, `launch`, `use`, and the supervisor render this
+  // record into the caller's own shell, where an empty value is not an unset
+  // one: botocore resolves AWS_CONFIG_FILE="" to "" rather than ~/.aws/config,
+  // so blanking these here would drop the caller's profiles, region, and
+  // credentials for every later command. The wider provider surface belongs to
+  // CLAUDE_CONTINUATION_SCRUB_ENV_KEYS and the continuation broker alone.
+  const keys = Object.keys(env);
+  for (const key of [
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AZURE_CLIENT_ID",
+    "CLOUDSDK_CONFIG",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+  ]) {
+    expect(keys).not.toContain(key);
+  }
+  expect(
+    keys.filter((key) => /^(AWS|AZURE|CLOUDSDK|GCE|GCLOUD|GOOGLE|VERTEX)_/.test(key)),
+  ).toEqual([]);
+  expect(keys).toEqual([
+    "CLAUDE_CONFIG_DIR",
+    "TELEGRAM_STATE_DIR",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_API_KEY_HELPER",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+  ]);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("applyProfile writes oauth to live paths", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-"));
   writeOAuth(workDir, "work@example.com");

@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
   CLAUDE_API_AUTH_ENV_KEYS,
+  CLAUDE_CONTINUATION_SCRUB_ENV_KEYS,
   CLAUDE_NETWORK_ROUTING_ENV_KEYS,
 } from "./lib/claude-auth.js";
 import type { Profile } from "./types.js";
@@ -45,6 +46,14 @@ const CLAUDE_220_SETTINGS_OVERRIDE_ENV_KEYS = [
 ] as const;
 // Unprefixed proxy and TLS-trust variables redirect and un-verify the launched
 // session even though no vendor prefix names them.
+const CLAUDE_220_CALLER_SDK_CONFIG_ENV_KEYS = [
+  "AWS_CONFIG_FILE",
+  "AWS_PROFILE",
+  "AWS_REGION",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "CLOUDSDK_CONFIG",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+] as const;
 const CLAUDE_220_GENERIC_ROUTING_ENV_KEYS = [
   "ALL_PROXY",
   "CURL_CA_BUNDLE",
@@ -472,10 +481,11 @@ describe.skipIf(process.platform !== "linux")("accounts sessions resume", () => 
     const sourcePath = writeSession(source);
     const sourceBytes = readFileSync(sourcePath);
     const sourceStat = lstatSync(sourcePath);
-    expect(CLAUDE_API_AUTH_ENV_KEYS).toEqual(
+    expect(CLAUDE_CONTINUATION_SCRUB_ENV_KEYS).toEqual(
       expect.arrayContaining([
         ...CLAUDE_220_AWS_METADATA_ENV_KEYS,
         ...CLAUDE_220_SETTINGS_OVERRIDE_ENV_KEYS,
+        ...CLAUDE_220_CALLER_SDK_CONFIG_ENV_KEYS,
       ]),
     );
     expect(CLAUDE_NETWORK_ROUTING_ENV_KEYS).toEqual(
@@ -493,7 +503,10 @@ describe.skipIf(process.platform !== "linux")("accounts sessions resume", () => 
       ],
       {
         ...Object.fromEntries(
-          CLAUDE_API_AUTH_ENV_KEYS.map((key) => [key, "caller-override"]),
+          [
+            ...CLAUDE_API_AUTH_ENV_KEYS,
+            ...CLAUDE_CONTINUATION_SCRUB_ENV_KEYS,
+          ].map((key) => [key, "caller-override"]),
         ),
         ...Object.fromEntries(
           CLAUDE_NETWORK_ROUTING_ENV_KEYS.map((key) => [
@@ -509,7 +522,8 @@ describe.skipIf(process.platform !== "linux")("accounts sessions resume", () => 
         LD_PRELOAD: "",
         NODE_OPTIONS: "",
         FAKE_CLAUDE_POISON_KEYS: [
-          ...CLAUDE_API_AUTH_ENV_KEYS.filter(
+          ...CLAUDE_API_AUTH_ENV_KEYS,
+          ...CLAUDE_CONTINUATION_SCRUB_ENV_KEYS.filter(
             (key) => key !== "AWS_EC2_METADATA_DISABLED",
           ),
           ...CLAUDE_NETWORK_ROUTING_ENV_KEYS,
@@ -2073,6 +2087,41 @@ setInterval(() => void fd, 1000);
     );
 
     expect(result.status).toBe(0);
+    expect(launchEvents().filter((entry) => entry.kind === "launch")).toHaveLength(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      mode: "cross_owner_fork",
+      target: target.name,
+    });
+  });
+
+  test("cross-owner launch pins the entry execvp would run, not an earlier non-executable one", () => {
+    const source = profile("source");
+    const target = profile("target");
+    writeStore([source, target]);
+    writeSession(source);
+    // A stale shim without the executable bit: execvp skips it, so the pinned
+    // private copy must be taken from the real binary further along PATH.
+    const shadowDir = join(root, "shadow-bin");
+    mkdirSync(shadowDir, { recursive: true });
+    const shadow = join(shadowDir, "claude");
+    writeFileSync(shadow, "#!/usr/bin/env bun\nprocess.exit(91);\n");
+    chmodSync(shadow, 0o644);
+
+    const result = runCli(
+      [
+        "sessions",
+        "resume",
+        SOURCE_UUID,
+        "--account",
+        target.name,
+        "--json",
+      ],
+      {
+        PATH: `${shadowDir}${delimiter}${binDir}${delimiter}${process.env.PATH ?? ""}`,
+      },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(launchEvents().filter((entry) => entry.kind === "launch")).toHaveLength(1);
     expect(JSON.parse(result.stdout)).toMatchObject({
       mode: "cross_owner_fork",

@@ -25,18 +25,39 @@ import { assertSafeWritePath } from "./safe-path.js";
 type JsonRecord = Record<string, unknown>;
 
 /**
- * Claude Code 2.1.220 credential, provider-selection, and provider-routing
- * environment surface. A selected Accounts profile is the sole auth authority:
- * inherited process variables must not redirect the client or inject alternate
- * credentials, headers, file descriptors, cloud profiles, or provider modes.
- *
- * Keep this explicit and version-reviewed with the continuation adapter. Broad
- * prefix deletion would also erase unrelated Claude feature flags.
+ * Anthropic credential and provider-mode variables a selected profile owns
+ * outright. `accounts env`, `accounts shell`, `accounts launch`, `accounts
+ * use`, and the supervisor blank exactly these through `profileEnv()`, so the
+ * list stays narrow: every key here is emitted as an empty export into the
+ * caller's own shell, and an empty value is not the same as an unset one.
  */
 export const CLAUDE_API_AUTH_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_API_KEY_HELPER",
+  "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+] as const;
+
+/**
+ * The rest of the Claude Code 2.1.220 credential, provider-selection, and
+ * provider-routing environment surface. A selected Accounts profile is the sole
+ * auth authority: inherited process variables must not redirect the client or
+ * inject alternate credentials, headers, file descriptors, cloud profiles, or
+ * provider modes.
+ *
+ * These stay out of CLAUDE_API_AUTH_ENV_KEYS on purpose, for the same reason
+ * CLAUDE_NETWORK_ROUTING_ENV_KEYS does: the cross-account continuation broker
+ * deletes them from the child environment it builds, while `accounts env`,
+ * `accounts run`, and `accounts use` must leave a caller's AWS, Azure, and
+ * Google SDK configuration alone.
+ *
+ * Keep this explicit and version-reviewed with the continuation adapter. Broad
+ * prefix deletion would also erase unrelated Claude feature flags.
+ */
+export const CLAUDE_CONTINUATION_SCRUB_ENV_KEYS = [
   "ANTHROPIC_CUSTOM_HEADERS",
   "ANTHROPIC_CONFIG_DIR",
   "ANTHROPIC_AWS_API_KEY",
@@ -165,8 +186,6 @@ export const CLAUDE_API_AUTH_ENV_KEYS = [
   "CLOUDSDK_PROXY_TYPE",
   "CLOUDSDK_PROXY_USERNAME",
   "CLOUD_ML_REGION",
-  "CLAUDE_CODE_API_KEY_HELPER",
-  "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
   "CLAUDE_CODE_CERT_STORE",
   "CLAUDE_CODE_CLIENT_CERT",
   "CLAUDE_CODE_CLIENT_KEY",
@@ -212,11 +231,9 @@ export const CLAUDE_API_AUTH_ENV_KEYS = [
   "CLAUDE_CODE_SKIP_VERTEX_AUTH",
   "CLAUDE_CODE_USE_ANTHROPIC_AWS",
   "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-  "CLAUDE_CODE_USE_BEDROCK",
   "CLAUDE_CODE_USE_FOUNDRY",
   "CLAUDE_CODE_USE_GATEWAY",
   "CLAUDE_CODE_USE_MANTLE",
-  "CLAUDE_CODE_USE_VERTEX",
   "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
   "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
   "CLAUDE_ENV_FILE",

@@ -39,6 +39,7 @@ import { accountsHome, profilesDir } from "../storage.js";
 import { AccountsError, type Profile, type ToolDef } from "../types.js";
 import {
   CLAUDE_API_AUTH_ENV_KEYS,
+  CLAUDE_CONTINUATION_SCRUB_ENV_KEYS,
   CLAUDE_NETWORK_ROUTING_ENV_KEYS,
 } from "./claude-auth.js";
 import { resolveExecutable, runClaudeLaunch } from "./claude-launch.js";
@@ -432,6 +433,10 @@ function claudeSessionEnv(profile: Profile): NodeJS.ProcessEnv {
   };
   const dynamicHostAuthKey = env.CLAUDE_CODE_HOST_AUTH_ENV_VAR;
   for (const key of CLAUDE_API_AUTH_ENV_KEYS) delete env[key];
+  // The wider provider surface is broker-only: `accounts env` and `accounts use`
+  // must not touch a caller's AWS, Azure, or Google SDK configuration, but the
+  // continuation child inherits nothing that could redirect or re-credential it.
+  for (const key of CLAUDE_CONTINUATION_SCRUB_ENV_KEYS) delete env[key];
   // Generic proxy and TLS-trust variables are provider routing without a vendor
   // prefix: keeping them would let the caller MITM the profile bearer token.
   for (const key of CLAUDE_NETWORK_ROUTING_ENV_KEYS) delete env[key];
@@ -486,6 +491,7 @@ function inspectProviderAuthSettings(profileDir: string, cwd: string): string {
   ]);
   const forbiddenEnv = new Set<string>([
     ...CLAUDE_API_AUTH_ENV_KEYS,
+    ...CLAUDE_CONTINUATION_SCRUB_ENV_KEYS,
     ...CLAUDE_NETWORK_ROUTING_ENV_KEYS,
     "BUN_OPTIONS",
     "DYLD_INSERT_LIBRARIES",
