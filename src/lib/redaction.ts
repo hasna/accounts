@@ -5,13 +5,17 @@ const SENSITIVE_REQUEST_HEADER_PATTERN =
   /(^|[^A-Za-z0-9_-])(["']?)(authorization|proxy-authorization|cookie|set-cookie)\2[ \t]*[:=][ \t]*/gim;
 const SERIALIZED_FIELD_BOUNDARY = /^,[ \t]*["']?[A-Za-z][A-Za-z0-9_-]*["']?[ \t]*:/;
 const HEADER_LINE_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:/;
-const FIELD_ASSIGNMENT_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*=/;
 const AUTH_PARAMETER_PATTERN =
   /^(?:credential|signedheaders|signature|username|realm|nonce|response|uri|algorithm|qop|nc|cnonce|opaque|charset|stale|userhash)[ \t]*=/i;
-const INDEPENDENT_DIAGNOSTIC_PATTERN =
-  /^(?:status|message|error|code|request[-_]?id|trace[-_]?id|span[-_]?id|attempt|retryable|completed|duration|elapsed|method|url|path|host|response|result|outcome|event|level|timestamp)[ \t]*[:=]/i;
 const SET_COOKIE_ATTRIBUTE_PATTERN =
   /^(?:(?:expires|max-age|domain|path|samesite)[ \t]*=|(?:secure|httponly|partitioned)(?:[ \t]*[;,]|$))/i;
+const HTTP_TOKEN_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const AUTH_TOKEN68_PATTERN = /^[A-Za-z0-9._~+/-]+=*$/;
+const COOKIE_VALUE_FRAGMENT_PATTERN = /^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+$/;
+const COOKIE_VALUE_TAIL_PATTERN =
+  /(?:^|;[ \t]*)[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*=[ \t]*(?:"[^"\r\n]*"|[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*)$/;
+const AUTH_PARAMETER_TAIL_PATTERN =
+  /(?:^|,[ \t]*)(?:credential|signedheaders|signature|username|realm|nonce|response|uri|algorithm|qop|nc|cnonce|opaque|charset|stale|userhash)[ \t]*=[ \t]*[^,\s]*$/i;
 
 type SensitiveHeaderName = "authorization" | "proxy-authorization" | "cookie" | "set-cookie";
 
@@ -27,28 +31,106 @@ function nextLineEnd(value: string, start: number): number {
   return Math.min(cr, lf);
 }
 
+function unfoldedHeaderValue(value: string): string {
+  return value.replace(/(?:\r\n|\r|\n)[ \t]+/g, " ").trim();
+}
+
+function compactFoldedHeaderValue(value: string): string {
+  return value.replace(/(?:\r\n|\r|\n)[ \t]+/g, "").trim();
+}
+
+function startsAuthorizationValue(value: string): boolean {
+  const separator = value.search(/[ \t]/);
+  if (separator <= 0 || !HTTP_TOKEN_PATTERN.test(value.slice(0, separator))) return false;
+  const credential = value.slice(separator).trim();
+  return AUTH_TOKEN68_PATTERN.test(credential) || AUTH_PARAMETER_PATTERN.test(credential);
+}
+
+function authorizationTokenCanContinue(value: string, nextLine: string): boolean {
+  if (!AUTH_TOKEN68_PATTERN.test(nextLine)) return false;
+  const compacted = compactFoldedHeaderValue(value);
+  if (HTTP_TOKEN_PATTERN.test(compacted)) return true;
+
+  const separator = compacted.search(/[ \t]/);
+  if (separator > 0 && HTTP_TOKEN_PATTERN.test(compacted.slice(0, separator))) {
+    const credential = compacted.slice(separator).trim();
+    if (AUTH_TOKEN68_PATTERN.test(credential)) return true;
+  }
+
+  return AUTH_PARAMETER_TAIL_PATTERN.test(compacted);
+}
+
+function isCookiePair(value: string): boolean {
+  const separator = value.indexOf("=");
+  if (separator <= 0 || !HTTP_TOKEN_PATTERN.test(value.slice(0, separator).trim())) return false;
+  const cookieValue = value.slice(separator + 1).trim();
+  if (!cookieValue) return false;
+  if (cookieValue.startsWith('"')) return cookieValue.length >= 2 && cookieValue.endsWith('"');
+  return COOKIE_VALUE_FRAGMENT_PATTERN.test(cookieValue);
+}
+
+function isCookiePairLine(headerName: SensitiveHeaderName, value: string): boolean {
+  const segments = value.split(";");
+  if (!isCookiePair(segments[0]!.trim())) return false;
+
+  for (const segment of segments.slice(1)) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    if (headerName === "set-cookie") {
+      if (!SET_COOKIE_ATTRIBUTE_PATTERN.test(trimmed)) return false;
+    } else if (!isCookiePair(trimmed)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function cookieValueCanContinue(
+  headerName: SensitiveHeaderName,
+  value: string,
+  nextLine: string,
+): boolean {
+  if (!COOKIE_VALUE_TAIL_PATTERN.test(compactFoldedHeaderValue(value))) return false;
+  if (COOKIE_VALUE_FRAGMENT_PATTERN.test(nextLine)) return true;
+
+  const delimiter = nextLine.indexOf(";");
+  if (delimiter <= 0 || !COOKIE_VALUE_FRAGMENT_PATTERN.test(nextLine.slice(0, delimiter).trim())) {
+    return false;
+  }
+  const remainder = nextLine.slice(delimiter + 1).trim();
+  if (!remainder) return true;
+  if (isCookiePairLine(headerName, remainder)) return true;
+  return headerName === "set-cookie" && SET_COOKIE_ATTRIBUTE_PATTERN.test(remainder);
+}
+
 function isSyntacticContinuation(
   headerName: SensitiveHeaderName,
+  headerValue: string,
   previousLine: string,
   nextLine: string,
 ): boolean {
   const trimmed = nextLine.trim();
   if (!trimmed || HEADER_LINE_PATTERN.test(trimmed)) return false;
+  const unfolded = unfoldedHeaderValue(headerValue);
 
   if (headerName === "authorization" || headerName === "proxy-authorization") {
-    if (!previousLine.trimEnd().endsWith(",")) return false;
-    if (AUTH_PARAMETER_PATTERN.test(trimmed)) return true;
-    return !INDEPENDENT_DIAGNOSTIC_PATTERN.test(trimmed) && FIELD_ASSIGNMENT_PATTERN.test(trimmed);
+    if (!unfolded) return startsAuthorizationValue(trimmed);
+    if (previousLine.trimEnd().endsWith(",")) return AUTH_PARAMETER_PATTERN.test(trimmed);
+    return authorizationTokenCanContinue(headerValue, trimmed);
   }
 
-  if (!/[;,][ \t]*$/.test(previousLine)) return false;
-  if (headerName === "set-cookie" && SET_COOKIE_ATTRIBUTE_PATTERN.test(trimmed)) return true;
-  return !INDEPENDENT_DIAGNOSTIC_PATTERN.test(trimmed) && FIELD_ASSIGNMENT_PATTERN.test(trimmed);
+  if (!unfolded) return isCookiePairLine(headerName, trimmed);
+  if (/[;,][ \t]*$/.test(previousLine)) {
+    if (isCookiePairLine(headerName, trimmed)) return true;
+    return headerName === "set-cookie" && SET_COOKIE_ATTRIBUTE_PATTERN.test(trimmed);
+  }
+  return cookieValueCanContinue(headerName, headerValue, trimmed);
 }
 
 function continuationStart(
   value: string,
   lineBreakStart: number,
+  headerValueStart: number,
   lineStart: number,
   headerName: SensitiveHeaderName,
 ): number | undefined {
@@ -57,6 +139,7 @@ function continuationStart(
   const nextEnd = nextLineEnd(value, nextLine);
   return isSyntacticContinuation(
     headerName,
+    value.slice(headerValueStart, lineBreakStart),
     value.slice(lineStart, lineBreakStart),
     value.slice(nextLine, nextEnd),
   )
@@ -73,7 +156,7 @@ function quotedValueEnd(
   let lineStart = start;
   for (let index = start + 1; index < value.length; index++) {
     if (value[index] === "\r" || value[index] === "\n") {
-      const continuation = continuationStart(value, index, lineStart, headerName);
+      const continuation = continuationStart(value, index, start, lineStart, headerName);
       if (continuation === undefined) return index;
       lineStart = continuation;
       index = continuation - 1;
@@ -98,7 +181,7 @@ function unquotedHeaderValueEnd(
   for (let index = start; index < value.length; index++) {
     const char = value[index]!;
     if (char === "\r" || char === "\n") {
-      const continuation = continuationStart(value, index, lineStart, headerName);
+      const continuation = continuationStart(value, index, start, lineStart, headerName);
       if (continuation === undefined) return index;
       lineStart = continuation;
       index = continuation - 1;

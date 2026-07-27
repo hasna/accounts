@@ -221,3 +221,125 @@ test("blank, quoted, and adjacent serialized boundaries retain non-sensitive dat
   expect(redacted).toContain("X-Diagnostic: keep-final-header");
   expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(2);
 });
+
+test("empty-first-line folded sensitive headers redact credential continuations", () => {
+  const input = [
+    "Authorization:\r",
+    " Bearer empty-auth-secret\r",
+    "X-Authorization-Diagnostic: keep-auth-adjacent\r",
+    "Proxy-Authorization:",
+    " Basic empty-proxy-secret",
+    "Cookie:\r",
+    " session=empty-cookie-secret; theme=night\r",
+    "Set-Cookie:",
+    " sid=empty-set-cookie-secret; Path=/",
+    "status=401 keep-status",
+    "message=keep-message",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "empty-auth-secret",
+    "empty-proxy-secret",
+    "empty-cookie-secret",
+    "empty-set-cookie-secret",
+    "theme=night",
+    "Path=/",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const diagnostic of [
+    "X-Authorization-Diagnostic: keep-auth-adjacent",
+    "status=401 keep-status",
+    "message=keep-message",
+  ]) {
+    expect(redacted).toContain(diagnostic);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
+
+test("delimiter-free folded credential tokens are fully redacted", () => {
+  const input = [
+    "Authorization: Bearer split-auth-",
+    " token-middle-a-",
+    " token-fragment-a",
+    "Proxy-Authorization: Basic split-proxy-",
+    "\ttoken-middle-b-",
+    "\ttoken-fragment-b",
+    "Cookie: session=split-cookie-",
+    " token-middle-c-",
+    " token-fragment-c",
+    "Set-Cookie: sid=split-set-cookie-",
+    "\ttoken-middle-d-",
+    "\ttoken-fragment-d; Path=/",
+    "status=429 keep-after-folded-tokens",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "split-auth-",
+    "token-middle-a",
+    "token-fragment-a",
+    "split-proxy-",
+    "token-middle-b",
+    "token-fragment-b",
+    "split-cookie-",
+    "token-middle-c",
+    "token-fragment-c",
+    "split-set-cookie-",
+    "token-middle-d",
+    "token-fragment-d",
+    "Path=/",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted).toContain("status=429 keep-after-folded-tokens");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
+
+test("authorization folding preserves arbitrary independent diagnostic assignments", () => {
+  const input = [
+    "Authorization: AWS4-HMAC-SHA256 Credential=diagnostic-access/20260727/us-east-1/bedrock/aws4_request,",
+    " SignedHeaders=content-type;host;x-amz-date,",
+    " Signature=diagnostic-signature,",
+    " stack=Error: independent credential failure",
+    " detail=Provider rejected request independently",
+    " status=403 keep-status",
+    " message=keep-message",
+    " X-Request-ID: keep-adjacent-header",
+  ].join("\n");
+
+  const redacted = redactText(input);
+
+  for (const secret of ["diagnostic-access", "SignedHeaders", "diagnostic-signature"]) {
+    expect(redacted).not.toContain(secret);
+  }
+  for (const diagnostic of [
+    "stack=Error: independent credential failure",
+    "detail=Provider rejected request independently",
+    "status=403 keep-status",
+    "message=keep-message",
+    "X-Request-ID: keep-adjacent-header",
+  ]) {
+    expect(redacted).toContain(diagnostic);
+  }
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(1);
+});
+
+test("empty sensitive headers preserve indented diagnostics instead of treating assignments as credentials", () => {
+  const input = [
+    "Authorization:",
+    " stack=Error: authorization failed independently",
+    "Proxy-Authorization:",
+    " detail=Proxy rejected request independently",
+    "Cookie:",
+    " status=401 keep-cookie-status",
+    "Set-Cookie:",
+    " message=keep set-cookie message",
+    "X-Request-ID: keep-adjacent-header",
+  ].join("\n");
+
+  expect(redactText(input)).toBe(input);
+});
