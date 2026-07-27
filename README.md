@@ -180,9 +180,14 @@ bound as that value. Only a complete bare option or a complete sensitive
 attached form replaces pending state. Bare option syntax is exactly one or two
 compatibility-normalized leading dashes, an alphanumeric body start, then only
 alphanumerics, dots, underscores, or dashes; exact `--` is reserved for the
-end-of-options marker. Three-or-more dash runs and dot- or underscore-leading
-bodies, including malformed attached credential-looking forms, remain one
-opaque bound value. Attached values that resemble options,
+end-of-options marker. Compatibility normalization applies to option names,
+not this control token: only one complete raw, unquoted, unescaped, standalone
+ASCII `--` token ends interpretation. Unicode dash pairs, quoted or escaped
+markers, wrappers, and punctuation-adjacent fragments remain value or text
+data, so they cannot expose a later credential option. Three-or-more dash runs
+and dot- or underscore-leading bodies, including malformed attached
+credential-looking forms, remain one opaque bound value. Attached values that
+resemble options,
 including `--api-key=--client-key` and its colon form, are redacted in place
 without consuming the next safe token. While a separate value is pending, the
 complete physical token is classified before embedded punctuation. Unless the
@@ -204,7 +209,7 @@ commas, and semicolons), while embedded word, URL, email, and arithmetic forms
 remain ordinary text. Balanced punctuation inside structured URL/email values
 stays data, while a closing outer wrapper or quote resumes option parsing. The
 scanner still retains later whitespace-separated options and explicit unquoted
-`--` boundaries, and
+standalone ASCII `--` boundaries, and
 its line, token, and quoted-segment passes remain forward-only for bounded
 linear work.
 Captured stderr and stdout are bounded and redacted as separate process

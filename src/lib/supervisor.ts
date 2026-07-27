@@ -1084,7 +1084,9 @@ export async function runSupervisedTool(
     // a local-only write that would diverge from the cloud "current".
     await store.useProfile(profile.name, tool.id);
     const env = profileEnv(profile, tool);
-    log(`accounts supervisor: starting ${tool.bin} for ${profile.name}`);
+    log(
+      `accounts supervisor: starting ${redactText(tool.bin)} for ${profile.name}`,
+    );
     prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
     requireStableBoundary(boundary);
     const proc = spawn(tool.bin, childArgs, {
@@ -1099,7 +1101,11 @@ export async function runSupervisedTool(
     persist();
 
     proc.once("error", (err) => {
-      log(`accounts supervisor: failed to start ${tool.bin}: ${redactText(err.message)}`);
+      log(
+        `accounts supervisor: failed to start ${redactText(tool.bin)}: ${redactText(
+          err.message,
+        )}`,
+      );
       if (!restarting && !stopping) finishRun(1);
     });
 

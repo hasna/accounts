@@ -368,7 +368,11 @@ async function relayProcess(tool: ToolDef, args: string[], env: NodeJS.ProcessEn
     };
     child.once("error", (error) => {
       cleanup();
-      reject(new AccountsError(`failed to launch ${tool.bin}: ${redactText(error.message)}`));
+      reject(
+        new AccountsError(
+          `failed to launch ${redactText(tool.bin)}: ${redactText(error.message)}`,
+        ),
+      );
     });
     child.once("exit", (code, signal) => {
       cleanup();

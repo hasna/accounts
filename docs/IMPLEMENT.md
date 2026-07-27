@@ -122,8 +122,12 @@ can replace pending state. The shared bare-option grammar requires exactly one
 or two compatibility-normalized leading dashes followed by an alphanumeric
 body start; later body characters may be alphanumeric, dot, underscore, or
 dash. Exact `--` is handled only as the end-of-options sentinel. Longer dash
-runs and dot- or underscore-leading bodies, including credential-looking
-attached forms, stay opaque bound values. Attached credential values that
+normalization is not used for that control decision: the scanner requires the
+complete physical token to be raw, unquoted, unescaped, standalone ASCII `--`.
+Unicode dash pairs, quoted or escaped markers, wrappers, and
+punctuation-adjacent fragments remain value or text data. Longer dash runs and
+dot- or underscore-leading bodies, including credential-looking attached
+forms, stay opaque bound values. Attached credential values that
 themselves resemble options are redacted in place before punctuation splitting,
 so the next safe token remains visible. A pending separate value is classified
 as one complete physical token before embedded punctuation is considered.
@@ -146,8 +150,8 @@ pending or active, safe punctuation boundaries include `:`, `=`, `|`, `/`, `<`,
 and arithmetic near-misses remain ordinary text. Balanced punctuation opened
 inside a structured URL/email value does not end that context, while a closing
 outer wrapper or quote resumes option parsing. Explicit unquoted `--` still
-ends options for that physical command record only when it is not part of a
-pending or active sensitive value.
+ends options for that physical command record only when it is the complete raw
+standalone ASCII token and is not part of a pending or active sensitive value.
 Prelaunch stderr and stdout are line-bounded and passed through the scanner as
 separate records; pending option state cannot cross a process-stream boundary.
 

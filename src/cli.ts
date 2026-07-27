@@ -607,7 +607,13 @@ program
         stdio: "inherit",
         env: providerLaunchEnv(process.env, env),
       });
-      if (res.error) die(`failed to launch ${tool.bin}: ${redactText(res.error.message)}`);
+      if (res.error) {
+        die(
+          `failed to launch ${redactText(tool.bin)}: ${redactText(
+            res.error.message,
+          )}`,
+        );
+      }
       if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
       const finalized = await finalizeLogin(name, tool.id, store);
       if (finalized.applied) {
@@ -753,7 +759,13 @@ addConfigsOptions(program
             stdio: "inherit",
             env: providerLaunchEnv(process.env, result.env),
           });
-          if (res.error) die(`failed to launch ${bin}: ${redactText(res.error.message)}`);
+          if (res.error) {
+            die(
+              `failed to launch ${redactText(bin!)}: ${redactText(
+                res.error.message,
+              )}`,
+            );
+          }
           process.exit(res.status ?? 0);
         }
       },

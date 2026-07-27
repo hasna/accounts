@@ -500,6 +500,90 @@ test("argument end-of-options preservation stays linear across large positional 
   expect(elapsedMs).toBeLessThan(1_500);
 });
 
+test("captured command end-of-options requires one exact raw ASCII token", () => {
+  const normalizedDashes = [
+    "\u2010",
+    "\u2011",
+    "\u2012",
+    "\u2013",
+    "\u2014",
+    "\u2015",
+    "\u2212",
+    "\uFE58",
+    "\uFE63",
+    "\uFF0D",
+  ];
+  const falseMarkers = [
+    ...normalizedDashes.map((dash) => `${dash}${dash}`),
+    '"--"',
+    "'--'",
+    "\\--",
+    "\\-\\-",
+    "(--)",
+    "[--]",
+    "{--}",
+    "<-->",
+    "x|--",
+    "x/--",
+    "x:--",
+  ];
+
+  for (const [markerIndex, marker] of falseMarkers.entries()) {
+    const ordinarySecret = `argv-false-marker-ordinary-${markerIndex}-secret`;
+    const ordinaryRetained = `keep-argv-false-marker-ordinary-${markerIndex}`;
+    const ordinary = redactArgv([
+      "provider",
+      marker,
+      `--client-key=${ordinarySecret}`,
+      "--trace",
+      ordinaryRetained,
+    ]);
+    expect(ordinary.join(" ")).not.toContain(ordinarySecret);
+    expect(ordinary).toContain(ordinaryRetained);
+
+    const pendingSecret = `argv-false-marker-pending-${markerIndex}-secret`;
+    const pendingRetained = `keep-argv-false-marker-pending-${markerIndex}`;
+    const pending = redactArgv([
+      "provider",
+      "--api-key",
+      marker,
+      `--client-key=${pendingSecret}`,
+      "--trace",
+      pendingRetained,
+    ]);
+    expect(pending.join(" ")).not.toContain(pendingSecret);
+    expect(pending).toContain(pendingRetained);
+  }
+
+  for (const [lineIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+    for (const [markerIndex, marker] of falseMarkers.entries()) {
+      for (const context of ["ordinary", "pending", "active"] as const) {
+        const secret =
+          `false-marker-${context}-${lineIndex}-${markerIndex}-secret`;
+        const retained =
+          `keep-false-marker-${context}-${lineIndex}-${markerIndex}`;
+        const input = context === "ordinary"
+          ? `provider${lineEnding}${marker} --client-key=${secret} --trace ${retained}`
+          : context === "pending"
+            ? `provider --api-key${lineEnding}${marker} --client-key=${secret} --trace ${retained}`
+            : `provider --api-key seed\\${lineEnding}tail/${marker} --client-key=${secret} --trace ${retained}`;
+        const redacted = redactText(input);
+
+        expect(redacted, input).not.toContain(secret);
+        expect(redacted, input).toContain(`--trace ${retained}`);
+      }
+    }
+
+    const ordinarySentinel =
+      `provider${lineEnding}-- --api-key keep-ordinary-${lineIndex}`;
+    expect(redactText(ordinarySentinel)).toBe(ordinarySentinel);
+
+    const pendingSentinel =
+      `provider --api-key${lineEnding}-- --client-key keep-pending-${lineIndex}`;
+    expect(redactText(pendingSentinel)).toBe(pendingSentinel);
+  }
+});
+
 test("command-text chained sensitive options preserve pending state across line endings", () => {
   for (const lineEnding of ["\n", "\r\n", "\r"]) {
     const secret = `command-chained-secret-${lineEnding.length}`;

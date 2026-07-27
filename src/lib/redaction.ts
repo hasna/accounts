@@ -486,7 +486,6 @@ interface CommandOptionView {
   prefix: string;
   suffix: string;
   option?: CredentialOption;
-  endOfOptions: boolean;
 }
 
 const EMBEDDED_OPTION_BOUNDARIES = new Set([
@@ -743,11 +742,19 @@ function commandOptionView(
     const token = value.slice(start, end);
     const normalized = normalizeCommandToken(token);
     if (normalized === "--") {
-      return {
-        prefix: value.slice(0, start),
-        suffix: value.slice(end),
-        endOfOptions: true,
-      };
+      // End-of-options is control syntax, not normalized option grammar.
+      // Embedded discovery must never promote a compatibility-normalized,
+      // wrapped, or punctuation-adjacent dash pair into that control state.
+      while (start < end) {
+        observeCommandSegmentChar(
+          segment,
+          value[start]!,
+          value[start + 1],
+          value[start + 2],
+        );
+        start++;
+      }
+      continue;
     }
 
     const separator = normalized.search(/[=:]/);
@@ -774,14 +781,12 @@ function commandOptionView(
         prefix: value.slice(0, start),
         suffix: value.slice(end),
         option,
-        endOfOptions: false,
       };
     }
     if (includeNonSensitive) {
       return {
         prefix: value.slice(0, start),
         suffix: value.slice(end),
-        endOfOptions: false,
       };
     }
     while (start < end) {
@@ -815,10 +820,23 @@ function completeCommandOptionView(
   const view = commandOptionView(token.decoded, true);
   if (!view || view.prefix || view.suffix) return undefined;
   const normalized = normalizeCommandToken(token.decoded);
-  if (view.endOfOptions) return normalized === "--" ? view : undefined;
 
   if (isBareCommandOption(normalized)) return view;
   return view.option?.kind === "attached" ? view : undefined;
+}
+
+function isExactCommandEndOfOptions(
+  token: CommandToken,
+  raw: string,
+): boolean {
+  return (
+    raw === "--" &&
+    token.decoded === "--" &&
+    !token.quoted &&
+    !token.escaped &&
+    token.openQuote === undefined &&
+    !token.trailingEscape
+  );
 }
 
 function scanCommandToken(
@@ -1102,7 +1120,10 @@ function scanCommandValueContinuation(
  * Open quotes and odd trailing backslashes keep that logical value redacted
  * across later physical fragments.
  */
-function redactCommandTokens(value: string): string {
+function redactCommandTokens(
+  value: string,
+  allowEndOfOptions = true,
+): string {
   const parts: string[] = [];
   let outputCursor = 0;
   let lineStart = 0;
@@ -1182,48 +1203,54 @@ function redactCommandTokens(value: string): string {
         !redactNext,
       );
       const raw = value.slice(item.start, item.end);
+      const exactEndOfOptions =
+        allowEndOfOptions && isExactCommandEndOfOptions(item, raw);
       const optionView = !endOfOptions
         ? commandOptionView(item.decoded)
         : undefined;
       const nextOptionView =
-        redactNext
+        redactNext && !exactEndOfOptions
           ? completeCommandOptionView(item)
           : undefined;
 
       if (redactNext) {
-        const bareLineContinuation =
-          !item.quoted &&
-          item.trailingEscape &&
-          item.decoded === "\\";
-        if (bareLineContinuation) {
-          pendingCrossedLine = false;
-          tokenCursor = item.end;
-          continue;
-        }
-        if (nextOptionView) {
+        if (exactEndOfOptions) {
           redactNext = false;
         } else {
-          parts.push(
-            value.slice(outputCursor, item.start),
-            replaceCommandValue(raw, item.quoted || item.escaped),
-          );
-          outputCursor = item.end;
-          redactNext = false;
-          pendingCrossedLine = false;
-          if (item.openQuote || item.trailingEscape) {
-            valueContinuation = {
-              quote: item.openQuote,
-              escaped: item.openQuote === undefined && item.trailingEscape,
-              crossedLine: false,
-            };
+          const bareLineContinuation =
+            !item.quoted &&
+            item.trailingEscape &&
+            item.decoded === "\\";
+          if (bareLineContinuation) {
+            pendingCrossedLine = false;
+            tokenCursor = item.end;
+            continue;
           }
-          tokenCursor = item.end;
-          continue;
+          if (nextOptionView) {
+            redactNext = false;
+          } else {
+            parts.push(
+              value.slice(outputCursor, item.start),
+              replaceCommandValue(raw, item.quoted || item.escaped),
+            );
+            outputCursor = item.end;
+            redactNext = false;
+            pendingCrossedLine = false;
+            if (item.openQuote || item.trailingEscape) {
+              valueContinuation = {
+                quote: item.openQuote,
+                escaped: item.openQuote === undefined && item.trailingEscape,
+                crossedLine: false,
+              };
+            }
+            tokenCursor = item.end;
+            continue;
+          }
         }
       }
 
       pendingCrossedLine = false;
-      if (!endOfOptions && optionView?.endOfOptions) {
+      if (!endOfOptions && exactEndOfOptions) {
         endOfOptions = true;
       } else if (optionView?.option) {
         if (optionView.option.kind === "attached") {
@@ -1314,7 +1341,7 @@ function redactQuotedCommandSegments(value: string): string {
       }
 
       const inner = value.slice(index + 1, close);
-      const redacted = redactCommandTokens(inner);
+      const redacted = redactCommandTokens(inner, false);
       if (redacted !== inner) {
         parts.push(
           value.slice(cursor, index + 1),

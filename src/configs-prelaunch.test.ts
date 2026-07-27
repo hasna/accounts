@@ -532,6 +532,65 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch false end markers never expose later credential options", () => {
+    const p = profile("codex");
+    const falseMarkers = [
+      ...[
+        "\u2010",
+        "\u2011",
+        "\u2012",
+        "\u2013",
+        "\u2014",
+        "\u2015",
+        "\u2212",
+        "\uFE58",
+        "\uFE63",
+        "\uFF0D",
+      ].map((dash) => `${dash}${dash}`),
+      '"--"',
+      "'--'",
+      "\\--",
+      "\\-\\-",
+      "(--)",
+      "[--]",
+      "{--}",
+      "<-->",
+      "x|--",
+      "x/--",
+      "x:--",
+    ];
+
+    for (const [lineIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+      for (const [markerIndex, marker] of falseMarkers.entries()) {
+        for (const pending of [false, true]) {
+          const secret =
+            `prelaunch-false-marker-${lineIndex}-${markerIndex}-${pending}-secret`;
+          const retained =
+            `keep-prelaunch-false-marker-${lineIndex}-${markerIndex}-${pending}`;
+          const output = pending
+            ? `provider --api-key${lineEnding}${marker} --client-key=${secret} --trace ${retained}`
+            : `provider${lineEnding}${marker} --client-key=${secret} --trace ${retained}`;
+          let message = "";
+          try {
+            runConfigsPrelaunch(p, getTool("codex"), {
+              runner: () => ({
+                status: 2,
+                stdout: Buffer.from(""),
+                stderr: Buffer.from(output),
+              }),
+            });
+          } catch (error) {
+            message = error instanceof Error ? error.message : String(error);
+          }
+
+          expect(message, output).not.toContain(secret);
+          expect(message, output).toContain("[REDACTED]");
+          expect(message, output).toContain(retained);
+        }
+      }
+    }
+  });
+
   test("prelaunch command redaction covers logical values continued across lines", () => {
     const p = profile("codex");
 

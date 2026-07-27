@@ -143,6 +143,36 @@ test.skipIf(process.platform !== "linux")("agents probe quotes custom executable
   expect(existsSync(injectionMarker)).toBe(false);
 });
 
+test.skipIf(process.platform === "win32")("agents probe errors reject false end markers before projection", () => {
+  const executable = join(home, "failing-agent-probe");
+  const secret = "agent-probe-false-marker-secret";
+  writeFileSync(
+    executable,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n' 'provider －－ --client-key=${secret} --trace keep-agent-probe' >&2`,
+      "exit 2",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(executable, 0o755);
+  addCustomTool({
+    id: "failing-probe-tool",
+    label: "Failing Probe Tool",
+    envVar: "FAILING_PROBE_HOME",
+    defaultDir: join(home, "failing-probe-default"),
+    bin: executable,
+  });
+  const profile = addProfile({ name: "failing-probe", tool: "failing-probe-tool" });
+
+  const result = runClaudeAgentsJson(profile);
+
+  expect(result.ok).toBe(false);
+  expect(result.error).not.toContain(secret);
+  expect(result.error).toContain("[REDACTED]");
+  expect(result.error).toContain("keep-agent-probe");
+});
+
 // --- default-dir and untracked-process coverage (headless loops were invisible) ---
 
 test("listAgentsAcrossProfiles queries the tool default dir as a synthetic (default) profile", () => {

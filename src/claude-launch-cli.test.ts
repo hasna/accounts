@@ -16,6 +16,7 @@ import {
   prepareWindowsBatchCommand,
   redactArgv,
   redactText,
+  runClaudeLaunch,
 } from "./lib/claude-launch.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -622,6 +623,32 @@ test("immediate crash and missing executable are returned as nonzero diagnostics
   } finally {
     rmSync(emptyPath, { recursive: true, force: true });
   }
+});
+
+test("provider launch errors reject false end markers before surfacing", async () => {
+  const secret = "provider-launch-false-marker-secret";
+  const profile = {
+    name: "provider-launch-error",
+    tool: "codex",
+    dir: home,
+    createdAt: "2026-07-27T00:00:00.000Z",
+  };
+  const tool = {
+    ...getTool("codex"),
+    bin: `missing-provider －－ --client-key=${secret} --trace keep-provider-launch`,
+  };
+  let message = "";
+
+  try {
+    await runClaudeLaunch(profile, tool, [], process.env, launchCwd);
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+
+  expect(message).toContain("failed to launch");
+  expect(message).not.toContain(secret);
+  expect(message).toContain("[REDACTED]");
+  expect(message).toContain("keep-provider-launch");
 });
 
 test("two concurrent profiles serialize keychain use and restore inherited state", async () => {
