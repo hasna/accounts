@@ -3,6 +3,10 @@ import { Argument, type Command } from "commander";
 import { AccountsError } from "../types.js";
 import { resolveStore } from "./store.js";
 import {
+  runClaudeSessionResume,
+  type ClaudeSessionResumeResult,
+} from "./claude-session-resume.js";
+import {
   isClaudeSessionUuid,
   listClaudeSessions,
   type ClaudeSessionCatalogEntry,
@@ -15,6 +19,9 @@ interface SessionsCliOptions {
   project?: string;
   uuid?: string;
   json?: boolean;
+  account?: string;
+  cwd?: string;
+  dryRun?: boolean;
 }
 
 type ActionWrapper = <Args extends unknown[]>(
@@ -232,16 +239,82 @@ async function printSessions(options: SessionsCliOptions): Promise<void> {
   await writeStdout(formatClaudeSessionTable(sessions));
 }
 
-/** Register both `accounts sessions` and the explicit `accounts sessions list`. */
+function formatResumeResult(result: ClaudeSessionResumeResult): string {
+  return [
+    `mode: ${result.mode}`,
+    `source: ${result.source}`,
+    `destination: ${result.destination}`,
+    `target: ${result.target}`,
+    `cwd: ${result.cwd}`,
+    `transaction: ${result.transaction ?? "none"}`,
+    ...(result.fork ? [`fork: ${result.fork}`] : []),
+    `recovery: ${result.recovery}`,
+  ].join("\n");
+}
+
+async function resumeSession(
+  referenceOrUuid: string | undefined,
+  options: SessionsCliOptions,
+): Promise<void> {
+  if (!referenceOrUuid) {
+    throw new AccountsError(
+      "sessions resume requires an opaque catalog reference or a unique UUID",
+    );
+  }
+  if (!options.account) {
+    throw new AccountsError("sessions resume requires --account <target>");
+  }
+  const store = resolveStore();
+  if (store.transport !== "local") {
+    throw new AccountsError(
+      "sessions resume is restricted to the local Accounts registry and uid trust domain",
+    );
+  }
+  const profiles = await store.listProfiles("claude");
+  const targetProfile = await store.getProfile(options.account, "claude");
+  const run = await runClaudeSessionResume({
+    profiles,
+    targetProfile,
+    referenceOrUuid,
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+    dryRun: options.dryRun === true,
+  });
+  if (options.json) await writeStdout(JSON.stringify(run.result, null, 2));
+  else await writeStdout(formatResumeResult(run.result));
+  if (run.exitCode !== 0) process.exitCode = run.exitCode;
+}
+
+/** Register catalog listing plus guarded native resume/fork. */
 export function registerClaudeSessionCommands(program: Command, wrapAction: ActionWrapper): void {
   addOptions(
     program
       .command("sessions")
-      .description("list Accounts-owned local Claude sessions without transcript content")
+      .description("list or safely resume Accounts-owned local Claude sessions")
       .addArgument(
         new Argument("[operation]", "session operation")
-          .choices(["list"])
+          .choices(["list", "resume"])
           .default("list"),
+      )
+      .addArgument(
+        new Argument(
+          "[catalog-ref-or-uuid]",
+          "opaque catalogRef or unique Claude session UUID",
+        ),
       ),
-  ).action(wrapAction((_operation: string, options: SessionsCliOptions) => printSessions(options)));
+  )
+    .option("--account <name>", "target local Accounts Claude profile")
+    .option("--cwd <path>", "explicit absolute launch cwd; never inferred from the caller")
+    .option("--dry-run", "validate all applicable gates without mutation or launch")
+    .action(
+      wrapAction(
+        (
+          operation: "list" | "resume",
+          referenceOrUuid: string | undefined,
+          options: SessionsCliOptions,
+        ) =>
+          operation === "resume"
+            ? resumeSession(referenceOrUuid, options)
+            : printSessions(options),
+      ),
+    );
 }

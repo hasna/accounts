@@ -299,19 +299,26 @@ function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefi
   return key ? env[key] : undefined;
 }
 
-function resolveExecutable(bin: string, env: NodeJS.ProcessEnv): string {
-  if (process.platform !== "win32" || isAbsolute(bin) || /[\\/]/.test(bin)) return bin;
-  const extensions = extname(bin)
-    ? [""]
-    : (environmentValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+export function resolveExecutable(bin: string, env: NodeJS.ProcessEnv): string {
+  if (isAbsolute(bin) || /[\\/]/.test(bin)) return bin;
+  const extensions =
+    process.platform === "win32"
+      ? extname(bin)
+        ? [""]
+        : (environmentValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+            .split(";")
+            .filter(Boolean)
+      : [""];
   for (const entry of (environmentValue(env, "PATH") ?? "").split(delimiter)) {
     const directory = entry.replace(/^"(.*)"$/, "$1");
     if (!directory) continue;
     for (const extension of extensions) {
       const candidate = join(directory, `${bin}${extension.toLowerCase()}`);
       if (existsSync(candidate)) return candidate;
-      const upperCandidate = join(directory, `${bin}${extension.toUpperCase()}`);
-      if (existsSync(upperCandidate)) return upperCandidate;
+      if (process.platform === "win32") {
+        const upperCandidate = join(directory, `${bin}${extension.toUpperCase()}`);
+        if (existsSync(upperCandidate)) return upperCandidate;
+      }
     }
   }
   return bin;

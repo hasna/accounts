@@ -159,6 +159,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts hook path` | Print hook script path. |
 | `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). `--background`, `--profile <name>`, `--json`. |
 | `accounts sessions` (`sessions list`) | Read-only catalog of root Claude sessions owned by registered local profiles. `--profile`, `--project`, `--uuid`, `--json`. |
+| `accounts sessions resume <catalog-ref-or-uuid> --account <name>` | Resume through the same Claude owner or create a guarded cross-account fork. Supports `--dry-run`, `--json`, and an explicit absolute `--cwd`. |
 | `accounts health` (`readiness`) | Print the sanitized account/provider readiness contract. Use `--json` for automation. |
 | `accounts detect <name>` | Re-detect email from config dir. |
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
@@ -217,6 +218,40 @@ UTF-16 identity metadata is skipped and reported by reason and canonical source
 path only; the identity text is not emitted. stdout stays a clean stream:
 closing the pipe early — `accounts sessions --json | head` — exits 0 without a
 stack trace.
+
+`accounts sessions resume` is deliberately narrower than the catalog:
+
+- A unique bare UUID is accepted, but duplicate UUIDs require the exact opaque
+  `catalogRef` returned by `accounts sessions --json`.
+- Resuming into the existing owner launches native Claude with exactly
+  `--resume <uuid>`. It never translates the request to `--continue`.
+- Cross-account continuation is supported only by the versioned Claude Code
+  `2.1.220` adapter and always launches exactly
+  `--resume <uuid> --fork-session`.
+- Cross-account mode requires one stable, complete root JSONL containing only
+  the adapter's explicit simple `user`/`assistant` record schema, with one
+  unambiguous project identity and no dependency-bearing records, companion
+  directory, task/file-history or unknown UUID sidecars, special/link/hardlink
+  anomaly, active writer, or target collision. There is no force bypass.
+- Accounts pins the canonical Claude executable path, stat identity, and
+  content digest across its exact-version probe and launch. Direct caller
+  credential overrides recognized by the adapter are cleared so authentication
+  remains bound to the selected local profile.
+- The source is byte-snapshotted into a private `0700` transaction directory;
+  artifacts and journal files are `0600`. Candidate promotion is serialized
+  per target account, never overwrites, and never shares a transcript inode.
+- After the interactive Claude process exits, validation is offline: Accounts
+  requires one new UUID, persisted copied history, unchanged source bytes, and
+  independent source/seed/fork inodes. It sends no smoke prompt.
+- Failed, uncertain, and successful artifacts are retained for recovery.
+  Pre-launch crash windows and dead broker locks recover only after exact
+  artifact validation; retries never launch a second fork after a launch
+  attempt.
+
+Use `--dry-run --json` to validate the applicable adapter, layout, collision,
+and quiescence gates without creating a journal, copying a transcript, or
+launching Claude. Accounts never infers the launch directory from its caller;
+it uses the cataloged session cwd unless an absolute `--cwd` is supplied.
 
 ## Cloud Runtime Entrypoints
 
