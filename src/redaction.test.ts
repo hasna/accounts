@@ -303,6 +303,77 @@ test("argument redaction fails closed on combined and Unicode credential short o
   expect(redacted.at(-1)).toBe("keep-bearer-mode");
 });
 
+test("argument redaction reclassifies chained sensitive options while awaiting a value", () => {
+  expect(
+    redactArgv([
+      "claude",
+      "--api-key",
+      "--client-key",
+      "chained-client-secret",
+      "--api-key",
+      "--api-key",
+      "repeated-api-secret",
+      "-k",
+      "-vk",
+      "clustered-short-secret",
+      "--api-key",
+      "--master-key=attached-master-secret",
+      "keep-after-attached-option",
+      "--api-key",
+      '"--client-key"',
+      "keep-after-quoted-value",
+      "--api-key",
+      "-not-a-credential-option",
+      "keep-after-dash-leading-value",
+      "--api-key",
+      "client-key",
+      "keep-after-unprefixed-value",
+    ]),
+  ).toEqual([
+    "claude",
+    "--api-key",
+    "--client-key",
+    "[REDACTED]",
+    "--api-key",
+    "--api-key",
+    "[REDACTED]",
+    "-k",
+    "-vk",
+    "[REDACTED]",
+    "--api-key",
+    "--master-key=[REDACTED]",
+    "keep-after-attached-option",
+    "--api-key",
+    "[REDACTED]",
+    "keep-after-quoted-value",
+    "--api-key",
+    "[REDACTED]",
+    "keep-after-dash-leading-value",
+    "--api-key",
+    "[REDACTED]",
+    "keep-after-unprefixed-value",
+  ]);
+});
+
+test("command-text chained sensitive options preserve pending state across line endings", () => {
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    const secret = `command-chained-secret-${lineEnding.length}`;
+    const input = [
+      "provider --api-key",
+      "--client-key",
+      secret,
+      "status=keep-command-chain-status",
+    ].join(lineEnding);
+
+    const redacted = redactText(input);
+
+    expect(redacted).not.toContain(secret);
+    expect(redacted).toContain("--api-key");
+    expect(redacted).toContain("--client-key");
+    expect(redacted).toContain("status=keep-command-chain-status");
+  }
+});
+
 test("command-text redaction shares argv option grammar across quoting and boundaries", () => {
   const secrets = [
     "command-api-secret",

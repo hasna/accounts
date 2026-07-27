@@ -592,7 +592,7 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
   expect(runCli("add", "acct", "--tool", "argv-grammar").status).toBe(0);
 
   const secrets = Array.from(
-    { length: 15 },
+    { length: 17 },
     (_, index) => `actual-switch-credential-${index}`,
   );
   const credentialArgs = [
@@ -621,6 +621,12 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     `--client-key:${secrets[13]}`,
     "--aws-access-key-id",
     secrets[14]!,
+    "--api-key",
+    "--client-key",
+    secrets[15]!,
+    "-k",
+    "-vk",
+    secrets[16]!,
   ];
 
   for (const surfaceArgs of [
@@ -643,6 +649,19 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
       expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
     }
     expect(result.stdout).toContain("[REDACTED]");
+    if (surfaceArgs.includes("--json")) {
+      const output = JSON.parse(result.stdout) as {
+        command: string[];
+        commandLine: string;
+      };
+      expect(output.command).toContain("--api-key");
+      expect(output.command).toContain("--client-key");
+      expect(output.command).toContain("-k");
+      expect(output.command).toContain("-vk");
+      expect(output.command.filter((arg) => arg === "[REDACTED]").length).toBeGreaterThanOrEqual(8);
+      expect(output.commandLine).toContain("'--api-key' '--client-key' '[REDACTED]'");
+      expect(output.commandLine).toContain("'-k' '-vk' '[REDACTED]'");
+    }
   }
 
   rmSync(logPath, { force: true });

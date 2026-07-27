@@ -1327,6 +1327,16 @@ export function redactArgv(argv: string[]): string[] {
   let redactNext = false;
   for (const arg of argv) {
     if (redactNext) {
+      const chainedOption = credentialOption(arg, true);
+      if (chainedOption?.kind === "attached") {
+        redacted.push(chainedOption.redactedToken);
+        redactNext = false;
+        continue;
+      }
+      if (chainedOption?.kind === "separate") {
+        redacted.push(chainedOption.redactedToken);
+        continue;
+      }
       redacted.push("[REDACTED]");
       redactNext = false;
       continue;

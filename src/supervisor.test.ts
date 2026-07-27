@@ -383,11 +383,11 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
   const one = addProfile({ name: "one", tool: "credentialgrammar" });
   const two = addProfile({ name: "two", tool: "credentialgrammar" });
   const initialSecrets = Array.from(
-    { length: 14 },
+    { length: 16 },
     (_, index) => `supervisor-initial-credential-${index}`,
   );
   const switchedSecrets = Array.from(
-    { length: 14 },
+    { length: 16 },
     (_, index) => `supervisor-switched-credential-${index}`,
   );
   const credentialArgs = (secrets: string[]) => [
@@ -415,6 +415,12 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     `--client-key:${secrets[12]}`,
     "--aws-access-key-id",
     secrets[13]!,
+    "--api-key",
+    "--client-key",
+    secrets[14]!,
+    "-k",
+    "-vk",
+    secrets[15]!,
   ];
   const previousFakeLog = process.env.FAKE_LOG;
   process.env.FAKE_LOG = logPath;
