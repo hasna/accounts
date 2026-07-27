@@ -16,7 +16,7 @@ import {
 import { providerLaunchEnv } from "./env.js";
 import { redactText } from "./redaction.js";
 
-export { redactText } from "./redaction.js";
+export { redactArgv, redactText } from "./redaction.js";
 
 export interface ClaudeLaunchOptions {
   headless?: boolean;
@@ -182,28 +182,6 @@ export function planClaudeLaunch(
   if (rawBackground) return { mode: "background", args: [...rawArgs], nonInteractive: true };
   if (rawPrint) return { mode: "headless", args: [...rawArgs], nonInteractive: true };
   return { mode: "interactive", args: [...rawArgs], nonInteractive: false };
-}
-
-const SECRET_VALUE_FLAG = /(?:api[-_]?key|auth(?:orization)?|credential|password|secret|token)$/i;
-
-export function redactArgv(argv: string[]): string[] {
-  const redacted: string[] = [];
-  let redactNext = false;
-  for (const arg of argv) {
-    if (redactNext) {
-      redacted.push("[REDACTED]");
-      redactNext = false;
-      continue;
-    }
-    const equals = arg.indexOf("=");
-    if (equals > 0 && SECRET_VALUE_FLAG.test(arg.slice(0, equals).replace(/^--?/, ""))) {
-      redacted.push(`${arg.slice(0, equals + 1)}[REDACTED]`);
-      continue;
-    }
-    redacted.push(redactText(arg));
-    if (SECRET_VALUE_FLAG.test(arg.replace(/^--?/, ""))) redactNext = true;
-  }
-  return redacted;
 }
 
 function numericTestSetting(name: string, fallback: number): number {

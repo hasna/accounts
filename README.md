@@ -149,6 +149,14 @@ Only structurally quoted serialized siblings are retained. Captured stderr and
 stdout are separated as distinct records before bounded redaction, preventing a
 missing trailing newline from fusing a diagnostic prefix with a
 credential-bearing header.
+Credential keys are classified through one separator/camel-case-aware policy,
+so forms such as `oauth_token`, `consumerSecret`, and `webhookCredential`
+receive the same treatment without matching benign names such as
+`tokenBucket` or `passwordless`. Valid JSON is redacted recursively after
+decoding escaped keys, while malformed serialized fragments remain
+fail-closed. Supervisor child arguments stay raw only for the immediate spawn;
+persisted state, restart responses, legacy state reads, and text/JSON status
+surfaces store or return argument-aware redacted command arrays.
 
 Printed POSIX handoffs validate every environment-variable name, single-quote
 every value and command word without expansion, and place an explicit `env --`

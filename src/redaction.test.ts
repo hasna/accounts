@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { redactText } from "./lib/redaction.js";
+import { isSensitiveCredentialKey, redactArgv, redactText } from "./lib/redaction.js";
 
 test("sensitive request headers redact their complete values", () => {
   const samples = [
@@ -54,6 +54,156 @@ test("request-header redaction leaves unrelated prose and fields unchanged", () 
   ].join("\n");
 
   expect(redactText(unrelated)).toBe(unrelated);
+});
+
+test("semantic credential-key normalization covers separator and camel-case variants without near misses", () => {
+  const sensitive = [
+    "oauth_token",
+    "bearer-token",
+    "signing_secret",
+    "consumerSecret",
+    "database_password",
+    "webhookCredential",
+    "apikey",
+    "clientsecret",
+    "oauthtoken",
+    "consumersecret",
+    "databasepassword",
+    "webhookcredential",
+    "auth",
+  ];
+  const benign = [
+    "oauth_scope",
+    "bearer_mode",
+    "signature_algorithm",
+    "consumerProfile",
+    "database_passwordless",
+    "webhookCredentialProvider",
+    "tokenBucket",
+    "secretariat",
+    "monkey",
+  ];
+
+  for (const key of sensitive) expect(isSensitiveCredentialKey(key), key).toBe(true);
+  for (const key of benign) expect(isSensitiveCredentialKey(key), key).toBe(false);
+
+  const rawSecrets = sensitive.map((key, index) => `${key}=normalized-raw-${index}`);
+  const jsonSecrets = Object.fromEntries(
+    sensitive.map((key, index) => [key, `normalized-json-${index}`]),
+  );
+  const redacted = redactText(`${rawSecrets.join("\n")}\n${JSON.stringify(jsonSecrets)}`);
+
+  for (let index = 0; index < sensitive.length; index++) {
+    expect(redacted).not.toContain(`normalized-raw-${index}`);
+    expect(redacted).not.toContain(`normalized-json-${index}`);
+  }
+
+  const benignInput = benign.map((key, index) => `${key}=benign-${index}`).join("\n");
+  expect(redactText(benignInput)).toBe(benignInput);
+});
+
+test("valid nested JSON recursively redacts decoded credential keys", () => {
+  const input = String.raw`{
+    "outer": {
+      "Authoriz\u0061tion": "escaped-auth-secret",
+      "nested": [
+        {"x-\u0061pi-key": "escaped-api-secret"},
+        {"consumer\u0053ecret": "escaped-consumer-secret"}
+      ]
+    },
+    "status": 401,
+    "message": "keep-json-diagnostic",
+    "providerError": "Authorization: Bearer nested-json-header-secret"
+  }`;
+
+  const redacted = redactText(input);
+
+  for (const secret of [
+    "escaped-auth-secret",
+    "escaped-api-secret",
+    "escaped-consumer-secret",
+    "nested-json-header-secret",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  const parsed = JSON.parse(redacted) as {
+    outer: { Authorization: string; nested: Array<Record<string, string>> };
+    status: number;
+    message: string;
+    providerError: string;
+  };
+  expect(parsed.outer.Authorization).toBe("[REDACTED]");
+  expect(parsed.outer.nested[0]?.["x-api-key"]).toBe("[REDACTED]");
+  expect(parsed.outer.nested[1]?.consumerSecret).toBe("[REDACTED]");
+  expect(parsed.providerError).toContain("[REDACTED]");
+  expect(redacted).toContain("[REDACTED]");
+  expect(redacted).toContain('"status":401');
+  expect(redacted).toContain('"message":"keep-json-diagnostic"');
+});
+
+test("escaped serialized credential keys fail closed across malformed sibling and fused-tail fragments", () => {
+  const samples: Array<(secret: string) => string> = [
+    (secret) => String.raw`{"Authoriz\u0061tion":"${secret}","status" 401}`,
+    (secret) => String.raw`{"Authoriz\u0061tion":"${secret}","status":}`,
+    (secret) => String.raw`{"x-\u0061pi-key":"${secret}","message"="denied"}`,
+    (secret) => String.raw`{"x-\u0061pi-key":"${secret}",message:"denied"}`,
+    (secret) => String.raw`{"consumer\u0053ecret":"${secret}"}fused=tail`,
+    (secret) => String.raw`{"database\u005fpassword":"${secret}","detail":"ok"`,
+    (secret) => String.raw`{"oauth\u005ftoken":"${secret}",,"status":401}`,
+    (secret) => String.raw`{"webhook\u0043redential":"${secret}";"status":401}`,
+  ];
+
+  for (const [index, render] of samples.entries()) {
+    const input = render(`escaped-fragment-${index}`);
+    const redacted = redactText(input);
+    expect(redacted, input).not.toContain(`escaped-fragment-${index}`);
+    expect(redacted, input).toContain("[REDACTED]");
+  }
+});
+
+test("argument redaction uses the same semantic credential-key classifier", () => {
+  const redacted = redactArgv([
+    "provider",
+    "--oauth_token",
+    "argv-oauth-secret",
+    "--consumerSecret=argv-consumer-secret",
+    "--tokenBucket",
+    "keep-token-bucket",
+    "--webhookCredential",
+    "argv-webhook-secret",
+  ]);
+
+  expect(redacted).toEqual([
+    "provider",
+    "--oauth_token",
+    "[REDACTED]",
+    "--consumerSecret=[REDACTED]",
+    "--tokenBucket",
+    "keep-token-bucket",
+    "--webhookCredential",
+    "[REDACTED]",
+  ]);
+});
+
+test("credential records nested inside non-sensitive wrapper values are still redacted", () => {
+  const input = [
+    "message=Authorization: Bearer wrapped-auth-secret",
+    "detail=oauth_token=wrapped-oauth-secret",
+    '{"message":"Authorization: Bearer wrapped-json-auth-secret"}',
+    '{"detail":"consumerSecret=wrapped-json-consumer-secret"}',
+    "status=401 keep-wrapper-status",
+  ].join("\n");
+
+  const redacted = redactText(input);
+  for (const secret of [
+    "wrapped-auth-secret",
+    "wrapped-oauth-secret",
+    "wrapped-json-auth-secret",
+    "wrapped-json-consumer-secret",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted).toContain("status=401 keep-wrapper-status");
 });
 
 test("an unterminated quoted header value does not consume later diagnostic lines", () => {

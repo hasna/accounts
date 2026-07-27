@@ -6,10 +6,13 @@ import { dirname, join } from "node:path";
 import { addProfile, currentProfile, useProfile } from "./lib/profiles.js";
 import { addCustomTool, getTool } from "./lib/tools.js";
 import {
+  listSupervisorStates,
+  readSupervisorState,
   resolveSupervisorLaunch,
   runSupervisedTool,
   sendSupervisorRequest,
   supervisorSocketPath,
+  supervisorStatePath,
 } from "./lib/supervisor.js";
 
 let home: string;
@@ -234,6 +237,134 @@ test("runSupervisedTool restarts a child under the requested profile", async () 
     }
     await sendSupervisorRequest("fakeagent", { type: "stop" }, { allowMissing: true }).catch(() => undefined);
   }
+});
+
+test("supervisor keeps raw credential arguments transient while persistence and status stay redacted", async () => {
+  const logPath = join(home, "credential-argv.log");
+  const scriptPath = join(home, "credential-argv.mjs");
+  writeFileSync(
+    scriptPath,
+    [
+      'import { appendFileSync } from "node:fs";',
+      'appendFileSync(process.env.FAKE_LOG, JSON.stringify({ args: process.argv.slice(2) }) + "\\n");',
+      'process.on("SIGTERM", () => process.exit(0));',
+      "setInterval(() => undefined, 1000);",
+    ].join("\n"),
+  );
+
+  addCustomTool({
+    id: "credentialagent",
+    label: "Credential Agent",
+    envVar: "FAKE_HOME",
+    defaultDir: join(home, "credential-default"),
+    bin: process.execPath,
+    resumeArgs: [scriptPath, "--resume"],
+  });
+  const one = addProfile({ name: "one", tool: "credentialagent" });
+  const two = addProfile({ name: "two", tool: "credentialagent" });
+  const tool = getTool("credentialagent");
+  const initialSecret = "supervisor-initial-api-secret";
+  const switchedSecret = "supervisor-switched-consumer-secret";
+  const previousFakeLog = process.env.FAKE_LOG;
+  process.env.FAKE_LOG = logPath;
+  const running = runSupervisedTool(
+    one,
+    tool,
+    [scriptPath, "--api-key", initialSecret],
+    { stdio: "ignore", restartDelayMs: 25 },
+  );
+
+  try {
+    await waitFor(() => (existsSync(supervisorSocketPath("credentialagent")) ? true : undefined));
+    await waitFor(() => {
+      const entry = readLog(logPath).find((item) => item.args.includes(initialSecret));
+      return entry;
+    });
+
+    const persistedInitial = readFileSync(supervisorStatePath("credentialagent"), "utf8");
+    expect(persistedInitial).not.toContain(initialSecret);
+    expect(persistedInitial).toContain("[REDACTED]");
+    expect(JSON.stringify(readSupervisorState("credentialagent"))).not.toContain(initialSecret);
+    expect(JSON.stringify(listSupervisorStates())).not.toContain(initialSecret);
+
+    const liveInitial = await sendSupervisorRequest("credentialagent", { type: "status" });
+    expect(JSON.stringify(liveInitial)).not.toContain(initialSecret);
+    expect(JSON.stringify(liveInitial)).toContain("[REDACTED]");
+    const initialStatusCli = Bun.spawn({
+      cmd: [process.execPath, "run", "src/cli.ts", "supervisor", "status", "credentialagent", "--json"],
+      env: { ...process.env, ACCOUNTS_HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [initialStatusExit, initialStatusStdout, initialStatusStderr] = await Promise.all([
+      initialStatusCli.exited,
+      new Response(initialStatusCli.stdout).text(),
+      new Response(initialStatusCli.stderr).text(),
+    ]);
+    expect(initialStatusExit, initialStatusStderr).toBe(0);
+    expect(initialStatusStdout).not.toContain(initialSecret);
+    expect(initialStatusStdout).toContain("[REDACTED]");
+
+    const switched = await sendSupervisorRequest("credentialagent", {
+      type: "switch_profile",
+      name: two.name,
+      resume: false,
+      args: [scriptPath, `--consumerSecret=${switchedSecret}`],
+    });
+    expect(JSON.stringify(switched)).not.toContain(switchedSecret);
+    expect(JSON.stringify(switched)).toContain("[REDACTED]");
+
+    await waitFor(() => {
+      const entry = readLog(logPath).find((item) => item.args.includes(`--consumerSecret=${switchedSecret}`));
+      return entry;
+    });
+    const persistedSwitched = readFileSync(supervisorStatePath("credentialagent"), "utf8");
+    expect(persistedSwitched).not.toContain(switchedSecret);
+    expect(persistedSwitched).toContain("--consumerSecret=[REDACTED]");
+    const liveSwitched = await sendSupervisorRequest("credentialagent", { type: "status" });
+    expect(JSON.stringify(liveSwitched)).not.toContain(switchedSecret);
+    const switchedStatusCli = Bun.spawn({
+      cmd: [process.execPath, "run", "src/cli.ts", "supervisor", "status", "credentialagent"],
+      env: { ...process.env, ACCOUNTS_HOME: home, NO_COLOR: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [switchedStatusExit, switchedStatusStdout, switchedStatusStderr] = await Promise.all([
+      switchedStatusCli.exited,
+      new Response(switchedStatusCli.stdout).text(),
+      new Response(switchedStatusCli.stderr).text(),
+    ]);
+    expect(switchedStatusExit, switchedStatusStderr).toBe(0);
+    expect(switchedStatusStdout).not.toContain(switchedSecret);
+    expect(switchedStatusStdout).toContain("--consumerSecret=[REDACTED]");
+
+    await sendSupervisorRequest("credentialagent", { type: "stop" });
+    expect(await running).toBe(0);
+  } finally {
+    process.env.FAKE_LOG = previousFakeLog;
+    await sendSupervisorRequest("credentialagent", { type: "stop" }, { allowMissing: true }).catch(() => undefined);
+  }
+});
+
+test("legacy supervisor state is redacted defensively when read", () => {
+  mkdirSync(dirname(supervisorStatePath("codewith")), { recursive: true });
+  writeFileSync(
+    supervisorStatePath("codewith"),
+    JSON.stringify({
+      version: 1,
+      tool: "codewith",
+      profile: "one",
+      pid: 123,
+      socketPath: supervisorSocketPath("codewith"),
+      command: ["codewith", "--webhookCredential", "legacy-supervisor-secret"],
+      startedAt: "2026-07-27T00:00:00.000Z",
+      updatedAt: "2026-07-27T00:00:00.000Z",
+    }),
+  );
+
+  const state = readSupervisorState("codewith");
+  expect(state?.command).toEqual(["codewith", "--webhookCredential", "[REDACTED]"]);
+  expect(JSON.stringify(state)).not.toContain("legacy-supervisor-secret");
 });
 
 test("supervisor switch preflights configs before queueing or stopping the current child", async () => {

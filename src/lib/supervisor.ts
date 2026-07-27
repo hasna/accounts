@@ -7,8 +7,8 @@ import { accountsHome, loadAppliedMap } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
-import { profileEnv, providerLaunchEnv } from "./env.js";
-import { redactText } from "./redaction.js";
+import { formatEnvAssignments, profileEnv, providerLaunchEnv, quotePosixShellWord } from "./env.js";
+import { redactArgv, redactText } from "./redaction.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
 import { getTool } from "./tools.js";
@@ -100,7 +100,10 @@ function parseState(raw: string): SupervisorState | undefined {
   ) {
     return undefined;
   }
-  return data as SupervisorState;
+  return {
+    ...(data as SupervisorState),
+    command: redactArgv(data.command as string[]),
+  };
 }
 
 export function readSupervisorState(toolId: string): SupervisorState | undefined {
@@ -125,7 +128,11 @@ export function listSupervisorStates(): SupervisorState[] {
 
 function writeSupervisorState(state: SupervisorState): void {
   mkdirSync(supervisorDir(), { recursive: true });
-  writeFileSync(supervisorStatePath(state.tool), JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(
+    supervisorStatePath(state.tool),
+    JSON.stringify({ ...state, command: redactArgv(state.command) }, null, 2) + "\n",
+    { mode: 0o600 },
+  );
 }
 
 function removeSupervisorFiles(toolId: string): void {
@@ -214,6 +221,15 @@ function killChildProcess(child: ChildProcess, signal: NodeJS.Signals): void {
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function publicSwitchResult(result: SwitchResult): SwitchResult {
+  const command = redactArgv(result.command);
+  return {
+    ...result,
+    command,
+    commandLine: `${formatEnvAssignments(result.env)} ${command.map(quotePosixShellWord).join(" ")}`.trim(),
+  };
 }
 
 async function listen(server: Server, socketPath: string): Promise<void> {
@@ -323,7 +339,7 @@ export async function runSupervisedTool(
     pid: process.pid,
     ...(child?.pid ? { childPid: child.pid } : {}),
     socketPath,
-    command: [tool.bin, ...childArgs],
+    command: redactArgv([tool.bin, ...childArgs]),
     startedAt,
     updatedAt: nowIso(),
     prelaunch: getConfigsPrelaunchSummary(profile, tool, configsSessionToolFor(tool)),
@@ -476,7 +492,7 @@ export async function runSupervisedTool(
       }, store);
       log(`accounts supervisor: switching ${tool.id} to ${result.profile.name}`);
       setTimeout(() => void restartWith(result, preflightedConfigs), 0);
-      return { ok: true, queued: true, result, state: state(), restartDelayMs };
+      return { ok: true, queued: true, result: publicSwitchResult(result), state: state(), restartDelayMs };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }

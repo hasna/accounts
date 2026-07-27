@@ -1,14 +1,84 @@
 const SECRET_PATTERN =
   /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[oprsu]_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b/g;
-const SENSITIVE_REQUEST_HEADER_PATTERN =
-  /(^|[^A-Za-z0-9_-])(["']?)(authorization|proxy-authorization|cookie|set-cookie)\2[ \t]*[:=][ \t]*/gim;
-const SENSITIVE_CREDENTIAL_FIELD_PATTERN =
-  /(^|[^A-Za-z0-9_-])(["']?)(x-api-key|x-goog-api-key|x-amz-security-token|api[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?token|(?:access|refresh|id|session)[-_]?token|credential|password|secret|token)\2[ \t]*[:=][ \t]*/gim;
+const CREDENTIAL_FIELD_PATTERN =
+  /(^|[^A-Za-z0-9_-])(["']?)([A-Za-z][A-Za-z0-9_-]*)\2[ \t]*[:=][ \t]*/gim;
+const SERIALIZED_FIELD_PATTERN =
+  /(^|[,{])([ \t]*)("(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*")[ \t]*:[ \t]*/gm;
 const HEADER_LINE_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:/;
 const EXPLICIT_DIAGNOSTIC_RECORD_PATTERN =
   /^(?:status|message|stack|detail)[ \t]*=[ \t]*\S/i;
+const SENSITIVE_TERMINAL_TOKENS = new Set(["credential", "password", "secret", "token"]);
+const SENSITIVE_KEY_QUALIFIERS = new Set([
+  "api",
+  "private",
+  "signing",
+  "webhook",
+  "auth",
+  "authorization",
+  "access",
+  "consumer",
+  "x",
+  "goog",
+  "amz",
+]);
+const SENSITIVE_EXACT_KEYS = new Set([
+  "auth",
+  "authorization",
+  "proxyauthorization",
+  "cookie",
+  "setcookie",
+  "apikey",
+  "privatekey",
+  "clientsecret",
+  "authtoken",
+  "oauthtoken",
+  "bearertoken",
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "sessiontoken",
+  "signingsecret",
+  "consumersecret",
+  "databasepassword",
+  "webhookcredential",
+  "xgoogapikey",
+  "xamzsecuritytoken",
+  "credential",
+  "password",
+  "secret",
+  "token",
+]);
 
 type FoldSeparator = "," | ";";
+
+function semanticKeyTokens(value: string): string[] {
+  return value
+    .trim()
+    .replace(/^--?/, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((token) => token.toLowerCase());
+}
+
+/**
+ * Classify credential-bearing keys after separator and camel-case
+ * normalization. The terminal-token rule intentionally avoids substring
+ * matches such as `tokenBucket`, `passwordless`, `secretariat`, and `monkey`.
+ */
+export function isSensitiveCredentialKey(value: string): boolean {
+  const tokens = semanticKeyTokens(value);
+  if (tokens.length === 0) return false;
+
+  const compact = tokens.join("");
+  if (SENSITIVE_EXACT_KEYS.has(compact)) return true;
+
+  const terminal = tokens[tokens.length - 1]!;
+  if (SENSITIVE_TERMINAL_TOKENS.has(terminal)) return true;
+  if (terminal !== "key") return false;
+  return tokens.slice(0, -1).some((token) => SENSITIVE_KEY_QUALIFIERS.has(token));
+}
 
 function lineBreakEnd(value: string, start: number): number {
   return value[start] === "\r" && value[start + 1] === "\n" ? start + 2 : start + 1;
@@ -180,17 +250,24 @@ function sensitiveRecordValueEnd(
   return value.length;
 }
 
-function redactSensitiveFields(value: string, pattern: RegExp): string {
+function redactSensitiveFields(value: string): string {
   let cursor = 0;
   let output = "";
-  pattern.lastIndex = 0;
+  CREDENTIAL_FIELD_PATTERN.lastIndex = 0;
 
   for (
-    let match = pattern.exec(value);
+    let match = CREDENTIAL_FIELD_PATTERN.exec(value);
     match;
-    match = pattern.exec(value)
+    match = CREDENTIAL_FIELD_PATTERN.exec(value)
   ) {
-    const valueStart = pattern.lastIndex;
+    const valueStart = CREDENTIAL_FIELD_PATTERN.lastIndex;
+    if (!isSensitiveCredentialKey(match[3]!)) {
+      // A non-sensitive wrapper can contain a credential record in its value
+      // (for example `message=Authorization: ...`). Resume just before the
+      // value instead of skipping it with the wrapper match.
+      CREDENTIAL_FIELD_PATTERN.lastIndex = Math.max(match.index + 1, valueStart - 1);
+      continue;
+    }
     const valueEnd = sensitiveRecordValueEnd(
       value,
       valueStart,
@@ -199,16 +276,109 @@ function redactSensitiveFields(value: string, pattern: RegExp): string {
     if (valueEnd === valueStart) continue;
     output += value.slice(cursor, valueStart) + "[REDACTED]";
     cursor = valueEnd;
-    pattern.lastIndex = valueEnd;
+    CREDENTIAL_FIELD_PATTERN.lastIndex = valueEnd;
   }
 
   return cursor === 0 ? value : output + value.slice(cursor);
 }
 
+function redactEscapedSerializedFields(value: string): string {
+  let cursor = 0;
+  let output = "";
+  SERIALIZED_FIELD_PATTERN.lastIndex = 0;
+
+  for (
+    let match = SERIALIZED_FIELD_PATTERN.exec(value);
+    match;
+    match = SERIALIZED_FIELD_PATTERN.exec(value)
+  ) {
+    const encodedKey = match[3]!;
+    if (!encodedKey.includes("\\")) continue;
+
+    let key: unknown;
+    try {
+      key = JSON.parse(encodedKey);
+    } catch {
+      continue;
+    }
+    if (typeof key !== "string" || !isSensitiveCredentialKey(key)) continue;
+
+    const valueStart = SERIALIZED_FIELD_PATTERN.lastIndex;
+    const valueEnd = sensitiveRecordValueEnd(value, valueStart, true);
+    if (valueEnd === valueStart) continue;
+    output += value.slice(cursor, valueStart) + "[REDACTED]";
+    cursor = valueEnd;
+    SERIALIZED_FIELD_PATTERN.lastIndex = valueEnd;
+  }
+
+  return cursor === 0 ? value : output + value.slice(cursor);
+}
+
+function redactPlainText(value: string): string {
+  return redactSensitiveFields(
+    redactEscapedSerializedFields(value),
+  ).replace(SECRET_PATTERN, "[REDACTED]");
+}
+
+function redactJsonDocument(value: string): { value: string; changed: boolean } {
+  const leading = value.match(/^\s*/)?.[0] ?? "";
+  const trailing = value.match(/\s*$/)?.[0] ?? "";
+  const document = value.slice(leading.length, value.length - trailing.length);
+  if (!document || (document[0] !== "{" && document[0] !== "[")) {
+    return { value, changed: false };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(document);
+  } catch {
+    return { value, changed: false };
+  }
+
+  let changed = false;
+  const redacted = JSON.stringify(parsed, (key, nested) => {
+    if (key && isSensitiveCredentialKey(key)) {
+      changed = true;
+      return "[REDACTED]";
+    }
+    if (typeof nested === "string") {
+      const safe = redactPlainText(nested);
+      if (safe !== nested) changed = true;
+      return safe;
+    }
+    return nested;
+  });
+  return {
+    value: changed ? `${leading}${redacted}${trailing}` : value,
+    changed,
+  };
+}
+
+/** Redact values that follow credential-bearing command-line flags. */
+export function redactArgv(argv: string[]): string[] {
+  const redacted: string[] = [];
+  let redactNext = false;
+  for (const arg of argv) {
+    if (redactNext) {
+      redacted.push("[REDACTED]");
+      redactNext = false;
+      continue;
+    }
+
+    const equals = arg.indexOf("=");
+    if (equals > 0 && isSensitiveCredentialKey(arg.slice(0, equals))) {
+      redacted.push(`${arg.slice(0, equals + 1)}[REDACTED]`);
+      continue;
+    }
+
+    redacted.push(redactText(arg));
+    if (isSensitiveCredentialKey(arg)) redactNext = true;
+  }
+  return redacted;
+}
+
 /** Redact common credential values and credential-bearing request headers. */
 export function redactText(value: string): string {
-  return redactSensitiveFields(
-    redactSensitiveFields(value, SENSITIVE_REQUEST_HEADER_PATTERN),
-    SENSITIVE_CREDENTIAL_FIELD_PATTERN,
-  ).replace(SECRET_PATTERN, "[REDACTED]");
+  const json = redactJsonDocument(value);
+  return json.changed ? json.value : redactPlainText(value);
 }

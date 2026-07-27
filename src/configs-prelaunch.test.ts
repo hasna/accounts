@@ -266,6 +266,46 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch errors redact normalized and escaped credential keys end to end", () => {
+    const p = profile("codex");
+    const samples: Array<[string, (secret: string) => string]> = [
+      ["prelaunch-oauth-secret", (secret) => `oauth_token=${secret}`],
+      ["prelaunch-bearer-secret", (secret) => `bearer-token=${secret}`],
+      ["prelaunch-signing-secret", (secret) => `signing_secret=${secret}`],
+      ["prelaunch-consumer-secret", (secret) => `consumerSecret=${secret}`],
+      ["prelaunch-database-secret", (secret) => `database_password=${secret}`],
+      ["prelaunch-webhook-secret", (secret) => `webhookCredential=${secret}`],
+      [
+        "prelaunch-escaped-auth-secret",
+        (secret) => String.raw`{"Authoriz\u0061tion":"${secret}","status":401}`,
+      ],
+      [
+        "prelaunch-escaped-api-secret",
+        (secret) => String.raw`{"x-\u0061pi-key":"${secret}","message"="malformed"}`,
+      ],
+    ];
+
+    for (const [secret, render] of samples) {
+      const output = render(secret);
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(output),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(message).toContain("configs prelaunch apply failed");
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain(secret);
+    }
+  });
+
   test("controlled prelaunch errors redact credential-shaped headers", () => {
     resetHome();
     const p = profileInHome("codex");

@@ -90,6 +90,13 @@ raw comma or semicolon tails are not trusted. Controlled prelaunch stderr and
 stdout are separated by a record boundary before line bounding and redaction.
 This keeps provably independent records visible without repeated suffix scans,
 fusing process streams, or exposing malformed folds.
+Credential-key classification is centralized and normalizes separators and
+camel case before applying terminal semantic tokens. Valid JSON documents are
+walked recursively after JSON key escape decoding; escaped keys in malformed
+serialized fragments use the same fail-closed record boundary. Supervisor
+arguments remain raw only in memory long enough to spawn the provider child.
+State files, legacy-state reads, switch responses, and live/stale status output
+all use the same argument-aware redaction before data leaves that boundary.
 
 ## Apply safety
 
