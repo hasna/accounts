@@ -39,13 +39,25 @@ async function waitFor<T>(read: () => T | undefined, timeoutMs = 2500): Promise<
   throw new Error("timed out waiting for condition");
 }
 
-function readLog(path: string): Array<{ active: string; home: string; args: string[] }> {
+function readLog(path: string): Array<{
+  active: string;
+  home: string;
+  args: string[];
+  requestDebug?: string[];
+  path?: string;
+}> {
   if (!existsSync(path)) return [];
   return readFileSync(path, "utf8")
     .trim()
     .split("\n")
     .filter(Boolean)
-    .map((line) => JSON.parse(line) as { active: string; home: string; args: string[] });
+    .map((line) => JSON.parse(line) as {
+      active: string;
+      home: string;
+      args: string[];
+      requestDebug?: string[];
+      path?: string;
+    });
 }
 
 function writeManifest(profile: { name: string; dir: string }, tool = "codewith") {
@@ -143,6 +155,8 @@ test("runSupervisedTool restarts a child under the requested profile", async () 
       "  active: process.env.ACCOUNTS_ACTIVE,",
       "  home: process.env.FAKE_HOME,",
       "  args: process.argv.slice(2),",
+      '  requestDebug: ["BUN_CONFIG_VERBOSE_FETCH", "NODE_DEBUG", "NODE_DEBUG_NATIVE"].filter((name) => process.env[name]),',
+      "  path: process.env.PATH,",
       '}) + "\\n");',
       'process.on("SIGTERM", () => process.exit(0));',
       "setInterval(() => undefined, 1000);",
@@ -163,7 +177,16 @@ test("runSupervisedTool restarts a child under the requested profile", async () 
   const tool = getTool("fakeagent");
 
   const previousFakeLog = process.env.FAKE_LOG;
+  const previousRequestDebug = {
+    BUN_CONFIG_VERBOSE_FETCH: process.env.BUN_CONFIG_VERBOSE_FETCH,
+    NODE_DEBUG: process.env.NODE_DEBUG,
+    NODE_DEBUG_NATIVE: process.env.NODE_DEBUG_NATIVE,
+  };
+  const inheritedPath = process.env.PATH;
   process.env.FAKE_LOG = logPath;
+  process.env.BUN_CONFIG_VERBOSE_FETCH = "1";
+  process.env.NODE_DEBUG = "http,http2";
+  process.env.NODE_DEBUG_NATIVE = "http";
   const running = runSupervisedTool(one, tool, [scriptPath, "--start"], {
     stdio: "ignore",
     restartDelayMs: 25,
@@ -197,12 +220,18 @@ test("runSupervisedTool restarts a child under the requested profile", async () 
     const second = entries.find((entry) => entry.active === "two");
     expect(second?.home).toBe(two.dir);
     expect(second?.args).toEqual(["--resume"]);
+    expect(entries.every((entry) => entry.requestDebug?.length === 0)).toBe(true);
+    expect(entries.every((entry) => entry.path === inheritedPath)).toBe(true);
     expect(currentProfile("fakeagent")?.name).toBe("two");
 
     await sendSupervisorRequest("fakeagent", { type: "stop" });
     expect(await running).toBe(0);
   } finally {
     process.env.FAKE_LOG = previousFakeLog;
+    for (const [name, value] of Object.entries(previousRequestDebug)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
     await sendSupervisorRequest("fakeagent", { type: "stop" }, { allowMissing: true }).catch(() => undefined);
   }
 });

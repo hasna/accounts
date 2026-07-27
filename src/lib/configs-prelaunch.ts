@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
+import { controlledProbeEnv } from "./env.js";
+import { redactText } from "./redaction.js";
 import {
   assessConfigsManifest,
   getConfigsPrelaunchSummary,
@@ -125,7 +127,7 @@ function resolveIdentityExports(profile: Profile, tool: ToolDef, opts: ConfigsPr
   ]);
   const failed = !!result.error || (result.status ?? 1) !== 0;
   if (failed && !opts.allowFailure) {
-    const detail = result.error ? `: ${result.error.message}` : outputSummary(result);
+    const detail = result.error ? `: ${redactText(result.error.message)}` : outputSummary(result);
     throw new AccountsError(`identity instruction export failed for ${tool.id}/${profile.name}${detail}`);
   }
   if (failed) return { paths: exports, bypassReason: "identity instruction export failed" };
@@ -136,12 +138,13 @@ function defaultRunner(command: string, args: string[]) {
   return spawnSync(command, args, {
     encoding: "buffer",
     stdio: ["ignore", "pipe", "pipe"],
+    env: controlledProbeEnv(),
   });
 }
 
 function outputSummary(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr">): string {
   const combined = `${result.stderr?.toString("utf8") ?? ""}${result.stdout?.toString("utf8") ?? ""}`.trim();
-  return combined ? `: ${combined.split("\n").slice(0, 3).join(" ")}` : "";
+  return combined ? `: ${redactText(combined.split("\n").slice(0, 3).join(" "))}` : "";
 }
 
 export function runConfigsPrelaunch(
@@ -204,7 +207,7 @@ export function runConfigsPrelaunch(
   const failed = !!result.error || (result.status ?? 1) !== 0;
   const identityBypass = resolved.bypassReason ? `${resolved.bypassReason}; --allow-configs-failure` : undefined;
   if (failed && !opts.allowFailure) {
-    const detail = result.error ? `: ${result.error.message}` : outputSummary(result);
+    const detail = result.error ? `: ${redactText(result.error.message)}` : outputSummary(result);
     recordConfigsPrelaunchAudit(profile, tool, configsTool, {
       mode,
       result: "failed",

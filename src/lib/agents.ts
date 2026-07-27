@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:os";
 import type { Profile } from "../types.js";
+import { controlledProbeEnv } from "./env.js";
+import { redactText } from "./redaction.js";
 import { getTool } from "./tools.js";
 
 export type AgentEntry = Record<string, unknown>;
@@ -34,6 +36,14 @@ export interface ProcessInfo {
 }
 
 export type ProcessScanner = () => ProcessInfo[];
+
+function scriptExecutable(): string {
+  return existsSync("/usr/bin/script") ? "/usr/bin/script" : "script";
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
 
 /**
  * Extract the first top-level JSON array from output that may be wrapped in
@@ -81,22 +91,32 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
 export function runClaudeAgentsJson(profile: ProfileLike, timeoutMs = 20_000): AgentsRunnerResult {
   const tool = getTool(profile.tool);
   const bin = tool.bin ?? "claude";
-  const env = { ...process.env, [tool.envVar]: profile.dir };
+  const env = controlledProbeEnv(process.env, { [tool.envVar]: profile.dir });
   const args =
     platform() === "darwin"
       ? ["-q", "/dev/null", bin, "agents", "--json"]
-      : ["-qefc", `${bin} agents --json`, "/dev/null"];
-  const res = spawnSync("script", args, {
+      : ["-qefc", `${shellQuote(bin)} agents --json`, "/dev/null"];
+  const res = spawnSync(scriptExecutable(), args, {
     encoding: "utf8",
     env,
     timeout: timeoutMs,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  if (res.error) return { ok: false, raw: "", error: res.error.message };
-  if (res.signal) return { ok: false, raw: res.stdout ?? "", error: `timed out (${res.signal})` };
+  if (res.error) return { ok: false, raw: "", error: redactText(res.error.message) };
+  if (res.signal) {
+    return {
+      ok: false,
+      raw: redactText(res.stdout ?? ""),
+      error: `timed out (${res.signal})`,
+    };
+  }
   if (res.status !== 0) {
     const detail = (res.stderr || res.stdout || "").trim().split("\n").pop() ?? "";
-    return { ok: false, raw: res.stdout ?? "", error: `exit ${res.status}${detail ? `: ${detail}` : ""}` };
+    return {
+      ok: false,
+      raw: redactText(res.stdout ?? ""),
+      error: `exit ${res.status}${detail ? `: ${redactText(detail)}` : ""}`,
+    };
   }
   return { ok: true, raw: res.stdout ?? "" };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Profile } from "./types.js";
@@ -220,6 +220,80 @@ describe("configs prelaunch", () => {
     expect(bypassed.status).toBe(2);
     expect(bypassed.result).toBe("bypassed");
     expect(bypassed.prelaunch.status).toBe("bypassed");
+  });
+
+  test("controlled prelaunch probes suppress inherited request-debug output", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const probe = join(home, "configs-probe");
+    const dummyCredential = "dummy-controlled-probe-credential";
+    const previous = {
+      BUN_CONFIG_VERBOSE_FETCH: process.env.BUN_CONFIG_VERBOSE_FETCH,
+      NODE_DEBUG: process.env.NODE_DEBUG,
+      NODE_DEBUG_NATIVE: process.env.NODE_DEBUG_NATIVE,
+    };
+    writeFileSync(
+      probe,
+      [
+        "#!/bin/sh",
+        'if [ -n "${BUN_CONFIG_VERBOSE_FETCH:-}${NODE_DEBUG:-}${NODE_DEBUG_NATIVE:-}" ]; then',
+        `  printf 'Authorization: Bearer %s\\n' ${JSON.stringify(dummyCredential)}`,
+        `  printf 'x-api-key=%s\\n' ${JSON.stringify(dummyCredential)} >&2`,
+        "fi",
+        "exit 2",
+      ].join("\n"),
+    );
+    chmodSync(probe, 0o755);
+
+    try {
+      process.env.BUN_CONFIG_VERBOSE_FETCH = "1";
+      process.env.NODE_DEBUG = "http,http2";
+      process.env.NODE_DEBUG_NATIVE = "http";
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), { configsBin: probe });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("configs prelaunch apply failed");
+      expect(message).not.toContain(dummyCredential);
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      cleanup();
+    }
+  });
+
+  test("controlled prelaunch errors redact credential-shaped headers", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const probe = join(home, "configs-redaction-probe");
+    const dummyCredential = "dummy-controlled-error-credential";
+    writeFileSync(
+      probe,
+      [
+        "#!/bin/sh",
+        `printf 'Authorization: Bearer %s\\n' ${JSON.stringify(dummyCredential)}`,
+        `printf 'x-api-key=%s\\n' ${JSON.stringify(dummyCredential)} >&2`,
+        "exit 2",
+      ].join("\n"),
+    );
+    chmodSync(probe, 0o755);
+
+    try {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), { configsBin: probe });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain(dummyCredential);
+    } finally {
+      cleanup();
+    }
   });
 
   test("fails closed when apply succeeds without a fresh manifest unless bypassed", () => {

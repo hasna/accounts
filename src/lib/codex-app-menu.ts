@@ -6,6 +6,7 @@ import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { accountsHome } from "../storage.js";
 import { appliedProfile } from "./apply.js";
+import { providerLaunchEnv } from "./env.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool } from "./tools.js";
 import { switchProfile, type SwitchResult } from "./switch.js";
@@ -132,7 +133,7 @@ export async function switchCodexAppFromMenu(
     const child = runner.spawn(bin, launchArgs, {
       detached: true,
       stdio: "ignore",
-      env: { ...process.env, ...result.env },
+      env: providerLaunchEnv(process.env, result.env),
     });
     child.unref?.();
   }

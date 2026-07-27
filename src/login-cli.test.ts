@@ -53,6 +53,10 @@ function writeFakeTool(binName: string, envVar: string, toolName = binName, exit
       "#!/bin/sh",
       `home="\${${envVar}:-}"`,
       `printf '{"tool":"${toolName}","args":"%s","home":"%s"}\\n' "$*" "$home" >> "$FAKE_LOGIN_LOG"`,
+      'if [ -n "${BUN_CONFIG_VERBOSE_FETCH:-}${NODE_DEBUG:-}${NODE_DEBUG_NATIVE:-}" ] && [ -n "${FAKE_DEBUG_CREDENTIAL:-}" ]; then',
+      '  printf "Authorization: Bearer %s\\n" "$FAKE_DEBUG_CREDENTIAL"',
+      '  printf "x-api-key=%s\\n" "$FAKE_DEBUG_CREDENTIAL" >&2',
+      "fi",
       `exit ${exitCode}`,
     ].join("\n"),
   );
@@ -230,6 +234,32 @@ test("switch --launch runs configs apply by default before spawning", () => {
   expect(configsCall).toContain("session apply --tool claude --profile acct");
   expect(configsCall).toContain(`--target-home ${profile!.dir}`);
   expect(readLogEntries()[0]?.tool).toBe("claude");
+});
+
+test("login and switch launch suppress inherited request-debug output", () => {
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  addFakeLoginTool();
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+  const dummyCredential = "dummy-login-request-credential";
+  const env = {
+    BUN_CONFIG_VERBOSE_FETCH: "1",
+    NODE_DEBUG: "http,http2",
+    NODE_DEBUG_NATIVE: "http",
+    FAKE_DEBUG_CREDENTIAL: dummyCredential,
+  };
+
+  const login = runCliWith(["login", "acct"], { env });
+  expect(login.status).toBe(0);
+  expect(login.stdout).not.toContain(dummyCredential);
+  expect(login.stderr).not.toContain(dummyCredential);
+
+  const launchedSwitch = runCliWith(
+    ["switch", "acct", "--tool", "fake-login", "--mode", "active", "--launch"],
+    { env },
+  );
+  expect(launchedSwitch.status).toBe(0);
+  expect(launchedSwitch.stdout).not.toContain(dummyCredential);
+  expect(launchedSwitch.stderr).not.toContain(dummyCredential);
 });
 
 test("env syncs Claude profile credentials into keychain before printing exports", () => {

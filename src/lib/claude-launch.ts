@@ -13,6 +13,10 @@ import {
   securityExecutable,
   writeClaudeKeychain,
 } from "./keychain.js";
+import { providerLaunchEnv } from "./env.js";
+import { redactText } from "./redaction.js";
+
+export { redactText } from "./redaction.js";
 
 export interface ClaudeLaunchOptions {
   headless?: boolean;
@@ -181,11 +185,6 @@ export function planClaudeLaunch(
 }
 
 const SECRET_VALUE_FLAG = /(?:api[-_]?key|auth(?:orization)?|credential|password|secret|token)$/i;
-const SECRET_PATTERN = /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[oprsu]_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b/g;
-
-export function redactText(value: string): string {
-  return value.replace(SECRET_PATTERN, "[REDACTED]");
-}
 
 export function redactArgv(argv: string[]): string[] {
   const redacted: string[] = [];
@@ -408,9 +407,10 @@ export async function runClaudeLaunch(
   env: NodeJS.ProcessEnv,
   cwd: string,
 ): Promise<number> {
-  if (tool.id !== "claude" || !keychainSupported()) return relayProcess(tool, args, env, cwd);
+  const launchEnv = providerLaunchEnv(env);
+  if (tool.id !== "claude" || !keychainSupported()) return relayProcess(tool, args, launchEnv, cwd);
   const credential = claudeKeychainCredentialFromProfile(profile.dir, profile.name);
-  if (!credential) return relayProcess(tool, args, env, cwd);
+  if (!credential) return relayProcess(tool, args, launchEnv, cwd);
 
   const release = await acquireKeychainLock();
   let pendingSignal: NodeJS.Signals | undefined;
@@ -424,7 +424,7 @@ export async function runClaudeLaunch(
     prior = captureClaudeKeychain();
     keychainTouched = true;
     writeClaudeKeychain(credential);
-    const code = await relayProcess(tool, args, env, cwd);
+    const code = await relayProcess(tool, args, launchEnv, cwd);
     return pendingSignal ? signalExitCode(pendingSignal) : code;
   } finally {
     try {

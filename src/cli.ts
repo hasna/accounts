@@ -37,7 +37,8 @@ import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.js";
-import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
+import { formatEnvAssignments, formatExportLines, profileEnv, providerLaunchEnv } from "./lib/env.js";
+import { redactText } from "./lib/redaction.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
@@ -599,9 +600,9 @@ program
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
-        env: { ...process.env, ...env },
+        env: providerLaunchEnv(process.env, env),
       });
-      if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
+      if (res.error) die(`failed to launch ${tool.bin}: ${redactText(res.error.message)}`);
       if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
       const finalized = await finalizeLogin(name, tool.id, store);
       if (finalized.applied) {
@@ -744,9 +745,9 @@ addConfigsOptions(program
           const [bin, ...launchArgs] = result.command;
           const res = spawnSync(bin!, launchArgs, {
             stdio: "inherit",
-            env: { ...process.env, ...result.env },
+            env: providerLaunchEnv(process.env, result.env),
           });
-          if (res.error) die(`failed to launch ${bin}: ${res.error.message}`);
+          if (res.error) die(`failed to launch ${bin}: ${redactText(res.error.message)}`);
           process.exit(res.status ?? 0);
         }
       },

@@ -96,6 +96,15 @@ let keychainAccount;
 if (process.env.FAKE_KEYCHAIN_STATE && existsSync(process.env.FAKE_KEYCHAIN_STATE)) {
   keychainAccount = JSON.parse(readFileSync(process.env.FAKE_KEYCHAIN_STATE, "utf8")).account;
 }
+const unsafeRequestDebug = [
+  "BUN_CONFIG_VERBOSE_FETCH",
+  "NODE_DEBUG",
+  "NODE_DEBUG_NATIVE",
+].filter((name) => process.env[name]);
+if (unsafeRequestDebug.length > 0 && process.env.FAKE_DEBUG_CREDENTIAL) {
+  console.log("Authorization: Bearer " + process.env.FAKE_DEBUG_CREDENTIAL);
+  console.error("x-api-key=" + process.env.FAKE_DEBUG_CREDENTIAL);
+}
 appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
   args,
   cwd: process.cwd(),
@@ -260,7 +269,7 @@ function profileDir(name: string): string {
 }
 
 function addProfile(name: string, credential?: string): void {
-  expect(runCli(["add", name, "--tool", "claude"]).status).toBe(0);
+  expectStatus(runCli(["add", name, "--tool", "claude"]), 0);
   if (credential) writeFileSync(join(profileDir(name), ".credentials.json"), credential, { mode: 0o600 });
 }
 
@@ -537,6 +546,7 @@ test("only print mode accepts raw output-format json; Accounts has no json mode"
 test("diagnostic redaction stays on stderr", () => {
   addProfile("acct");
   const secret = "sk-ant-abcdefghijklmnopqrstuvwxyz";
+  const dummyCredential = "dummy-redaction-credential";
   const result = runCli([
     "launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "--api-key", secret, "Prompt",
   ]);
@@ -548,6 +558,38 @@ test("diagnostic redaction stays on stderr", () => {
     "claude", "--api-key", "[REDACTED]", "--token=[REDACTED]",
   ]);
   expect(redactText(`failed ${secret}`)).toBe("failed [REDACTED]");
+  expect(redactText(`Authorization: Bearer ${dummyCredential}`)).toBe("Authorization: [REDACTED]");
+  expect(redactText(`x-api-key=${dummyCredential}`)).toBe("x-api-key=[REDACTED]");
+  expect(redactText(`x-amz-security-token: ${dummyCredential}`)).toBe("x-amz-security-token: [REDACTED]");
+  expect(redactText(`cookie="session=${dummyCredential}"`)).toBe("cookie=[REDACTED]");
+});
+
+test("credential-bearing launches suppress inherited request-debug output", () => {
+  addProfile("acct");
+  const dummyCredential = "dummy-provider-request-credential";
+  const dangerousSettings = [
+    ["BUN_CONFIG_VERBOSE_FETCH", "1"],
+    ["NODE_DEBUG", "http,http2"],
+    ["NODE_DEBUG_NATIVE", "http"],
+  ] as const;
+
+  for (const [name, value] of dangerousSettings) {
+    const result = runCli(
+      ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "Prompt"],
+      {
+        cwd: launchCwd,
+        env: {
+          [name]: value,
+          FAKE_DEBUG_CREDENTIAL: dummyCredential,
+        },
+      },
+    );
+    expectStatus(result, 0);
+    expect(result.stdout).not.toContain(dummyCredential);
+    expect(result.stderr).not.toContain(dummyCredential);
+    expect(result.stdout).toBe("fake-claude-stdout\n");
+    expect(result.stderr).toContain("fake-claude-stderr");
+  }
 });
 
 test("immediate crash and missing executable are returned as nonzero diagnostics", () => {

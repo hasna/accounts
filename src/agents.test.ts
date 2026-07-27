@@ -1,6 +1,6 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, listProfiles } from "./lib/profiles.js";
@@ -8,8 +8,10 @@ import {
   extractJsonArray,
   isToolSessionCommand,
   listAgentsAcrossProfiles,
+  runClaudeAgentsJson,
   type AgentsRunner,
 } from "./lib/agents.js";
+import { addCustomTool } from "./lib/tools.js";
 
 let home: string;
 
@@ -119,6 +121,26 @@ test("accounts agents --help registers the command", () => {
   expect(result.status).toBe(0);
   expect(result.stdout).toContain("--json");
   expect(result.stdout).toContain("--background");
+});
+
+test.skipIf(process.platform !== "linux")("agents probe quotes custom executable names before the script shell", () => {
+  const executable = join(home, "safe-agent-probe");
+  const injectionMarker = join(home, "injected");
+  writeFileSync(executable, "#!/bin/sh\nprintf '[]\\n'\n");
+  chmodSync(executable, 0o755);
+  addCustomTool({
+    id: "probe-tool",
+    label: "Probe Tool",
+    envVar: "PROBE_HOME",
+    defaultDir: join(home, "probe-default"),
+    bin: `${executable}; touch ${injectionMarker}; #`,
+  });
+  const profile = addProfile({ name: "probe", tool: "probe-tool" });
+
+  const result = runClaudeAgentsJson(profile);
+
+  expect(result.ok).toBe(false);
+  expect(existsSync(injectionMarker)).toBe(false);
 });
 
 // --- default-dir and untracked-process coverage (headless loops were invisible) ---

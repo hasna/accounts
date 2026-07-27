@@ -7,7 +7,8 @@ import { accountsHome, loadAppliedMap } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
-import { profileEnv } from "./env.js";
+import { profileEnv, providerLaunchEnv } from "./env.js";
+import { redactText } from "./redaction.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
 import { getTool } from "./tools.js";
@@ -411,14 +412,17 @@ export async function runSupervisedTool(
     prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
     const proc = spawn(tool.bin, childArgs, {
       stdio: opts.stdio ?? "inherit",
-      env: { ...process.env, ...env, ACCOUNTS_SUPERVISOR: "1", ACCOUNTS_ACTIVE: profile.name },
+      env: providerLaunchEnv(process.env, env, {
+        ACCOUNTS_SUPERVISOR: "1",
+        ACCOUNTS_ACTIVE: profile.name,
+      }),
       detached: process.platform !== "win32",
     });
     child = proc;
     persist();
 
     proc.once("error", (err) => {
-      log(`accounts supervisor: failed to start ${tool.bin}: ${err.message}`);
+      log(`accounts supervisor: failed to start ${tool.bin}: ${redactText(err.message)}`);
       if (!restarting && !stopping) finishRun(1);
     });
 
