@@ -299,11 +299,11 @@ test("delimiter-free folded credential tokens are fully redacted", () => {
   expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
 });
 
-test("authorization folding preserves arbitrary independent diagnostic assignments", () => {
+test("authorization folding preserves diagnostics after a syntactically complete value", () => {
   const input = [
     "Authorization: AWS4-HMAC-SHA256 Credential=diagnostic-access/20260727/us-east-1/bedrock/aws4_request,",
     " SignedHeaders=content-type;host;x-amz-date,",
-    " Signature=diagnostic-signature,",
+    " Signature=diagnostic-signature",
     " stack=Error: independent credential failure",
     " detail=Provider rejected request independently",
     " status=403 keep-status",
@@ -328,20 +328,30 @@ test("authorization folding preserves arbitrary independent diagnostic assignmen
   expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(1);
 });
 
-test("empty sensitive headers preserve indented diagnostics instead of treating assignments as credentials", () => {
+test("empty sensitive headers fail closed on indented diagnostic-looking continuations", () => {
   const input = [
     "Authorization:",
-    " stack=Error: authorization failed independently",
+    " stack=Error:opaque-authorization-credential",
     "Proxy-Authorization:",
-    " detail=Proxy rejected request independently",
+    " detail=opaque-proxy-credential",
     "Cookie:",
-    " status=401 keep-cookie-status",
+    " status=opaque-cookie-credential",
     "Set-Cookie:",
-    " message=keep set-cookie message",
+    " message=opaque-set-cookie-credential",
     "X-Request-ID: keep-adjacent-header",
   ].join("\n");
 
-  expect(redactText(input)).toBe(input);
+  const redacted = redactText(input);
+  for (const secret of [
+    "opaque-authorization-credential",
+    "opaque-proxy-credential",
+    "opaque-cookie-credential",
+    "opaque-set-cookie-credential",
+  ]) {
+    expect(redacted).not.toContain(secret);
+  }
+  expect(redacted).toContain("X-Request-ID: keep-adjacent-header");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
 });
 
 test("sensitive folds accept leading separators and padding-only credential tails", () => {
@@ -710,4 +720,55 @@ test("empty sensitive headers fail closed on malformed and extension continuatio
     expect(redacted).toContain(diagnostic);
   }
   expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(4);
+});
+
+test("ambiguous folded credential boundaries fail closed across headers and line endings", () => {
+  const headers = [
+    "Authorization",
+    "Proxy-Authorization",
+    "Cookie",
+    "Set-Cookie",
+  ];
+
+  for (const lineEnding of ["\n", "\r\n", "\r"]) {
+    for (const header of headers) {
+      const label = header.toLowerCase().replaceAll("-", "_");
+      for (const headerSyntax of [header, JSON.stringify(header)]) {
+        const cases = [
+          `${headerSyntax}:${lineEnding} message=${label}_empty_secret${lineEnding}status=418 keep-empty-boundary`,
+          `${headerSyntax}: seed=${label}_dangling_seed,${lineEnding} stack=Error:${label}_dangling_secret${lineEnding}status=418 keep-dangling-boundary`,
+          `${headerSyntax}: seed=${label}_separator_seed,${lineEnding} ,${lineEnding} detail=${label}_separator_secret${lineEnding}status=418 keep-separator-boundary`,
+          `${headerSyntax}: seed=${label}_serialized_seed, nonce:${label}_serialized_secret${lineEnding}status=418 keep-serialized-boundary`,
+          `${headerSyntax}: seed=${label}_quoted_serialized_seed, "nonce":${label}_quoted_serialized_secret${lineEnding}status=418 keep-quoted-serialized-boundary`,
+        ];
+
+        for (const input of cases) {
+          const redacted = redactText(input);
+          expect(redacted).not.toContain(`${label}_empty_secret`);
+          expect(redacted).not.toContain(`${label}_dangling_secret`);
+          expect(redacted).not.toContain(`${label}_separator_secret`);
+          expect(redacted).not.toContain(`${label}_serialized_secret`);
+          expect(redacted).not.toContain(`${label}_quoted_serialized_secret`);
+          expect(redacted).toContain("status=418 keep-");
+        }
+      }
+    }
+  }
+});
+
+test("properly quoted serialized values retain adjacent non-sensitive fields", () => {
+  for (const header of [
+    "Authorization",
+    "Proxy-Authorization",
+    "Cookie",
+    "Set-Cookie",
+  ]) {
+    const label = header.toLowerCase().replaceAll("-", "_");
+    const input = `{"${header}":"${label}_serialized_secret","status":418,"message":"keep-${label}"}`;
+    const redacted = redactText(input);
+
+    expect(redacted).not.toContain(`${label}_serialized_secret`);
+    expect(redacted).toContain('"status":418');
+    expect(redacted).toContain(`"message":"keep-${label}"`);
+  }
 });

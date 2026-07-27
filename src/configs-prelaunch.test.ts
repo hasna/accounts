@@ -299,6 +299,34 @@ describe("configs prelaunch", () => {
     }
   });
 
+  test("prelaunch error summaries keep stderr and stdout as separate records before redaction", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const fusedCredential = "controlled-fused-stream-credential";
+
+    try {
+      for (const stderrEnding of ["", "\n", "\r\n", "\r"]) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stderr: Buffer.from(`diagnostic-prefix${stderrEnding}`),
+              stdout: Buffer.from(`Authorization: Bearer ${fusedCredential}`),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("diagnostic-prefix");
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(fusedCredential);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
   test("fails closed when apply succeeds without a fresh manifest unless bypassed", () => {
     resetHome();
     try {

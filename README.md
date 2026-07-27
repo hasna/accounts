@@ -141,7 +141,10 @@ Controlled launch and prelaunch errors also redact complete
 including folded quoted values, token fragments, arbitrary extension
 parameters, and cookie attributes. Folded input is scanned once and fails
 closed until a clear record boundary, so malformed or unfamiliar credential
-syntax is not emitted merely because its parameter name is unknown.
+syntax is not emitted merely because its parameter name resembles a diagnostic
+or serialized field. Captured stderr and stdout are separated as distinct
+records before bounded redaction, preventing a missing trailing newline from
+fusing a diagnostic prefix with a credential-bearing header.
 
 Printed POSIX handoffs validate every environment-variable name, single-quote
 every value and command word without expansion, and place an explicit `env --`

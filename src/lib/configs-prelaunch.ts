@@ -142,8 +142,16 @@ function defaultRunner(command: string, args: string[]) {
   });
 }
 
+function capturedOutputRecords(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr">): string {
+  const stderr = result.stderr?.toString("utf8") ?? "";
+  const stdout = result.stdout?.toString("utf8") ?? "";
+  if (!stderr) return stdout;
+  if (!stdout) return stderr;
+  return `${stderr}${/[\r\n]$/.test(stderr) ? "" : "\n"}${stdout}`;
+}
+
 function outputSummary(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr">): string {
-  const combined = `${result.stderr?.toString("utf8") ?? ""}${result.stdout?.toString("utf8") ?? ""}`.trim();
+  const combined = capturedOutputRecords(result).trim();
   if (!combined) return "";
   const bounded = combined.split(/\r\n|\r|\n/).slice(0, 3).join("\n");
   return `: ${redactText(bounded).replace(/\n/g, " ")}`;

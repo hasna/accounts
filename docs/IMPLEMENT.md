@@ -79,10 +79,15 @@ names remain inside a folded credential record. Open quotes and ambiguous
 indented continuations fail closed. A new header, an unambiguous structured
 diagnostic record, or an explicit `status`, `message`, `stack`, or `detail`
 record after a syntactically complete non-separated value ends the record.
-Unknown assignment names and diagnostic-looking names after a dangling
-credential separator remain sensitive. This keeps the supported independent
-diagnostics visible without rescanning the accumulated header prefix or
-exposing malformed folds.
+Unknown assignment names, diagnostic-looking names after an empty value or
+dangling credential separator, separator-only folds, and serialized-looking
+malformed tails remain sensitive. A properly quoted sensitive value terminates
+at its closing quote; a comma followed by field-like text is not trusted as a
+record boundary for an unquoted or malformed credential. Controlled prelaunch
+stderr and stdout are separated by a record boundary before line bounding and
+redaction. This keeps supported independent records visible without rescanning
+the accumulated header prefix, fusing process streams, or exposing malformed
+folds.
 
 ## Apply safety
 

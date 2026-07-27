@@ -3,11 +3,7 @@ const SECRET_FIELD_PATTERN =
   /(\b(?:x-api-key|x-goog-api-key|x-amz-security-token|api[-_]?key|private[-_]?key|client[-_]?secret|auth[-_]?token|(?:access|refresh|id|session)[-_]?token|credential|password|secret|token)\b["']?[ \t]*[:=][ \t]*)(?:"[^"\r\n]*"|'[^'\r\n]*'|(?:Bearer|Basic)[ \t]+[^\s,;]+|[^\s,;]+)/gi;
 const SENSITIVE_REQUEST_HEADER_PATTERN =
   /(^|[^A-Za-z0-9_-])(["']?)(authorization|proxy-authorization|cookie|set-cookie)\2[ \t]*[:=][ \t]*/gim;
-const SERIALIZED_FIELD_BOUNDARY_PATTERN =
-  /,[ \t]*["']?[A-Za-z][A-Za-z0-9_-]*["']?[ \t]*:/y;
 const HEADER_LINE_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:/;
-const STRONG_DIAGNOSTIC_RECORD_PATTERN =
-  /^(?:status[ \t]*=[ \t]*[1-5][0-9]{2}(?:[ \t]|$)|stack[ \t]*=[ \t]*(?:[A-Za-z][A-Za-z0-9_.-]*Error|Error)(?::|[ \t]|$))/i;
 const EXPLICIT_DIAGNOSTIC_RECORD_PATTERN =
   /^(?:status|message|stack|detail)[ \t]*=[ \t]*\S/i;
 
@@ -36,11 +32,6 @@ function leadingFoldSeparator(
   };
 }
 
-function isSerializedFieldBoundary(value: string, index: number): boolean {
-  SERIALIZED_FIELD_BOUNDARY_PATTERN.lastIndex = index;
-  return SERIALIZED_FIELD_BOUNDARY_PATTERN.test(value);
-}
-
 function isSyntacticContinuation(
   sawContent: boolean,
   lastSignificant: string | undefined,
@@ -50,16 +41,15 @@ function isSyntacticContinuation(
   if (!trimmed || HEADER_LINE_PATTERN.test(trimmed)) return false;
 
   if (!sawContent) {
-    return !EXPLICIT_DIAGNOSTIC_RECORD_PATTERN.test(trimmed);
+    return true;
   }
 
   const leadingSeparator = leadingFoldSeparator(trimmed);
   if (leadingSeparator) {
-    return Boolean(leadingSeparator.remainder);
+    return true;
   }
 
   if (lastSignificant === "," || lastSignificant === ";") {
-    if (STRONG_DIAGNOSTIC_RECORD_PATTERN.test(trimmed)) return false;
     return true;
   }
 
@@ -116,7 +106,6 @@ function sensitiveHeaderValueEnd(
       lastSignificant = char;
       continue;
     }
-    if (char === "," && isSerializedFieldBoundary(value, index)) return index;
     if (char !== " " && char !== "\t") {
       sawContent = true;
       lastSignificant = char;
