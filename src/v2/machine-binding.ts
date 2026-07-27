@@ -62,15 +62,7 @@ export class MachineBindingOverlay {
     }
     const bindingKey = scopedKey(scope, binding.id);
     const existing = this.bindings.get(bindingKey);
-    if (
-      existing &&
-      (existing.accountId !== binding.accountId ||
-        existing.runtimeId !== binding.runtimeId ||
-        existing.tenantId !== binding.tenantId ||
-        existing.scopeId !== binding.scopeId)
-    ) {
-      throw new Error("binding identity fields are immutable");
-    }
+    if (existing) assertBindingTransition(existing, binding);
     this.bindings.set(bindingKey, binding);
     return immutableBinding(binding);
   }
@@ -144,4 +136,38 @@ function scopedKey(scope: ScopeRef, id: string): string {
 
 function immutableBinding(input: MachineBinding): MachineBinding {
   return Object.freeze(machineBindingSchema.parse(input));
+}
+
+function assertBindingTransition(current: MachineBinding, next: MachineBinding): void {
+  if (
+    current.id !== next.id ||
+    current.accountId !== next.accountId ||
+    current.runtimeId !== next.runtimeId ||
+    current.machineId !== next.machineId ||
+    current.tenantId !== next.tenantId ||
+    current.scopeId !== next.scopeId
+  ) {
+    throw new Error("binding identity fields are immutable");
+  }
+  if (next.generation < current.generation) {
+    throw new Error("machine binding generation cannot move backwards");
+  }
+  if (next.generation === current.generation && !sameBinding(current, next)) {
+    throw new Error("same-generation machine binding update must be an exact idempotent replay");
+  }
+}
+
+function sameBinding(first: MachineBinding, second: MachineBinding): boolean {
+  return (
+    first.id === second.id &&
+    first.tenantId === second.tenantId &&
+    first.scopeId === second.scopeId &&
+    first.accountId === second.accountId &&
+    first.runtimeId === second.runtimeId &&
+    first.machineId === second.machineId &&
+    first.rootPath === second.rootPath &&
+    first.credentialRef === second.credentialRef &&
+    first.authentication === second.authentication &&
+    first.generation === second.generation
+  );
 }

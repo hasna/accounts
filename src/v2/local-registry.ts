@@ -1,10 +1,11 @@
 import {
   accountIdSchema,
   accountSchema,
+  assertAccountRenameTransition,
   assertEntityScope,
+  parseAccountRename,
   RegistryConflictError,
   RegistryNotFoundError,
-  renameAccountInputSchema,
   registryScopeSchema,
   runtimeIdSchema,
   runtimeSchema,
@@ -75,17 +76,15 @@ export class LocalAccountsRegistry implements AccountsRegistry {
   ): Promise<Account> {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
-    const rename = renameAccountInputSchema.parse({
-      name: nameInput,
-      updatedAt: updatedAtInput,
-    });
     const current = this.accounts.get(key(scope, accountId));
     if (!current) throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
+    const rename = parseAccountRename(current, nameInput, updatedAtInput);
     const renamed = immutableAccount({
       ...current,
       name: rename.name,
       updatedAt: rename.updatedAt,
     });
+    assertAccountRenameTransition(current, rename, renamed);
     this.accounts.set(key(scope, accountId), renamed);
     return immutableAccount(renamed);
   }

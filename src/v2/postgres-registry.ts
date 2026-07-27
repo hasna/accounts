@@ -1,11 +1,21 @@
-import type { PoolQueryClient } from "../generated/storage-kit/index.js";
+import type {
+  PoolQueryClient,
+  QueryResult,
+} from "../generated/storage-kit/index.js";
+import type { QueryResultRow } from "pg";
 import {
   accountIdSchema,
   accountSchema,
+  assertAccountLookupIdentity,
+  assertAccountRenameRequest,
+  assertAccountRenameTransition,
   assertEntityScope,
+  assertRuntimeLookupIdentity,
+  assertSameAccountIdentity,
+  assertSameRuntimeIdentity,
+  parseAccountRenameInput,
   RegistryConflictError,
   RegistryNotFoundError,
-  renameAccountInputSchema,
   registryScopeSchema,
   runtimeIdSchema,
   runtimeSchema,
@@ -65,15 +75,17 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
   async getAccount(scopeInput: RegistryScope, accountIdInput: AccountId): Promise<Account | null> {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
-    const row = await this.client.get<AccountRow>(
+    const result = await this.client.query<AccountRow>(
       `SELECT account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at
        FROM accounts_v2
        WHERE tenant_id = $1 AND scope_id = $2 AND account_id = $3`,
       [scope.tenantId, scope.scopeId, accountId],
     );
+    const row = optionalExactRow(result, "account lookup");
     if (!row) return null;
     const account = toAccount(row);
     assertEntityScope(scope, account);
+    assertAccountLookupIdentity(accountId, account);
     return account;
   }
 
@@ -82,25 +94,28 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
     const account = accountSchema.parse(accountInput);
     assertEntityScope(scope, account);
     try {
-      const row = await this.client.one<AccountRow>(
-        `INSERT INTO accounts_v2
-           (account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at`,
-        [
-          account.id,
-          scope.tenantId,
-          scope.scopeId,
-          account.name,
-          account.runtimeId,
-          account.email ?? null,
-          account.createdAt,
-          account.updatedAt,
-        ],
-      );
-      const created = toAccount(row);
-      assertEntityScope(scope, created);
-      return created;
+      return await this.client.transaction(async (client) => {
+        const result = await client.query<AccountRow>(
+          `INSERT INTO accounts_v2
+             (account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at`,
+          [
+            account.id,
+            scope.tenantId,
+            scope.scopeId,
+            account.name,
+            account.runtimeId,
+            account.email ?? null,
+            account.createdAt,
+            account.updatedAt,
+          ],
+        );
+        const created = toAccount(requiredExactRow(result, "account creation"));
+        assertEntityScope(scope, created);
+        assertSameAccountIdentity(account, created);
+        return created;
+      });
     } catch (error) {
       if (isUniqueViolation(error)) {
         throw new RegistryConflictError(`account id "${account.id}" already exists in this scope`);
@@ -117,18 +132,49 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
   ): Promise<Account> {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
-    const rename = renameAccountInputSchema.parse({ name: nameInput, updatedAt });
-    const row = await this.client.get<AccountRow>(
-      `UPDATE accounts_v2
-       SET name = $4, updated_at = $5
-       WHERE tenant_id = $1 AND scope_id = $2 AND account_id = $3
-       RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at`,
-      [scope.tenantId, scope.scopeId, accountId, rename.name, rename.updatedAt],
-    );
-    if (!row) throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
-    const renamed = toAccount(row);
-    assertEntityScope(scope, renamed);
-    return renamed;
+    const rename = parseAccountRenameInput(nameInput, updatedAt);
+    return this.client.transaction(async (client) => {
+      const currentResult = await client.query<AccountRow>(
+        `SELECT account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at
+         FROM accounts_v2
+         WHERE tenant_id = $1 AND scope_id = $2 AND account_id = $3
+         FOR UPDATE`,
+        [scope.tenantId, scope.scopeId, accountId],
+      );
+      const currentRow = optionalExactRow(currentResult, "account rename pre-read");
+      if (!currentRow) {
+        throw new RegistryNotFoundError(
+          `account id "${accountId}" was not found in this scope`,
+        );
+      }
+      const current = toAccount(currentRow);
+      assertEntityScope(scope, current);
+      assertAccountLookupIdentity(accountId, current);
+      assertAccountRenameRequest(current, rename);
+
+      const result = await client.query<AccountRow>(
+        `UPDATE accounts_v2
+         SET name = $4, updated_at = $5
+         WHERE tenant_id = $1 AND scope_id = $2 AND account_id = $3
+           AND name = $6 AND runtime_id = $7 AND created_at = $8 AND updated_at = $9
+         RETURNING account_id, tenant_id, scope_id, name, runtime_id, email, created_at, updated_at`,
+        [
+          scope.tenantId,
+          scope.scopeId,
+          accountId,
+          rename.name,
+          rename.updatedAt,
+          current.name,
+          current.runtimeId,
+          current.createdAt,
+          current.updatedAt,
+        ],
+      );
+      const renamed = toAccount(requiredExactRow(result, "account rename"));
+      assertEntityScope(scope, renamed);
+      assertAccountRenameTransition(current, rename, renamed);
+      return renamed;
+    });
   }
 
   async listRuntimes(scopeInput: RegistryScope): Promise<readonly Runtime[]> {
@@ -150,15 +196,17 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
   async getRuntime(scopeInput: RegistryScope, runtimeIdInput: RuntimeId): Promise<Runtime | null> {
     const scope = registryScopeSchema.parse(scopeInput);
     const runtimeId = runtimeIdSchema.parse(runtimeIdInput);
-    const row = await this.client.get<RuntimeRow>(
+    const result = await this.client.query<RuntimeRow>(
       `SELECT runtime_id, tenant_id, scope_id, key, label, created_at, updated_at
        FROM runtimes_v2
        WHERE tenant_id = $1 AND scope_id = $2 AND runtime_id = $3`,
       [scope.tenantId, scope.scopeId, runtimeId],
     );
+    const row = optionalExactRow(result, "runtime lookup");
     if (!row) return null;
     const runtime = toRuntime(row);
     assertEntityScope(scope, runtime);
+    assertRuntimeLookupIdentity(runtimeId, runtime);
     return runtime;
   }
 
@@ -167,24 +215,27 @@ export class PostgresAccountsRegistry implements AccountsRegistry {
     const runtime = runtimeSchema.parse(runtimeInput);
     assertEntityScope(scope, runtime);
     try {
-      const row = await this.client.one<RuntimeRow>(
-        `INSERT INTO runtimes_v2
-           (runtime_id, tenant_id, scope_id, key, label, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING runtime_id, tenant_id, scope_id, key, label, created_at, updated_at`,
-        [
-          runtime.id,
-          scope.tenantId,
-          scope.scopeId,
-          runtime.key,
-          runtime.label,
-          runtime.createdAt,
-          runtime.updatedAt,
-        ],
-      );
-      const created = toRuntime(row);
-      assertEntityScope(scope, created);
-      return created;
+      return await this.client.transaction(async (client) => {
+        const result = await client.query<RuntimeRow>(
+          `INSERT INTO runtimes_v2
+             (runtime_id, tenant_id, scope_id, key, label, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING runtime_id, tenant_id, scope_id, key, label, created_at, updated_at`,
+          [
+            runtime.id,
+            scope.tenantId,
+            scope.scopeId,
+            runtime.key,
+            runtime.label,
+            runtime.createdAt,
+            runtime.updatedAt,
+          ],
+        );
+        const created = toRuntime(requiredExactRow(result, "runtime registration"));
+        assertEntityScope(scope, created);
+        assertSameRuntimeIdentity(runtime, created);
+        return created;
+      });
     } catch (error) {
       if (isUniqueViolation(error)) {
         throw new RegistryConflictError(`runtime id "${runtime.id}" already exists in this scope`);
@@ -225,4 +276,24 @@ function iso(value: string | Date): string {
 
 function isUniqueViolation(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === "23505");
+}
+
+function optionalExactRow<T extends QueryResultRow>(
+  result: QueryResult<T>,
+  operation: string,
+): T | null {
+  if (result.rowCount === 0 && result.rows.length === 0) return null;
+  return requiredExactRow(result, operation);
+}
+
+function requiredExactRow<T extends QueryResultRow>(
+  result: QueryResult<T>,
+  operation: string,
+): T {
+  if (result.rowCount !== 1 || result.rows.length !== 1) {
+    throw new RegistryConflictError(
+      `v2 PostgreSQL ${operation} must return exactly one row`,
+    );
+  }
+  return result.rows[0] as T;
 }

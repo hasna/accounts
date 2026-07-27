@@ -2,10 +2,15 @@ import {
   accountIdSchema,
   accountSchema,
   accountV2ListSchema,
+  assertAccountLookupIdentity,
+  assertAccountRenameTransition,
   assertEntityScope,
+  assertRuntimeLookupIdentity,
+  assertSameAccountIdentity,
+  assertSameRuntimeIdentity,
+  parseAccountRename,
   RegistryConflictError,
   RegistryNotFoundError,
-  renameAccountInputSchema,
   registryScopeSchema,
   runtimeIdSchema,
   runtimeSchema,
@@ -61,9 +66,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     if (body === null) return null;
     const account = accountSchema.parse(body);
     assertEntityScope(scope, account);
-    if (account.id !== accountId) {
-      throw new RegistryConflictError("v2 registry returned a different account identity for lookup");
-    }
+    assertAccountLookupIdentity(accountId, account);
     return account;
   }
 
@@ -89,39 +92,18 @@ export class HttpAccountsRegistry implements AccountsRegistry {
   ): Promise<Account> {
     const scope = registryScopeSchema.parse(scopeInput);
     const accountId = accountIdSchema.parse(accountIdInput);
-    const rename = renameAccountInputSchema.parse({ name: nameInput, updatedAt });
     const current = await this.getAccount(scope, accountId);
     if (!current) {
       throw new RegistryNotFoundError(`account id "${accountId}" was not found in this scope`);
     }
-    if (rename.name === current.name) {
-      throw new RegistryConflictError(
-        "requested account name must be different from the current name",
-      );
-    }
-    if (!timestampAdvances(current.updatedAt, rename.updatedAt)) {
-      throw new RegistryConflictError(
-        "requested updatedAt must advance the current account timestamp",
-      );
-    }
+    const rename = parseAccountRename(current, nameInput, updatedAt);
     const body = await this.request(scope, `/accounts/${encodeURIComponent(accountId)}/rename`, {
       method: "POST",
       body: rename,
     });
     const renamed = accountSchema.parse(body);
     assertEntityScope(scope, renamed);
-    assertSameAccountIdentity(current, renamed);
-    if (renamed.name !== rename.name) {
-      throw new RegistryConflictError("v2 registry rename response did not apply the requested name");
-    }
-    if (!timestampAdvances(current.updatedAt, renamed.updatedAt)) {
-      throw new RegistryConflictError("v2 registry rename response did not advance updatedAt");
-    }
-    if (Date.parse(renamed.updatedAt) !== Date.parse(rename.updatedAt)) {
-      throw new RegistryConflictError(
-        "v2 registry rename response did not apply the requested timestamp",
-      );
-    }
+    assertAccountRenameTransition(current, rename, renamed);
     return renamed;
   }
 
@@ -143,11 +125,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     if (body === null) return null;
     const runtime = runtimeSchema.parse(body);
     assertEntityScope(scope, runtime);
-    if (runtime.id !== runtimeId) {
-      throw new RegistryConflictError(
-        "v2 registry returned a different runtime identity for lookup",
-      );
-    }
+    assertRuntimeLookupIdentity(runtimeId, runtime);
     return runtime;
   }
 
@@ -161,9 +139,7 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     });
     const created = runtimeSchema.parse(body);
     assertEntityScope(scope, created);
-    if (created.id !== runtime.id) {
-      throw new RegistryConflictError("v2 registry returned a different runtime identity after registration");
-    }
+    assertSameRuntimeIdentity(runtime, created);
     return created;
   }
 
@@ -196,18 +172,4 @@ export class HttpAccountsRegistry implements AccountsRegistry {
     }
     return response.status === 204 ? null : response.json();
   }
-}
-
-function assertSameAccountIdentity(expected: Account, actual: Account): void {
-  if (
-    actual.id !== expected.id ||
-    actual.runtimeId !== expected.runtimeId ||
-    Date.parse(actual.createdAt) !== Date.parse(expected.createdAt)
-  ) {
-    throw new RegistryConflictError("v2 registry returned different immutable account identity fields");
-  }
-}
-
-function timestampAdvances(current: string, next: string): boolean {
-  return Date.parse(next) > Date.parse(current);
 }

@@ -558,8 +558,18 @@ function postgresFixture(): AdapterFixture {
       runtimes.set(itemKey, row);
       return row;
     },
-    async query() {
-      throw new Error("unexpected query");
+    async query(sql: string, params: readonly unknown[] = []) {
+      const statement = sql.trimStart();
+      if (statement.startsWith("INSERT")) {
+        const row = await this.one(sql, params);
+        return { rows: [row], rowCount: 1 };
+      }
+      if (statement.startsWith("UPDATE") || sql.includes(" = $3")) {
+        const row = await this.get(sql, params);
+        return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+      }
+      const rows = await this.many(sql, params);
+      return { rows, rowCount: rows.length };
     },
     async execute() {
       throw new Error("unexpected execute");
