@@ -64,6 +64,9 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
           "-x=client-key=mcp-opaque-bound-secret",
           "keep-after-opaque-bound-value",
           "--api-key",
+          "--label=opaque/--label=mcp-complete-token-secret",
+          "keep-after-complete-token-value",
+          "--api-key",
           "--",
           "--client-key",
           "keep-mcp-positional-client-value",
@@ -78,6 +81,7 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
     expect(text).not.toContain("mcp-chained-client-secret");
     expect(text).not.toContain("mcp-chained-short-secret");
     expect(text).not.toContain("mcp-opaque-bound-secret");
+    expect(text).not.toContain("mcp-complete-token-secret");
     const output = JSON.parse(text ?? "{}") as {
       command: string[];
       commandLine: string;
@@ -94,6 +98,9 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
       "[REDACTED]",
       "keep-after-opaque-bound-value",
       "--api-key",
+      "[REDACTED]",
+      "keep-after-complete-token-value",
+      "--api-key",
       "--",
       "--client-key",
       "keep-mcp-positional-client-value",
@@ -107,6 +114,9 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
     expect(output.commandLine).toContain("'-k' '-vk' '[REDACTED]'");
     expect(output.commandLine).toContain(
       "'--api-key' '[REDACTED]' 'keep-after-opaque-bound-value'",
+    );
+    expect(output.commandLine).toContain(
+      "'--api-key' '[REDACTED]' 'keep-after-complete-token-value'",
     );
     expect(output.commandLine).toContain(
       "'--api-key' '--' '--client-key' 'keep-mcp-positional-client-value'",

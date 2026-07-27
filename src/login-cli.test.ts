@@ -592,7 +592,7 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
   expect(runCli("add", "acct", "--tool", "argv-grammar").status).toBe(0);
 
   const secrets = Array.from(
-    { length: 18 },
+    { length: 19 },
     (_, index) => `actual-switch-credential-${index}`,
   );
   const credentialArgs = [
@@ -631,6 +631,9 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     `-x=client-key=${secrets[17]}`,
     "keep-after-opaque-bound-value",
     "--api-key",
+    `--label=opaque/--label=${secrets[18]}`,
+    "keep-after-complete-token-value",
+    "--api-key",
     "--",
     "--client-key",
     "keep-switch-positional-client-value",
@@ -660,6 +663,7 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     }
     expect(result.stdout).toContain("[REDACTED]");
     expect(result.stdout).toContain("keep-after-opaque-bound-value");
+    expect(result.stdout).toContain("keep-after-complete-token-value");
     expect(result.stdout).toContain("keep-switch-positional-client-value");
     expect(result.stdout).toContain("--api-key=keep-switch-positional-attached-value");
     expect(result.stdout).toContain("keep-switch-positional-short-value");
@@ -677,6 +681,8 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
       expect(output.commandLine).toContain("'-k' '-vk' '[REDACTED]'");
       expect(output.command).toContain("keep-after-opaque-bound-value");
       expect(output.commandLine).toContain("'keep-after-opaque-bound-value'");
+      expect(output.command).toContain("keep-after-complete-token-value");
+      expect(output.commandLine).toContain("'keep-after-complete-token-value'");
       expect(output.command).toContain("keep-switch-positional-client-value");
       expect(output.command).toContain("--api-key=keep-switch-positional-attached-value");
       expect(output.command).toContain("keep-switch-positional-short-value");

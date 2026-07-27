@@ -244,6 +244,30 @@ test("public switch projection preserves positional arguments after exact end-of
   );
 });
 
+test("public switch projection redacts pending opaque tokens with internal punctuation", async () => {
+  addProfile({ name: "complete-token", tool: "codex" });
+  const internal = await switchProfile("complete-token", {
+    tool: "codex",
+    mode: "active",
+    args: [
+      "--api-key",
+      "--label=opaque/--label=public-switch-hidden",
+      "keep-public-complete-token",
+    ],
+  });
+
+  const output = publicSwitchResult(internal);
+  expect(JSON.stringify(output)).not.toContain("public-switch-hidden");
+  expect(output.command.slice(-3)).toEqual([
+    "--api-key",
+    "[REDACTED]",
+    "keep-public-complete-token",
+  ]);
+  expect(output.commandLine).toContain(
+    "'--api-key' '[REDACTED]' 'keep-public-complete-token'",
+  );
+});
+
 test("launch environment policy is case-insensitive and preserves same-binding routing", () => {
   const inherited = {
     Path: "/trusted/bin",

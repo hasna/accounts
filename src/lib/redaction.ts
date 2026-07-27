@@ -809,16 +809,12 @@ function completeCommandOptionView(
   if (token.quoted || token.escaped) return undefined;
 
   const view = commandOptionView(token.decoded, true);
-  if (!view) return undefined;
-  const candidateEnd = token.decoded.length - view.suffix.length;
-  const candidate = normalizeCommandToken(
-    token.decoded.slice(view.prefix.length, candidateEnd),
-  );
-  if (view.endOfOptions) return candidate === "--" ? view : undefined;
-  if (isBareCommandOption(candidate)) return view;
-  return credentialOption(candidate, true)?.kind === "attached"
-    ? view
-    : undefined;
+  if (!view || view.prefix || view.suffix) return undefined;
+  const normalized = normalizeCommandToken(token.decoded);
+  if (view.endOfOptions) return normalized === "--" ? view : undefined;
+
+  if (isBareCommandOption(normalized)) return view;
+  return view.option?.kind === "attached" ? view : undefined;
 }
 
 function scanCommandToken(
@@ -826,6 +822,7 @@ function scanCommandToken(
   start: number,
   lineEnd: number,
   protectArithmetic = true,
+  splitEmbeddedOptions = true,
 ): CommandToken {
   let decoded = "";
   let quote: "'" | '"' | undefined;
@@ -859,6 +856,7 @@ function scanCommandToken(
           true,
         )?.kind === "attached";
     if (
+      splitEmbeddedOptions &&
       startsEmbeddedOption &&
       index > start &&
       !startsSensitiveAttachedValue &&
@@ -1183,6 +1181,7 @@ function redactCommandTokens(value: string): string {
         tokenCursor,
         lineEnd,
         !redactNext,
+        !redactNext,
       );
       const raw = value.slice(item.start, item.end);
       const optionView = !endOfOptions
@@ -1201,21 +1200,6 @@ function redactCommandTokens(value: string): string {
         if (bareLineContinuation) {
           pendingCrossedLine = false;
           tokenCursor = item.end;
-          continue;
-        }
-        const split = commandValueOptionSplit(item, raw);
-        if (split) {
-          parts.push(
-            value.slice(outputCursor, item.start),
-            replaceCommandValue(
-              value.slice(item.start, split.valueEnd),
-              item.quoted || item.escaped,
-            ),
-          );
-          outputCursor = split.valueEnd;
-          redactNext = false;
-          pendingCrossedLine = false;
-          tokenCursor = split.optionStart;
           continue;
         }
         if (nextOptionView) {

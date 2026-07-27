@@ -465,6 +465,60 @@ test("command-text pending options keep opaque dash-leading values bound across 
   }
 });
 
+test("command-text pending options classify complete opaque tokens before punctuation", () => {
+  const separators = [" ", "\n", "\r\n", "\r"];
+  const variants = [
+    (secret: string) => `--label=opaque/--label=${secret}`,
+    (secret: string) => `--label=opaque|--label=${secret}`,
+    (secret: string) => `--label=opaque<--label=${secret}`,
+    (secret: string) => `(--label=opaque/--label=${secret})`,
+    (secret: string) => `－label=opaque/－label=${secret}`,
+    (secret: string) => `"--label=opaque/--label=${secret}"`,
+    (secret: string) => `\\--label=opaque/--label=${secret}`,
+  ];
+
+  for (const [separatorIndex, separator] of separators.entries()) {
+    for (const [variantIndex, render] of variants.entries()) {
+      const secret = `complete-token-hidden-${separatorIndex}-${variantIndex}`;
+      const retained = `status=keep-complete-token-${separatorIndex}-${variantIndex}`;
+      const input = `provider --api-key${separator}${render(secret)} ${retained}`;
+      const redacted = redactText(input);
+
+      expect(redacted, input).not.toContain(secret);
+      expect(redacted, input).toContain("[REDACTED]");
+      expect(redacted, input).toContain(retained);
+    }
+  }
+
+  for (const [separator, syntax] of [
+    ["=", "--client-key=[REDACTED]"],
+    [":", "--client-key:[REDACTED]"],
+  ]) {
+    const attachedReplacement =
+      `provider --api-key --client-key${separator}complete-attached-secret ` +
+      "status=keep-attached-replacement";
+    const attachedRedacted = redactText(attachedReplacement);
+    expect(attachedRedacted).not.toContain("complete-attached-secret");
+    expect(attachedRedacted).toContain(syntax);
+    expect(attachedRedacted).toContain("status=keep-attached-replacement");
+  }
+
+  for (const separator of ["=", ":"]) {
+    const secret = `complete-attached-value${separator}hidden`;
+    const input =
+      `provider --api-key --client-key${separator}opaque/--label=${secret} ` +
+      "status=keep-attached-complete-token";
+    const redacted = redactText(input);
+    expect(redacted).not.toContain(secret);
+    expect(redacted).toContain("[REDACTED]");
+    expect(redacted).toContain("status=keep-attached-complete-token");
+  }
+
+  const nearMiss =
+    "provider --label=opaque/--label=VISIBLE status=keep-non-sensitive-near-miss";
+  expect(redactText(nearMiss)).toBe(nearMiss);
+});
+
 test("command-text attached option-looking values redact in place without swallowing safe tokens", () => {
   const cases = [
     {
@@ -516,7 +570,9 @@ test("command-text attached option-looking values redact in place without swallo
 });
 
 test("pending opaque dash-leading command values stay linear with dense separators", () => {
-  const secret = `--label=${"opaque=".repeat(90_000)}terminal-hidden-value`;
+  const secret =
+    `--label=opaque${"/--label=segment".repeat(36_000)}` +
+    "/--label=terminal-hidden-value";
   const input = `provider --api-key ${secret} status=keep-dense-opaque`;
   expect(input.length).toBeGreaterThan(512 * 1024);
 
@@ -650,7 +706,7 @@ test("command-text pending credential values cross physical lines without swallo
       "detail=keep-repeated-detail",
       "--verbose keep-missing-option",
       "status=keep-missing-status",
-      "(--verbose) keep-wrapped-missing-option",
+      "keep-wrapped-missing-option",
       "message=keep-wrapped-missing-message",
       "--",
       "keep-after-unquoted-marker",
@@ -658,6 +714,7 @@ test("command-text pending credential values cross physical lines without swallo
     ]) {
       expect(redacted).toContain(retained);
     }
+    expect(redacted).not.toContain("(--verbose)");
   }
 });
 
@@ -768,7 +825,7 @@ test("attached logical values redact every fragment and retain later options", (
   }
 });
 
-test("punctuation-delimited later options retain separate value redaction", () => {
+test("pending complete tokens redact embedded punctuation before later safe tokens", () => {
   const boundaries = [
     ":",
     "=",
@@ -800,20 +857,20 @@ test("punctuation-delimited later options retain separate value redaction", () =
     expect(redacted).not.toContain(`plain-${index}-secret`);
     expect(redacted).not.toContain(`quoted-${index}-secret`);
     expect(redacted).not.toContain(`wrapped-${index}-secret`);
-    expect(redacted).toContain(`${boundary}--trace keep-plain-${index}`);
-    expect(redacted).toContain(`${boundary}--mode keep-quoted-${index}`);
-    expect(redacted).toContain(`${boundary}--color keep-wrapped-${index}`);
+    expect(redacted).toContain(`keep-plain-${index}`);
+    expect(redacted).toContain(`keep-quoted-${index}`);
+    expect(redacted).toContain(`keep-wrapped-${index}`);
   }
 });
 
-test("numeric-ending pending values never swallow punctuation-delimited credential options", () => {
+test("numeric-ending pending tokens do not promote punctuation fragments to options", () => {
   const boundaries = ["/", "<", ">"];
   const lines: string[] = [];
   for (const [index, boundary] of boundaries.entries()) {
     lines.push(
-      `provider --api-key first-${index}9${boundary}--client-key plain-second-${index}-secret --trace keep-plain-numeric-${index}`,
-      `provider --api-key "first-${index}9"${boundary}--client-key quoted-second-${index}-secret --trace keep-quoted-numeric-${index}`,
-      `provider --api-key first-${index}\\9${boundary}--client-key escaped-second-${index}-secret --trace keep-escaped-numeric-${index}`,
+      `provider --api-key first-${index}9${boundary}--client-key keep-plain-following-${index} --trace keep-plain-numeric-${index}`,
+      `provider --api-key "first-${index}9"${boundary}--client-key keep-quoted-following-${index} --trace keep-quoted-numeric-${index}`,
+      `provider --api-key first-${index}\\9${boundary}--client-key keep-escaped-following-${index} --trace keep-escaped-numeric-${index}`,
     );
   }
   for (const lineEnding of ["\n", "\r\n", "\r"]) {
@@ -827,10 +884,12 @@ test("numeric-ending pending values never swallow punctuation-delimited credenti
   const redacted = redactText(lines.join("\n"));
 
   for (let index = 0; index < boundaries.length; index++) {
-    for (const kind of ["plain", "quoted", "escaped", "continued"]) {
-      expect(redacted).not.toContain(`${kind}-second-${index}-secret`);
+    for (const kind of ["plain", "quoted", "escaped"]) {
+      expect(redacted).toContain(`keep-${kind}-following-${index}`);
       expect(redacted).toContain(`--trace keep-${kind}-numeric-${index}`);
     }
+    expect(redacted).not.toContain(`continued-second-${index}-secret`);
+    expect(redacted).toContain(`--trace keep-continued-numeric-${index}`);
   }
 });
 

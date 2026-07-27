@@ -120,14 +120,18 @@ escaped dash-leading text remains the value. Opaque dash-leading text remains
 bound too: only a complete bare option or a complete sensitive attached form
 can replace pending state. Attached credential values that themselves resemble
 options are redacted in place before punctuation splitting, so the next safe
-token remains visible. Open quotes and odd trailing backslashes preserve
+token remains visible. A pending separate value is classified as one complete
+physical token before embedded punctuation is considered. Unless that whole
+token is proven bare option syntax or a supported sensitive attached form, the
+whole token is redacted and the next whitespace-separated token remains
+visible. Open quotes and odd trailing backslashes preserve
 fail-closed redaction across later physical fragments inside one command
 record. Blank physical lines and explicit `status`, `message`, `stack`, or
 `detail` records take precedence over incomplete shell syntax and terminate
 both missing-value and active continuation state, preventing unbounded carry
 into independent output. Physical lines, tokens, embedded punctuation, and
-quoted segments are each scanned forward-only. Safe
-punctuation boundaries include `:`, `=`, `|`, `/`, `<`, `>`, brackets,
+quoted segments are each scanned forward-only. When no separate value is
+pending, safe punctuation boundaries include `:`, `=`, `|`, `/`, `<`, `>`, brackets,
 parentheses, commas, and semicolons. Embedded word, URL, email, and arithmetic
 near-misses remain ordinary text. Balanced punctuation opened inside a
 structured URL/email value does not end that context, while a closing outer

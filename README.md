@@ -179,19 +179,23 @@ value; quoting, escaping, or opaque non-bare syntax keeps dash-leading text
 bound as that value. Only a complete bare option or a complete sensitive
 attached form replaces pending state. Attached values that resemble options,
 including `--api-key=--client-key` and its colon form, are redacted in place
-without consuming the next safe token. An open quote or odd trailing backslash
-keeps the logical value redacted across later physical fragments. A
+without consuming the next safe token. While a separate value is pending, the
+complete physical token is classified before embedded punctuation. Unless the
+whole token is proven option syntax, it is redacted as one bound value and the
+next whitespace-separated token remains unchanged. An open quote or odd
+trailing backslash keeps the logical value redacted across later physical fragments. A
 blank physical line or an explicit
 `status`, `message`, `stack`, or `detail` record ends the pending command
 record, including an active quote or backslash continuation; this explicit
 record boundary takes precedence over incomplete shell syntax so sensitive
-state cannot carry into independent diagnostics. Options may begin after the
-package's safe
-punctuation boundaries (`:`, `=`, `|`, `/`, `<`, `>`, brackets, parentheses,
+state cannot carry into independent diagnostics. When no separate value is
+pending, options may begin after the package's safe punctuation boundaries
+(`:`, `=`, `|`, `/`, `<`, `>`, brackets, parentheses,
 commas, and semicolons), while embedded word, URL, email, and arithmetic forms
 remain ordinary text. Balanced punctuation inside structured URL/email values
 stays data, while a closing outer wrapper or quote resumes option parsing. The
-scanner still retains later options and explicit unquoted `--` boundaries, and
+scanner still retains later whitespace-separated options and explicit unquoted
+`--` boundaries, and
 its line, token, and quoted-segment passes remain forward-only for bounded
 linear work.
 Captured stderr and stdout are bounded and redacted as separate process

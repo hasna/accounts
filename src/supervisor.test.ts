@@ -383,11 +383,11 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
   const one = addProfile({ name: "one", tool: "credentialgrammar" });
   const two = addProfile({ name: "two", tool: "credentialgrammar" });
   const initialSecrets = Array.from(
-    { length: 17 },
+    { length: 18 },
     (_, index) => `supervisor-initial-credential-${index}`,
   );
   const switchedSecrets = Array.from(
-    { length: 17 },
+    { length: 18 },
     (_, index) => `supervisor-switched-credential-${index}`,
   );
   const credentialArgs = (secrets: string[]) => [
@@ -425,6 +425,9 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     `-x=client-key=${secrets[16]}`,
     "keep-after-opaque-bound-value",
     "--api-key",
+    `--label=opaque/--label=${secrets[17]}`,
+    "keep-after-complete-token-value",
+    "--api-key",
     "--",
     "--client-key",
     "keep-supervisor-positional-client-value",
@@ -455,6 +458,7 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     });
     for (const secret of initialSecrets) expect(initialPublic).not.toContain(secret);
     expect(initialPublic).toContain("keep-after-opaque-bound-value");
+    expect(initialPublic).toContain("keep-after-complete-token-value");
     expect(initialPublic).toContain("keep-supervisor-positional-client-value");
     expect(initialPublic).toContain("--api-key=keep-supervisor-positional-attached-value");
     expect(initialPublic).toContain("keep-supervisor-positional-short-value");
@@ -467,6 +471,7 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     });
     const responseJson = JSON.stringify(response);
     for (const secret of switchedSecrets) expect(responseJson).not.toContain(secret);
+    expect(responseJson).toContain("keep-after-complete-token-value");
     expect(responseJson).toContain("keep-supervisor-positional-client-value");
     expect(responseJson).toContain("--api-key=keep-supervisor-positional-attached-value");
     expect(responseJson).toContain("keep-supervisor-positional-short-value");
@@ -482,6 +487,7 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     });
     for (const secret of switchedSecrets) expect(switchedPublic).not.toContain(secret);
     expect(switchedPublic).toContain("keep-after-opaque-bound-value");
+    expect(switchedPublic).toContain("keep-after-complete-token-value");
     expect(switchedPublic).toContain("keep-supervisor-positional-client-value");
     expect(switchedPublic).toContain("--api-key=keep-supervisor-positional-attached-value");
     expect(switchedPublic).toContain("keep-supervisor-positional-short-value");

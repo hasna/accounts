@@ -418,6 +418,13 @@ describe("configs prelaunch", () => {
         `－label/client-key/prelaunch-hidden-${lineIndex}-3`,
         `(--label/client-key/prelaunch-hidden-${lineIndex}-4)`,
         `|--label/client-key/prelaunch-hidden-${lineIndex}-5`,
+        `--label=opaque/--label=prelaunch-hidden-${lineIndex}-6`,
+        `--label=opaque|--label=prelaunch-hidden-${lineIndex}-7`,
+        `--label=opaque<--label=prelaunch-hidden-${lineIndex}-8`,
+        `(--label=opaque/--label=prelaunch-hidden-${lineIndex}-9)`,
+        `－label=opaque/－label=prelaunch-hidden-${lineIndex}-10`,
+        `"--label=opaque/--label=prelaunch-hidden-${lineIndex}-11"`,
+        `\\--label=opaque/--label=prelaunch-hidden-${lineIndex}-12`,
       ].entries()) {
         cases.push({
           output:
@@ -527,7 +534,7 @@ describe("configs prelaunch", () => {
         {
           output: 'provider --api-key "prelaunch-separate-punctuation-secret"|--color keep-prelaunch-separate-punctuation',
           secret: "prelaunch-separate-punctuation-secret",
-          retained: "|--color keep-prelaunch-separate-punctuation",
+          retained: "keep-prelaunch-separate-punctuation",
         },
       ];
 
