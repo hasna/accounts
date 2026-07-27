@@ -16,6 +16,7 @@ import {
 import { dirname, isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import { assertSafeWritePath } from "../lib/safe-path.js";
+import { AccountsError } from "../types.js";
 import {
   accountIdSchema,
   bindingIdSchema,
@@ -47,7 +48,7 @@ export const migrationDigestSchema = z
 
 export type MigrationDigest = z.infer<typeof migrationDigestSchema>;
 
-const migrationRedactionDomainSchema = z.enum([
+export const migrationRedactionDomainSchema = z.enum([
   "machine",
   "source.key",
   "source.authority-id",
@@ -64,7 +65,8 @@ const migrationRedactionDomainSchema = z.enum([
   "diagnostic.plan",
   "diagnostic.source-key",
   "diagnostic.source-tool",
-  "diagnostic.alias",
+  "diagnostic.alias.account",
+  "diagnostic.alias.session",
   "diagnostic.runtime-id",
 ]);
 
@@ -84,6 +86,10 @@ interface MigrationDiagnosticOptions {
 }
 
 const sourceAuthoritySchema = z.enum(["local-v1", "api-v1"]);
+export const migrationAliasKindSchema = z.enum([
+  "legacy_account",
+  "session_ref",
+]);
 const legacyKeySchema = z
   .string()
   .min(1)
@@ -621,7 +627,13 @@ export const migrationPlanSchema = z
 
 export type MigrationPlan = Readonly<z.infer<typeof migrationPlanSchema>>;
 
-export type MigrationIdKind = "plan" | "runtime" | "account" | "binding";
+export const migrationIdKindSchema = z.enum([
+  "plan",
+  "runtime",
+  "account",
+  "binding",
+]);
+export type MigrationIdKind = z.infer<typeof migrationIdKindSchema>;
 export type MigrationIdFactory = (kind: MigrationIdKind, seed: string) => string;
 
 export interface BuildMigrationPlanOptions {
@@ -629,7 +641,16 @@ export interface BuildMigrationPlanOptions {
   existingPlan?: MigrationPlan;
 }
 
-export class MigrationConflictError extends Error {
+const buildMigrationPlanOptionsSchema = z
+  .object({
+    idFactory: z
+      .custom<MigrationIdFactory>((value) => typeof value === "function")
+      .optional(),
+    existingPlan: migrationPlanSchema.optional(),
+  })
+  .strict();
+
+export class MigrationConflictError extends AccountsError {
   readonly code: string;
   readonly count?: number;
   readonly references: readonly MigrationDiagnosticReference[];
@@ -641,9 +662,25 @@ export class MigrationConflictError extends Error {
     this.count = options.count;
     this.references = deepFreeze([...(options.references ?? [])]);
   }
+
+  toJSON(): Readonly<{
+    name: string;
+    message: string;
+    code: string;
+    count?: number;
+    references: readonly MigrationDiagnosticReference[];
+  }> {
+    return deepFreeze({
+      name: this.name,
+      message: this.message,
+      code: this.code,
+      ...(this.count === undefined ? {} : { count: this.count }),
+      references: this.references,
+    });
+  }
 }
 
-export class MigrationDriftError extends Error {
+export class MigrationDriftError extends AccountsError {
   readonly code: string;
   readonly count?: number;
   readonly references: readonly MigrationDiagnosticReference[];
@@ -655,6 +692,76 @@ export class MigrationDriftError extends Error {
     this.count = options.count;
     this.references = deepFreeze([...(options.references ?? [])]);
   }
+
+  toJSON(): Readonly<{
+    name: string;
+    message: string;
+    code: string;
+    count?: number;
+    references: readonly MigrationDiagnosticReference[];
+  }> {
+    return deepFreeze({
+      name: this.name,
+      message: this.message,
+      code: this.code,
+      ...(this.count === undefined ? {} : { count: this.count }),
+      references: this.references,
+    });
+  }
+}
+
+function publicMigrationBoundary<T>(
+  code: string,
+  operation: () => T,
+): T {
+  try {
+    return operation();
+  } catch (error) {
+    if (
+      error instanceof MigrationConflictError ||
+      error instanceof MigrationDriftError
+    ) {
+      throw error;
+    }
+    throw new MigrationConflictError("migration public input was rejected", {
+      code,
+    });
+  }
+}
+
+async function publicMigrationBoundaryAsync<T>(
+  code: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (
+      error instanceof MigrationConflictError ||
+      error instanceof MigrationDriftError
+    ) {
+      throw error;
+    }
+    throw new MigrationConflictError("migration public operation was rejected", {
+      code,
+    });
+  }
+}
+
+function parsePublicMigrationSchema<TSchema extends z.ZodTypeAny>(
+  schema: TSchema,
+  value: unknown,
+  code: string,
+): z.output<TSchema> {
+  try {
+    const result = schema.safeParse(value);
+    if (result.success) return result.data;
+  } catch {
+    // Getter, proxy, or coercion failures are caller-origin diagnostics too.
+  }
+  throw new MigrationConflictError("migration public input was rejected", {
+    code,
+  });
 }
 
 function normalizeMigrationPlanInput(input: MigrationPlanInput): MigrationPlanInput {
@@ -686,7 +793,7 @@ function normalizeMigrationPlanInput(input: MigrationPlanInput): MigrationPlanIn
   };
 }
 
-export function buildMigrationPlan(
+function buildMigrationPlanInternal(
   inputValue: MigrationPlanInput,
   options: BuildMigrationPlanOptions = {},
 ): MigrationPlan {
@@ -726,7 +833,7 @@ export function buildMigrationPlan(
   }
 
   const idFactory = options.idFactory ?? defaultIdFactory;
-  const planId = migrationOpaqueIdSchema.parse(idFactory("plan", inputDigest));
+  const planId = invokeMigrationIdFactory(idFactory, "plan", inputDigest);
   const scopedSeed = `${input.scope.tenantId}:${input.scope.scopeId}`;
   const sourceKeys = new Set<string>();
   const runtimeIdByTool = new Map<string, RuntimeId>();
@@ -768,7 +875,11 @@ export function buildMigrationPlan(
       runtimeIdByTool.set(
         observation.source.tool,
         runtimeIdSchema.parse(
-          idFactory("runtime", `${scopedSeed}:${observation.source.tool}`),
+          invokeMigrationIdFactory(
+            idFactory,
+            "runtime",
+            `${scopedSeed}:${observation.source.tool}`,
+          ),
         ),
       );
     }
@@ -782,9 +893,17 @@ export function buildMigrationPlan(
     );
 
     const target = migrationTargetSchema.parse({
-      accountId: idFactory("account", `${scopedSeed}:${key}`),
+      accountId: invokeMigrationIdFactory(
+        idFactory,
+        "account",
+        `${scopedSeed}:${key}`,
+      ),
       runtimeId: runtimeIdByTool.get(observation.source.tool),
-      bindingId: idFactory("binding", `${scopedSeed}:${key}`),
+      bindingId: invokeMigrationIdFactory(
+        idFactory,
+        "binding",
+        `${scopedSeed}:${key}`,
+      ),
     });
 
     const disposition =
@@ -855,6 +974,25 @@ export function buildMigrationPlan(
     planDigest: hashCanonical(planCore),
   });
   return deepFreeze(plan);
+}
+
+export function buildMigrationPlan(
+  inputValue: MigrationPlanInput,
+  options: BuildMigrationPlanOptions = {},
+): MigrationPlan {
+  const input = parsePublicMigrationSchema(
+    migrationPlanInputSchema,
+    inputValue,
+    "migration_invalid_plan_input",
+  );
+  const parsedOptions = parsePublicMigrationSchema(
+    buildMigrationPlanOptionsSchema,
+    options,
+    "migration_invalid_plan_input",
+  );
+  return publicMigrationBoundary("migration_invalid_plan_input", () =>
+    buildMigrationPlanInternal(input, parsedOptions),
+  );
 }
 
 function rootQuarantineReason(
@@ -942,6 +1080,21 @@ function defaultIdFactory(kind: MigrationIdKind, seed: string): string {
     .slice(0, 32)}`;
 }
 
+function invokeMigrationIdFactory(
+  idFactory: MigrationIdFactory,
+  kind: MigrationIdKind,
+  seed: string,
+): string {
+  try {
+    return migrationOpaqueIdSchema.parse(idFactory(kind, seed));
+  } catch {
+    throw new MigrationConflictError(
+      "migration identifier allocation was rejected",
+      { code: "migration_id_allocation_failed" },
+    );
+  }
+}
+
 function migrationPlanInputFromPlan(plan: MigrationPlan): MigrationPlanInput {
   return {
     scope: plan.scope,
@@ -1018,7 +1171,9 @@ export interface RedactedMigrationPlan {
   records: readonly RedactedMigrationRecord[];
 }
 
-export function redactMigrationPlan(planInput: MigrationPlan): RedactedMigrationPlan {
+function redactMigrationPlanInternal(
+  planInput: MigrationPlan,
+): RedactedMigrationPlan {
   const plan = migrationPlanSchema.parse(planInput);
   return deepFreeze({
     schemaVersion: 1 as const,
@@ -1077,7 +1232,10 @@ export function redactMigrationPlan(planInput: MigrationPlan): RedactedMigration
           : {
               state: record.root.state,
               code: record.root.code,
-              pathDigest: record.root.pathDigest,
+              pathDigest: migrationRedactionDigest(
+                "root.path",
+                record.root.pathDigest,
+              ),
               reasonDigest: migrationRedactionDigest(
                 "root.unsafe-reason",
                 record.root.reason,
@@ -1096,6 +1254,19 @@ export function redactMigrationPlan(planInput: MigrationPlan): RedactedMigration
       disposition: record.disposition,
     })),
   });
+}
+
+export function redactMigrationPlan(
+  planInput: MigrationPlan,
+): RedactedMigrationPlan {
+  const plan = parsePublicMigrationSchema(
+    migrationPlanSchema,
+    planInput,
+    "migration_invalid_redaction_plan",
+  );
+  return publicMigrationBoundary("migration_invalid_redaction_plan", () =>
+    redactMigrationPlanInternal(plan),
+  );
 }
 
 const backupRestoreEvidenceSchema = z
@@ -1128,8 +1299,9 @@ const migrationGateEvidenceSchema = z
   .strict();
 
 export type MigrationGateEvidence = Readonly<z.infer<typeof migrationGateEvidenceSchema>>;
-export type MigrationGateIntent = "partial" | "final";
-const migrationStateSchema = z.enum([
+export const migrationGateIntentSchema = z.enum(["partial", "final"]);
+export type MigrationGateIntent = z.infer<typeof migrationGateIntentSchema>;
+export const migrationStateSchema = z.enum([
   "planned",
   "partial_ready",
   "partial_applied",
@@ -1149,7 +1321,7 @@ const migrationGateReceiptCoreSchema = z
   .object({
     schemaVersion: z.literal(1),
     sequence: z.number().int().positive().safe(),
-    intent: z.enum(["partial", "final"]),
+    intent: migrationGateIntentSchema,
     targetState: z.enum(["partial_ready", "final_ready"]),
     sourceIntegrityDigest: migrationDigestSchema,
     planId: migrationOpaqueIdSchema,
@@ -1219,13 +1391,14 @@ export type MigrationBackfillReceipt = Readonly<
   z.infer<typeof migrationBackfillReceiptSchema>
 >;
 
-export function evaluateMigrationGates(
+function evaluateMigrationGatesInternal(
   planInput: MigrationPlan,
   evidenceInput: MigrationGateEvidence,
   intent: MigrationGateIntent,
 ): MigrationGateResult {
   const plan = migrationPlanSchema.parse(planInput);
   const evidence = migrationGateEvidenceSchema.parse(evidenceInput);
+  const parsedIntent = migrationGateIntentSchema.parse(intent);
   const reasons = new Set<string>();
 
   if (evidence.planId !== plan.id || evidence.idempotencyKey !== plan.idempotencyKey) {
@@ -1271,16 +1444,49 @@ export function evaluateMigrationGates(
     (record) => record.disposition.state === "quarantined",
   );
   const readyRecords = plan.records.some((record) => record.disposition.state === "ready");
-  if (intent === "final" && quarantined) reasons.add("unresolved_quarantine");
-  if (intent === "partial" && !readyRecords) reasons.add("no_ready_records");
+  if (parsedIntent === "final" && quarantined) {
+    reasons.add("unresolved_quarantine");
+  }
+  if (parsedIntent === "partial" && !readyRecords) {
+    reasons.add("no_ready_records");
+  }
 
   return deepFreeze({
-    intent,
+    intent: parsedIntent,
     ready: reasons.size === 0,
     nextState:
-      reasons.size === 0 ? (intent === "partial" ? "partial_ready" : "final_ready") : null,
+      reasons.size === 0
+        ? parsedIntent === "partial"
+          ? "partial_ready"
+          : "final_ready"
+        : null,
     reasons: [...reasons],
   });
+}
+
+export function evaluateMigrationGates(
+  planInput: MigrationPlan,
+  evidenceInput: MigrationGateEvidence,
+  intent: MigrationGateIntent,
+): MigrationGateResult {
+  const parsedIntent = parsePublicMigrationSchema(
+    migrationGateIntentSchema,
+    intent,
+    "migration_invalid_gate_intent",
+  );
+  const plan = parsePublicMigrationSchema(
+    migrationPlanSchema,
+    planInput,
+    "migration_invalid_gate_input",
+  );
+  const evidence = parsePublicMigrationSchema(
+    migrationGateEvidenceSchema,
+    evidenceInput,
+    "migration_invalid_gate_input",
+  );
+  return publicMigrationBoundary("migration_invalid_gate_input", () =>
+    evaluateMigrationGatesInternal(plan, evidence, parsedIntent),
+  );
 }
 
 function hasAllRequiredArtifacts(values: readonly string[]): boolean {
@@ -1293,7 +1499,7 @@ function hasAllRequiredArtifacts(values: readonly string[]): boolean {
 
 const migrationAliasInputSchema = z
   .object({
-    kind: z.enum(["legacy_account", "session_ref"]),
+    kind: migrationAliasKindSchema,
     alias: canonicalAliasSchema,
     sourceKey: legacyKeySchema,
     targetId: migrationOpaqueIdSchema,
@@ -1356,7 +1562,9 @@ export const migrationSidecarSchema = migrationSidecarCoreSchema
 
 export type MigrationSidecar = Readonly<z.infer<typeof migrationSidecarSchema>>;
 
-export function createMigrationSidecar(planInput: MigrationPlan): MigrationSidecar {
+function createMigrationSidecarInternal(
+  planInput: MigrationPlan,
+): MigrationSidecar {
   const plan = migrationPlanSchema.parse(planInput);
   return withSidecarIntegrity({
     schemaVersion: 1,
@@ -1369,7 +1577,20 @@ export function createMigrationSidecar(planInput: MigrationPlan): MigrationSidec
   });
 }
 
-export function appendMigrationAlias(
+export function createMigrationSidecar(
+  planInput: MigrationPlan,
+): MigrationSidecar {
+  const plan = parsePublicMigrationSchema(
+    migrationPlanSchema,
+    planInput,
+    "migration_invalid_sidecar_plan",
+  );
+  return publicMigrationBoundary("migration_invalid_sidecar_plan", () =>
+    createMigrationSidecarInternal(plan),
+  );
+}
+
+function appendMigrationAliasInternal(
   sidecarInput: MigrationSidecar,
   aliasInput: MigrationAliasInput,
 ): MigrationSidecar {
@@ -1389,6 +1610,25 @@ export function appendMigrationAlias(
     backfillReceipts: sidecar.backfillReceipts,
     transitionJournal: sidecar.transitionJournal,
   });
+}
+
+export function appendMigrationAlias(
+  sidecarInput: MigrationSidecar,
+  aliasInput: MigrationAliasInput,
+): MigrationSidecar {
+  const sidecar = parsePublicMigrationSchema(
+    migrationSidecarSchema,
+    sidecarInput,
+    "migration_invalid_alias_input",
+  );
+  const alias = parsePublicMigrationSchema(
+    migrationAliasInputSchema,
+    aliasInput,
+    "migration_invalid_alias_input",
+  );
+  return publicMigrationBoundary("migration_invalid_alias_input", () =>
+    appendMigrationAliasInternal(sidecar, alias),
+  );
 }
 
 function canonicalGenesisAliasJournal(
@@ -1444,7 +1684,7 @@ function appendAliasToJournal(
         code: "migration_alias_source_not_in_plan",
         references: [
           diagnosticReference("diagnostic.source-key", alias.sourceKey),
-          diagnosticReference("diagnostic.alias", alias.alias),
+          diagnosticAliasReference(alias.kind, alias.alias),
         ],
       },
     );
@@ -1458,7 +1698,7 @@ function appendAliasToJournal(
         code: "migration_alias_target_mismatch",
         references: [
           diagnosticReference("diagnostic.source-key", alias.sourceKey),
-          diagnosticReference("diagnostic.alias", alias.alias),
+          diagnosticAliasReference(alias.kind, alias.alias),
         ],
       },
     );
@@ -1476,7 +1716,7 @@ function appendAliasToJournal(
         code: "migration_alias_identity_conflict",
         count: 2,
         references: [
-          diagnosticReference("diagnostic.alias", alias.alias),
+          diagnosticAliasReference(alias.kind, alias.alias),
         ],
       },
     );
@@ -1516,45 +1756,56 @@ export interface TransitionMigrationSidecarOptions {
   backfillReceipt?: MigrationBackfillReceipt;
 }
 
-export function transitionMigrationSidecar(
+const transitionMigrationSidecarOptionsSchema = z
+  .object({
+    gateEvidence: migrationGateEvidenceSchema.optional(),
+    backfillReceipt: migrationBackfillReceiptSchema.optional(),
+  })
+  .strict();
+
+function transitionMigrationSidecarInternal(
   sidecarInput: MigrationSidecar,
   target: MigrationState,
   options: TransitionMigrationSidecarOptions = {},
 ): MigrationSidecar {
   const sidecar = parseSidecar(sidecarInput);
-  if (target === sidecar.state) return sidecar;
-  if (stateRank[target] < stateRank[sidecar.state]) {
+  const parsedTarget = migrationStateSchema.parse(target);
+  const parsedOptions = transitionMigrationSidecarOptionsSchema.parse(options);
+  if (parsedTarget === sidecar.state) return sidecar;
+  if (stateRank[parsedTarget] < stateRank[sidecar.state]) {
     throw new MigrationConflictError("cannot move migration state backwards");
   }
-  if (!allowedTransitions[sidecar.state].includes(target)) {
+  if (!allowedTransitions[sidecar.state].includes(parsedTarget)) {
     throw new MigrationConflictError(
-      `invalid migration state transition ${sidecar.state} -> ${target}`,
+      `invalid migration state transition ${sidecar.state} -> ${parsedTarget}`,
     );
   }
   let gateReceipts = sidecar.gateReceipts;
   let backfillReceipts = sidecar.backfillReceipts;
-  if (target === "partial_ready" || target === "final_ready") {
-    if (!options.gateEvidence) {
+  if (parsedTarget === "partial_ready" || parsedTarget === "final_ready") {
+    if (!parsedOptions.gateEvidence) {
       throw new MigrationConflictError(
-        `entering ${target} requires current migration gate evidence`,
+        `entering ${parsedTarget} requires current migration gate evidence`,
       );
     }
     const gate = evaluateMigrationGates(
       sidecar.plan,
-      options.gateEvidence,
-      target === "partial_ready" ? "partial" : "final",
+      parsedOptions.gateEvidence,
+      parsedTarget === "partial_ready" ? "partial" : "final",
     );
-    if (!gate.ready || gate.nextState !== target) {
+    if (!gate.ready || gate.nextState !== parsedTarget) {
       throw new MigrationConflictError(
-        `migration gates block ${target}: ${gate.reasons.join(", ")}`,
+        `migration gates block ${parsedTarget}: ${gate.reasons.join(", ")}`,
       );
     }
-    const evidence = migrationGateEvidenceSchema.parse(options.gateEvidence);
+    const evidence = migrationGateEvidenceSchema.parse(
+      parsedOptions.gateEvidence,
+    );
     const receiptCore = migrationGateReceiptCoreSchema.parse({
       schemaVersion: 1,
       sequence: sidecar.gateReceipts.length + 1,
-      intent: target === "partial_ready" ? "partial" : "final",
-      targetState: target,
+      intent: parsedTarget === "partial_ready" ? "partial" : "final",
+      targetState: parsedTarget,
       sourceIntegrityDigest: sidecar.integrityDigest,
       planId: sidecar.plan.id,
       idempotencyKey: sidecar.plan.idempotencyKey,
@@ -1568,16 +1819,18 @@ export function transitionMigrationSidecar(
       }),
     ];
   }
-  if (target === "partial_applied" || target === "final_applied") {
-    if (!options.backfillReceipt) {
+  if (parsedTarget === "partial_applied" || parsedTarget === "final_applied") {
+    if (!parsedOptions.backfillReceipt) {
       throw new MigrationConflictError(
-        `entering ${target} requires a committed scope-bound backfill receipt`,
+        `entering ${parsedTarget} requires a committed scope-bound backfill receipt`,
       );
     }
-    const receipt = migrationBackfillReceiptSchema.parse(options.backfillReceipt);
+    const receipt = migrationBackfillReceiptSchema.parse(
+      parsedOptions.backfillReceipt,
+    );
     validateBackfillReceipt(sidecar.plan, receipt);
     const expectedReadyState =
-      target === "partial_applied" ? "partial_ready" : "final_ready";
+      parsedTarget === "partial_applied" ? "partial_ready" : "final_ready";
     if (
       receipt.readyState !== expectedReadyState ||
       receipt.sourceIntegrityDigest !== sidecar.integrityDigest ||
@@ -1590,7 +1843,7 @@ export function transitionMigrationSidecar(
     backfillReceipts = [...sidecar.backfillReceipts, receipt];
   }
   if (
-    (target === "final_ready" || target === "final_applied") &&
+    (parsedTarget === "final_ready" || parsedTarget === "final_applied") &&
     sidecar.plan.records.some((record) => record.disposition.state === "quarantined")
   ) {
     throw new MigrationConflictError(
@@ -1602,7 +1855,7 @@ export function transitionMigrationSidecar(
     sequence: sidecar.transitionJournal.length + 1,
     previousDigest: sidecar.transitionJournal.at(-1)?.digest ?? null,
     sourceState: sidecar.state,
-    targetState: target,
+    targetState: parsedTarget,
     sourceIntegrityDigest: sidecar.integrityDigest,
     sourceAliasJournalLength: sidecar.aliasJournal.length,
     sourceGateReceiptCount: sidecar.gateReceipts.length,
@@ -1615,12 +1868,41 @@ export function transitionMigrationSidecar(
   return withSidecarIntegrity({
     schemaVersion: 1,
     plan: sidecar.plan,
-    state: target,
+    state: parsedTarget,
     aliasJournal: sidecar.aliasJournal,
     gateReceipts,
     backfillReceipts,
     transitionJournal: [...sidecar.transitionJournal, transition],
   });
+}
+
+export function transitionMigrationSidecar(
+  sidecarInput: MigrationSidecar,
+  target: MigrationState,
+  options: TransitionMigrationSidecarOptions = {},
+): MigrationSidecar {
+  const parsedTarget = parsePublicMigrationSchema(
+    migrationStateSchema,
+    target,
+    "migration_invalid_transition_target",
+  );
+  const sidecar = parsePublicMigrationSchema(
+    migrationSidecarSchema,
+    sidecarInput,
+    "migration_invalid_transition_input",
+  );
+  const parsedOptions = parsePublicMigrationSchema(
+    transitionMigrationSidecarOptionsSchema,
+    options,
+    "migration_invalid_transition_input",
+  );
+  return publicMigrationBoundary("migration_invalid_transition_input", () =>
+    transitionMigrationSidecarInternal(
+      sidecar,
+      parsedTarget,
+      parsedOptions,
+    ),
+  );
 }
 
 function withSidecarIntegrity(
@@ -1940,6 +2222,14 @@ export interface MigrationBackfillPort {
   ): Promise<T>;
 }
 
+export const migrationBackfillPortSchema = z
+  .object({
+    transaction: z.custom<MigrationBackfillPort["transaction"]>(
+      (value) => typeof value === "function",
+    ),
+  })
+  .strict();
+
 export interface MigrationBackfillResult {
   runtimes: { created: number; adopted: number };
   accounts: { created: number; adopted: number };
@@ -1948,7 +2238,7 @@ export interface MigrationBackfillResult {
   receipt: MigrationBackfillReceipt;
 }
 
-export async function applyScopedBackfill(
+async function applyScopedBackfillInternal(
   sidecarInput: MigrationSidecar,
   port: MigrationBackfillPort,
 ): Promise<MigrationBackfillResult> {
@@ -1989,54 +2279,78 @@ export async function applyScopedBackfill(
     runtimes.set(runtime.id, runtime);
   }
 
-  const result = await port.transaction(sidecar.plan.scope, async (transaction) => {
-    const counts: MigrationBackfillCounts = {
-      runtimes: { created: 0, adopted: 0 },
-      accounts: { created: 0, adopted: 0 },
-      crosswalks: { created: 0, adopted: 0 },
-      epoch: "created",
-    };
+  let result: MigrationBackfillCounts;
+  try {
+    const transactionResult = await port.transaction(
+      sidecar.plan.scope,
+      async (transaction) => {
+        const counts: MigrationBackfillCounts = {
+          runtimes: { created: 0, adopted: 0 },
+          accounts: { created: 0, adopted: 0 },
+          crosswalks: { created: 0, adopted: 0 },
+          epoch: "created",
+        };
 
-    for (const runtime of [...runtimes.values()].sort((a, b) => a.id.localeCompare(b.id))) {
-      tally(counts.runtimes, await transaction.ensureRuntime(deepFreeze(runtime)));
-    }
-    for (const record of [...records].sort((a, b) => a.sourceKey.localeCompare(b.sourceKey))) {
-      const account: ScopedBackfillAccount = {
-        id: record.target.accountId,
-        tenantId: sidecar.plan.scope.tenantId,
-        scopeId: sidecar.plan.scope.scopeId,
-        name: record.source.name,
-        runtimeId: record.target.runtimeId,
-        createdAt: sidecar.plan.createdAt,
-        updatedAt: sidecar.plan.createdAt,
-      };
-      tally(counts.accounts, await transaction.ensureAccount(deepFreeze(account)));
-    }
-    for (const record of [...records].sort((a, b) => a.sourceKey.localeCompare(b.sourceKey))) {
-      const crosswalk: ScopedBackfillCrosswalk = {
-        sourceKey: record.sourceKey,
-        sourceAuthority: record.source.authority,
-        sourceAuthorityId: record.source.authorityId,
-        legacyTool: record.source.tool,
-        legacyName: record.source.name,
-        accountId: record.target.accountId,
-        runtimeId: record.target.runtimeId,
-        bindingId: record.target.bindingId,
-      };
-      tally(
-        counts.crosswalks,
-        await transaction.ensureCrosswalk(deepFreeze(crosswalk)),
-      );
-    }
-    counts.epoch = ensureResultSchema.parse(
-      await transaction.recordEpoch({
-        planId: sidecar.plan.id,
-        idempotencyKey: sidecar.plan.idempotencyKey,
-        cutoverEpoch: sidecar.plan.cutoverEpoch,
-      }),
+        for (const runtime of [...runtimes.values()].sort((a, b) =>
+          a.id.localeCompare(b.id)
+        )) {
+          tally(
+            counts.runtimes,
+            await transaction.ensureRuntime(deepFreeze(runtime)),
+          );
+        }
+        for (const record of [...records].sort((a, b) =>
+          a.sourceKey.localeCompare(b.sourceKey)
+        )) {
+          const account: ScopedBackfillAccount = {
+            id: record.target.accountId,
+            tenantId: sidecar.plan.scope.tenantId,
+            scopeId: sidecar.plan.scope.scopeId,
+            name: record.source.name,
+            runtimeId: record.target.runtimeId,
+            createdAt: sidecar.plan.createdAt,
+            updatedAt: sidecar.plan.createdAt,
+          };
+          tally(
+            counts.accounts,
+            await transaction.ensureAccount(deepFreeze(account)),
+          );
+        }
+        for (const record of [...records].sort((a, b) =>
+          a.sourceKey.localeCompare(b.sourceKey)
+        )) {
+          const crosswalk: ScopedBackfillCrosswalk = {
+            sourceKey: record.sourceKey,
+            sourceAuthority: record.source.authority,
+            sourceAuthorityId: record.source.authorityId,
+            legacyTool: record.source.tool,
+            legacyName: record.source.name,
+            accountId: record.target.accountId,
+            runtimeId: record.target.runtimeId,
+            bindingId: record.target.bindingId,
+          };
+          tally(
+            counts.crosswalks,
+            await transaction.ensureCrosswalk(deepFreeze(crosswalk)),
+          );
+        }
+        counts.epoch = ensureResultSchema.parse(
+          await transaction.recordEpoch({
+            planId: sidecar.plan.id,
+            idempotencyKey: sidecar.plan.idempotencyKey,
+            cutoverEpoch: sidecar.plan.cutoverEpoch,
+          }),
+        );
+        return deepFreeze(migrationBackfillCountsSchema.parse(counts));
+      },
     );
-    return deepFreeze(migrationBackfillCountsSchema.parse(counts));
-  });
+    result = migrationBackfillCountsSchema.parse(transactionResult);
+  } catch {
+    throw new MigrationConflictError(
+      "migration backfill port operation was rejected",
+      { code: "migration_backfill_failed" },
+    );
+  }
 
   const receiptCore = migrationBackfillReceiptCoreSchema.parse({
     schemaVersion: 1,
@@ -2057,6 +2371,25 @@ export async function applyScopedBackfill(
     ...result,
     receipt,
   });
+}
+
+export async function applyScopedBackfill(
+  sidecarInput: MigrationSidecar,
+  port: MigrationBackfillPort,
+): Promise<MigrationBackfillResult> {
+  const sidecar = parsePublicMigrationSchema(
+    migrationSidecarSchema,
+    sidecarInput,
+    "migration_backfill_failed",
+  );
+  parsePublicMigrationSchema(
+    migrationBackfillPortSchema,
+    port,
+    "migration_backfill_failed",
+  );
+  return publicMigrationBoundaryAsync("migration_backfill_failed", () =>
+    applyScopedBackfillInternal(sidecar, port),
+  );
 }
 
 function tally(counter: { created: number; adopted: number }, value: EnsureResult): void {
@@ -2180,25 +2513,33 @@ const migrationWalSchema = z
 
 type MigrationWal = z.infer<typeof migrationWalSchema>;
 
-export type MigrationDurabilityEvent =
-  | "wal_file_fsync"
-  | "wal_rename"
-  | "wal_directory_fsync"
-  | "sidecar_file_fsync"
-  | "sidecar_rename"
-  | "sidecar_directory_fsync"
-  | "wal_remove"
-  | "cleanup_directory_fsync";
+export const migrationDurabilityEventSchema = z.enum([
+  "wal_file_fsync",
+  "wal_rename",
+  "wal_directory_fsync",
+  "sidecar_file_fsync",
+  "sidecar_rename",
+  "sidecar_directory_fsync",
+  "wal_remove",
+  "cleanup_directory_fsync",
+]);
+export type MigrationDurabilityEvent = z.infer<
+  typeof migrationDurabilityEventSchema
+>;
 
-export type MigrationSidecarFailurePoint =
-  | "after_wal_file_fsync"
-  | "after_wal_rename"
-  | "after_wal_directory_fsync"
-  | "after_sidecar_file_fsync"
-  | "after_sidecar_rename"
-  | "after_sidecar_directory_fsync"
-  | "before_wal_remove"
-  | "after_wal_remove";
+export const migrationSidecarFailurePointSchema = z.enum([
+  "after_wal_file_fsync",
+  "after_wal_rename",
+  "after_wal_directory_fsync",
+  "after_sidecar_file_fsync",
+  "after_sidecar_rename",
+  "after_sidecar_directory_fsync",
+  "before_wal_remove",
+  "after_wal_remove",
+]);
+export type MigrationSidecarFailurePoint = z.infer<
+  typeof migrationSidecarFailurePointSchema
+>;
 
 export interface MigrationSidecarStoreOptions {
   sidecarPath: string;
@@ -2211,204 +2552,278 @@ export interface MigrationSidecarInstallOptions {
   expectedPreviousDigest?: MigrationDigest | null;
 }
 
+const migrationSidecarStoreOptionsSchema = z
+  .object({
+    sidecarPath: z.string().min(1),
+    legacyStorePath: z.string().min(1),
+    injectFailure: z
+      .custom<NonNullable<MigrationSidecarStoreOptions["injectFailure"]>>(
+        (value) => typeof value === "function",
+      )
+      .optional(),
+    onDurabilityEvent: z
+      .custom<NonNullable<MigrationSidecarStoreOptions["onDurabilityEvent"]>>(
+        (value) => typeof value === "function",
+      )
+      .optional(),
+  })
+  .strict();
+
+const migrationSidecarInstallOptionsSchema = z
+  .object({
+    expectedPreviousDigest: migrationDigestSchema.nullable().optional(),
+  })
+  .strict();
+
 export class MigrationSidecarStore {
-  readonly sidecarPath: string;
-  readonly legacyStorePath: string;
-  private readonly directory: string;
-  private readonly walPath: string;
-  private readonly walTempPath: string;
-  private readonly lockPath: string;
-  private readonly injectFailure?: (point: MigrationSidecarFailurePoint) => void;
-  private readonly onDurabilityEvent?: (event: MigrationDurabilityEvent) => void;
+  readonly #sidecarPath: string;
+  readonly #legacyStorePath: string;
+  readonly #directory: string;
+  readonly #walPath: string;
+  readonly #walTempPath: string;
+  readonly #lockPath: string;
+  readonly #injectFailure?: (point: MigrationSidecarFailurePoint) => void;
+  readonly #onDurabilityEvent?: (event: MigrationDurabilityEvent) => void;
 
   constructor(options: MigrationSidecarStoreOptions) {
-    this.sidecarPath = resolve(options.sidecarPath);
-    this.legacyStorePath = resolve(options.legacyStorePath);
-    this.assertDistinctLegacyStore();
-    this.directory = dirname(this.sidecarPath);
-    this.walPath = `${this.sidecarPath}.wal`;
-    this.walTempPath = `${this.walPath}.tmp`;
-    this.lockPath = `${this.sidecarPath}.lock`;
-    this.injectFailure = options.injectFailure;
-    this.onDurabilityEvent = options.onDurabilityEvent;
+    const parsedOptions = parsePublicMigrationSchema(
+      migrationSidecarStoreOptionsSchema,
+      options,
+      "migration_invalid_store_options",
+    );
+    this.#sidecarPath = resolve(parsedOptions.sidecarPath);
+    this.#legacyStorePath = resolve(parsedOptions.legacyStorePath);
+    this.#directory = dirname(this.#sidecarPath);
+    this.#walPath = `${this.#sidecarPath}.wal`;
+    this.#walTempPath = `${this.#walPath}.tmp`;
+    this.#lockPath = `${this.#sidecarPath}.lock`;
+    this.#injectFailure = parsedOptions.injectFailure;
+    this.#onDurabilityEvent = parsedOptions.onDurabilityEvent;
+    this.#storeBoundary("migration_store_initialization_failed", () =>
+      this.#assertDistinctLegacyStore(),
+    );
+  }
+
+  toJSON(): Readonly<{
+    schemaVersion: 1;
+    kind: "migration_sidecar_store";
+  }> {
+    return deepFreeze({
+      schemaVersion: 1 as const,
+      kind: "migration_sidecar_store" as const,
+    });
   }
 
   load(): MigrationSidecar | null {
-    if (!existsSync(this.sidecarPath)) return null;
-    assertPrivateRegularFile(this.sidecarPath, "migration sidecar");
-    try {
-      return parseSidecar(JSON.parse(readFileSync(this.sidecarPath, "utf8")));
-    } catch (error) {
-      if (error instanceof MigrationDriftError) throw error;
-      throw new MigrationDriftError(
-        "could not parse migration sidecar",
-        { code: "migration_sidecar_parse_failed" },
-      );
-    }
+    return this.#storeBoundary("migration_store_read_failed", () => {
+      if (!existsSync(this.#sidecarPath)) return null;
+      assertPrivateRegularFile(this.#sidecarPath, "migration sidecar");
+      try {
+        return parseSidecar(
+          JSON.parse(readFileSync(this.#sidecarPath, "utf8")),
+        );
+      } catch (error) {
+        if (error instanceof MigrationDriftError) throw error;
+        throw new MigrationDriftError("could not parse migration sidecar", {
+          code: "migration_sidecar_parse_failed",
+        });
+      }
+    });
   }
 
   install(
     sidecarInput: MigrationSidecar,
     options: MigrationSidecarInstallOptions = {},
   ): MigrationSidecar {
-    const sidecar = parseSidecar(sidecarInput);
-    const expectedPreviousDigest =
-      options.expectedPreviousDigest === undefined
-        ? undefined
-        : options.expectedPreviousDigest === null
-          ? null
-          : migrationDigestSchema.parse(options.expectedPreviousDigest);
-    return this.withLock(() => {
-      this.assertDistinctLegacyStore();
-      if (existsSync(this.walPath) || existsSync(this.walTempPath)) {
-        throw new MigrationConflictError(
-          "pending migration WAL must be repaired before another install",
-        );
-      }
-      const current = this.load();
-      if (current?.integrityDigest === sidecar.integrityDigest) return current;
-      if (!current && expectedPreviousDigest !== undefined && expectedPreviousDigest !== null) {
-        throw new MigrationConflictError(
-          "migration sidecar compare-and-swap expected an existing predecessor",
-        );
-      }
-      if (!current && sidecar.state !== "planned") {
-        throw new MigrationConflictError(
-          "the first durable migration sidecar state must be planned",
-        );
-      }
-      if (!current) assertCanonicalPlannedGenesis(sidecar);
-      if (current && expectedPreviousDigest === undefined) {
-        throw new MigrationConflictError(
-          "updating a migration sidecar requires its expected previous integrity digest",
-        );
-      }
-      if (current && expectedPreviousDigest !== current.integrityDigest) {
-        throw new MigrationConflictError(
-          "migration sidecar changed since it was read; refusing a stale writer",
-        );
-      }
-      if (current && hashCanonical(current.plan) !== hashCanonical(sidecar.plan)) {
-        throw new MigrationConflictError(
-          "existing migration sidecar belongs to a different frozen plan",
-        );
-      }
-      if (current) assertSidecarSuccessor(current, sidecar);
-      const wal = migrationWalSchema.parse({
-        schemaVersion: 1,
-        planId: sidecar.plan.id,
-        idempotencyKey: sidecar.plan.idempotencyKey,
-        previousDigest: current?.integrityDigest ?? null,
-        nextDigest: sidecar.integrityDigest,
-        nextSidecar: sidecar,
+    const parsedSidecarInput = parsePublicMigrationSchema(
+      migrationSidecarSchema,
+      sidecarInput,
+      "migration_store_install_failed",
+    );
+    const parsedOptions = parsePublicMigrationSchema(
+      migrationSidecarInstallOptionsSchema,
+      options,
+      "migration_store_install_failed",
+    );
+    return this.#storeBoundary("migration_store_install_failed", () => {
+      const sidecar = parseSidecar(parsedSidecarInput);
+      const expectedPreviousDigest = parsedOptions.expectedPreviousDigest;
+      return this.#withLock(() => {
+        this.#assertDistinctLegacyStore();
+        if (existsSync(this.#walPath) || existsSync(this.#walTempPath)) {
+          throw new MigrationConflictError(
+            "pending migration WAL must be repaired before another install",
+          );
+        }
+        const current = this.load();
+        if (current?.integrityDigest === sidecar.integrityDigest) return current;
+        if (
+          !current &&
+          expectedPreviousDigest !== undefined &&
+          expectedPreviousDigest !== null
+        ) {
+          throw new MigrationConflictError(
+            "migration sidecar compare-and-swap expected an existing predecessor",
+          );
+        }
+        if (!current && sidecar.state !== "planned") {
+          throw new MigrationConflictError(
+            "the first durable migration sidecar state must be planned",
+          );
+        }
+        if (!current) assertCanonicalPlannedGenesis(sidecar);
+        if (current && expectedPreviousDigest === undefined) {
+          throw new MigrationConflictError(
+            "updating a migration sidecar requires its expected previous integrity digest",
+          );
+        }
+        if (current && expectedPreviousDigest !== current.integrityDigest) {
+          throw new MigrationConflictError(
+            "migration sidecar changed since it was read; refusing a stale writer",
+          );
+        }
+        if (
+          current &&
+          hashCanonical(current.plan) !== hashCanonical(sidecar.plan)
+        ) {
+          throw new MigrationConflictError(
+            "existing migration sidecar belongs to a different frozen plan",
+          );
+        }
+        if (current) assertSidecarSuccessor(current, sidecar);
+        const wal = migrationWalSchema.parse({
+          schemaVersion: 1,
+          planId: sidecar.plan.id,
+          idempotencyKey: sidecar.plan.idempotencyKey,
+          previousDigest: current?.integrityDigest ?? null,
+          nextDigest: sidecar.integrityDigest,
+          nextSidecar: sidecar,
+        });
+        this.#prepareDirectory();
+        this.#writeWal(wal);
+        this.#writeSidecar(sidecar);
+        this.#finishWal();
+        return sidecar;
       });
-      this.prepareDirectory();
-      this.writeWal(wal);
-      this.writeSidecar(sidecar);
-      this.finishWal();
-      return sidecar;
     });
   }
 
   repair(): MigrationSidecar | null {
-    return this.withLock(() => {
-      this.prepareDirectory();
-      if (!existsSync(this.walPath) && existsSync(this.walTempPath)) {
-        assertPrivateRegularFile(this.walTempPath, "migration WAL staging file");
-        this.readWal(this.walTempPath);
-        renameSync(this.walTempPath, this.walPath);
-        chmodSync(this.walPath, SIDECAR_MODE);
-        this.onDurabilityEvent?.("wal_rename");
-        fsyncDirectory(this.directory);
-        this.onDurabilityEvent?.("wal_directory_fsync");
-      }
-      if (!existsSync(this.walPath)) return this.load();
-
-      const wal = this.readWal(this.walPath);
-      if (wal.previousDigest === null) {
-        assertCanonicalPlannedGenesis(wal.nextSidecar);
-      }
-      let current: MigrationSidecar | null;
-      try {
-        current = this.load();
-      } catch (error) {
-        throw new MigrationDriftError(
-          "migration sidecar drift is ambiguous; preserving WAL",
-          { code: "migration_sidecar_drift_ambiguous" },
-        );
-      }
-      if (current?.integrityDigest === wal.nextDigest) {
-        this.finishWal({ allowFailureInjection: false });
-        return current;
-      }
-      if (
-        (current === null && wal.previousDigest === null) ||
-        current?.integrityDigest === wal.previousDigest
-      ) {
-        if (current) {
-          if (
-            hashCanonical(current.plan) !==
-            hashCanonical(wal.nextSidecar.plan)
-          ) {
-            throw new MigrationConflictError(
-              "migration WAL successor belongs to a different frozen plan",
-            );
-          }
-          assertSidecarSuccessor(current, wal.nextSidecar);
+    return this.#storeBoundary("migration_store_repair_failed", () =>
+      this.#withLock(() => {
+        this.#prepareDirectory();
+        if (!existsSync(this.#walPath) && existsSync(this.#walTempPath)) {
+          assertPrivateRegularFile(
+            this.#walTempPath,
+            "migration WAL staging file",
+          );
+          this.#readWal(this.#walTempPath);
+          renameSync(this.#walTempPath, this.#walPath);
+          chmodSync(this.#walPath, SIDECAR_MODE);
+          this.#emitDurabilityEvent("wal_rename");
+          fsyncDirectory(this.#directory);
+          this.#emitDurabilityEvent("wal_directory_fsync");
         }
-        this.writeSidecar(wal.nextSidecar, { allowFailureInjection: false });
-        this.finishWal({ allowFailureInjection: false });
-        return wal.nextSidecar;
-      }
-      throw new MigrationDriftError(
-        "migration sidecar changed outside the frozen WAL transition; preserving WAL and data",
-      );
+        if (!existsSync(this.#walPath)) return this.load();
+
+        const wal = this.#readWal(this.#walPath);
+        if (wal.previousDigest === null) {
+          assertCanonicalPlannedGenesis(wal.nextSidecar);
+        }
+        let current: MigrationSidecar | null;
+        try {
+          current = this.load();
+        } catch {
+          throw new MigrationDriftError(
+            "migration sidecar drift is ambiguous; preserving WAL",
+            { code: "migration_sidecar_drift_ambiguous" },
+          );
+        }
+        if (current?.integrityDigest === wal.nextDigest) {
+          this.#finishWal({ allowFailureInjection: false });
+          return current;
+        }
+        if (
+          (current === null && wal.previousDigest === null) ||
+          current?.integrityDigest === wal.previousDigest
+        ) {
+          if (current) {
+            if (
+              hashCanonical(current.plan) !==
+              hashCanonical(wal.nextSidecar.plan)
+            ) {
+              throw new MigrationConflictError(
+                "migration WAL successor belongs to a different frozen plan",
+              );
+            }
+            assertSidecarSuccessor(current, wal.nextSidecar);
+          }
+          this.#writeSidecar(wal.nextSidecar, {
+            allowFailureInjection: false,
+          });
+          this.#finishWal({ allowFailureInjection: false });
+          return wal.nextSidecar;
+        }
+        throw new MigrationDriftError(
+          "migration sidecar changed outside the frozen WAL transition; preserving WAL and data",
+        );
+      }),
+    );
+  }
+
+  #prepareDirectory(): void {
+    this.#assertDistinctLegacyStore();
+    assertSafeWritePath(this.#sidecarPath, {
+      mustStayUnder: this.#directory,
     });
+    assertSafeWritePath(this.#walPath, { mustStayUnder: this.#directory });
+    assertSafeWritePath(this.#walTempPath, {
+      mustStayUnder: this.#directory,
+    });
+    assertSafeWritePath(this.#lockPath, { mustStayUnder: this.#directory });
   }
 
-  private prepareDirectory(): void {
-    this.assertDistinctLegacyStore();
-    assertSafeWritePath(this.sidecarPath, { mustStayUnder: this.directory });
-    assertSafeWritePath(this.walPath, { mustStayUnder: this.directory });
-    assertSafeWritePath(this.walTempPath, { mustStayUnder: this.directory });
-    assertSafeWritePath(this.lockPath, { mustStayUnder: this.directory });
-  }
-
-  private assertDistinctLegacyStore(): void {
+  #assertDistinctLegacyStore(): void {
     if (
-      this.sidecarPath === this.legacyStorePath ||
-      pathsReferToSameFile(this.sidecarPath, this.legacyStorePath)
+      this.#sidecarPath === this.#legacyStorePath ||
+      pathsReferToSameFile(this.#sidecarPath, this.#legacyStorePath)
     ) {
       throw new MigrationConflictError(
         "migration sidecar path must not be accounts.json or the configured v1 registry path",
+        {
+          code: "migration_store_path_rejected",
+          references: [
+            diagnosticReference("root.path", this.#sidecarPath),
+          ],
+        },
       );
     }
   }
 
-  private writeWal(wal: MigrationWal): void {
-    this.writeDurableFile(
-      this.walPath,
+  #writeWal(wal: MigrationWal): void {
+    this.#writeDurableFile(
+      this.#walPath,
       JSON.stringify(wal, null, 2) + "\n",
       "wal",
-      this.walTempPath,
+      this.#walTempPath,
       true,
     );
   }
 
-  private writeSidecar(
+  #writeSidecar(
     sidecar: MigrationSidecar,
     options: { allowFailureInjection?: boolean } = {},
   ): void {
-    this.writeDurableFile(
-      this.sidecarPath,
+    this.#writeDurableFile(
+      this.#sidecarPath,
       JSON.stringify(sidecar, null, 2) + "\n",
       "sidecar",
-      `${this.sidecarPath}.tmp`,
+      `${this.#sidecarPath}.tmp`,
       options.allowFailureInjection ?? true,
     );
   }
 
-  private writeDurableFile(
+  #writeDurableFile(
     target: string,
     contents: string,
     kind: "wal" | "sidecar",
@@ -2422,17 +2837,23 @@ export class MigrationSidecarStore {
       descriptor = openSync(temp, "wx", SIDECAR_MODE);
       writeFileSync(descriptor, contents, { encoding: "utf8" });
       fsyncSync(descriptor);
-      this.onDurabilityEvent?.(`${kind}_file_fsync`);
-      if (allowFailureInjection) this.injectFailure?.(`after_${kind}_file_fsync`);
+      this.#emitDurabilityEvent(`${kind}_file_fsync`);
+      if (allowFailureInjection) {
+        this.#injectFailurePoint(`after_${kind}_file_fsync`);
+      }
       closeSync(descriptor);
       descriptor = undefined;
       renameSync(temp, target);
       chmodSync(target, SIDECAR_MODE);
-      this.onDurabilityEvent?.(`${kind}_rename`);
-      if (allowFailureInjection) this.injectFailure?.(`after_${kind}_rename`);
-      fsyncDirectory(this.directory);
-      this.onDurabilityEvent?.(`${kind}_directory_fsync`);
-      if (allowFailureInjection) this.injectFailure?.(`after_${kind}_directory_fsync`);
+      this.#emitDurabilityEvent(`${kind}_rename`);
+      if (allowFailureInjection) {
+        this.#injectFailurePoint(`after_${kind}_rename`);
+      }
+      fsyncDirectory(this.#directory);
+      this.#emitDurabilityEvent(`${kind}_directory_fsync`);
+      if (allowFailureInjection) {
+        this.#injectFailurePoint(`after_${kind}_directory_fsync`);
+      }
       completed = true;
     } finally {
       if (descriptor !== undefined) closeSync(descriptor);
@@ -2440,18 +2861,40 @@ export class MigrationSidecarStore {
     }
   }
 
-  private finishWal(options: { allowFailureInjection?: boolean } = {}): void {
+  #finishWal(options: { allowFailureInjection?: boolean } = {}): void {
     const allowFailureInjection = options.allowFailureInjection ?? true;
-    if (allowFailureInjection) this.injectFailure?.("before_wal_remove");
-    if (existsSync(this.walPath)) unlinkSync(this.walPath);
-    rmSync(this.walTempPath, { force: true });
-    this.onDurabilityEvent?.("wal_remove");
-    if (allowFailureInjection) this.injectFailure?.("after_wal_remove");
-    fsyncDirectory(this.directory);
-    this.onDurabilityEvent?.("cleanup_directory_fsync");
+    if (allowFailureInjection) this.#injectFailurePoint("before_wal_remove");
+    if (existsSync(this.#walPath)) unlinkSync(this.#walPath);
+    rmSync(this.#walTempPath, { force: true });
+    this.#emitDurabilityEvent("wal_remove");
+    if (allowFailureInjection) this.#injectFailurePoint("after_wal_remove");
+    fsyncDirectory(this.#directory);
+    this.#emitDurabilityEvent("cleanup_directory_fsync");
   }
 
-  private readWal(path: string): MigrationWal {
+  #emitDurabilityEvent(event: MigrationDurabilityEvent): void {
+    try {
+      this.#onDurabilityEvent?.(event);
+    } catch {
+      throw new MigrationConflictError(
+        "migration durability callback was rejected",
+        { code: "migration_store_callback_failed" },
+      );
+    }
+  }
+
+  #injectFailurePoint(point: MigrationSidecarFailurePoint): void {
+    try {
+      this.#injectFailure?.(point);
+    } catch {
+      throw new MigrationConflictError(
+        "migration failure-injection callback was rejected",
+        { code: "migration_store_callback_failed" },
+      );
+    }
+  }
+
+  #readWal(path: string): MigrationWal {
     assertPrivateRegularFile(path, "migration WAL");
     try {
       const wal = migrationWalSchema.parse(JSON.parse(readFileSync(path, "utf8")));
@@ -2473,34 +2916,34 @@ export class MigrationSidecarStore {
     }
   }
 
-  private withLock<T>(operation: () => T): T {
-    this.prepareDirectory();
-    const descriptor = this.acquireLock();
+  #withLock<T>(operation: () => T): T {
+    this.#prepareDirectory();
+    const descriptor = this.#acquireLock();
     try {
       return operation();
     } finally {
       closeSync(descriptor);
-      unlinkSync(this.lockPath);
-      fsyncDirectory(this.directory);
+      unlinkSync(this.#lockPath);
+      fsyncDirectory(this.#directory);
     }
   }
 
-  private acquireLock(): number {
+  #acquireLock(): number {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       let descriptor: number | undefined;
       try {
-        descriptor = openSync(this.lockPath, "wx", SIDECAR_MODE);
+        descriptor = openSync(this.#lockPath, "wx", SIDECAR_MODE);
         writeFileSync(descriptor, `${process.pid}\n`, { encoding: "utf8" });
         fsyncSync(descriptor);
         return descriptor;
       } catch (error) {
         if (descriptor !== undefined) {
           closeSync(descriptor);
-          rmSync(this.lockPath, { force: true });
-          fsyncDirectory(this.directory);
+          rmSync(this.#lockPath, { force: true });
+          fsyncDirectory(this.#directory);
         }
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (attempt === 0 && this.removeDeadWriterLock()) continue;
+        if (attempt === 0 && this.#removeDeadWriterLock()) continue;
         throw new MigrationConflictError(
           "another v2 migration writer holds the sidecar lock",
         );
@@ -2509,20 +2952,45 @@ export class MigrationSidecarStore {
     throw new MigrationConflictError("could not acquire the v2 migration writer lock");
   }
 
-  private removeDeadWriterLock(): boolean {
-    assertPrivateRegularFile(this.lockPath, "migration writer lock");
-    const observedStat = lstatSync(this.lockPath);
-    const rawPid = readFileSync(this.lockPath, "utf8").trim();
+  #removeDeadWriterLock(): boolean {
+    assertPrivateRegularFile(this.#lockPath, "migration writer lock");
+    const observedStat = lstatSync(this.#lockPath);
+    const rawPid = readFileSync(this.#lockPath, "utf8").trim();
     if (!/^[1-9][0-9]*$/.test(rawPid)) return false;
     const pid = Number(rawPid);
     if (!Number.isSafeInteger(pid) || processIsAlive(pid)) return false;
-    const currentStat = lstatSync(this.lockPath);
+    const currentStat = lstatSync(this.#lockPath);
     if (observedStat.dev !== currentStat.dev || observedStat.ino !== currentStat.ino) {
       return false;
     }
-    unlinkSync(this.lockPath);
-    fsyncDirectory(this.directory);
+    unlinkSync(this.#lockPath);
+    fsyncDirectory(this.#directory);
     return true;
+  }
+
+  #storeBoundary<T>(code: string, operation: () => T): T {
+    try {
+      return operation();
+    } catch (error) {
+      if (
+        error instanceof MigrationConflictError ||
+        error instanceof MigrationDriftError
+      ) {
+        throw error;
+      }
+      const pathRejected = error instanceof AccountsError;
+      throw new MigrationConflictError(
+        pathRejected
+          ? "migration store path was rejected"
+          : "migration store operation failed",
+        {
+          code: pathRejected ? "migration_store_path_rejected" : code,
+          references: [
+            diagnosticReference("root.path", this.#sidecarPath),
+          ],
+        },
+      );
+    }
   }
 }
 
@@ -2668,10 +3136,10 @@ function processIsAlive(pid: number): boolean {
 function assertPrivateRegularFile(path: string, label: string): void {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw new MigrationDriftError(`${label} must be a regular non-symlink file`);
+    throw new AccountsError(`${label} must be a regular non-symlink file`);
   }
   if ((stat.mode & 0o777) !== SIDECAR_MODE) {
-    throw new MigrationDriftError(`${label} must be mode 0600`);
+    throw new AccountsError(`${label} must be mode 0600`);
   }
 }
 
@@ -2696,6 +3164,14 @@ export function migrationRedactionDigest(
     );
   }
   const domain = domainResult.data;
+  const valueResult = z.string().safeParse(value);
+  if (!valueResult.success) {
+    throw new MigrationConflictError(
+      "migration redaction value was rejected",
+      { code: "migration_invalid_redaction_value" },
+    );
+  }
+  const parsedValue = valueResult.data;
   const frame = (part: string): Buffer => {
     const payload = Buffer.from(part, "utf8");
     const length = Buffer.allocUnsafe(4);
@@ -2706,7 +3182,7 @@ export function migrationRedactionDigest(
     .update(frame("hasna.accounts.v2.migration.redaction"))
     .update(frame("1"))
     .update(frame(domain))
-    .update(frame(value))
+    .update(frame(parsedValue))
     .digest("hex")}`;
 }
 
@@ -2718,6 +3194,18 @@ function diagnosticReference(
     domain,
     digest: migrationRedactionDigest(domain, value),
   });
+}
+
+function diagnosticAliasReference(
+  kind: z.infer<typeof migrationAliasKindSchema>,
+  value: string,
+): MigrationDiagnosticReference {
+  return diagnosticReference(
+    kind === "legacy_account"
+      ? "diagnostic.alias.account"
+      : "diagnostic.alias.session",
+    value,
+  );
 }
 
 function stableDiagnosticCode(message: string): string {

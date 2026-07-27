@@ -13,6 +13,8 @@ import {
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
+import { AccountsError } from "../types.js";
 import {
   MigrationConflictError,
   MigrationDriftError,
@@ -344,58 +346,68 @@ describe("v2 migration plan", () => {
 
     expect(migrationPlanSchema.safeParse(forgedPlan).success).toBe(false);
     expect(migrationPlanSchema.safeParse(duplicatePlan).success).toBe(false);
-    expect(() =>
-      buildMigrationPlan(planInput([observation]), {
+    expect(
+      captureError(() =>
+        buildMigrationPlan(planInput([observation]), {
         idFactory: stableId,
         existingPlan: forgedPlan,
-      }),
-    ).toThrow("canonical");
+        }),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
   });
 
   test("rejects duplicate aliases before digest allocation and across plan records", () => {
-    expect(() =>
-      buildPlan([
+    expect(
+      captureError(() =>
+        buildPlan([
         safeObservation("alice", "claude", {
           historicalAliases: [
             "legacy:claude:alice",
             "legacy:claude:alice",
           ],
         }),
-      ]),
-    ).toThrow("duplicate historical alias");
+        ]),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
 
-    expect(() =>
-      buildPlan([
+    expect(
+      captureError(() =>
+        buildPlan([
         safeObservation("alice", "claude", {
           historicalAliases: [
             "legacy:claude:cafe\u0301",
             "legacy:claude:café",
           ],
         }),
-      ]),
-    ).toThrow("duplicate historical alias");
+        ]),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
 
-    expect(() =>
-      buildPlan([
+    expect(
+      captureError(() =>
+        buildPlan([
         safeObservation("alice", "claude", {
           historicalAliases: ["legacy:shared-account-alias"],
         }),
         safeObservation("bob", "codex", {
           historicalAliases: ["legacy:shared-account-alias"],
         }),
-      ]),
-    ).toThrow("duplicate legacy account alias");
+        ]),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
 
-    expect(() =>
-      buildPlan([
+    expect(
+      captureError(() =>
+        buildPlan([
         safeObservation("alice", "claude", {
           historicalSessionAliases: ["session:shared-alias"],
         }),
         safeObservation("bob", "codex", {
           historicalSessionAliases: ["session:shared-alias"],
         }),
-      ]),
-    ).toThrow("duplicate session alias");
+        ]),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
   });
 
   test("rejects changed input when reusing a frozen plan idempotency boundary", () => {
@@ -672,38 +684,46 @@ describe("v2 migration plan", () => {
       ]),
     ).toThrow("conflicting runtime labels");
 
-    expect(() =>
-      buildMigrationPlan(planInput(), {
+    expect(
+      captureError(() =>
+        buildMigrationPlan(planInput(), {
         idFactory: (kind, seed) =>
           kind === "account" ? "account_duplicate0000" : stableId(kind, seed),
-      }),
-    ).toThrow("duplicate account id");
+        }),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
 
-    expect(() =>
-      buildMigrationPlan(planInput([safeObservation("alice")]), {
+    expect(
+      captureError(() =>
+        buildMigrationPlan(planInput([safeObservation("alice")]), {
         idFactory: () => "shared_identifier_000000000001",
-      }),
-    ).toThrow("globally unique across entity kinds");
+        }),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
 
-    expect(() =>
-      buildMigrationPlan(
+    expect(
+      captureError(() =>
+        buildMigrationPlan(
         {
           ...planInput([safeObservation("alice")]),
           backup: { ...backupPlan(), requiredBytes: 2047 },
         },
         { idFactory: stableId },
-      ),
-    ).toThrow("cover every verified root byte");
+        ),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
 
-    expect(() =>
-      buildMigrationPlan(
+    expect(
+      captureError(() =>
+        buildMigrationPlan(
         {
           ...planInput(),
           cutoverEpoch: "2026-07-27T11:59:59.999Z",
         },
         { idFactory: stableId },
-      ),
-    ).toThrow("must not precede plan creation");
+        ),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
 
     const plan = buildPlan();
     expect(
@@ -796,8 +816,9 @@ describe("v2 migration plan", () => {
       }).success,
     ).toBe(false);
 
-    expect(() =>
-      buildMigrationPlan(planInput(), {
+    expect(
+      captureError(() =>
+        buildMigrationPlan(planInput(), {
         existingPlan: {
           ...plan,
           records: [
@@ -808,8 +829,9 @@ describe("v2 migration plan", () => {
             plan.records[1],
           ],
         },
-      }),
-    ).toThrow("input digest");
+        }),
+      ).code,
+    ).toBe("migration_invalid_plan_input");
   });
 
   test("redacts paths and aliases while retaining counts, digests, and conflict evidence", () => {
@@ -886,12 +908,13 @@ describe("v2 migration plan", () => {
     expect(unsafeRecord?.root).toMatchObject({
       state: "unsafe",
       code: "missing",
-      pathDigest: digest("missing-path"),
+      pathDigest: redactionDigest("root.path", digest("missing-path")),
       reasonDigest: redactionDigest(
         "root.unsafe-reason",
         "private root /secret/missing was absent",
       ),
     });
+    expect(unsafeRecord?.root.pathDigest).not.toBe(digest("missing-path"));
   });
 
   test("domain-separates and length-frames every caller-origin redacted value", () => {
@@ -1046,6 +1069,213 @@ describe("v2 migration plan", () => {
     );
     expect(domainError.message).not.toContain(marker);
     expect(domainError.code).toBe("migration_invalid_redaction_domain");
+  });
+
+  test("runtime-validates public discriminants before branching or echoing caller text", () => {
+    const marker = "bearer-invalid-discriminant-marker";
+    const plan = buildPlan();
+    const initial = createMigrationSidecar(plan);
+    const invalidIntent = captureError(() =>
+      evaluateMigrationGates(plan, passingEvidence(plan), marker as never),
+    );
+    const invalidTarget = captureError(() =>
+      transitionMigrationSidecar(initial, marker as never),
+    );
+    const invalidAliasKind = captureError(() =>
+      appendMigrationAlias(initial, {
+        kind: marker as never,
+        alias: "safe-alias",
+        sourceKey: initial.plan.records[0]!.sourceKey,
+        targetId: initial.plan.records[0]!.target.accountId,
+      }),
+    );
+    const invalidRedactionValue = captureError(() =>
+      migrationRedactionDigest("alias", { [marker]: marker } as never),
+    );
+    const throwingInput = {
+      ...planInput(),
+    } as Record<string, unknown>;
+    Object.defineProperty(throwingInput, "scope", {
+      enumerable: true,
+      get() {
+        throw new MigrationConflictError(marker);
+      },
+    });
+    const throwingGetter = captureError(() =>
+      buildMigrationPlan(throwingInput as never),
+    );
+    const throwingIdFactory = captureError(() =>
+      buildMigrationPlan(planInput(), {
+        idFactory() {
+          throw new MigrationConflictError(marker);
+        },
+      }),
+    );
+
+    for (const [error, code] of [
+      [invalidIntent, "migration_invalid_gate_intent"],
+      [invalidTarget, "migration_invalid_transition_target"],
+      [invalidAliasKind, "migration_invalid_alias_input"],
+      [invalidRedactionValue, "migration_invalid_redaction_value"],
+      [throwingGetter, "migration_invalid_plan_input"],
+      [throwingIdFactory, "migration_id_allocation_failed"],
+    ] as const) {
+      expect(error).toBeInstanceOf(MigrationConflictError);
+      expect(error.code).toBe(code);
+      expect(error.message).not.toContain(marker);
+      expect(String(error)).not.toContain(marker);
+      expect(JSON.stringify(error)).not.toContain(marker);
+      expect(inspect(error)).not.toContain(marker);
+    }
+  });
+
+  test("domain-separates account and session diagnostic aliases", () => {
+    const marker = "shared-diagnostic-alias-marker";
+    const initial = createMigrationSidecar(buildPlan());
+    const accountError = captureError(() =>
+      appendMigrationAlias(initial, {
+        kind: "legacy_account",
+        alias: marker,
+        sourceKey: "unknown:account:source",
+        targetId: initial.plan.records[0]!.target.accountId,
+      }),
+    );
+    const sessionError = captureError(() =>
+      appendMigrationAlias(initial, {
+        kind: "session_ref",
+        alias: marker,
+        sourceKey: "unknown:session:source",
+        targetId: initial.plan.records[0]!.target.bindingId,
+      }),
+    );
+    const accountAlias = accountError.references?.find(
+      (reference) =>
+        (reference as { domain?: string }).domain ===
+        "diagnostic.alias.account",
+    ) as { domain: string; digest: string } | undefined;
+    const sessionAlias = sessionError.references?.find(
+      (reference) =>
+        (reference as { domain?: string }).domain ===
+        "diagnostic.alias.session",
+    ) as { domain: string; digest: string } | undefined;
+
+    expect(accountAlias).toBeDefined();
+    expect(sessionAlias).toBeDefined();
+    expect(accountAlias?.digest).not.toBe(sessionAlias?.digest);
+    expect(accountAlias?.digest).toBe(
+      redactionDigest("diagnostic.alias.account", marker),
+    );
+    expect(sessionAlias?.digest).toBe(
+      redactionDigest("diagnostic.alias.session", marker),
+    );
+    expect(
+      captureError(() =>
+        appendMigrationAlias(initial, {
+          kind: "legacy_account",
+          alias: marker,
+          sourceKey: "another:unknown:account",
+          targetId: initial.plan.records[0]!.target.accountId,
+        }),
+      ).references?.find(
+        (reference) =>
+          (reference as { domain?: string }).domain ===
+          "diagnostic.alias.account",
+      ),
+    ).toMatchObject({ digest: accountAlias?.digest });
+  });
+
+  test("sanitizes strict-schema failures at every public migration boundary", async () => {
+    const marker = "bearer-unknown-schema-key-marker";
+    const plan = buildPlan();
+    const initial = createMigrationSidecar(plan);
+    const errors = [
+      captureError(() =>
+        buildMigrationPlan({ ...planInput(), [marker]: marker } as never),
+      ),
+      captureError(() =>
+        buildMigrationPlan(planInput(), { [marker]: marker } as never),
+      ),
+      captureError(() =>
+        redactMigrationPlan({ ...plan, [marker]: marker } as never),
+      ),
+      captureError(() =>
+        evaluateMigrationGates(
+          plan,
+          { ...passingEvidence(plan), [marker]: marker } as never,
+          "partial",
+        ),
+      ),
+      captureError(() =>
+        createMigrationSidecar({ ...plan, [marker]: marker } as never),
+      ),
+      captureError(() =>
+        appendMigrationAlias(initial, {
+          kind: "legacy_account",
+          alias: "safe-alias",
+          sourceKey: initial.plan.records[0]!.sourceKey,
+          targetId: initial.plan.records[0]!.target.accountId,
+          [marker]: marker,
+        } as never),
+      ),
+      captureError(() =>
+        transitionMigrationSidecar(
+          { ...initial, [marker]: marker } as never,
+          "partial_ready",
+          { gateEvidence: passingEvidence(plan) },
+        ),
+      ),
+      captureError(() =>
+        transitionMigrationSidecar(initial, "partial_ready", {
+          gateEvidence: passingEvidence(plan),
+          [marker]: marker,
+        } as never),
+      ),
+    ];
+    const backfillError = await applyScopedBackfill(
+      transitionMigrationSidecar(initial, "partial_ready", {
+        gateEvidence: passingEvidence(plan),
+      }),
+      {
+        async transaction() {
+          throw new MigrationConflictError(marker);
+        },
+      },
+    ).then(
+      () => {
+        throw new Error("expected backfill to reject");
+      },
+      (error) => error as Error & { code?: string },
+    );
+    const unknownPortError = await applyScopedBackfill(
+      transitionMigrationSidecar(initial, "partial_ready", {
+        gateEvidence: passingEvidence(plan),
+      }),
+      {
+        [marker]: marker,
+        async transaction() {
+          throw new Error("strict port parsing should reject before invocation");
+        },
+      } as never,
+    ).then(
+      () => {
+        throw new Error("expected strict backfill port parsing to reject");
+      },
+      (error) => error as Error & { code?: string },
+    );
+    errors.push(backfillError, unknownPortError);
+
+    for (const error of errors) {
+      const exported = [
+        error.message,
+        String(error),
+        JSON.stringify(error),
+        inspect(error),
+      ].join("\n");
+      expect(error).toBeInstanceOf(MigrationConflictError);
+      expect(error.code).toMatch(/^migration_[a-z0-9_]+$/);
+      expect(exported).not.toContain(marker);
+      expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+    }
   });
 
   test("strict schemas reject credential and transcript tunnels", () => {
@@ -1213,12 +1443,14 @@ describe("backup, gates, aliases, and cutover states", () => {
         targetId: initial.plan.records[0]!.target.accountId,
       }),
     ).toThrow("does not target its frozen immutable identity");
-    expect(() =>
-      appendMigrationAlias(once, {
+    expect(
+      captureError(() =>
+        appendMigrationAlias(once, {
         ...alias,
         alias: "legacy:claude:cafe\u0301",
-      }),
-    ).toThrow("canonical Unicode NFC");
+        }),
+      ).code,
+    ).toBe("migration_invalid_alias_input");
   });
 
   test("enforces durable gate and scope-bound backfill receipts across cutover states", async () => {
@@ -1390,22 +1622,38 @@ class RecordingBackfillTransaction implements MigrationBackfillTransaction {
 }
 
 class RecordingBackfillPort implements MigrationBackfillPort {
-  readonly transactionImpl = new RecordingBackfillTransaction();
-  committed = false;
-  rolledBack = false;
-  observedScope?: { tenantId: string; scopeId: string };
+  readonly #transactionImpl = new RecordingBackfillTransaction();
+  #committed = false;
+  #rolledBack = false;
+  #observedScope?: { tenantId: string; scopeId: string };
+
+  get transactionImpl(): RecordingBackfillTransaction {
+    return this.#transactionImpl;
+  }
+
+  get committed(): boolean {
+    return this.#committed;
+  }
+
+  get rolledBack(): boolean {
+    return this.#rolledBack;
+  }
+
+  get observedScope(): { tenantId: string; scopeId: string } | undefined {
+    return this.#observedScope;
+  }
 
   async transaction<T>(
     scope: { tenantId: string; scopeId: string },
     operation: (transaction: MigrationBackfillTransaction) => Promise<T>,
   ): Promise<T> {
-    this.observedScope = scope;
+    this.#observedScope = scope;
     try {
-      const result = await operation(this.transactionImpl);
-      this.committed = true;
+      const result = await operation(this.#transactionImpl);
+      this.#committed = true;
       return result;
     } catch (error) {
-      this.rolledBack = true;
+      this.#rolledBack = true;
       throw error;
     }
   }
@@ -1463,9 +1711,15 @@ describe("scoped transactional backfill hooks", () => {
       { gateEvidence: passingEvidence(plan) },
     );
 
-    await expect(applyScopedBackfill(sidecar, port)).rejects.toThrow(
-      "forced crosswalk failure",
+    const error = await applyScopedBackfill(sidecar, port).then(
+      () => {
+        throw new Error("expected backfill to reject");
+      },
+      (caught) => caught as Error & { code?: string },
     );
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_backfill_failed");
+    expect(error.message).not.toContain("forced crosswalk failure");
     expect(port.committed).toBe(false);
     expect(port.rolledBack).toBe(true);
     expect(sidecar.state).toBe("partial_ready");
@@ -1486,6 +1740,48 @@ describe("scoped transactional backfill hooks", () => {
     expect(port.rolledBack).toBe(true);
   });
 
+  test("sanitizes poisoned successful backfill return values", async () => {
+    const marker = "bearer-backfill-return-marker";
+    const plan = buildPlan();
+    const sidecar = transitionMigrationSidecar(
+      createMigrationSidecar(plan),
+      "partial_ready",
+      { gateEvidence: passingEvidence(plan) },
+    );
+    const poisonedResult = {} as Record<string, unknown>;
+    Object.defineProperty(poisonedResult, "runtimes", {
+      enumerable: true,
+      get() {
+        throw new MigrationConflictError(marker);
+      },
+    });
+
+    const error = await applyScopedBackfill(sidecar, {
+      async transaction() {
+        return poisonedResult as never;
+      },
+    }).then(
+      () => {
+        throw new Error("expected poisoned backfill result to reject");
+      },
+      (caught) => caught as Error & {
+        code?: string;
+        cause?: unknown;
+      },
+    );
+    const exported = [
+      error.message,
+      String(error),
+      JSON.stringify(error),
+      inspect(error),
+    ].join("\n");
+
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_backfill_failed");
+    expect(exported).not.toContain(marker);
+    expect(error.cause).toBeUndefined();
+  });
+
   test("validates the epoch result before the transaction callback can commit", async () => {
     const port = new RecordingBackfillPort();
     port.transactionImpl.invalidResultAt = "epoch";
@@ -1503,12 +1799,169 @@ describe("scoped transactional backfill hooks", () => {
 });
 
 describe("durable sidecar WAL and repair", () => {
+  test("keeps every configured path and callback out of stringify and inspection", () => {
+    const marker = "bearer-private-store-path-marker";
+    const root = tempRoot();
+    const sidecarPath = join(root, marker, "migration-v2.json");
+    const legacyStorePath = join(root, marker, "accounts.json");
+    const injectFailure = () => {
+      throw new Error(marker);
+    };
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath,
+      injectFailure,
+      onDurabilityEvent: injectFailure,
+    });
+
+    expect(Object.keys(store)).toEqual([]);
+    expect(JSON.stringify(store)).toBe(
+      '{"schemaVersion":1,"kind":"migration_sidecar_store"}',
+    );
+    expect(inspect(store)).not.toContain(marker);
+    expect(inspect(store)).not.toContain(sidecarPath);
+    expect(inspect(store)).not.toContain(legacyStorePath);
+    expect(inspect(store)).not.toContain("injectFailure");
+    expect(inspect(store)).not.toContain("onDurabilityEvent");
+  });
+
+  test("sanitizes strict store constructor and install options", () => {
+    const marker = "bearer-store-option-marker";
+    const root = tempRoot();
+    const sidecarPath = join(root, "migration-v2.json");
+    const legacyStorePath = join(root, "accounts.json");
+    const constructorError = captureError(
+      () =>
+        new MigrationSidecarStore({
+          sidecarPath,
+          legacyStorePath,
+          [marker]: marker,
+        } as never),
+    );
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath,
+    });
+    const installError = captureError(() =>
+      store.install(createMigrationSidecar(buildPlan()), {
+        [marker]: marker,
+      } as never),
+    );
+    const throwingOptions = {} as Record<string, unknown>;
+    Object.defineProperty(throwingOptions, "sidecarPath", {
+      enumerable: true,
+      get() {
+        throw new MigrationConflictError(marker);
+      },
+    });
+    throwingOptions.legacyStorePath = legacyStorePath;
+    const throwingConstructorError = captureError(
+      () => new MigrationSidecarStore(throwingOptions as never),
+    );
+
+    expect(constructorError.code).toBe("migration_invalid_store_options");
+    expect(installError.code).toBe("migration_store_install_failed");
+    expect(throwingConstructorError.code).toBe(
+      "migration_invalid_store_options",
+    );
+    for (const error of [
+      constructorError,
+      installError,
+      throwingConstructorError,
+    ]) {
+      const exported = [
+        error.message,
+        String(error),
+        JSON.stringify(error),
+        inspect(error),
+      ].join("\n");
+      expect(error).toBeInstanceOf(AccountsError);
+      expect(exported).not.toContain(marker);
+      expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+    }
+  });
+
+  test("maps safe-path and filesystem failures to stable path references", () => {
+    const marker = "bearer-symlink-path-marker";
+    const root = tempRoot();
+    const target = join(root, "target");
+    const linked = join(root, marker);
+    const legacy = join(root, "accounts.json");
+    mkdirSync(target);
+    symlinkSync(target, linked);
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    const store = new MigrationSidecarStore({
+      sidecarPath: join(linked, "nested", "migration-v2.json"),
+      legacyStorePath: legacy,
+    });
+    const error = captureError(() =>
+      store.install(createMigrationSidecar(buildPlan())),
+    );
+    const exported = [
+      error.message,
+      String(error),
+      JSON.stringify(error),
+      inspect(error),
+    ].join("\n");
+
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_store_path_rejected");
+    expect(error.references).toHaveLength(1);
+    expect(error.references?.[0]).toMatchObject({
+      domain: "root.path",
+      digest: redactionDigest(
+        "root.path",
+        join(linked, "nested", "migration-v2.json"),
+      ),
+    });
+    expect(exported).not.toContain(marker);
+    expect(exported).not.toContain(linked);
+    expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(existsSync(join(target, "nested"))).toBe(false);
+  });
+
+  test("sanitizes caller-thrown migration errors from store callbacks", () => {
+    const marker = "bearer-store-callback-marker";
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+      onDurabilityEvent() {
+        throw new MigrationConflictError(marker);
+      },
+    });
+    const error = captureError(() =>
+      store.install(createMigrationSidecar(buildPlan())),
+    );
+    const exported = [
+      error.message,
+      String(error),
+      JSON.stringify(error),
+      inspect(error),
+    ].join("\n");
+
+    expect(error.code).toBe("migration_store_callback_failed");
+    expect(exported).not.toContain(marker);
+    expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+  });
+
   test("refuses to share a path with the untouched v1 registry", () => {
     const root = tempRoot();
     const legacy = join(root, "accounts.json");
-    expect(
+    const error = captureError(
       () => new MigrationSidecarStore({ sidecarPath: legacy, legacyStorePath: legacy }),
-    ).toThrow("must not be accounts.json");
+    );
+    expect(error.code).toBe("migration_store_path_rejected");
+    expect(error.references).toEqual([
+      {
+        domain: "root.path",
+        digest: redactionDigest("root.path", legacy),
+      },
+    ]);
+    expect(JSON.stringify(error)).not.toContain(legacy);
   });
 
   test("refuses hard-link aliases of the untouched v1 registry", () => {
@@ -1518,9 +1971,18 @@ describe("durable sidecar WAL and repair", () => {
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
     linkSync(legacy, sidecarPath);
 
-    expect(
+    const error = captureError(
       () => new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy }),
-    ).toThrow("must not be accounts.json");
+    );
+    expect(error.code).toBe("migration_store_path_rejected");
+    expect(error.references).toEqual([
+      {
+        domain: "root.path",
+        digest: redactionDigest("root.path", sidecarPath),
+      },
+    ]);
+    expect(JSON.stringify(error)).not.toContain(sidecarPath);
+    expect(JSON.stringify(error)).not.toContain(legacy);
   });
 
   test("refuses symlink ancestors before creating sidecar directories", () => {
@@ -1534,9 +1996,11 @@ describe("durable sidecar WAL and repair", () => {
     const sidecarPath = join(linked, "nested", "migration-v2.json");
     const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
 
-    expect(() => store.install(createMigrationSidecar(buildPlan()))).toThrow(
-      "symlink base directory",
+    const error = captureError(() =>
+      store.install(createMigrationSidecar(buildPlan())),
     );
+    expect(error.code).toBe("migration_store_path_rejected");
+    expect(error.message).not.toContain(linked);
     expect(existsSync(join(target, "nested"))).toBe(false);
   });
 
@@ -1598,7 +2062,9 @@ describe("durable sidecar WAL and repair", () => {
         },
       });
 
-      expect(() => failing.install(sidecar)).toThrow(`forced crash ${point}`);
+      const error = captureError(() => failing.install(sidecar));
+      expect(error.code).toBe("migration_store_callback_failed");
+      expect(error.message).not.toContain(`forced crash ${point}`);
 
       const repaired = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
       expect(repaired.repair()).toEqual(sidecar);
@@ -1621,7 +2087,9 @@ describe("durable sidecar WAL and repair", () => {
         if (point === "after_wal_directory_fsync") throw new Error("crash");
       },
     });
-    expect(() => failing.install(sidecar)).toThrow("crash");
+    expect(captureError(() => failing.install(sidecar)).code).toBe(
+      "migration_store_callback_failed",
+    );
     writeFileSync(sidecarPath, JSON.stringify({ unexpected: "drift" }), { mode: 0o600 });
 
     const repaired = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
@@ -1669,7 +2137,9 @@ describe("durable sidecar WAL and repair", () => {
         if (point === "after_wal_directory_fsync") throw new Error("crash");
       },
     });
-    expect(() => crashing.install(first)).toThrow("crash");
+    expect(captureError(() => crashing.install(first)).code).toBe(
+      "migration_store_callback_failed",
+    );
     const walBefore = readFileSync(`${sidecarPath}.wal`, "utf8");
 
     const second = createMigrationSidecar(
@@ -1872,7 +2342,16 @@ describe("durable sidecar WAL and repair", () => {
     chmodSync(sidecarPath, 0o644);
 
     const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
-    expect(() => store.load()).toThrow("must be mode 0600");
+    const error = captureError(() => store.load());
+    expect(error.message).toBe("migration store path was rejected");
+    expect(error.code).toBe("migration_store_path_rejected");
+    expect(error.references).toEqual([
+      {
+        domain: "root.path",
+        digest: redactionDigest("root.path", sidecarPath),
+      },
+    ]);
+    expect(JSON.stringify(error)).not.toContain(sidecarPath);
   });
 });
 

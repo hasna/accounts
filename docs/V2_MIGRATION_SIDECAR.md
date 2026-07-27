@@ -39,13 +39,23 @@ caller text in different fields therefore cannot produce a shared digest, and
 delimiter-like text cannot cross a frame boundary. The view retains only
 schema-owned enums, counts, content/input digests, allocated opaque IDs, and
 quarantine evidence; raw filesystem identity and arbitrary census text are
-never emitted.
+never emitted. An unsafe-root digest supplied by an upstream scanner is still
+caller-origin evidence, so the exported redacted view wraps that digest again
+in the versioned `root.path` domain rather than passing the upstream digest
+through as a stable cross-surface identifier.
 
 Public migration conflict and drift errors expose a stable
 `migration_*` code, optional numeric counts, and only domain-hashed opaque
-references. They do not interpolate plan IDs, source keys, tool keys, aliases,
-runtime IDs, nested parser messages, or other caller-controlled text into the
-message.
+references. Both error classes are `AccountsError` subclasses. They do not
+interpolate plan IDs, source keys, tool keys, aliases, runtime IDs, nested
+parser messages, or other caller-controlled text into the message.
+Account-alias and session-alias diagnostics use distinct
+`diagnostic.alias.account` and `diagnostic.alias.session` domains. Every public
+migration function parses strict inputs at its boundary, including the runtime
+gate-intent, state-target, alias-kind, and store-option schemas. Validation and
+callback failures are mapped to stable Accounts migration errors; Zod issue
+paths, unknown keys, values, messages, and raw causes are never part of the
+public error.
 
 ## Conflict quarantine and aliases
 
@@ -128,6 +138,13 @@ frozen account, runtime, and binding IDs.
 `MigrationSidecarStore` must use a path distinct from the v1 registry, including
 hard-link or symlink aliases. Existing sidecar and WAL files must be regular,
 non-symlink files with mode `0600`.
+
+All configured store paths and callbacks are ECMAScript-private runtime state,
+not enumerable properties. Stringification returns only the schema version and
+the schema-owned `migration_sidecar_store` kind. Filesystem and safe-path
+failures are mapped to stable codes plus a versioned `root.path` reference; raw
+paths and underlying error causes are not exposed through the message, JSON,
+string conversion, or object inspection.
 
 Each update uses:
 
