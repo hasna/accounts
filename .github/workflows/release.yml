@@ -1,0 +1,89 @@
+name: Release npm package
+
+on:
+  push:
+    tags:
+      - "npm/accounts/v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'hasna/accounts'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: accounts_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d accounts_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install locked dependencies with release-age quarantine
+        run: bun install --frozen-lockfile --minimum-release-age 604800
+
+      - name: Reject high-severity dependency advisories
+        run: bun audit --audit-level high
+
+      - name: Verify release
+        run: |
+          bun run typecheck
+          bun run test:compat
+          bun test
+          bun run build
+          bun run contracts:no-cloud-scan
+          bun test src/sdk.test.ts src/contracts.test.ts
+          bun run contracts:conformance
+          bun run vendor-kit:check
+          bun run conformance
+          ACCOUNTS_REQUIRE_POSTGRES=1 \
+            HASNA_ACCOUNTS_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/accounts_test \
+            bun run test:postgres
+
+      - name: Bind tag, commit, and deterministic package
+        run: >-
+          bun run scripts/release-provenance.ts candidate
+          --out "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Reject an existing immutable version
+        run: >-
+          bun run scripts/release-provenance.ts ensure-unpublished
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Publish through npm trusted publishing
+        run: npm publish --provenance --access public
+
+      - name: Verify registry provenance and exact install
+        run: >-
+          bun run scripts/release-provenance.ts verify-registry
+          --candidate "$RUNNER_TEMP/release-candidate.json"

@@ -93,6 +93,9 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Deterministic packed artifact
+        run: bun run verify:pack
+
       - name: Build output no-cloud boundary
         run: bun run contracts:no-cloud-scan
 
