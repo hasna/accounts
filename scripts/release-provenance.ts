@@ -1460,12 +1460,17 @@ function isCanonicalRegistryVersion(version: string): boolean {
 
 export function registryPromotionSnapshot(input: unknown): RegistryPromotionSnapshot {
   const metadata = record(input, "registry package metadata");
+  const packageName = text(metadata.name, "registry package name");
   const tags = record(metadata["dist-tags"], "registry dist-tags");
   const versionsRecord = record(metadata.versions, "registry versions");
   const versions = Object.keys(versionsRecord);
   for (const version of versions) {
     check(isCanonicalRegistryVersion(version), `registry version ${version} is not canonical SemVer`);
     const manifest = record(versionsRecord[version], `registry version ${version}`);
+    check(
+      manifest.name === packageName,
+      `registry version ${version} package identity disagrees`,
+    );
     check(
       manifest.version === version,
       `registry version ${version} manifest identity disagrees`,
@@ -1586,6 +1591,13 @@ export function assertFinalMonotonicPromotion(
   input: unknown,
 ): void {
   const snapshot = promotionSnapshotForCandidate(value, input);
+  assertFinalMonotonicPromotionSnapshot(value, snapshot);
+}
+
+function assertFinalMonotonicPromotionSnapshot(
+  value: ReleaseCandidate,
+  snapshot: RegistryPromotionSnapshot,
+): void {
   check(
     candidatePromotionState(value, snapshot) === "idempotent",
     `registry is not in the final monotonic state for ${value.version}; ` +
@@ -1598,10 +1610,11 @@ async function failSupersededAfterCompensation(
   value: ReleaseCandidate,
   registry: PromotionRegistry,
   initial: RegistryPromotionSnapshot,
-  mutationBudget: { remaining: number },
+  maxCompensationAttempts: number,
 ): Promise<never> {
   let snapshot = initial;
   let lastMutationFailure: unknown;
+  let compensationAttempts = 0;
   while (true) {
     const target = snapshot.highestStable;
     check(
@@ -1614,15 +1627,17 @@ async function failSupersededAfterCompensation(
           `registry latest was restored to ${target}`,
       );
     }
-    if (mutationBudget.remaining === 0) {
+    if (compensationAttempts === maxCompensationAttempts) {
       const detail = lastMutationFailure instanceof Error
         ? `; last dist-tag error: ${lastMutationFailure.message}`
         : "";
       throw new Error(
-        `could not restore monotonic latest ${target} within the promotion mutation budget${detail}`,
+        `could not restore monotonic latest ${target} within ` +
+          `${maxCompensationAttempts} forward-compensation ` +
+          `attempt${maxCompensationAttempts === 1 ? "" : "s"}${detail}`,
       );
     }
-    mutationBudget.remaining--;
+    compensationAttempts++;
     try {
       await registry.setLatest(target);
       lastMutationFailure = undefined;
@@ -1642,12 +1657,11 @@ export async function promoteLatestMonotonically(
     Number.isInteger(maxAttempts) && maxAttempts > 0 && maxAttempts <= 8,
     "promotion attempts must be between 1 and 8",
   );
-  const mutationBudget = { remaining: maxAttempts };
   let expected = await readPromotionSnapshot(value, registry);
   let state = candidatePromotionState(value, expected);
   if (state === "superseded") {
     if (expected.latest === value.version) {
-      return failSupersededAfterCompensation(value, registry, expected, mutationBudget);
+      return failSupersededAfterCompensation(value, registry, expected, maxAttempts);
     }
     throw new Error(
       `candidate ${value.version} was superseded before promotion by ` +
@@ -1667,7 +1681,7 @@ export async function promoteLatestMonotonically(
             value,
             registry,
             immediatelyBeforeMutation,
-            mutationBudget,
+            maxAttempts,
           );
         }
         throw new Error(
@@ -1680,8 +1694,6 @@ export async function promoteLatestMonotonically(
       continue;
     }
 
-    if (mutationBudget.remaining === 0) break;
-    mutationBudget.remaining--;
     try {
       await registry.setLatest(value.version);
       lastMutationFailure = undefined;
@@ -1692,7 +1704,7 @@ export async function promoteLatestMonotonically(
     const after = await readPromotionSnapshot(value, registry);
     state = candidatePromotionState(value, after);
     if (state === "superseded") {
-      return failSupersededAfterCompensation(value, registry, after, mutationBudget);
+      return failSupersededAfterCompensation(value, registry, after, maxAttempts);
     }
     if (after.latest === value.version) return "promoted";
     expected = after;
@@ -1780,10 +1792,10 @@ function verifyRegistryPackageState(
   input: unknown,
 ): void {
   const metadata = record(input, "registry package metadata");
-  check(metadata.name === value.name, `registry package identity must be ${value.name}`);
+  const snapshot = promotionSnapshotForCandidate(value, metadata);
   verifyDistTags(value, metadata, phase);
   if (phase === "promoted") {
-    assertFinalMonotonicPromotion(value, metadata);
+    assertFinalMonotonicPromotionSnapshot(value, snapshot);
   }
 }
 

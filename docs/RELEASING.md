@@ -191,15 +191,20 @@ state. If a newer stable version appeared in the mutation seam while the
 candidate became `latest`, it uses the same scoped credential to move `latest`
 forward to the newest unique stable version, verifies the result, and fails the
 candidate run as superseded. An external overwrite back to an older tag is
-retried. Mutation and compensation attempts are bounded; a non-converging
-publisher race or failed compensation fails loudly with the last observed
-target and error state and requires operator recovery. No script can prevent a
-new external mutation after its final successful read. The staged and promoted
-verification passes therefore reread the complete package metadata after the
-slow tarball download, exact install, signature audit, cryptographic check, and
-semantic check, then immediately revalidate the dist-tags and, for the promoted
-phase, the final monotonic state. Release operators must still not publish or
-move this package's dist-tags concurrently.
+retried. Candidate promotion attempts and forward-compensation attempts each
+have an independent bounded allowance, so a successful candidate write cannot
+consume the only opportunity to repair `latest` after a newer stable version is
+observed. A non-converging publisher race or failed compensation fails loudly
+with the last observed target and error state and requires operator recovery.
+This is forward repair, not transactional rollback or an atomicity guarantee.
+No script can prevent a new external mutation after its final successful read.
+The staged and promoted verification passes therefore reread the complete
+package metadata after the slow tarball download, exact install, signature
+audit, cryptographic check, and semantic check. Every package reread validates
+the exact package name on every version manifest and requires every dist-tag to
+target a complete present version before revalidating the phase-specific tags
+and, for the promoted phase, the final monotonic state. Release operators must
+still not publish or move this package's dist-tags concurrently.
 
 Before publication, the workflow requires:
 

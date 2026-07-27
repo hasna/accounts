@@ -157,7 +157,9 @@ function registryPackage(
       ...extraTags,
       ...(latest === undefined ? {} : { latest }),
     },
-    versions: Object.fromEntries(versions.map((version) => [version, { version }])),
+    versions: Object.fromEntries(
+      versions.map((version) => [version, { name: value.name, version }]),
+    ),
   };
 }
 
@@ -632,6 +634,48 @@ test("derives an exact monotonic promotion snapshot from full registry versions 
       ["0.1.0+one", "0.1.0+two", "0.2.0", candidate.version],
     ),
   ).highestStable).toBe(candidate.version);
+
+  for (const invalidName of [
+    undefined,
+    "@hasna/other",
+    "@HASNA/ACCOUNTS",
+    " @hasna/accounts",
+    "@hasna/accounts ",
+    "@hasna/account\u017f",
+  ]) {
+    const metadata = registryPackage(
+      "0.2.12",
+      ["0.2.12", candidate.version],
+    );
+    const versions = metadata.versions as Record<string, Record<string, unknown>>;
+    if (invalidName === undefined) {
+      delete versions[candidate.version]!.name;
+    } else {
+      versions[candidate.version]!.name = invalidName;
+    }
+    expect(() => registryPromotionSnapshot(metadata))
+      .toThrow(`registry version ${candidate.version} package identity disagrees`);
+  }
+
+  const missingVersion = registryPackage(
+    "0.2.12",
+    ["0.2.12", candidate.version],
+  );
+  delete (
+    missingVersion.versions as Record<string, Record<string, unknown>>
+  )[candidate.version]!.version;
+  expect(() => registryPromotionSnapshot(missingVersion))
+    .toThrow(`registry version ${candidate.version} manifest identity disagrees`);
+
+  const wrongOlderPackage = registryPackage(
+    "0.2.12",
+    ["0.2.12", candidate.version],
+  );
+  (
+    wrongOlderPackage.versions as Record<string, Record<string, unknown>>
+  )["0.2.12"]!.name = "@hasna/other";
+  expect(() => registryPromotionSnapshot(wrongOlderPackage))
+    .toThrow("registry version 0.2.12 package identity disagrees");
 });
 
 test("compensates when a newer stable release appears after the final pre-mutation read", async () => {
@@ -654,6 +698,82 @@ test("compensates when a newer stable release appears after the final pre-mutati
   })).rejects.toThrow("superseded by newer stable 0.4.0");
   expect(writes).toEqual([candidate.version, "0.4.0"]);
   expect(reads).toHaveLength(0);
+});
+
+test("reserves a bounded forward-compensation attempt when maxAttempts is one", async () => {
+  const reads = [
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+    registryPackage("0.4.0", ["0.2.12", candidate.version, "0.4.0"]),
+  ];
+  const writes: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      const next = reads.shift();
+      if (!next) throw new Error("unexpected registry read");
+      return next;
+    },
+    setLatest: async (version) => {
+      writes.push(version);
+    },
+  }, 1)).rejects.toThrow(
+    "candidate 0.3.0 was superseded by newer stable 0.4.0; registry latest was restored",
+  );
+  expect(writes).toEqual([candidate.version, "0.4.0"]);
+  expect(reads).toHaveLength(0);
+
+  const failedCompensationReads = [
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage("0.2.12", ["0.2.12", candidate.version]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+    registryPackage(candidate.version, ["0.2.12", candidate.version, "0.4.0"]),
+  ];
+  const failedCompensationWrites: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      const next = failedCompensationReads.shift();
+      if (!next) throw new Error("unexpected registry read");
+      return next;
+    },
+    setLatest: async (version) => {
+      failedCompensationWrites.push(version);
+      if (version === "0.4.0") {
+        throw new Error("simulated forward-compensation failure");
+      }
+    },
+  }, 1)).rejects.toThrow(
+    "could not restore monotonic latest 0.4.0 within 1 forward-compensation attempt",
+  );
+  expect(failedCompensationWrites).toEqual([candidate.version, "0.4.0"]);
+  expect(failedCompensationReads).toHaveLength(0);
+
+  let latest = "0.2.12";
+  let partialFailureRead = 0;
+  const partialFailureWrites: string[] = [];
+  await expect(promoteLatestMonotonically(candidate, {
+    readPackage: async () => {
+      partialFailureRead++;
+      if (partialFailureRead <= 2) {
+        return registryPackage(latest, ["0.2.12", candidate.version]);
+      }
+      return registryPackage(
+        latest,
+        ["0.2.12", candidate.version, "0.4.0"],
+      );
+    },
+    setLatest: async (version) => {
+      partialFailureWrites.push(version);
+      latest = version;
+      if (version === "0.4.0") {
+        throw new Error("ambiguous failure after forward compensation committed");
+      }
+    },
+  }, 1)).rejects.toThrow(
+    "candidate 0.3.0 was superseded by newer stable 0.4.0; registry latest was restored",
+  );
+  expect(partialFailureWrites).toEqual([candidate.version, "0.4.0"]);
+  expect(partialFailureRead).toBe(4);
 });
 
 test("handles races at every promotion and compensation seam without accepting a stale latest", async () => {
@@ -729,7 +849,9 @@ test("bounds ever-advancing promotion races and reports failed compensation", as
       latest = version;
     },
   }, 3)).rejects.toThrow("could not restore monotonic latest");
-  expect(writes.length).toBeLessThanOrEqual(3);
+  expect(writes).toHaveLength(4);
+  expect(writes[0]).toBe(candidate.version);
+  expect(writes.slice(1)).toEqual(["0.4.0", "0.5.0", "0.6.0"]);
 
   const rollbackReads = [
     registryPackage("0.2.12", ["0.2.12", candidate.version]),
@@ -1058,6 +1180,146 @@ test("rejects a staged dist-tag mutation during install and audit before reporti
     verifySemantically: () => {},
   })).rejects.toThrow("latest was promoted before registry verification completed");
   expect(packageReads).toBe(2);
+});
+
+test("validates every version identity and dist-tag target in every package reread", async () => {
+  const packageJson = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
+  const tarball = archive([
+    tarEntry("package/package.json", packageJson.length, "0", packageJson),
+    tarEntry("package/dist/cli.js", 3, "0", Buffer.from("cli")),
+  ]);
+  const value: ReleaseCandidate = {
+    ...candidate,
+    size: tarball.length,
+    shasum: createHash("sha1").update(tarball).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+    fileCount: 2,
+    unpackedBytes: packageJson.length + 3,
+  };
+  const validForPhase = (phase: "staged" | "promoted") =>
+    registryPackage(
+      phase === "staged" ? "0.2.12" : value.version,
+      ["0.2.12", value.version],
+      value,
+    );
+  const invalidSnapshots: Array<{
+    label: string;
+    expected: string;
+    build: (phase: "staged" | "promoted") => Record<string, unknown>;
+  }> = [
+    {
+      label: "unrelated tag targets an absent version",
+      expected: "registry dist-tag legacy target 9.9.9 is absent",
+      build: (phase) =>
+        registryPackage(
+          phase === "staged" ? "0.2.12" : value.version,
+          ["0.2.12", value.version],
+          value,
+          { legacy: "9.9.9" },
+        ),
+    },
+    {
+      label: "unrelated tag has a malformed target",
+      expected: "registry dist-tag legacy target  0.2.12 is not canonical SemVer",
+      build: (phase) =>
+        registryPackage(
+          phase === "staged" ? "0.2.12" : value.version,
+          ["0.2.12", value.version],
+          value,
+          { legacy: " 0.2.12" },
+        ),
+    },
+    {
+      label: "version manifest is partial",
+      expected: `registry version ${value.version} package identity disagrees`,
+      build: (phase) => {
+        const metadata = validForPhase(phase);
+        delete (
+          metadata.versions as Record<string, Record<string, unknown>>
+        )[value.version]!.name;
+        return metadata;
+      },
+    },
+  ];
+
+  for (const invalid of invalidSnapshots) {
+    for (const phase of ["staged", "promoted"] as const) {
+      for (const invalidRead of [1, 2]) {
+        let packageReads = 0;
+        await expect(verifyRegistryReleaseAttempt(value, phase, {
+          readVersionMetadata: async () => registryVersionMetadata(value),
+          readPackageMetadata: async () => {
+            packageReads++;
+            return packageReads === invalidRead
+              ? invalid.build(phase)
+              : validForPhase(phase);
+          },
+          readTarball: async () => tarball,
+          verifyConsumer: () => attestations(),
+          verifyCryptographically: async () => {},
+          verifySemantically: () => {},
+        })).rejects.toThrow(invalid.expected);
+        expect(packageReads).toBe(invalidRead);
+      }
+    }
+  }
+
+  for (const phase of ["staged", "promoted"] as const) {
+    const latest = phase === "staged" ? "0.2.12" : value.version;
+    const completeTagChanges = [
+      {
+        initial: validForPhase(phase),
+        terminal: registryPackage(
+          latest,
+          ["0.2.12", value.version],
+          value,
+          { legacy: "0.2.12" },
+        ),
+      },
+      {
+        initial: registryPackage(
+          latest,
+          ["0.2.12", value.version],
+          value,
+          { legacy: "0.2.12" },
+        ),
+        terminal: validForPhase(phase),
+      },
+      {
+        initial: registryPackage(
+          latest,
+          ["0.2.12", value.version],
+          value,
+          { legacy: "0.2.12" },
+        ),
+        terminal: registryPackage(
+          latest,
+          ["0.2.12", value.version],
+          value,
+          { legacy: value.version },
+        ),
+      },
+    ];
+    for (const change of completeTagChanges) {
+      let packageReads = 0;
+      await expect(verifyRegistryReleaseAttempt(value, phase, {
+        readVersionMetadata: async () => registryVersionMetadata(value),
+        readPackageMetadata: async () => {
+          packageReads++;
+          return packageReads === 1 ? change.initial : change.terminal;
+        },
+        readTarball: async () => tarball,
+        verifyConsumer: () => attestations(),
+        verifyCryptographically: async () => {},
+        verifySemantically: () => {},
+      })).resolves.toBeUndefined();
+      expect(packageReads).toBe(2);
+    }
+  }
 });
 
 test("rejects promoted monotonic drift at every slow verification gate before reporting success", async () => {
