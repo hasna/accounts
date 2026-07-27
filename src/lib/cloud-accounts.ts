@@ -125,6 +125,23 @@ const RETIRED_MODES = new Set(["remote", "hybrid", "s3"]);
 const MODE_ENV_KEYS = ["HASNA_ACCOUNTS_STORAGE_MODE", "ACCOUNTS_STORAGE_MODE", "HASNA_ACCOUNTS_MODE"] as const;
 
 /**
+ * Return the first canonical authority in env-key precedence order. Retired
+ * words are absent authority, so they must be skipped rather than allowed to
+ * hide a canonical value from a lower-priority compatibility key.
+ */
+function explicitStorageMode(env: NodeJS.ProcessEnv): string {
+  for (const key of MODE_ENV_KEYS) {
+    const rawMode = (env[key] ?? "").trim().toLowerCase();
+    if (!rawMode || RETIRED_MODES.has(rawMode)) continue;
+    if (CANONICAL_MODES.has(rawMode)) return rawMode;
+    throw new AccountsError(
+      `invalid accounts storage mode "${rawMode}"; expected local, self_hosted, or cloud`,
+    );
+  }
+  return "";
+}
+
+/**
  * Bridge the fleet flip's two-var convention to the contracts resolver. The
  * toggle is the presence of BOTH `HASNA_ACCOUNTS_API_URL` and
  * `HASNA_ACCOUNTS_API_KEY`: when both are set (and mode is not explicitly
@@ -137,19 +154,7 @@ const MODE_ENV_KEYS = ["HASNA_ACCOUNTS_STORAGE_MODE", "ACCOUNTS_STORAGE_MODE", "
 function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const url = env.HASNA_ACCOUNTS_API_URL || env.ACCOUNTS_API_URL;
   const key = env.HASNA_ACCOUNTS_API_KEY || env.ACCOUNTS_API_KEY;
-  const rawMode = (
-    env.HASNA_ACCOUNTS_STORAGE_MODE ||
-    env.ACCOUNTS_STORAGE_MODE ||
-    env.HASNA_ACCOUNTS_MODE ||
-    ""
-  ).trim().toLowerCase();
-  const explicitMode = CANONICAL_MODES.has(rawMode) ? rawMode : "";
-
-  if (rawMode && !explicitMode && !RETIRED_MODES.has(rawMode)) {
-    throw new AccountsError(
-      `invalid accounts storage mode "${rawMode}"; expected local, self_hosted, or cloud`,
-    );
-  }
+  const explicitMode = explicitStorageMode(env);
 
   const next: NodeJS.ProcessEnv = { ...env };
   for (const k of MODE_ENV_KEYS) delete next[k];

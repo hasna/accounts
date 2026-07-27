@@ -82,4 +82,6 @@ local-only compatibility. They preserve local behavior, but fail before local
 I/O whenever hosted/self-hosted authority is configured. The deprecated
 `ensureProfileForLogin` root export uses that same canonical authority resolver,
 including `HASNA_ACCOUNTS_MODE`, rather than maintaining a separate mode policy.
+Retired `remote`, `hybrid`, and `s3` words are skipped as absent authority and
+cannot mask a canonical value from a lower-precedence compatibility key.
 Async v1 callers use `resolveStore()`; new callers use `@hasna/accounts/v2`.
