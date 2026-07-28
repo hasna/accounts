@@ -245,12 +245,23 @@ interface SessionsMergeCliOptions {
 function formatMergeReport(report: SessionMergeReport): string {
   const lines: string[] = [];
   lines.push(report.dryRun ? chalk.yellow("dry run — nothing was written") : chalk.bold("session merge"));
+  if (report.approximate) {
+    lines.push(
+      chalk.yellow(
+        "counts are BOUNDS, not exact: nothing is placed, so each source is compared against a shared tree that " +
+          "never received the earlier sources. MERGED is an upper bound and FORKED a lower bound.",
+      ),
+    );
+  }
   lines.push(`shared home: ${report.sharedHome}`);
   lines.push(
     `transcripts in the shared home: ${report.sharedTranscriptsBefore} -> ${report.sharedTranscriptsAfter}` +
       (report.dryRun ? " (unchanged; this is a dry run)" : ""),
   );
-  lines.push(`history records: ${report.history.recordsBefore} -> ${report.history.recordsAfter}`);
+  lines.push(
+    `history records: ${report.history.recordsBefore} -> ${report.history.recordsAfter}` +
+      (report.history.readable ? "" : chalk.red(" (shared history UNREADABLE — left untouched)")),
+  );
   lines.push("");
   const headers = ["SOURCE", "REG", "OWN", "MERGED", "SAME", "GREW", "FORKED", "DEFER", "LINK"] as const;
   const rows = report.sources.map((source) => ({
@@ -315,7 +326,12 @@ async function runMerge(options: SessionsMergeCliOptions): Promise<void> {
       throw new AccountsError("--active-window-ms must be a non-negative number of milliseconds");
     }
   }
+  // The same store the rest of this command group reads: on a machine pointed
+  // at a self-hosted registry the on-box file is empty, and every profile would
+  // otherwise be treated as unregistered and silently never linked.
+  const profiles = await resolveStore().listProfiles("claude");
   const report = mergeClaudeSessions({
+    profiles,
     ...(options.profile ? { profile: options.profile } : {}),
     ...(options.from ? { from: options.from } : {}),
     ...(activeWindowMs !== undefined ? { activeWindowMs } : {}),

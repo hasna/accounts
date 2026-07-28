@@ -582,7 +582,22 @@ export function sharedCapabilityHealth(profileDir: string, tool: ToolDef): Share
   for (const entry of health.entries) {
     if (entry.status === "missing") health.problems.push(`${entry.entry} is not shared (expected a link to ${entry.source})`);
     else if (entry.status === "diverged") health.problems.push(`${entry.entry} links to ${realpathIfExists(entry.target)}, not ${entry.source}`);
-    else if (entry.status === "local") health.warnings.push(`${entry.entry} is a profile-local copy, not the shared corpus`);
+    else if (entry.status === "local") {
+      // For a capability corpus a local copy is a deliberate override, so it is
+      // only a warning. For sessions it is the signature of a profile that has
+      // silently STOPPED sharing — the tool recreates a real directory whenever
+      // the link is lost, `shareEntry` then correctly refuses to replace it, and
+      // the floor check below is skipped for anything that is not `shared`. As a
+      // warning that state is invisible: doctor exits 0 and calls it healthy.
+      if (corpusIsRecursive(tool, entry.entry) || tool.sessions?.history === entry.entry) {
+        health.problems.push(
+          `${entry.entry} is a profile-local directory, not the shared corpus — this profile is no longer sharing ` +
+            "sessions; re-run `accounts sessions merge --link` to migrate and re-link it",
+        );
+      } else {
+        health.warnings.push(`${entry.entry} is a profile-local copy, not the shared corpus`);
+      }
+    }
     if (entry.status !== "shared") continue;
     // The link being correct says nothing about the corpus still having
     // anything in it — a delete through the link leaves the pointer intact.

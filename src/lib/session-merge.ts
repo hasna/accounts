@@ -1,26 +1,32 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   linkSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   utimesSync,
   type Stats,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { basename, dirname, extname, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { AccountsError, type Profile, type ToolDef } from "../types.js";
 import { loadStore, profilesDir } from "../storage.js";
 import { getTool } from "./tools.js";
 import { writeFileAtomic } from "./safe-path.js";
 import { ensureSharedCapabilities, sharedHomeFor } from "./shared-capabilities.js";
+import { withApplyLock } from "./apply-lock.js";
 
 /**
  * Sessions are the one capability that cannot simply be linked.
@@ -65,6 +71,8 @@ const MAX_WALK_DEPTH = 32;
 const RETAINED_DIR = ".accounts-session-migration";
 
 export type SessionLinkState =
+  /** The swap failed and the original could NOT be put back. */
+  | "restore-failed"
   /** Newly pointed at the shared home; the original is under `retainedAt`. */
   | "linked"
   /** Already resolved to the shared home before this run. */
@@ -91,6 +99,8 @@ export interface SessionMergeSourceReport {
   transcriptsAfter: number;
   /** Files the shared home did not have, now present. */
   merged: number;
+  /** How many of those were regular `.jsonl` transcripts (what the floor counts). */
+  mergedTranscripts: number;
   /** How many of those were placed with `link(2)`. */
   hardlinked: number;
   /** How many had to be copied byte-for-byte (a source on another filesystem). */
@@ -128,11 +138,15 @@ export interface SessionMergeHistoryReport {
   unparsedPreserved: number;
   /** True when the merged file is in ascending timestamp order. */
   ascending: boolean;
+  /** False when the shared file exists but could not be read — never rewritten. */
+  readable: boolean;
 }
 
 export interface SessionMergeReport {
   tool: string;
   dryRun: boolean;
+  /** Counts are bounds, not exact: a dry run places nothing (see `dryRun`). */
+  approximate: boolean;
   sharedHome: string;
   sharedTranscriptsBefore: number;
   sharedTranscriptsAfter: number;
@@ -161,6 +175,25 @@ export interface SessionMergeOptions {
    * never written to.
    */
   from?: readonly string[];
+  /**
+   * Profiles considered registered, and therefore eligible to be linked.
+   *
+   * Defaults to the on-box registry file, but this machine can be pointed at a
+   * self-hosted registry, in which case the on-box file is empty and every
+   * profile would be treated as unregistered — silently linking nothing. The
+   * caller resolves the store it actually uses and passes it in.
+   */
+  profiles?: readonly Profile[];
+  /** Test seam: fires before an existing shared file is replaced. */
+  onBeforeSwap?: () => void;
+  /** Test seam: fires after every source has been merged, before verification. */
+  onAfterMerge?: () => void;
+  /** Test seam: fires after verification, before the link loop. */
+  onBeforeLink?: () => void;
+  /** Test seam: fires after the link loop, before the post-link census. */
+  onAfterLink?: () => void;
+  /** Test seam: fires when a failed swap starts restoring the original. */
+  onRollback?: () => void;
 }
 
 function message(err: unknown): string {
@@ -208,6 +241,13 @@ export function assertNoTrailingSeparator(path: string, label: string): void {
 interface WalkedFile {
   rel: string;
   stat: Stats;
+  /**
+   * Claude Code creates symlinks INSIDE the session tree for forked and resumed
+   * subagent transcripts. Discarding them made every profile that had one
+   * permanently ineligible for linking, so they are carried through the merge
+   * and reproduced in the shared corpus.
+   */
+  kind: "file" | "symlink";
 }
 
 /**
@@ -238,7 +278,12 @@ function walkFiles(root: string, onSkip: (rel: string, reason: string) => void):
       const childRel = rel ? join(rel, entry.name) : entry.name;
       const child = join(dir, entry.name);
       if (entry.isSymbolicLink()) {
-        onSkip(childRel, "symbolic link inside the session tree");
+        const stat = lstatIfExists(child);
+        if (!stat) {
+          onSkip(childRel, "disappeared while listing");
+          continue;
+        }
+        files.push({ rel: childRel, stat, kind: "symlink" });
         continue;
       }
       if (entry.isDirectory()) {
@@ -254,7 +299,7 @@ function walkFiles(root: string, onSkip: (rel: string, reason: string) => void):
         onSkip(childRel, "disappeared while listing");
         continue;
       }
-      files.push({ rel: childRel, stat });
+      files.push({ rel: childRel, stat, kind: "file" });
     }
   };
   if (existsSync(root)) visit(root, "", 0);
@@ -267,7 +312,10 @@ function walkFiles(root: string, onSkip: (rel: string, reason: string) => void):
  * could be lost without the number moving.
  */
 export function countTranscripts(root: string): number {
-  return walkFiles(root, () => {}).filter((file) => file.rel.endsWith(".jsonl")).length;
+  // Regular files only: a symlink inside the tree is another name for a
+  // transcript that is already counted, so counting it would inflate the floor
+  // that is meant to catch loss.
+  return walkFiles(root, () => {}).filter((file) => file.kind === "file" && file.rel.endsWith(".jsonl")).length;
 }
 
 // --- placing one file -------------------------------------------------------
@@ -358,6 +406,8 @@ interface MergeFileContext {
   profile: string;
   dryRun: boolean;
   cutoff: number;
+  /** Test seam: fires immediately before an existing shared file is replaced. */
+  onBeforeSwap?: () => void;
 }
 
 type PlaceResult = { placed: "hardlink" | "copy" } | { outcome: "deferred" | "vanished" } | { error: string };
@@ -408,9 +458,77 @@ function outcomeFor(result: PlaceResult, outcome: FileOutcome, rel: string): Fil
   return { outcome, hardlinked: result.placed === "hardlink", copied: result.placed === "copy" };
 }
 
+/** True when `candidate` is `root` itself or sits underneath it. */
+function isInside(candidate: string, root: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * Reproduce a symlink that Claude Code created inside the session tree.
+ *
+ * The link is only reproduced when it points back into the same tree, and it is
+ * rewritten relative to its own directory so the shared corpus stays portable —
+ * an absolute path into one profile's directory would break the moment another
+ * profile read it. A link out of the tree is refused: following it would merge
+ * something nobody put in the corpus, and silently dropping it would leave the
+ * profile permanently unlinkable with no explanation.
+ */
+function mergeSymlink(ctx: MergeFileContext, file: WalkedFile, sourcePath: string, targetPath: string): FileResult {
+  let raw: string;
+  try {
+    raw = readlinkSync(sourcePath);
+  } catch (err) {
+    return { outcome: "unaccounted", error: `${file.rel}: could not read the symbolic link (${message(err)})` };
+  }
+  const absolute = resolve(dirname(sourcePath), raw);
+  // In-tree by path, or in-tree by resolution: a retained tree's links still
+  // name the profile's own `projects/`, which by then IS the shared corpus.
+  let inTree: string | undefined;
+  if (isInside(absolute, ctx.sourceRoot)) {
+    inTree = relative(ctx.sourceRoot, absolute);
+  } else {
+    const realRoot = realpathIfExists(ctx.targetRoot);
+    const realAbsolute = realpathIfExists(absolute);
+    if (realRoot && realAbsolute && isInside(realAbsolute, realRoot)) inTree = relative(realRoot, realAbsolute);
+  }
+  if (inTree === undefined) {
+    return {
+      outcome: "unaccounted",
+      error:
+        `${file.rel}: symbolic link points outside the session tree (${raw}); ` +
+        "it is not reproduced in the shared corpus — move or remove it, then merge again",
+    };
+  }
+  const desired = relative(dirname(targetPath), join(ctx.targetRoot, inTree));
+  const existing = lstatIfExists(targetPath);
+  if (existing) {
+    if (!existing.isSymbolicLink()) {
+      return { outcome: "unaccounted", error: `${file.rel}: a regular entry occupies the path this link needs` };
+    }
+    let current: string;
+    try {
+      current = readlinkSync(targetPath);
+    } catch (err) {
+      return { outcome: "unaccounted", error: `${file.rel}: could not read the shared link (${message(err)})` };
+    }
+    if (current === desired) return { outcome: "alreadyMerged" };
+    return { outcome: "unaccounted", error: `${file.rel}: shared link points at ${current}, not ${desired}` };
+  }
+  if (ctx.dryRun) return { outcome: "merged" };
+  try {
+    mkdirSync(dirname(targetPath), { recursive: true });
+    symlinkSync(desired, targetPath);
+    return { outcome: "merged" };
+  } catch (err) {
+    return { outcome: "unaccounted", error: `${file.rel}: could not reproduce the symbolic link (${message(err)})` };
+  }
+}
+
 function mergeFile(ctx: MergeFileContext, file: WalkedFile): FileResult {
   const sourcePath = join(ctx.sourceRoot, file.rel);
   const targetPath = join(ctx.targetRoot, file.rel);
+  if (file.kind === "symlink") return mergeSymlink(ctx, file, sourcePath, targetPath);
   const targetStat = lstatIfExists(targetPath);
 
   if (targetStat?.isSymbolicLink()) {
@@ -456,7 +574,7 @@ function mergeFile(ctx: MergeFileContext, file: WalkedFile): FileResult {
     if (!current || current.size !== targetStat.size || current.mtimeMs !== targetStat.mtimeMs) {
       return { outcome: "deferred" };
     }
-    return outcomeFor(replaceAtomically(ctx, file, sourcePath, targetPath), "extended", file.rel);
+    return outcomeFor(replaceAtomically(ctx, file, sourcePath, targetPath, existing), "extended", file.rel);
   }
 
   // Neither contains the other: two genuinely forked histories at one path.
@@ -492,13 +610,45 @@ function mergeFile(ctx: MergeFileContext, file: WalkedFile): FileResult {
  * sees the old file or the new one and never a gap — and any other name that
  * pointed at the old inode keeps it.
  */
+/** Read exactly the first `length` bytes of a path, or fewer if it is shorter. */
+function readPrefixBytes(path: string, length: number): Uint8Array | undefined {
+  if (length === 0) return new Uint8Array(0);
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(length);
+    const read = readSync(fd, buffer, 0, length, 0);
+    return buffer.subarray(0, read);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * Replace an existing entry with the source, atomically, and only after
+ * re-proving on the exact inode about to be published that it still begins with
+ * the bytes the shared copy holds.
+ *
+ * Re-stating the source's stat is not enough. The prefix was proved on bytes
+ * read from one inode; `mv`, `cp`, an editor, `rsync` (temp-plus-rename by
+ * default) or a restore puts a DIFFERENT inode at that path, and linking that
+ * one into place publishes content nothing ever proved to contain the shared
+ * copy — silently replacing a whole transcript with an unrelated file while
+ * reporting `extended`. An append is safe precisely because it keeps the inode
+ * and only adds, which is what this re-proof accepts and a stat comparison
+ * would reject.
+ */
 function replaceAtomically(
   ctx: MergeFileContext,
   file: WalkedFile,
   sourcePath: string,
   targetPath: string,
+  provenPrefix: Uint8Array,
 ): PlaceResult {
   if (ctx.dryRun) return { placed: "hardlink" };
+  ctx.onBeforeSwap?.();
   const temp = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
   try {
     linkSync(sourcePath, temp);
@@ -508,7 +658,12 @@ function replaceAtomically(
     if (code !== "EXDEV" && code !== "EPERM" && code !== "EMLINK" && code !== "EOPNOTSUPP") {
       return { error: message(err) };
     }
-    return placeFileByCopyOver(ctx, file, sourcePath, targetPath);
+    return placeFileByCopyOver(ctx, file, sourcePath, targetPath, provenPrefix);
+  }
+  const actual = readPrefixBytes(temp, provenPrefix.byteLength);
+  if (!actual || actual.byteLength !== provenPrefix.byteLength || !Buffer.from(actual).equals(Buffer.from(provenPrefix))) {
+    rmSync(temp, { force: true });
+    return { outcome: "deferred" };
   }
   try {
     renameSync(temp, targetPath);
@@ -524,9 +679,18 @@ function placeFileByCopyOver(
   file: WalkedFile,
   sourcePath: string,
   targetPath: string,
+  provenPrefix?: Uint8Array,
 ): PlaceResult {
   const read = readStable(sourcePath, file.stat, { requireCompleteLine: targetPath.endsWith(".jsonl") });
   if ("outcome" in read) return { outcome: read.outcome };
+  if (provenPrefix) {
+    // Same re-proof as the hardlink path: these are freshly read bytes, and
+    // they must still contain what the shared copy holds.
+    const head = read.contents.subarray(0, provenPrefix.byteLength);
+    if (head.byteLength !== provenPrefix.byteLength || !Buffer.from(head).equals(Buffer.from(provenPrefix))) {
+      return { outcome: "deferred" };
+    }
+  }
   try {
     writeFileAtomic(targetPath, read.contents, {
       mode: (file.stat.mode & 0o777) || 0o600,
@@ -568,12 +732,22 @@ interface HistoryRecord {
   order: number;
 }
 
-function readHistoryLines(path: string): string[] {
-  if (!existsSync(path)) return [];
+type HistoryRead = { state: "ok"; lines: string[] } | { state: "unreadable"; reason: string };
+
+/**
+ * "Absent" and "unreadable" must never give the same answer. Swallowing a read
+ * error into an empty list makes the merge believe the file held nothing, write
+ * a document built from the other sources over it, and — because the same
+ * failed read also supplies `recordsBefore` — pass a "records never decreased"
+ * check that could not have failed. One transient EACCES or EMFILE during a
+ * fourteen-thousand-file run would destroy the whole prompt history.
+ */
+function readHistory(path: string): HistoryRead {
+  if (!existsSync(path)) return { state: "ok", lines: [] };
   try {
-    return readFileSync(path, "utf8").split("\n").filter((line) => line.trim().length > 0);
-  } catch {
-    return [];
+    return { state: "ok", lines: readFileSync(path, "utf8").split("\n").filter((line) => line.trim().length > 0) };
+  } catch (err) {
+    return { state: "unreadable", reason: message(err) };
   }
 }
 
@@ -737,8 +911,12 @@ function planEntryLink(profileDir: string, sharedHome: string, entry: string): E
   return { entry, alreadyLinked: false, nothingToDo: false };
 }
 
-/** The link resolves to the shared entry AND that entry still holds something. */
-function linkIsGood(profileDir: string, sharedHome: string, entry: string): boolean {
+/**
+ * The link resolves to the shared entry AND that entry still holds the corpus.
+ * "Not empty" is not the test: one surviving file passes it while the rest of
+ * the corpus is gone, which is precisely the state this is meant to refuse.
+ */
+function linkIsGood(profileDir: string, sharedHome: string, entry: string, minimumTranscripts: number): boolean {
   const target = join(profileDir, entry);
   const source = join(sharedHome, entry);
   if (!lstatIfExists(target)?.isSymbolicLink()) return false;
@@ -752,9 +930,7 @@ function linkIsGood(profileDir: string, sharedHome: string, entry: string): bool
     return false;
   }
   // A link that resolves to an empty corpus is the failure this check exists for.
-  // Cheap check first: a full recursive census of the shared corpus runs once
-  // per profile, and the top-level listing already answers "is it empty".
-  if (stat.isDirectory()) return readdirSync(realTarget).length > 0 || countTranscripts(realTarget) > 0;
+  if (stat.isDirectory()) return countTranscripts(realTarget) >= minimumTranscripts;
   return stat.size > 0;
 }
 
@@ -774,7 +950,8 @@ function linkSource(
   tool: ToolDef,
   sharedHome: string,
   stamp: string,
-): { state: SessionLinkState; retainedAt?: string; errors: string[] } {
+  opts: { cutoff: number; minimumTranscripts: number; onRollback?: () => void },
+): { state: SessionLinkState; retainedAt?: string; errors: string[]; residueMerged?: number } {
   const sessions = tool.sessions!;
   const errors: string[] = [];
   const entries = [sessions.transcripts, sessions.history];
@@ -784,16 +961,37 @@ function linkSource(
 
   const retainedAt = join(source.dir, RETAINED_DIR, stamp);
   const moved: { entry: string; from: string; to: string }[] = [];
-  const rollback = (): void => {
+  /**
+   * Put everything back. Returns false if it could not, which must be reported
+   * rather than swallowed: a live writer can recreate `projects/` inside the
+   * swap window, and skipping the restore in silence leaves the real tree
+   * stranded under the retained directory while the run says "rolled back".
+   * "Rolled back" has to mean "left exactly as it was".
+   */
+  const rollback = (): boolean => {
+    let restored = true;
     for (const item of moved) {
       try {
         const link = lstatIfExists(item.from);
         if (link?.isSymbolicLink()) unlinkSync(item.from);
-        if (!existsSync(item.from)) renameSync(item.to, item.from);
+        // The window a live writer actually races: the link is gone and the
+        // original has not been renamed back yet.
+        opts.onRollback?.();
+        if (existsSync(item.from)) {
+          restored = false;
+          errors.push(
+            `${item.entry}: could not restore the original — something else now occupies ${item.from}; ` +
+              `the original is still at ${item.to} and must be moved back by hand`,
+          );
+          continue;
+        }
+        renameSync(item.to, item.from);
       } catch (err) {
+        restored = false;
         errors.push(`${item.entry}: could not restore the original after a failed swap (${message(err)})`);
       }
     }
+    return restored;
   };
 
   for (const plan of movable) {
@@ -806,8 +1004,7 @@ function linkSource(
       moved.push({ entry: plan.entry, from, to });
     } catch (err) {
       errors.push(`${plan.entry}: could not retain the original (${message(err)})`);
-      rollback();
-      return { state: "rolled-back", errors };
+      return { state: rollback() ? "rolled-back" : "restore-failed", errors };
     }
   }
 
@@ -818,24 +1015,56 @@ function linkSource(
     const plan = plans.find((candidate) => candidate.entry === entry)!;
     if (plan.alreadyLinked) return false;
     if (plan.nothingToDo && !moved.some((item) => item.entry === entry)) return false;
-    return !linkIsGood(source.dir, sharedHome, entry);
+    return !linkIsGood(source.dir, sharedHome, entry, opts.minimumTranscripts);
   });
   if (failed.length > 0) {
-    errors.push(`${failed.join(", ")}: link did not resolve to a populated shared entry`);
-    rollback();
-    return { state: "rolled-back", errors };
+    errors.push(`${failed.join(", ")}: link did not resolve to the expected shared corpus`);
+    return { state: rollback() ? "rolled-back" : "restore-failed", errors };
+  }
+
+  // Anything written to the profile's own tree between the walk and this rename
+  // is now sitting under the retained directory, reachable from no profile at
+  // all — and a clean re-run cannot find it, because the source is a link by
+  // then. Merge the retained tree before declaring the swap good.
+  let residueMerged = 0;
+  if (moved.some((item) => item.entry === sessions.transcripts)) {
+    const residue = mergeOneSource(
+      { profile: `${source.profile}:retained`, dir: retainedAt, registered: false },
+      tool,
+      sharedHome,
+      { dryRun: false, cutoff: opts.cutoff },
+    );
+    residueMerged = residue.report.merged;
+    const stranded =
+      residue.report.deferredActive + residue.report.vanished + residue.report.unaccounted + residue.report.errors.length;
+    if (stranded > 0) {
+      errors.push(
+        `${sessions.transcripts}: ${stranded} entrie(s) written during the run could not be merged from ${retainedAt}`,
+        ...residue.report.errors,
+      );
+      return { state: rollback() ? "rolled-back" : "restore-failed", errors, residueMerged };
+    }
   }
 
   const newlyLinked = entries.filter(
     (entry) => result.linked.includes(entry) || result.repaired.includes(entry),
   );
-  if (moved.length === 0 && newlyLinked.length === 0) return { state: "already-linked", errors };
-  return { state: "linked", ...(moved.length > 0 ? { retainedAt } : {}), errors };
+  if (moved.length === 0 && newlyLinked.length === 0) return { state: "already-linked", errors, residueMerged };
+  return { state: "linked", ...(moved.length > 0 ? { retainedAt } : {}), errors, residueMerged };
 }
 
 // --- entry point ------------------------------------------------------------
 
+/**
+ * Serialized against the other mutating Accounts operations. Two merges
+ * interleaving in the rename window is exactly the condition that leaves a
+ * profile with a recreated `projects/` and an unrestorable original.
+ */
 export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionMergeReport {
+  return withApplyLock(() => runMerge(options));
+}
+
+function runMerge(options: SessionMergeOptions): SessionMergeReport {
   const tool = getTool(options.toolId ?? "claude");
   if (!tool.sessions) {
     throw new AccountsError(`tool "${tool.id}" does not declare where it stores sessions`);
@@ -850,8 +1079,8 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
   const sharedRoot = join(sharedHome, tool.sessions.transcripts);
   const sharedHistoryPath = join(sharedHome, tool.sessions.history);
 
-  const store = loadStore();
-  let sources = discoverSessionSources(tool, store.profiles);
+  const profiles = options.profiles ?? loadStore().profiles;
+  let sources = discoverSessionSources(tool, profiles);
   for (const root of options.from ?? []) {
     assertNoTrailingSeparator(root, "--from");
     const extra = discoverExtraSources(root, tool);
@@ -871,6 +1100,13 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
   const report: SessionMergeReport = {
     tool: tool.id,
     dryRun,
+    // A dry run places nothing, so each source is evaluated against a shared
+    // tree that never received the earlier sources: two profiles holding the
+    // same new path both count as `merged` where a real run would record one
+    // merge and one collision. Merge counts are an upper bound and collision
+    // counts a lower bound, and the report says so rather than implying
+    // precision it cannot have.
+    approximate: dryRun,
     sharedHome,
     sharedTranscriptsBefore: countTranscripts(sharedRoot),
     sharedTranscriptsAfter: 0,
@@ -879,22 +1115,38 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
     sources: [],
     history: {
       target: sharedHistoryPath,
-      recordsBefore: readHistoryLines(sharedHistoryPath).length,
+      recordsBefore: 0,
       recordsAfter: 0,
       unparsedPreserved: 0,
       ascending: true,
+      readable: true,
     },
     verification: { assertion: "", passed: false },
     errors: [],
   };
 
-  const sharedHistoryBefore = readHistoryLines(sharedHistoryPath);
+  const sharedHistory = readHistory(sharedHistoryPath);
+  if (sharedHistory.state === "unreadable") {
+    report.history.readable = false;
+    report.errors.push(
+      `${tool.sessions.history}: could not be read (${sharedHistory.reason}); ` +
+        "refusing to rewrite it, because a document built from the other sources would replace whatever it still holds",
+    );
+  }
+  const sharedHistoryBefore = sharedHistory.state === "ok" ? sharedHistory.lines : [];
+  report.history.recordsBefore = sharedHistoryBefore.length;
+
   const historySources: string[][] = [sharedHistoryBefore];
   for (const source of sources) {
-    const merged = mergeOneSource(source, tool, sharedHome, { dryRun, cutoff });
+    const merged = mergeOneSource(source, tool, sharedHome, {
+      dryRun,
+      cutoff,
+      ...(options.onBeforeSwap ? { onBeforeSwap: options.onBeforeSwap } : {}),
+    });
     report.sources.push(merged.report);
     historySources.push(merged.historyLines);
   }
+  options.onAfterMerge?.();
 
   const union = unionHistory(historySources);
   report.history.recordsAfter = union.lines.length;
@@ -904,7 +1156,7 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
   // ascending timestamps, so a same-length but out-of-order file still has to be
   // rewritten. Comparing the whole document keeps the re-run a no-op.
   const historyChanged = union.lines.join("\n") !== sharedHistoryBefore.join("\n");
-  if (!dryRun && historyChanged) {
+  if (!dryRun && report.history.readable && historyChanged) {
     try {
       writeFileAtomic(sharedHistoryPath, union.lines.join("\n") + "\n", {
         mode: 0o600,
@@ -921,31 +1173,29 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
   report.totalTranscriptsAfter =
     report.sharedTranscriptsAfter + report.sources.reduce((sum, source) => sum + source.transcriptsAfter, 0);
 
-  // Assert the work, not the exit code: every transcript a source held has to
-  // be present in the shared home, and no count anywhere may have gone down.
-  const expectedGrowth = report.sources.reduce((sum, source) => sum + source.merged, 0);
-  const grew =
-    report.sharedTranscriptsAfter >= report.sharedTranscriptsBefore &&
-    report.totalTranscriptsAfter >= report.totalTranscriptsBefore &&
-    report.history.recordsAfter >= report.history.recordsBefore &&
-    report.history.ascending;
-  report.verification = {
-    assertion:
-      "shared transcripts, total transcripts and history records must all be >= their counts before the merge, " +
-      "and the merged history must be in ascending timestamp order",
-    passed: grew,
-    ...(grew
-      ? {}
-      : {
-          detail:
-            `shared ${report.sharedTranscriptsBefore} -> ${report.sharedTranscriptsAfter} ` +
-            `(${expectedGrowth} files merged), total ${report.totalTranscriptsBefore} -> ${report.totalTranscriptsAfter}, ` +
-            `history ${report.history.recordsBefore} -> ${report.history.recordsAfter}, ` +
-            `ascending=${report.history.ascending}`,
-        }),
-  };
+  // The floor is counted on the SHARED side only. Adding the sources back in
+  // double-counts every hardlink — the same inode under two names — which gave
+  // the check about a hundred per cent of slack: it could only fire once more
+  // than half the corpus was gone. What has to hold is that the shared tree
+  // grew by exactly the transcripts this run placed into it.
+  // A dry run places nothing by definition, so holding it to a growth floor
+  // would fail every time and report a loss that never happened.
+  const expectedGrowth = dryRun ? 0 : report.sources.reduce((sum, source) => sum + source.mergedTranscripts, 0);
+  const expectedShared = report.sharedTranscriptsBefore + expectedGrowth;
+  const sharedHeld = report.sharedTranscriptsAfter >= expectedShared;
+  const historyHeld = report.history.readable && report.history.recordsAfter >= report.history.recordsBefore;
+  const passed = sharedHeld && historyHeld && report.history.ascending;
+  const assertion =
+    "the shared transcript count must be at least its count before the merge plus the transcripts this run placed, " +
+    "the shared history must be readable and never lose records, and the merged history must be in ascending order";
+  const detailFor = (extra?: string): string =>
+    `shared ${report.sharedTranscriptsBefore} -> ${report.sharedTranscriptsAfter}, expected at least ${expectedShared} ` +
+    `(${expectedGrowth} transcripts placed); history ${report.history.recordsBefore} -> ${report.history.recordsAfter}, ` +
+    `readable=${report.history.readable}, ascending=${report.history.ascending}${extra ? `; ${extra}` : ""}`;
+  report.verification = { assertion, passed, ...(passed ? {} : { detail: detailFor() }) };
 
   const stamp = new Date(now).toISOString().replace(/[:.]/g, "-");
+  options.onBeforeLink?.();
   for (const source of report.sources) {
     if (dryRun) {
       source.linkState = "dry-run";
@@ -973,10 +1223,31 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
       continue;
     }
     const descriptor = sources.find((candidate) => candidate.dir === source.dir)!;
-    const linked = linkSource(descriptor, tool, sharedHome, stamp);
+    const linked = linkSource(descriptor, tool, sharedHome, stamp, {
+      cutoff,
+      minimumTranscripts: report.sharedTranscriptsAfter,
+      ...(options.onRollback ? { onRollback: options.onRollback } : {}),
+    });
     source.linkState = linked.state;
     if (linked.retainedAt) source.retainedAt = linked.retainedAt;
+    if (linked.residueMerged) source.merged += linked.residueMerged;
     source.errors.push(...linked.errors);
+  }
+  options.onAfterLink?.();
+
+  // The census above was taken BEFORE the destructive step, so on its own it
+  // says nothing about what the link loop did. Re-count afterwards, or the only
+  // part of the run that can destroy anything is the part nothing checks.
+  if (!dryRun && link) {
+    const afterLink = countTranscripts(sharedRoot);
+    report.sharedTranscriptsAfter = afterLink;
+    if (afterLink < expectedShared) {
+      report.verification = {
+        assertion,
+        passed: false,
+        detail: detailFor(`shared transcripts fell to ${afterLink} after linking`),
+      };
+    }
   }
 
   return report;
@@ -986,7 +1257,7 @@ function mergeOneSource(
   source: MergeSource,
   tool: ToolDef,
   sharedHome: string,
-  options: { dryRun: boolean; cutoff: number },
+  options: { dryRun: boolean; cutoff: number; onBeforeSwap?: () => void },
 ): { report: SessionMergeSourceReport; historyLines: string[] } {
   const sessions = tool.sessions!;
   const sourceRoot = join(source.dir, sessions.transcripts);
@@ -998,6 +1269,7 @@ function mergeOneSource(
     transcriptsBefore: 0,
     transcriptsAfter: 0,
     merged: 0,
+    mergedTranscripts: 0,
     hardlinked: 0,
     copied: 0,
     alreadyMerged: 0,
@@ -1029,6 +1301,7 @@ function mergeOneSource(
       profile: source.profile,
       dryRun: options.dryRun,
       cutoff: options.cutoff,
+      ...(options.onBeforeSwap ? { onBeforeSwap: options.onBeforeSwap } : {}),
     };
     for (const file of files) {
       const result = mergeFile(ctx, file);
@@ -1038,6 +1311,7 @@ function mergeOneSource(
       switch (result.outcome) {
         case "merged":
           report.merged += 1;
+          if (file.kind === "file" && file.rel.endsWith(".jsonl")) report.mergedTranscripts += 1;
           break;
         case "alreadyMerged":
           report.alreadyMerged += 1;
@@ -1070,7 +1344,17 @@ function mergeOneSource(
     report.transcriptsAfter = countTranscripts(sourceRoot);
   }
 
-  const historyLines = historyPlan.alreadyLinked ? [] : readHistoryLines(join(source.dir, sessions.history));
+  let historyLines: string[] = [];
+  if (!historyPlan.alreadyLinked) {
+    const read = readHistory(join(source.dir, sessions.history));
+    if (read.state === "unreadable") {
+      // Not "this profile has no history". Merging on would silently drop it,
+      // and linking would then hide the file behind a link to the shared one.
+      report.errors.push(`${sessions.history}: could not be read (${read.reason})`);
+    } else {
+      historyLines = read.lines;
+    }
+  }
   report.historyRecords = historyLines.length;
   return { report, historyLines };
 }
