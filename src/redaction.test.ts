@@ -1001,6 +1001,7 @@ test("sensitive URL query values redact across public positional surfaces", () =
 
 test("URL authority userinfo redacts across public positional surfaces", () => {
   const urls = [
+    "x://operator:one-letter-authority-secret@example.test/callback",
     "https://operator:authority-password-secret@example.test/callback",
     "https://token%40user:encoded-authority-secret@example.test/callback?visible=keep",
     "ftp://deploy:ftp-authority-secret@example.test/releases",
@@ -1038,6 +1039,7 @@ test("URL authority userinfo redacts across public positional surfaces", () => {
     { redacted: JSON.stringify(publicRedacted), jsonEscaped: true },
   ]) {
     for (const secret of [
+      "one-letter-authority-secret",
       "authority-password-secret",
       "encoded-authority-secret",
       "ftp-authority-secret",
@@ -1045,6 +1047,7 @@ test("URL authority userinfo redacts across public positional surfaces", () => {
     ]) {
       expect(redacted).not.toContain(secret);
     }
+    expect(redacted).toContain("x://[REDACTED]@example.test/callback");
     expect(redacted).toContain("https://[REDACTED]@example.test/callback");
     expect(redacted).toContain("https://[REDACTED]@example.test/callback?visible=keep");
     expect(redacted).toContain("ftp://[REDACTED]@example.test/releases");
@@ -1477,6 +1480,7 @@ test("command-text redaction shares argv option grammar across quoting and bound
     "command-attached-punctuation-secret",
     "command-escaped-semicolon-secret",
     "command-quoted-semicolon-secret",
+    "command-escaped-option-secret",
   ];
   const input = [
     `provider --api-key ${secrets[0]} --verbose keep-verbose`,
@@ -1497,6 +1501,7 @@ test("command-text redaction shares argv option grammar across quoting and bound
     `error:--master-key=${secrets[16]};status=keep-attached-punctuation`,
     `provider --api-key=${secrets[17]}\\;escaped-tail-marker --keep escaped-semicolon-diagnostic`,
     `provider --client-key="${secrets[18]};quoted-tail-marker" --keep quoted-semicolon-diagnostic`,
+    String.raw`provider \--api-key ${secrets[19]} --profile keep-escaped-option`,
     "provider --api-key --verbose keep-missing-value",
     "provider -- --api-key keep-after-end-of-options",
     "status=418 keep-final-command-diagnostic",
@@ -1524,6 +1529,7 @@ test("command-text redaction shares argv option grammar across quoting and bound
     "status=keep-attached-punctuation",
     "--keep escaped-semicolon-diagnostic",
     "--keep quoted-semicolon-diagnostic",
+    "--profile keep-escaped-option",
     "--api-key --verbose keep-missing-value",
     "-- --api-key keep-after-end-of-options",
     "status=418 keep-final-command-diagnostic",
@@ -1931,6 +1937,9 @@ test("URL and email punctuation never turns embedded text into credential option
     "mailto:?subject=(test)/--api-key keep-mailto-paren-query",
   ];
 
+  for (const nearMiss of nearMisses) {
+    expect(redactText(nearMiss)).toBe(nearMiss);
+  }
   expect(redactText(nearMisses.join("\n"))).toBe(nearMisses.join("\n"));
 });
 
