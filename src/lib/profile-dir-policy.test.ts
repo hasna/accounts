@@ -66,6 +66,20 @@ describe("classifyProfileDir", () => {
     expect(result.reason.code).toBe("outside-profile-roots");
   });
 
+  // Regression: CI redirects tmpdir() into the checkout under
+  // node_modules/.cache, producing a path that IS under a home root but whose
+  // first segment is `work`. This is correctly refused — the point of recording
+  // it is that such a path must never be judged by a CLIENT, because the client
+  // may legitimately be writing to a test double rather than to production.
+  test("rejects a CI checkout path under a home root", () => {
+    const result = classifyProfileDir(
+      "/home/runner/work/accounts/accounts/node_modules/.cache/accounts-tests/worker-b2VcWH/case-300/tmp/accounts-store-tools-LFBsC5/profiles/acme/work",
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason.code).toBe("outside-profile-roots");
+  });
+
   test("rejects a bare home directory", () => {
     const result = classifyProfileDir("/home/hasna");
     expect(result.ok).toBe(false);

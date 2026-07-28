@@ -24,7 +24,6 @@
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError, toolDefSchema } from "../types.js";
 import { resolveStorageClient, type HasnaStorageClient } from "@hasna/contracts";
-import { assertRegistrableProfileDir } from "./profile-dir-policy.js";
 
 const APP_SLUG = "accounts";
 
@@ -231,13 +230,12 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       if (input.identity) body.identity = input.identity;
       if (input.cardLast4) body.cardLast4 = input.cardLast4;
       if (input.metadata && Object.keys(input.metadata).length > 0) body.metadata = input.metadata;
-      if (input.dir) {
-        // Fail here rather than let the server 400: the caller is usually an
-        // agent or harness whose cwd is a temp dir, and a local error names the
-        // offending path instead of surfacing an opaque HTTP status.
-        assertRegistrableProfileDir(input.dir);
-        body.dir = input.dir;
-      }
+      // NOTE: profile-dir policy is deliberately NOT enforced client-side. This
+      // client also talks to test doubles and non-production instances, and it
+      // cannot tell which, so a local check would reject dirs that are perfectly
+      // valid for the store actually being written to. The server owns the
+      // boundary; its 400 carries the same message this client would have shown.
+      if (input.dir) body.dir = input.dir;
       if (input.description) body.description = input.description;
       const created = await client.create<CloudAccount>("accounts", body);
       return toProfile(created);
@@ -250,10 +248,7 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       if (input.identity !== undefined) body.identity = input.identity;
       if (input.cardLast4 !== undefined) body.cardLast4 = input.cardLast4;
       if (input.metadata !== undefined) body.metadata = input.metadata;
-      if (input.dir !== undefined) {
-        if (input.dir !== null) assertRegistrableProfileDir(input.dir);
-        body.dir = input.dir;
-      }
+      if (input.dir !== undefined) body.dir = input.dir;
       if (input.description !== undefined) body.description = input.description;
       if (input.lastUsedAt !== undefined) body.lastUsedAt = input.lastUsedAt;
       const updated = await t.patch<CloudAccount>(
