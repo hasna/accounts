@@ -7,6 +7,7 @@ export const ACCOUNTS_AUTH_DIR = ".accounts-auth";
 export const OAUTH_SNAPSHOT = "oauth-account.json";
 export const CREDENTIALS_SNAPSHOT = "credentials.json";
 export const KEYCHAIN_SNAPSHOT = "keychain.json";
+export const SWITCHED_ACCOUNT_MARKER = "switched-account.json";
 
 /** Root directory for live Claude auth files (home or ACCOUNTS_TEST_LIVE_DIR). */
 export function liveClaudeBase(): string {
@@ -47,4 +48,13 @@ export function profileCredentialsSnapshot(profileDir: string): string {
 
 export function profileKeychainSnapshot(profileDir: string): string {
   return join(profileAuthDir(profileDir), KEYCHAIN_SNAPSHOT);
+}
+
+/**
+ * Marker recording that a config dir's LIVE auth files currently carry another
+ * profile's account (written by in-place `switch-account`, cleared when the
+ * dir's own account is restored or a fresh login lands).
+ */
+export function profileSwitchedAccountMarker(profileDir: string): string {
+  return join(profileAuthDir(profileDir), SWITCHED_ACCOUNT_MARKER);
 }
