@@ -59,6 +59,18 @@ export const BUILTIN_TOOLS: ToolDef[] = [
       // literally doing so; the user drew the line at "only tokens should not".
       exclude: ["secrets"],
     },
+    // Measured on this machine: transcripts live at
+    // `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<sessionId>.jsonl`, with
+    // subagent transcripts and per-project memory nested beneath the same root,
+    // and the prompt history at `<CLAUDE_CONFIG_DIR>/history.jsonl`.
+    //
+    // `sessions/` is NOT listed and must not be: it holds one file per running
+    // process (`<pid>.json` with a status heartbeat and `peerProtocol`), so
+    // sharing it would show every profile the other profiles' live processes as
+    // its own peers, and each instance reaps entries whose PID it believes to be
+    // dead. Nothing is lost by keeping it per-profile — a finished session's
+    // durable record is the transcript under `projects/`.
+    sessions: { transcripts: "projects", history: "history.jsonl" },
   },
   {
     id: "codex-app",

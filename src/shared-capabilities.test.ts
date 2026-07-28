@@ -272,7 +272,13 @@ test("health reports a correctly shared profile as clean", () => {
   const health = sharedCapabilityHealth(p.dir, getTool("claude"));
   expect(health.supported).toBe(true);
   expect(health.problems).toEqual([]);
-  expect(health.entries.map((e) => e.status)).toEqual(["shared", "shared"]);
+  // The capability corpora this fixture seeds. Session entries are reported too
+  // and are "unavailable" here, because this shared home has no session tree —
+  // they are covered by the session merge tests.
+  expect(health.entries.filter((e) => ["skills", "agents"].includes(e.entry)).map((e) => e.status)).toEqual([
+    "shared",
+    "shared",
+  ]);
   expect(health.config[0]!.status).toBe("shared");
 });
 

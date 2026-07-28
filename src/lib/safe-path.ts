@@ -156,7 +156,7 @@ export function assertSafeWritePath(filePath: string, opts?: { mustStayUnder?: s
  */
 export function writeFileAtomic(
   path: string,
-  contents: string,
+  contents: string | Uint8Array,
   opts: { mode: number; mustStayUnder?: string },
 ): void {
   const guard = opts.mustStayUnder ? { mustStayUnder: opts.mustStayUnder } : undefined;
@@ -167,7 +167,10 @@ export function writeFileAtomic(
   let fd: number | undefined;
   try {
     fd = openSync(temp, "wx", opts.mode);
-    writeFileSync(fd, contents, "utf8");
+    // No encoding argument: a `Uint8Array` must land as its exact bytes, and a
+    // string still defaults to utf8. Session trees carry binary attachments
+    // alongside JSONL, so a utf8 round-trip here would corrupt them.
+    writeFileSync(fd, contents);
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;

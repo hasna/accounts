@@ -117,8 +117,19 @@ export function sharedHomeFor(tool: ToolDef): string {
   return resolve(value);
 }
 
+/**
+ * Every profile-relative entry linked to the shared home: the declared
+ * capability corpora plus the tool's session entries. Session entries are
+ * derived from `ToolDef.sessions` rather than restated in `sharedEntries` so
+ * the two can never disagree about which paths a merge is expected to free.
+ */
+export function sharedEntriesFor(tool: ToolDef): string[] {
+  const sessions = tool.sessions ? [tool.sessions.transcripts, tool.sessions.history] : [];
+  return [...new Set([...(tool.sharedEntries ?? []), ...sessions])];
+}
+
 export function toolSharesCapabilities(tool: ToolDef): boolean {
-  return (tool.sharedEntries?.length ?? 0) > 0 || tool.sharedConfig !== undefined;
+  return sharedEntriesFor(tool).length > 0 || tool.sharedConfig !== undefined;
 }
 
 function lstatIfExists(path: string) {
@@ -367,19 +378,60 @@ function writeBaselines(file: CorpusBaselineFile): void {
   });
 }
 
-/** Directory-granularity census: entry count plus a digest of the sorted names. */
-function measureCorpus(path: string): SharedCapabilityFloor | undefined {
-  let names: string[];
+/** Every file under `path`, relative to it. Bounded so a link loop cannot hang. */
+function listFilesRecursively(path: string, rel = "", depth = 0): string[] | undefined {
+  if (depth > 32) return [];
+  let entries;
   try {
-    names = readdirSync(path).sort();
+    entries = readdirSync(path, { withFileTypes: true });
   } catch {
     return undefined;
   }
+  const found: string[] = [];
+  for (const entry of entries) {
+    const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) {
+      found.push(...(listFilesRecursively(join(path, entry.name), childRel, depth + 1) ?? []));
+    } else {
+      found.push(childRel);
+    }
+  }
+  return found;
+}
+
+/**
+ * Census of a shared corpus: entry count plus a digest of the sorted names.
+ *
+ * Flat corpora (skills, subagents) are counted at the top level, where one
+ * directory is one skill. A session tree must be counted RECURSIVELY: its top
+ * level is one directory per project, so every transcript inside them could be
+ * deleted without the top-level count moving at all — the floor would be blind
+ * to exactly the loss it exists to catch.
+ */
+function measureCorpus(path: string, recursive: boolean): SharedCapabilityFloor | undefined {
+  let names: string[] | undefined;
+  if (recursive) {
+    names = listFilesRecursively(path);
+  } else {
+    try {
+      names = readdirSync(path);
+    } catch {
+      names = undefined;
+    }
+  }
+  if (!names) return undefined;
+  names = [...names].sort();
   return {
     entries: names.length,
     digest: createHash("sha256").update(names.join("\n")).digest("hex").slice(0, 16),
     recordedAt: new Date().toISOString(),
   };
+}
+
+/** Session trees nest; capability corpora do not. */
+function corpusIsRecursive(tool: ToolDef, entry: string): boolean {
+  return tool.sessions?.transcripts === entry;
 }
 
 function corpusKey(source: string): string {
@@ -391,8 +443,8 @@ function corpusKey(source: string): string {
  * shrinkage is the event this exists to catch, so it takes an explicit
  * `resetCapabilityBaseline` to accept it.
  */
-function recordCorpusFloor(source: string): void {
-  const current = measureCorpus(source);
+function recordCorpusFloor(source: string, recursive: boolean): void {
+  const current = measureCorpus(source, recursive);
   if (!current) return;
   const key = corpusKey(source);
   try {
@@ -414,9 +466,9 @@ function corpusFloor(source: string): SharedCapabilityFloor | undefined {
 export function resetCapabilityBaseline(tool: ToolDef): void {
   const sharedHome = sharedHomeFor(tool);
   const file = readBaselines();
-  for (const entry of tool.sharedEntries ?? []) {
+  for (const entry of sharedEntriesFor(tool)) {
     const source = join(sharedHome, entry);
-    const current = measureCorpus(source);
+    const current = measureCorpus(source, corpusIsRecursive(tool, entry));
     if (current) file.corpora[corpusKey(source)] = current;
     else delete file.corpora[corpusKey(source)];
   }
@@ -449,10 +501,10 @@ export function ensureSharedCapabilities(profileDir: string, tool: ToolDef): Sha
   }
 
   result.sharedHome = ctx.sharedHome;
-  for (const entry of tool.sharedEntries ?? []) {
+  for (const entry of sharedEntriesFor(tool)) {
     shareEntry(ctx, entry, result);
     if (result.linked.includes(entry) || result.repaired.includes(entry) || result.kept.includes(entry)) {
-      recordCorpusFloor(join(ctx.sharedHome, entry));
+      recordCorpusFloor(join(ctx.sharedHome, entry), corpusIsRecursive(tool, entry));
     }
   }
   mergeSharedConfig(ctx, tool, result);
@@ -515,7 +567,7 @@ export function sharedCapabilityHealth(profileDir: string, tool: ToolDef): Share
   };
   if (!health.supported) return health;
   if (!health.sharedHomeExists || samePath(sharedHome, profileDir)) {
-    health.entries = (tool.sharedEntries ?? []).map((entry) => ({
+    health.entries = sharedEntriesFor(tool).map((entry) => ({
       entry,
       status: "unavailable" as const,
       target: join(profileDir, entry),
@@ -524,7 +576,7 @@ export function sharedCapabilityHealth(profileDir: string, tool: ToolDef): Share
     return health;
   }
 
-  health.entries = (tool.sharedEntries ?? []).map((entry) => entryHealth(sharedHome, profileDir, entry));
+  health.entries = sharedEntriesFor(tool).map((entry) => entryHealth(sharedHome, profileDir, entry));
   health.config = configHealth(sharedHome, profileDir, tool);
 
   for (const entry of health.entries) {
@@ -535,7 +587,7 @@ export function sharedCapabilityHealth(profileDir: string, tool: ToolDef): Share
     // The link being correct says nothing about the corpus still having
     // anything in it — a delete through the link leaves the pointer intact.
     const floor = corpusFloor(entry.source);
-    const current = measureCorpus(entry.source);
+    const current = measureCorpus(entry.source, corpusIsRecursive(tool, entry.entry));
     if (floor && current && current.entries < floor.entries) {
       health.problems.push(
         `${entry.entry} corpus has shrunk: ${current.entries} entries in ${entry.source}, was ${floor.entries} ` +

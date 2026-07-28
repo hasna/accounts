@@ -1,7 +1,8 @@
 import chalk from "chalk";
-import { Argument, type Command } from "commander";
+import { type Command } from "commander";
 import { AccountsError } from "../types.js";
 import { resolveStore } from "./store.js";
+import { mergeClaudeSessions, type SessionMergeReport } from "./session-merge.js";
 import {
   isClaudeSessionUuid,
   listClaudeSessions,
@@ -232,16 +233,128 @@ async function printSessions(options: SessionsCliOptions): Promise<void> {
   await writeStdout(formatClaudeSessionTable(sessions));
 }
 
-/** Register both `accounts sessions` and the explicit `accounts sessions list`. */
+interface SessionsMergeCliOptions {
+  profile?: string;
+  from?: string[];
+  dryRun?: boolean;
+  link?: boolean;
+  activeWindowMs?: string;
+  json?: boolean;
+}
+
+function formatMergeReport(report: SessionMergeReport): string {
+  const lines: string[] = [];
+  lines.push(report.dryRun ? chalk.yellow("dry run — nothing was written") : chalk.bold("session merge"));
+  lines.push(`shared home: ${report.sharedHome}`);
+  lines.push(
+    `transcripts in the shared home: ${report.sharedTranscriptsBefore} -> ${report.sharedTranscriptsAfter}` +
+      (report.dryRun ? " (unchanged; this is a dry run)" : ""),
+  );
+  lines.push(`history records: ${report.history.recordsBefore} -> ${report.history.recordsAfter}`);
+  lines.push("");
+  const headers = ["SOURCE", "REG", "OWN", "MERGED", "SAME", "GREW", "FORKED", "DEFER", "LINK"] as const;
+  const rows = report.sources.map((source) => ({
+    SOURCE: truncate(printable(source.profile), 28),
+    REG: source.registered ? "yes" : "no",
+    OWN: String(source.transcriptsBefore),
+    MERGED: String(source.merged),
+    SAME: String(source.alreadyMerged + source.identical + source.contained),
+    GREW: String(source.extended),
+    FORKED: String(source.divergent),
+    DEFER: String(source.deferredActive + source.vanished + source.unaccounted),
+    LINK: source.linkState,
+  }));
+  const widths = Object.fromEntries(
+    headers.map((header) => [
+      header,
+      rows.reduce((width, row) => Math.max(width, displayWidth(row[header])), displayWidth(header)),
+    ]),
+  ) as Record<(typeof headers)[number], number>;
+  lines.push(headers.map((header) => pad(header, widths[header])).join("  ").trimEnd());
+  lines.push(headers.map((header) => "-".repeat(widths[header])).join("  "));
+  for (const row of rows) lines.push(headers.map((header) => pad(row[header], widths[header])).join("  ").trimEnd());
+
+  const problems = report.sources.flatMap((source) => source.errors.map((error) => `${source.profile}: ${error}`));
+  if (problems.length > 0) {
+    lines.push("");
+    lines.push(chalk.yellow(`${problems.length} problem(s):`));
+    for (const problem of problems.slice(0, MAX_REPORTED_SKIPS)) lines.push(chalk.dim(`  ${printable(problem)}`));
+    if (problems.length > MAX_REPORTED_SKIPS) {
+      lines.push(chalk.dim(`  … and ${problems.length - MAX_REPORTED_SKIPS} more`));
+    }
+  }
+  lines.push("");
+  lines.push(
+    report.verification.passed
+      ? chalk.green(`verified: ${report.verification.assertion}`)
+      : chalk.red(`VERIFICATION FAILED: ${report.verification.detail ?? report.verification.assertion}`),
+  );
+  const retained = report.sources.filter((source) => source.retainedAt);
+  if (retained.length > 0) {
+    lines.push("");
+    lines.push("originals retained (nothing was deleted):");
+    for (const source of retained) lines.push(chalk.dim(`  ${source.profile}: ${source.retainedAt}`));
+  }
+  const unregistered = report.sources.filter((source) => source.linkState === "skipped-unregistered");
+  if (unregistered.length > 0) {
+    lines.push("");
+    lines.push(
+      `${unregistered.length} source(s) were merged but not linked because Accounts does not know about them; ` +
+        "their sessions are now in the shared home, and their own directories are untouched. " +
+        "Run `accounts import <dir>` to register one, then merge again to link it.",
+    );
+  }
+  return lines.join("\n");
+}
+
+async function runMerge(options: SessionsMergeCliOptions): Promise<void> {
+  let activeWindowMs: number | undefined;
+  if (options.activeWindowMs !== undefined) {
+    activeWindowMs = Number(options.activeWindowMs);
+    if (!Number.isFinite(activeWindowMs) || activeWindowMs < 0) {
+      throw new AccountsError("--active-window-ms must be a non-negative number of milliseconds");
+    }
+  }
+  const report = mergeClaudeSessions({
+    ...(options.profile ? { profile: options.profile } : {}),
+    ...(options.from ? { from: options.from } : {}),
+    ...(activeWindowMs !== undefined ? { activeWindowMs } : {}),
+    dryRun: options.dryRun ?? false,
+    // Linking replaces a profile's own directory with a link, so it is opt-in
+    // even though the merge itself only ever adds.
+    link: options.link ?? false,
+  });
+  await writeStdout(options.json ? JSON.stringify(report, null, 2) : formatMergeReport(report));
+  if (!report.verification.passed) {
+    throw new AccountsError("session merge verification failed; nothing was linked");
+  }
+}
+
+/** Register `accounts sessions` (list by default), `… list` and `… merge`. */
 export function registerClaudeSessionCommands(program: Command, wrapAction: ActionWrapper): void {
+  const sessions = program
+    .command("sessions")
+    .description("inspect and share local Claude sessions across Accounts profiles");
+
   addOptions(
-    program
-      .command("sessions")
-      .description("list Accounts-owned local Claude sessions without transcript content")
-      .addArgument(
-        new Argument("[operation]", "session operation")
-          .choices(["list"])
-          .default("list"),
-      ),
-  ).action(wrapAction((_operation: string, options: SessionsCliOptions) => printSessions(options)));
+    sessions
+      .command("list", { isDefault: true })
+      .description("list Accounts-owned local Claude sessions without transcript content"),
+  ).action(wrapAction((options: SessionsCliOptions) => printSessions(options)));
+
+  sessions
+    .command("merge")
+    .description(
+      "union every profile's sessions into the shared Claude home so any profile can resume any session",
+    )
+    .option("--dry-run", "report what would be merged without writing anything")
+    .option("--profile <name>", "merge only this profile directory")
+    .option(
+      "--from <dir...>",
+      "also merge these read-only trees (e.g. a backup) so transcripts deleted since are restored",
+    )
+    .option("--link", "after merging, point each registered profile at the shared home (originals are retained)")
+    .option("--active-window-ms <ms>", "treat a file modified within this window as still being written")
+    .option("--json", "output the structured merge report")
+    .action(wrapAction((options: SessionsMergeCliOptions) => runMerge(options)));
 }

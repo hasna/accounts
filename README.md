@@ -131,7 +131,9 @@ machine, so every profile reads the same corpus:
 | Concern | Where it lives | Shared? |
 |---------|----------------|---------|
 | OAuth account, credentials, keychain snapshot | `<profile>/.claude.json`, `<profile>/.credentials.json`, `<profile>/.accounts-auth/` | No — per profile |
-| Sessions, projects, history, transcripts | `<profile>/sessions`, `projects`, `history.jsonl`, … | No — per profile |
+| Live per-process session state | `<profile>/sessions` | No — per profile |
+| Transcripts (sessions, subagents, workflows) | `<profile>/projects` → `~/.claude/projects` | Yes — symlink, **after `accounts sessions merge`** |
+| Prompt history | `<profile>/history.jsonl` → `~/.claude/history.jsonl` | Yes — symlink, **after `accounts sessions merge`** |
 | Skills | `<profile>/skills` → `~/.claude/skills` | Yes — symlink |
 | Subagents | `<profile>/agents` → `~/.claude/agents` | Yes — symlink |
 | MCP servers | `mcpServers` merged into `<profile>/.claude.json` | Yes — merged (the profile's own entries always win) |
@@ -157,6 +159,68 @@ unsubstituted `{{PLACEHOLDER}}` is dropped rather than shipped broken, and the
 identity's tool list is the closest thing to sharing tokens without sharing them.
 If the profile's own config file exists but does not parse, the merge is refused
 and reported: it is never rebuilt from scratch over whatever the file still held.
+
+### Sessions: merge first, then link
+
+Sessions are the one capability that cannot simply be linked. A profile created
+before session sharing already owns a real, populated `projects/` directory, and
+the linker deliberately refuses to replace a real directory a profile owns — that
+guard is what stops a link from swallowing real data. Listing sessions as a shared
+entry on its own would therefore do nothing at all while reporting success. The
+contents have to be unioned into the shared home first:
+
+```bash
+accounts sessions merge --dry-run      # report only, writes nothing
+accounts sessions merge                # union every profile's sessions into the shared home
+accounts sessions merge --link         # …and then point each registered profile at it
+```
+
+What the merge guarantees:
+
+- **Nothing is deleted, ever.** Source files are only read. When `--link` replaces
+  a profile's own directory, the original is *renamed* to
+  `<profile>/.accounts-session-migration/<timestamp>/`, never removed, and if the
+  swap fails at any point the rename is undone and that profile is left exactly as
+  it was.
+- **Files are merged with `link(2)`, not copied.** The shared home gets the same
+  inode, so a transcript that is still being appended to arrives whole instead of
+  as a torn prefix of itself, mtimes are preserved (the tool prunes sessions by
+  age — a copy that reset them would stop pruning entirely), the migration costs
+  no disk, and a re-run is a no-op by construction: the same inode means the file
+  is already merged. Copying is the fallback for a source on another filesystem,
+  and it refuses a JSONL body that does not end in a newline.
+- **Files are keyed by their full path under `projects/`, never by name.** The
+  tree is nested — subagent and workflow transcripts sit several directories down,
+  and `journal.jsonl` alone occurs at hundreds of distinct paths — so a
+  name-keyed merge would collapse unrelated files into one.
+- **A conflict never overwrites.** Same path, identical bytes: nothing to do. Same
+  path, and the shared copy is a *proven* byte prefix of the incoming one:
+  the longer one replaces it atomically, which cannot lose a byte. Anything else
+  is a genuine fork, and both copies are kept — the second under a deterministic
+  `<name>.from-<source>.<hash>.jsonl`, so a re-run finds its own copy instead of
+  making another.
+- **Sources are enumerated from the filesystem, not the registry.** Profile
+  directories that Accounts has forgotten still hold real transcripts, and they
+  are merged too. They are never *linked*, because only registered profiles are
+  visited by the launch-time repair that keeps a link pointing at the right place;
+  they are listed in the report so you can `accounts import` them and merge again.
+- **`--from <dir>` merges extra read-only trees**, such as a backup taken before
+  the migration, so a transcript deleted from the live tree since the backup is
+  restored rather than lost.
+- **It verifies before it links.** Transcript counts are taken recursively before
+  and after, and a profile is only linked when everything under it is
+  demonstrably in the shared home.
+
+`<profile>/sessions` is deliberately *not* shared: it holds one file per running
+process, with a status heartbeat, and each instance reaps entries whose process it
+believes to be dead — two profiles sharing it would reap each other's live
+sessions. Nothing is lost by keeping it per-profile, because a session's durable
+record is its transcript under `projects/`.
+
+Because the shared corpus is write-through, `accounts doctor` records a floor for
+it and fails if it shrinks. For `projects/` that floor is counted **recursively**:
+its top level is one directory per project, so a top-level count would not move
+even if every transcript inside were deleted.
 
 Instruction files (`CLAUDE.md`, `rules/`) are **not** handled here, and the status
 quo is not by design: Claude Code discovers memory by walking the working
