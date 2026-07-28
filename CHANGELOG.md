@@ -6,6 +6,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- `accounts switch-account [name]` — switch the CURRENT Claude Code session's
+  account in place, with no restart and the conversation intact. Measured on
+  Claude Code 2.1.220: a running session re-reads `<configDir>/.credentials.json`
+  from disk on every API request, so installing another profile's credentials +
+  `oauthAccount` into the session's config dir flips its identity on the next
+  message. The verb snapshots the dir's outgoing credentials back to their owning
+  profile first, records a `switched-account` marker so snapshot machinery never
+  cross-contaminates profiles, refuses dead-auth targets loudly before touching
+  anything, and refuses config dirs shared by multiple live sessions without
+  `--yes` (they all flip together). The live default dir routes through the
+  existing `apply` semantics.
+
 ### Fixed
 
 - Share capabilities across profiles instead of isolating them. A profile is an
