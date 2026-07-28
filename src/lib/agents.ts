@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { platform } from "node:os";
+import { homedir, platform } from "node:os";
 import type { Profile } from "../types.js";
 import { controlledProbeEnv } from "./env.js";
 import { redactPublicValue, redactText } from "./redaction.js";
@@ -102,6 +102,44 @@ interface AgentJsonCandidate {
   depth: number;
   inString: boolean;
   escaped: boolean;
+  byteLength: number;
+}
+
+interface InvalidAgentJsonRegion {
+  depth: number;
+  inString: boolean;
+  escaped: boolean;
+}
+
+function utf8ByteWidthAt(text: string, index: number): number {
+  const code = text.charCodeAt(index);
+  if (code <= 0x7f) return 1;
+  if (code <= 0x7ff) return 2;
+  if (code >= 0xd800 && code <= 0xdbff) {
+    const next = text.charCodeAt(index + 1);
+    return next >= 0xdc00 && next <= 0xdfff ? 4 : 3;
+  }
+  if (code >= 0xdc00 && code <= 0xdfff) {
+    const previous = text.charCodeAt(index - 1);
+    return previous >= 0xd800 && previous <= 0xdbff ? 0 : 3;
+  }
+  return 3;
+}
+
+function advanceArrayScanState(
+  state: Pick<AgentJsonCandidate, "depth" | "inString" | "escaped">,
+  char: string,
+): boolean {
+  if (state.inString) {
+    if (state.escaped) state.escaped = false;
+    else if (char === "\\") state.escaped = true;
+    else if (char === '"') state.inString = false;
+    return false;
+  }
+  if (char === '"') state.inString = true;
+  else if (char === "[") state.depth++;
+  else if (char === "]") state.depth--;
+  return state.depth === 0;
 }
 
 function stripTerminalControlSequences(raw: string): string {
@@ -135,6 +173,7 @@ function stripTerminalControlSequences(raw: string): string {
     let cursor = start;
     while (cursor < raw.length) {
       const code = raw.charCodeAt(cursor);
+      if (code === 0x0a || code === 0x0d) return cursor;
       cursor++;
       if (code === 0x18 || code === 0x1a) break;
       if (code >= 0x40 && code <= 0x7e) break;
@@ -212,7 +251,15 @@ function parseAgentArrayCandidate(
     const parsed = JSON.parse(candidate) as unknown;
     if (
       !Array.isArray(parsed) ||
-      !parsed.every((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry))
+      !parsed.every((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry)) ||
+      (
+        parsed.length > 0 &&
+        !parsed.some(
+          (entry) =>
+            (entry as Record<string, unknown>).kind === "background" ||
+            (entry as Record<string, unknown>).kind === "interactive",
+        )
+      )
     ) {
       return undefined;
     }
@@ -232,14 +279,32 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
   const active: AgentJsonCandidate[] = [];
   let completed: { start: number; parsed: unknown[] } | undefined;
   let emptyCompleted: { start: number; parsed: unknown[] } | undefined;
+  let invalidRegion: InvalidAgentJsonRegion | undefined;
 
+  scan:
   for (let index = 0; index < text.length; index++) {
     const char = text[index]!;
+    if (invalidRegion) {
+      if (advanceArrayScanState(invalidRegion, char)) invalidRegion = undefined;
+      continue;
+    }
+
+    const byteWidth = utf8ByteWidthAt(text, index);
     for (let candidateIndex = active.length - 1; candidateIndex >= 0; candidateIndex--) {
       const candidate = active[candidateIndex]!;
-      if (index - candidate.start > MAX_AGENT_JSON_CANDIDATE_BYTES) {
-        active.splice(candidateIndex, 1);
-        continue;
+      candidate.byteLength += byteWidth;
+      if (candidate.byteLength > MAX_AGENT_JSON_CANDIDATE_BYTES) {
+        const root = active[0]!;
+        const region: InvalidAgentJsonRegion = {
+          depth: root.depth,
+          inString: root.inString,
+          escaped: root.escaped,
+        };
+        invalidRegion = advanceArrayScanState(region, char) ? undefined : region;
+        if (completed && completed.start > root.start) completed = undefined;
+        if (emptyCompleted && emptyCompleted.start > root.start) emptyCompleted = undefined;
+        active.length = 0;
+        continue scan;
       }
 
       if (candidate.inString) {
@@ -249,23 +314,32 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
         else if (char === "\n") active.splice(candidateIndex, 1);
         continue;
       }
-      if (char === '"') {
-        candidate.inString = true;
-      } else if (char === "[") {
-        candidate.depth++;
-        if (candidate.depth > MAX_AGENT_JSON_NESTING) active.splice(candidateIndex, 1);
-      } else if (char === "]") {
-        candidate.depth--;
-        if (candidate.depth === 0) {
-          active.splice(candidateIndex, 1);
-          const parsed = parseAgentArrayCandidate(text, candidate.start, index + 1);
-          if (parsed?.length === 0) {
-            if (!emptyCompleted || candidate.start < emptyCompleted.start) {
-              emptyCompleted = { start: candidate.start, parsed };
-            }
-          } else if (parsed && (!completed || candidate.start < completed.start)) {
-            completed = { start: candidate.start, parsed };
+      const closed = advanceArrayScanState(candidate, char);
+      if (candidate.depth > MAX_AGENT_JSON_NESTING) {
+        const root = active[0]!;
+        const region: InvalidAgentJsonRegion = {
+          depth: root.depth,
+          inString: root.inString,
+          escaped: root.escaped,
+        };
+        invalidRegion =
+          candidateIndex === 0 || !advanceArrayScanState(region, char)
+            ? region
+            : undefined;
+        if (completed && completed.start > root.start) completed = undefined;
+        if (emptyCompleted && emptyCompleted.start > root.start) emptyCompleted = undefined;
+        active.length = 0;
+        continue scan;
+      }
+      if (closed) {
+        active.splice(candidateIndex, 1);
+        const parsed = parseAgentArrayCandidate(text, candidate.start, index + 1);
+        if (parsed?.length === 0) {
+          if (!emptyCompleted || candidate.start < emptyCompleted.start) {
+            emptyCompleted = { start: candidate.start, parsed };
           }
+        } else if (parsed && (!completed || candidate.start < completed.start)) {
+          completed = { start: candidate.start, parsed };
         }
       }
     }
@@ -274,7 +348,13 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
       if (active.length >= MAX_AGENT_JSON_FALLBACK_CANDIDATES) {
         active.splice(1, 1);
       }
-      active.push({ start: index, depth: 1, inString: false, escaped: false });
+      active.push({
+        start: index,
+        depth: 1,
+        inString: false,
+        escaped: false,
+        byteLength: 1,
+      });
     }
 
     if (completed) {
@@ -384,15 +464,28 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--watch-path",
     "--watch-kill-signal",
     "--test-concurrency",
+    "--test-coverage-branches",
+    "--test-coverage-exclude",
+    "--test-coverage-functions",
+    "--test-coverage-include",
+    "--test-coverage-lines",
     "--test-name-pattern",
     "--test-reporter",
     "--test-reporter-destination",
     "--test-shard",
+    "--test-skip-pattern",
     "--test-timeout",
+    "--report-directory",
+    "--report-dir",
+    "--report-filename",
+    "--report-signal",
+    "--secure-heap",
+    "--secure-heap-min",
     "--tls-cipher-list",
     "--tls-keylog",
     "--trace-event-categories",
     "--trace-event-file-pattern",
+    "--trace-require-module",
     "--use-largepages",
     "--v8-pool-size",
     "--max-http-header-size",
@@ -406,16 +499,44 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--inspect-wait",
   ]),
   optionsWithoutValues: new Set([
+    "--abort-on-uncaught-exception",
     "--cpu-prof",
+    "--disallow-code-generation-from-strings",
     "--enable-source-maps",
     "--expose-gc",
+    "--force-context-aware",
+    "--frozen-intrinsics",
     "--heap-prof",
+    "--insecure-http-parser",
+    "--jitless",
     "--no-addons",
     "--no-deprecation",
     "--no-warnings",
+    "--openssl-legacy-provider",
+    "--openssl-shared-config",
+    "--pending-deprecation",
     "--preserve-symlinks",
     "--preserve-symlinks-main",
+    "--prof",
+    "--report-compact",
+    "--report-exclude-env",
+    "--report-exclude-network",
+    "--report-on-fatalerror",
+    "--report-on-signal",
+    "--report-uncaught-exception",
     "--throw-deprecation",
+    "--trace-deprecation",
+    "--trace-env",
+    "--trace-env-js-stack",
+    "--trace-env-native-stack",
+    "--trace-exit",
+    "--trace-promises",
+    "--trace-sigint",
+    "--trace-sync-io",
+    "--trace-tls",
+    "--trace-uncaught",
+    "--trace-warnings",
+    "--track-heap-objects",
     "--use-bundled-ca",
     "--use-openssl-ca",
     "--use-system-ca",
@@ -425,6 +546,7 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
   ]),
   executionModeOptions: new Set([
     "-",
+    "--build-snapshot",
     "-c",
     "--check",
     "--completion-bash",
@@ -540,7 +662,7 @@ const BUN_OPTION_SCHEMA: InterpreterOptionSchema = {
   attachedShortValueOptions: ["-r", "-c", "-F"],
 };
 
-const TOOL_OPTIONS_WITH_VALUES = new Set([
+const CLAUDE_OPTIONS_WITH_VALUES = new Set([
   "--config",
   "--config-dir",
   "--allowedTools",
@@ -554,29 +676,62 @@ const TOOL_OPTIONS_WITH_VALUES = new Set([
   "--effort",
   "--file",
   "--from-pr",
+  "--thinking",
+  "--thinking-display",
+  "--max-thinking-tokens",
+  "--task-budget",
+  "--permission-prompt-tool",
   "--settings",
+  "--managed-settings",
   "--model",
   "--permission-mode",
   "--session-id",
   "-r",
   "--resume",
+  "--resume-session-at",
   "--name",
   "-n",
   "--output-format",
   "--input-format",
   "--system-prompt",
+  "--system-prompt-file",
   "--append-system-prompt",
+  "--append-system-prompt-file",
+  "--append-subagent-system-prompt",
+  "--plan-mode-instructions",
   "--fallback-model",
   "--json-schema",
   "--max-budget-usd",
   "--mcp-config",
   "--agent",
   "--agents",
+  "--agent-id",
+  "--agent-name",
+  "--agent-type",
+  "--agent-color",
+  "--team-name",
+  "--parent-session-id",
+  "--teammate-mode",
   "--add-dir",
+  "--channels",
+  "--dangerously-load-development-channels",
   "--plugin-dir",
+  "--plugin-dir-no-mcp",
   "--plugin-url",
   "--prompt-suggestions",
+  "--prefill",
+  "--prefill-b64",
+  "--deep-link-repo",
+  "--deep-link-last-fetch",
+  "--deep-link-cwd-b64",
+  "--advisor",
+  "--sdk-url",
+  "--workload",
   "--remote-control",
+  "--teleport",
+  "--cloud",
+  "--remote",
+  "--rc",
   "--remote-control-session-name-prefix",
   "--setting-sources",
   "--tools",
@@ -586,16 +741,77 @@ const TOOL_OPTIONS_WITH_VALUES = new Set([
   "-w",
 ]);
 
-const TOOL_OPTIONS_WITH_OPTIONAL_VALUES = new Set([
+const CLAUDE_OPTIONS_WITH_OPTIONAL_VALUES = new Set([
   "-d",
   "--debug",
   "--from-pr",
   "--prompt-suggestions",
   "--remote-control",
+  "--teleport",
+  "--cloud",
+  "--remote",
+  "--rc",
   "-r",
   "--resume",
   "-w",
   "--worktree",
+]);
+
+const CLAUDE_OPTIONS_WITH_VARIADIC_VALUES = new Set([
+  "--add-dir",
+  "--allowedTools",
+  "--allowed-tools",
+  "--betas",
+  "--channels",
+  "--dangerously-load-development-channels",
+  "--disallowedTools",
+  "--disallowed-tools",
+  "--file",
+  "--mcp-config",
+  "--tools",
+]);
+
+const CLAUDE_TERMINAL_OPTIONS = new Set([
+  "-h",
+  "--help",
+  "-v",
+  "-V",
+  "--version",
+  "--update",
+  "--upgrade",
+  "--init-only",
+  "--rewind-files",
+  "--handle-uri",
+]);
+
+const CLAUDE_HELPER_OPTIONS = new Set([
+  "--bg-pty-host",
+  "--bg-spare",
+  "--chrome-native-host",
+  "--claude-in-chrome-mcp",
+  "--computer-use-mcp",
+  "--daemon-worker",
+  "--preload",
+]);
+
+const CLAUDE_NON_SESSION_COMMANDS = new Set([
+  "agents",
+  "auth",
+  "auto-mode",
+  "daemon",
+  "doctor",
+  "gateway",
+  "install",
+  "mcp",
+  "plugin",
+  "plugins",
+  "project",
+  "rc",
+  "remote-control",
+  "setup-token",
+  "ultrareview",
+  "update",
+  "upgrade",
 ]);
 
 function commandBasename(value: string): string {
@@ -658,13 +874,16 @@ function executableTokenMatches(
 
 function isVersionedToolBuild(observed: string, configured: string): boolean {
   if (hasPathComponent(configured)) return false;
-  const components = observed.replaceAll("\\", "/").split("/").filter(Boolean);
-  if (components.length < 3) return false;
-  const [tool, versions, version] = components.slice(-3);
+  const tool = commandBasename(configured).replace(/\.exe$/i, "");
+  const trustedRoot = normalizeExecutablePath(
+    `${homedir().replaceAll("\\", "/")}/.local/share/${tool}/versions`,
+  );
+  const normalizedObserved = normalizeExecutablePath(observed);
+  if (!normalizedObserved.startsWith(`${trustedRoot}/`)) return false;
+  const version = normalizedObserved.slice(trustedRoot.length + 1);
   return (
-    tool === commandBasename(configured) &&
-    versions === "versions" &&
-    /^\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/.test(version ?? "")
+    !version.includes("/") &&
+    /^\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/.test(version)
   );
 }
 
@@ -779,32 +998,53 @@ function commandArguments(command: string, offset: number): string[] {
   }
 }
 
-function classifyToolArguments(args: string[]): {
+function classifyClaudeArguments(args: string[]): {
   helper: boolean;
+  terminal: boolean;
+  invalid?: boolean;
   mode?: string;
 } {
+  const handleUriIndex = args.indexOf("--handle-uri");
+  if (handleUriIndex !== -1 && args[handleUriIndex + 1]) {
+    return { helper: false, terminal: true };
+  }
+
+  let mode: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
-    if (arg === "--") return { helper: false };
-    if (!arg.startsWith("-") || arg === "-") return { helper: false, mode: arg };
+    if (arg === "--") return { helper: false, terminal: false, mode };
+    if (!arg.startsWith("-") || arg === "-") {
+      mode ??= arg;
+      continue;
+    }
     const name = optionName(arg);
-    if (name === "--bg-pty-host" || name === "--bg-spare") return { helper: true };
-    if (TOOL_OPTIONS_WITH_VALUES.has(name) && !arg.includes("=")) {
+    if (CLAUDE_TERMINAL_OPTIONS.has(name)) return { helper: false, terminal: true };
+    if (CLAUDE_HELPER_OPTIONS.has(name)) {
+      return { helper: true, terminal: false };
+    }
+    if (CLAUDE_OPTIONS_WITH_VARIADIC_VALUES.has(name) && !arg.includes("=")) {
+      if (args[index + 1] === undefined) {
+        return { helper: false, terminal: false, invalid: true };
+      }
+      index++;
+      while (args[index + 1] !== undefined && !args[index + 1]!.startsWith("-")) {
+        index++;
+      }
+      continue;
+    }
+    if (CLAUDE_OPTIONS_WITH_VALUES.has(name) && !arg.includes("=")) {
       const next = args[index + 1];
-      if (
-        !TOOL_OPTIONS_WITH_OPTIONAL_VALUES.has(name) ||
-        (
-          next !== undefined &&
-          !next.startsWith("-") &&
-          next !== "agents" &&
-          next !== "daemon"
-        )
-      ) {
+      if (!CLAUDE_OPTIONS_WITH_OPTIONAL_VALUES.has(name)) {
+        if (next === undefined) {
+          return { helper: false, terminal: false, invalid: true };
+        }
+        index++;
+      } else if (next !== undefined && !next.startsWith("-")) {
         index++;
       }
     }
   }
-  return { helper: false };
+  return { helper: false, terminal: false, mode };
 }
 
 export function isToolSessionCommand(command: string, bin: string): boolean {
@@ -827,10 +1067,19 @@ export function isToolSessionCommand(command: string, bin: string): boolean {
   const executable = matchExecutableAt(command, executableOffset, bin);
   if (!executable) return false;
 
+  if (commandBasename(bin).toLowerCase().replace(/\.exe$/, "") !== "claude") {
+    return true;
+  }
+
   const args = commandArguments(command, executable.end);
-  const classification = classifyToolArguments(args);
-  if (classification.helper) return false;
-  if (classification.mode === "agents" || classification.mode === "daemon") return false;
+  const classification = classifyClaudeArguments(args);
+  if (classification.helper || classification.terminal || classification.invalid) return false;
+  if (
+    classification.mode &&
+    CLAUDE_NON_SESSION_COMMANDS.has(classification.mode)
+  ) {
+    return false;
+  }
   return true;
 }
 

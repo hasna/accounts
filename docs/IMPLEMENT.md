@@ -188,9 +188,15 @@ rendering reads only validated scalar fields without coercing provider values.
 Configured and observed executable paths must match in full whenever both are
 available; neither direct nor Node/Bun-wrapped processes can borrow the identity
 of a different or unresolved same-named executable. Versioned native builds
-require an exact `<tool>/versions/<semver>` path suffix, and exact helper
-options plus leading daemon/agents subcommands are excluded without substring
-matching. Interpreter wrappers use separate Node and Bun option schemas,
+must live under the current user's exact
+`~/.local/share/<tool>/versions/<semver>` root. Exact helper options, terminal
+help/version flags, and known Claude non-session subcommands are excluded
+without substring matching. Tool argument scanning honors required, optional,
+and mandatory-first variadic option arities from the installed Claude root
+command grammar, including hidden options and pre-parser exit paths, before
+treating a positional token as a subcommand. That grammar is scoped to Claude;
+arbitrary custom tools do not inherit Claude terminal, helper, or option
+semantics. Interpreter wrappers use separate Node and Bun option schemas,
 recognize only documented option arities, and fail closed on unknown or
 execution-mode options before accepting a later executable-shaped argument.
 Provider projection is iterative and bounded by explicit depth, object, and
@@ -199,7 +205,12 @@ Pseudo-TTY JSON extraction removes CSI/OSC terminal controls before a bounded
 single-pass candidate scan. It preserves the earliest possible root while
 rolling a fixed number of fallback candidates, recovers a later agent-record
 array after malformed or unterminated wrapper noise, enforces the candidate
-limit in UTF-8 bytes, and never retries from every opening bracket.
+limit in UTF-8 bytes, and never retries from every opening bracket. Non-empty
+payloads must contain a known background or interactive agent kind. When a
+containing candidate exceeds its byte or nesting bound, its region is
+quarantined through the matching close so a nested fallback cannot replace the
+bounded-out payload's identity; scanning can resume for later independent
+output.
 
 Supervisor arguments remain raw only in memory long enough to spawn the
 provider child. State files, legacy-state reads, switch responses, and

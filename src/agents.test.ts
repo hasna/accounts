@@ -1,7 +1,7 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, listProfiles } from "./lib/profiles.js";
 import {
@@ -29,7 +29,9 @@ afterEach(() => {
 });
 
 test("extractJsonArray parses a clean JSON array", () => {
-  expect(extractJsonArray('[{"pid":1}]')).toEqual([{ pid: 1 }]);
+  expect(extractJsonArray('[{"kind":"background","pid":1}]')).toEqual([
+    { kind: "background", pid: 1 },
+  ]);
 });
 
 test("extractJsonArray strips pty and ANSI noise around the array", () => {
@@ -45,6 +47,15 @@ test("extractJsonArray ignores bracketed ANSI OSC payloads before agent data", (
 test("extractJsonArray recovers agent data after an unterminated OSC line", () => {
   const raw = '\u001b]0;broken [1]\n[{"pid":42,"kind":"background"}]\n';
   expect(extractJsonArray(raw)).toEqual([{ pid: 42, kind: "background" }]);
+});
+
+test("extractJsonArray recovers agent data after an unterminated CSI line", () => {
+  for (const control of ["\u001b[31", "\u009b31"]) {
+    const raw = `${control}\n[{"pid":42,"kind":"background"}]\n`;
+    expect(extractJsonArray(raw), JSON.stringify(control)).toEqual([
+      { pid: 42, kind: "background" },
+    ]);
+  }
 });
 
 test("extractJsonArray resumes after CAN or SUB cancels a terminal control", () => {
@@ -74,8 +85,11 @@ test("extractJsonArray keeps BEL-delimited bracket data inside DCS-family contro
 });
 
 test("extractJsonArray handles brackets inside strings and escapes", () => {
-  const raw = 'noise [ {"name": "x\\"]y", "cwd": "/a[b"} ] trailing';
-  expect(extractJsonArray(raw)).toEqual([{ name: 'x"]y', cwd: "/a[b" }]);
+  const raw =
+    'noise [ {"kind":"background","name": "x\\"]y", "cwd": "/a[b"} ] trailing';
+  expect(extractJsonArray(raw)).toEqual([
+    { kind: "background", name: 'x"]y', cwd: "/a[b" },
+  ]);
 });
 
 test("extractJsonArray returns undefined when no array present", () => {
@@ -99,6 +113,14 @@ test("extractJsonArray prefers later agent records over an empty noise array", (
     extractJsonArray('progress []\n[{"pid":7,"kind":"background"}]'),
   ).toEqual([{ pid: 7, kind: "background" }]);
   expect(extractJsonArray("[]")).toEqual([]);
+});
+
+test("extractJsonArray skips unrelated record arrays before agent data", () => {
+  expect(
+    extractJsonArray(
+      '[{"diagnostic":"warming"}]\n[{"kind":"background","pid":42}]',
+    ),
+  ).toEqual([{ kind: "background", pid: 42 }]);
 });
 
 test("extractJsonArray recovers after an unterminated string in malformed wrapper noise", () => {
@@ -126,6 +148,23 @@ test("extractJsonArray enforces its candidate limit in UTF-8 bytes", () => {
   expect(oversized.length).toBeLessThan(1024 * 1024);
   expect(Buffer.byteLength(oversized, "utf8")).toBeGreaterThan(1024 * 1024);
   expect(extractJsonArray(oversized) === undefined).toBe(true);
+});
+
+test("extractJsonArray fails closed on nested fallbacks inside bounded-out roots", () => {
+  const nestedAgent = '[{"kind":"background","pid":999}]';
+  const oversized =
+    `[{"kind":"background","padding":"${"x".repeat(1_100_000)}",` +
+    `"nested":${nestedAgent}}]`;
+  expect(Buffer.byteLength(oversized, "utf8")).toBeGreaterThan(1024 * 1024);
+  expect(extractJsonArray(oversized)).toBeUndefined();
+  expect(
+    extractJsonArray(`${oversized}\n[{"kind":"background","pid":42}]`),
+  ).toEqual([{ kind: "background", pid: 42 }]);
+
+  const tooDeep =
+    `[{"kind":"background","nested":${"[".repeat(32_769)}` +
+    `${nestedAgent}${"]".repeat(32_769)}}]`;
+  expect(extractJsonArray(tooDeep)).toBeUndefined();
 });
 
 test("extractJsonArray stays linear on dense malformed bracket noise", () => {
@@ -355,21 +394,72 @@ test("(untracked) section is omitted when everything is accounted for or a profi
 });
 
 test("isToolSessionCommand matches real session processes and rejects helpers", () => {
+  const versionedClaude = join(
+    homedir(),
+    ".local",
+    "share",
+    "claude",
+    "versions",
+    "2.1.170",
+  );
   const cases: Array<[string, boolean]> = [
     ["claude", true],
     ["/home/u/.local/bin/claude --resume abc --allow-dangerously-skip-permissions", true],
     ["node /home/u/.local/bin/claude --dangerously-skip-permissions", true],
-    ["/home/u/.local/share/claude/versions/2.1.170 --session-id abc", true],
+    [`${versionedClaude} --session-id abc`, true],
+    ["/tmp/evil/claude/versions/2.1.170 --session-id abc", false],
     ["/tmp/not-claude/claude/versions/helper --session-id abc", false],
-    ["/home/u/.local/share/claude/versions/2.1.170 --bg-pty-host /tmp/x.sock 79 74", false],
-    ["/home/u/.local/share/claude/versions/2.1.170 --bg-spare /tmp/y.sock", false],
+    [`${versionedClaude} --bg-pty-host /tmp/x.sock 79 74`, false],
+    [`${versionedClaude} --bg-spare /tmp/y.sock`, false],
     ["/home/u/.local/bin/claude daemon run --origin transient", false],
-    ["/home/u/.local/bin/claude --debug daemon run --origin transient", false],
+    ["/home/u/.local/bin/claude --debug daemon run --origin transient", true],
     ["claude agents --json", false],
+    ["claude auth", false],
+    ["claude auto-mode", false],
+    ["claude doctor", false],
+    ["claude gateway", false],
+    ["claude install latest", false],
+    ["claude mcp serve", false],
+    ["claude plugin list", false],
+    ["claude project", false],
+    ["claude setup-token", false],
+    ["claude ultrareview", false],
+    ["claude update", false],
+    ["claude upgrade", false],
+    ["claude --debug=api gateway", false],
+    ["claude --help", false],
+    ["claude --version", false],
     ["claude --config /tmp agents --json", false],
     ["claude --debug-file /dev/null agents --json", false],
     ["claude --debug-file /dev/null daemon run", false],
     ["claude --debug api daemon run", false],
+    ["claude --debug gateway", true],
+    ["claude --resume gateway", true],
+    ["claude --from-pr gateway", true],
+    ["claude --remote-control gateway", true],
+    ["claude --worktree gateway", true],
+    ["claude --add-dir /tmp gateway", true],
+    ["claude --allowedTools Bash gateway", true],
+    ["claude --allowed-tools Bash gateway", true],
+    ["claude --betas beta-a gateway", true],
+    ["claude --disallowedTools Write gateway", true],
+    ["claude --disallowed-tools Write gateway", true],
+    ["claude --file file_abc:a.txt gateway", true],
+    ["claude --mcp-config config.json gateway", true],
+    ["claude --tools Bash gateway", true],
+    ["claude --add-dir --verbose gateway", true],
+    ["claude --add-dir --debug=api gateway", true],
+    ["claude --allowedTools --verbose gateway", true],
+    ["claude --allowed-tools --verbose gateway", true],
+    ["claude --betas --verbose gateway", true],
+    ["claude --disallowedTools --verbose gateway", true],
+    ["claude --disallowed-tools --verbose gateway", true],
+    ["claude --file --verbose gateway", true],
+    ["claude --mcp-config --verbose gateway", true],
+    ["claude --tools --verbose gateway", true],
+    ["claude --add-dir /tmp --verbose gateway", false],
+    ["claude --add-dir=/tmp gateway", false],
+    ["claude --add-dir", false],
     ["claude -r abc agents --json", false],
     ["claude --effort high agents --json", false],
     ['claude --json-schema "{}" agents --json', false],
@@ -377,6 +467,7 @@ test("isToolSessionCommand matches real session processes and rejects helpers", 
     ["claude -p explain--bg-pty-host-behavior", true],
     ["claude --bg-sparely user-data", true],
     ["claude -- --bg-spare", true],
+    ["claude -- gateway", true],
     ["claude --system-prompt --bg-spare --resume abc", true],
     ["claude --debug --bg-spare /tmp/y.sock", false],
     ["node /home/u/.local/bin/accounts login acct1 --tool claude", false],
@@ -388,6 +479,265 @@ test("isToolSessionCommand matches real session processes and rejects helpers", 
   }
 });
 
+test("isToolSessionCommand enforces every required scalar tool option arity", () => {
+  const requiredValueOptions = [
+    "--config",
+    "--config-dir",
+    "--debug-file",
+    "--effort",
+    "--thinking",
+    "--thinking-display",
+    "--max-thinking-tokens",
+    "--task-budget",
+    "--permission-prompt-tool",
+    "--settings",
+    "--managed-settings",
+    "--model",
+    "--permission-mode",
+    "--session-id",
+    "--resume-session-at",
+    "--name",
+    "-n",
+    "--output-format",
+    "--input-format",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--append-subagent-system-prompt",
+    "--plan-mode-instructions",
+    "--fallback-model",
+    "--json-schema",
+    "--max-budget-usd",
+    "--agent",
+    "--agents",
+    "--agent-id",
+    "--agent-name",
+    "--agent-type",
+    "--agent-color",
+    "--team-name",
+    "--parent-session-id",
+    "--teammate-mode",
+    "--plugin-dir",
+    "--plugin-dir-no-mcp",
+    "--plugin-url",
+    "--prefill",
+    "--prefill-b64",
+    "--deep-link-repo",
+    "--deep-link-last-fetch",
+    "--deep-link-cwd-b64",
+    "--advisor",
+    "--sdk-url",
+    "--workload",
+    "--remote-control-session-name-prefix",
+    "--setting-sources",
+    "--max-turns",
+    "--budget-usd",
+  ];
+
+  for (const option of requiredValueOptions) {
+    expect(isToolSessionCommand(`claude ${option}`, "claude"), `${option} missing`).toBe(false);
+    expect(isToolSessionCommand(`claude ${option} value`, "claude"), `${option} separate`).toBe(
+      true,
+    );
+    expect(
+      isToolSessionCommand(`claude ${option} value --bg-spare`, "claude"),
+      `${option} separate boundary`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude ${option}=value --bg-spare`, "claude"),
+      `${option} attached boundary`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude ${option} --bg-spare`, "claude"),
+      `${option} dash-leading value`,
+    ).toBe(true);
+    expect(
+      isToolSessionCommand(`claude hello ${option}`, "claude"),
+      `${option} post-positional missing`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude hello ${option} value`, "claude"),
+      `${option} post-positional separate`,
+    ).toBe(true);
+    expect(
+      isToolSessionCommand(`claude hello ${option}=value --bg-spare`, "claude"),
+      `${option} post-positional attached boundary`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude hello ${option} --bg-spare`, "claude"),
+      `${option} post-positional dash-leading value`,
+    ).toBe(true);
+  }
+});
+
+test("isToolSessionCommand consumes every optional tool option value when present", () => {
+  const optionalValueOptions = [
+    "-d",
+    "--debug",
+    "--from-pr",
+    "--prompt-suggestions",
+    "--remote-control",
+    "--teleport",
+    "--cloud",
+    "--remote",
+    "--rc",
+    "-r",
+    "--resume",
+    "-w",
+    "--worktree",
+  ];
+
+  for (const option of optionalValueOptions) {
+    expect(isToolSessionCommand(`claude ${option}`, "claude"), `${option} omitted`).toBe(true);
+    expect(
+      isToolSessionCommand(`claude ${option} gateway`, "claude"),
+      `${option} separate named like subcommand`,
+    ).toBe(true);
+    expect(
+      isToolSessionCommand(`claude ${option}=value --bg-spare`, "claude"),
+      `${option} attached boundary`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude hello ${option}`, "claude"),
+      `${option} post-positional omitted`,
+    ).toBe(true);
+    expect(
+      isToolSessionCommand(`claude hello ${option} gateway`, "claude"),
+      `${option} post-positional separate named like subcommand`,
+    ).toBe(true);
+    expect(
+      isToolSessionCommand(`claude hello ${option}=value --bg-spare`, "claude"),
+      `${option} post-positional attached boundary`,
+    ).toBe(false);
+  }
+});
+
+test("isToolSessionCommand enforces every mandatory-first variadic tool option arity", () => {
+  const variadicValueOptions = [
+    "--add-dir",
+    "--allowedTools",
+    "--allowed-tools",
+    "--betas",
+    "--channels",
+    "--dangerously-load-development-channels",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--file",
+    "--mcp-config",
+    "--tools",
+  ];
+
+  for (const option of variadicValueOptions) {
+    expect(isToolSessionCommand(`claude ${option}`, "claude"), `${option} missing`).toBe(false);
+    expect(isToolSessionCommand(`claude ${option} value`, "claude"), `${option} one value`).toBe(
+      true,
+    );
+    expect(
+      isToolSessionCommand(`claude ${option} first second`, "claude"),
+      `${option} multiple values`,
+    ).toBe(true);
+    expect(
+      isToolSessionCommand(`claude ${option} --bg-spare`, "claude"),
+      `${option} mandatory dash-leading first value`,
+    ).toBe(true);
+    expect(
+      isToolSessionCommand(`claude ${option} first --bg-spare`, "claude"),
+      `${option} helper boundary`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude ${option}=first --bg-spare`, "claude"),
+      `${option} attached boundary`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude hello ${option}`, "claude"),
+      `${option} post-positional missing`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude hello ${option} first second --bg-spare`, "claude"),
+      `${option} post-positional helper boundary`,
+    ).toBe(false);
+  }
+});
+
+test("isToolSessionCommand validates global options after a positional until end-of-options", () => {
+  expect(isToolSessionCommand("claude hello --tools", "claude")).toBe(false);
+  expect(isToolSessionCommand("claude hello --add-dir", "claude")).toBe(false);
+  expect(isToolSessionCommand("claude hello --debug", "claude")).toBe(true);
+  expect(isToolSessionCommand("claude hello -- --help", "claude")).toBe(true);
+  expect(isToolSessionCommand("claude hello -- --model", "claude")).toBe(true);
+});
+
+test("isToolSessionCommand excludes every terminal and helper option spelling", () => {
+  const terminalOptions = [
+    "-h",
+    "--help",
+    "-v",
+    "-V",
+    "--version",
+    "--update",
+    "--upgrade",
+    "--init-only",
+    "--rewind-files",
+    "--handle-uri",
+  ];
+  const helperOptions = [
+    "--bg-pty-host",
+    "--bg-spare",
+    "--chrome-native-host",
+    "--claude-in-chrome-mcp",
+    "--computer-use-mcp",
+    "--daemon-worker",
+    "--preload",
+  ];
+
+  for (const option of [...terminalOptions, ...helperOptions]) {
+    expect(isToolSessionCommand(`claude ${option}`, "claude"), `${option} leading`).toBe(false);
+    expect(
+      isToolSessionCommand(`claude hello ${option}`, "claude"),
+      `${option} post-positional`,
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(`claude -- ${option}`, "claude"),
+      `${option} after end-of-options`,
+    ).toBe(true);
+  }
+});
+
+test("isToolSessionCommand excludes Claude pre-parser and positional exit modes", () => {
+  for (const command of [
+    "claude remote-control",
+    "claude rc",
+    "claude --handle-uri cc://test",
+    "claude --handle-uri=cc://test",
+    "claude -- --handle-uri cc://test",
+    "claude hello --handle-uri cc://test",
+    "claude --init-only",
+    "claude hello --init-only",
+    "claude --rewind-files abc",
+    "claude hello --rewind-files abc",
+  ]) {
+    expect(isToolSessionCommand(command, "claude"), command).toBe(false);
+  }
+  for (const command of [
+    "claude -- --handle-uri",
+    "claude -- --handle-uri=cc://test",
+    "claude hello -- --handle-uri",
+    "claude hello -- --handle-uri=cc://test",
+    'claude -- --handle-uri ""',
+    'claude hello -- --handle-uri ""',
+    'claude -- --handle-uri "" --handle-uri cc://test',
+  ]) {
+    expect(isToolSessionCommand(command, "claude"), command).toBe(true);
+  }
+  expect(
+    isToolSessionCommand(
+      "claude -- --handle-uri=cc://first --handle-uri cc://test",
+      "claude",
+    ),
+  ).toBe(false);
+});
+
 test("isToolSessionCommand matches absolute tool bins and interpreter wrappers", () => {
   const customBin = "/opt/acme/bin/custom-agent";
   for (const command of [
@@ -395,6 +745,7 @@ test("isToolSessionCommand matches absolute tool bins and interpreter wrappers",
     `node ${customBin} --resume abc`,
     `bun ${customBin} --resume abc`,
     `node --no-warnings ${customBin} --resume abc`,
+    `node --trace-warnings ${customBin} --resume abc`,
     `node --experimental-loader /dev/null ${customBin} --resume abc`,
     `node --require=/dev/null ${customBin} --resume abc`,
     `node -C custom ${customBin} --resume abc`,
@@ -409,6 +760,16 @@ test("isToolSessionCommand matches absolute tool bins and interpreter wrappers",
     `bun --cwd /tmp ${customBin} --resume abc`,
     `bun -c=/dev/null ${customBin} --resume abc`,
     `bun --cpu-prof-name p.cpuprofile ${customBin} --resume abc`,
+    `${customBin} --preload`,
+    `${customBin} --daemon-worker`,
+    `${customBin} --update`,
+    `${customBin} --handle-uri cc://test`,
+    `${customBin} --init-only`,
+    `${customBin} --rewind-files abc`,
+    `${customBin} remote-control`,
+    `${customBin} rc`,
+    `node ${customBin} --preload`,
+    `bun ${customBin} --daemon-worker`,
   ]) {
     expect(isToolSessionCommand(command, customBin), command).toBe(true);
   }
@@ -465,7 +826,19 @@ test("isToolSessionCommand matches absolute tool bins and interpreter wrappers",
   expect(isToolSessionCommand("node custom-agent --resume abc", customBin)).toBe(false);
 
   const codexAppBin = "/Applications/Codex.app/Contents/MacOS/Codex";
-  expect(isToolSessionCommand(`${codexAppBin} --user-data-dir=/safe`, codexAppBin)).toBe(true);
+  for (const command of [
+    `${codexAppBin} --user-data-dir=/safe`,
+    `${codexAppBin} --preload`,
+    `${codexAppBin} --daemon-worker`,
+    `${codexAppBin} --update`,
+    `${codexAppBin} --handle-uri codex://test`,
+    `${codexAppBin} --init-only`,
+    `${codexAppBin} --rewind-files abc`,
+    `${codexAppBin} remote-control`,
+    `${codexAppBin} rc`,
+  ]) {
+    expect(isToolSessionCommand(command, codexAppBin), command).toBe(true);
+  }
 
   const spacedBin = "/Applications/Custom Agent.app/Contents/MacOS/custom-agent";
   for (const command of [
