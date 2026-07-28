@@ -6,6 +6,24 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- Share capabilities across profiles instead of isolating them. A profile is an
+  isolated config dir, so pointing Claude Code at a freshly created one gave it
+  none of the machine's skills, subagents, or MCP servers — only credentials are
+  meant to be per-profile. `skills/` and `agents/` are now linked to the tool's
+  shared home and user-scope `mcpServers` are merged into the profile's account
+  file, both idempotently, on profile creation and on every launch (so profiles
+  created by earlier versions are repaired the next time they are used). Which
+  entries and keys are shared is per-tool data (`ToolDef.sharedEntries` /
+  `ToolDef.sharedConfig`), not a hard-coded Claude mapping.
+
+### Changed
+
+- `accounts doctor` now checks capability sharing by realpath, so a profile with
+  no skills, no subagents, no MCP servers, or a dangling capability link is
+  reported as a problem instead of a green check.
+
 ## [0.2.12] - 2026-07-27
 
 ### Added
