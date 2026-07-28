@@ -54,7 +54,8 @@ const CUTOVER_EPOCH = "2026-07-27T13:00:00.000Z";
 const tempRoots: string[] = [];
 
 afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of tempRoots.splice(0))
+    rmSync(root, { recursive: true, force: true });
 });
 
 function tempRoot(): string {
@@ -160,7 +161,10 @@ function safeObservation(
       realPath: root,
       device: "1",
       inode: Number.parseInt(
-        createHash("sha256").update(`${tool}:${name}`).digest("hex").slice(0, 12),
+        createHash("sha256")
+          .update(`${tool}:${name}`)
+          .digest("hex")
+          .slice(0, 12),
         16,
       ).toString(),
       entryCount: 12,
@@ -302,13 +306,24 @@ describe("v2 migration plan", () => {
     const plan = buildPlan();
 
     expect(plan.records).toHaveLength(2);
-    expect(plan.records.map((record) => record.disposition.state)).toEqual(["ready", "ready"]);
-    expect(new Set(plan.records.map((record) => record.target.accountId)).size).toBe(2);
-    expect(new Set(plan.records.map((record) => record.target.bindingId)).size).toBe(2);
-    expect(new Set(plan.records.map((record) => record.target.runtimeId)).size).toBe(2);
+    expect(plan.records.map((record) => record.disposition.state)).toEqual([
+      "ready",
+      "ready",
+    ]);
+    expect(
+      new Set(plan.records.map((record) => record.target.accountId)).size,
+    ).toBe(2);
+    expect(
+      new Set(plan.records.map((record) => record.target.bindingId)).size,
+    ).toBe(2);
+    expect(
+      new Set(plan.records.map((record) => record.target.runtimeId)).size,
+    ).toBe(2);
     expect(plan.records[0]?.binding?.rootPath).toBe("/profiles/claude/alice");
     expect(plan.records[1]?.binding?.rootPath).toBe("/profiles/codex/bob");
-    expect(plan.records.every((record) => !("credentialRef" in record))).toBe(true);
+    expect(plan.records.every((record) => !("credentialRef" in record))).toBe(
+      true,
+    );
     expect(migrationPlanSchema.parse(plan)).toEqual(plan);
 
     const rerun = buildPlan(
@@ -352,7 +367,9 @@ describe("v2 migration plan", () => {
       "session:claude:alice-a",
       "session:claude:alice-z",
     ]);
-    expect(createMigrationSidecar(plan).aliasJournal.map((entry) => entry.alias)).toEqual([
+    expect(
+      createMigrationSidecar(plan).aliasJournal.map((entry) => entry.alias),
+    ).toEqual([
       "legacy:claude:alice-a",
       "legacy:claude:alice-z",
       "legacy:claude:café",
@@ -394,8 +411,8 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildMigrationPlan(planInput([observation]), {
-        idFactory: stableId,
-        existingPlan: forgedPlan,
+          idFactory: stableId,
+          existingPlan: forgedPlan,
         }),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -405,12 +422,9 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildPlan([
-        safeObservation("alice", "claude", {
-          historicalAliases: [
-            "legacy:claude:alice",
-            "legacy:claude:alice",
-          ],
-        }),
+          safeObservation("alice", "claude", {
+            historicalAliases: ["legacy:claude:alice", "legacy:claude:alice"],
+          }),
         ]),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -418,12 +432,12 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildPlan([
-        safeObservation("alice", "claude", {
-          historicalAliases: [
-            "legacy:claude:cafe\u0301",
-            "legacy:claude:café",
-          ],
-        }),
+          safeObservation("alice", "claude", {
+            historicalAliases: [
+              "legacy:claude:cafe\u0301",
+              "legacy:claude:café",
+            ],
+          }),
         ]),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -431,12 +445,12 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildPlan([
-        safeObservation("alice", "claude", {
-          historicalAliases: ["legacy:shared-account-alias"],
-        }),
-        safeObservation("bob", "codex", {
-          historicalAliases: ["legacy:shared-account-alias"],
-        }),
+          safeObservation("alice", "claude", {
+            historicalAliases: ["legacy:shared-account-alias"],
+          }),
+          safeObservation("bob", "codex", {
+            historicalAliases: ["legacy:shared-account-alias"],
+          }),
         ]),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -444,12 +458,12 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildPlan([
-        safeObservation("alice", "claude", {
-          historicalSessionAliases: ["session:shared-alias"],
-        }),
-        safeObservation("bob", "codex", {
-          historicalSessionAliases: ["session:shared-alias"],
-        }),
+          safeObservation("alice", "claude", {
+            historicalSessionAliases: ["session:shared-alias"],
+          }),
+          safeObservation("bob", "codex", {
+            historicalSessionAliases: ["session:shared-alias"],
+          }),
         ]),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -460,7 +474,9 @@ describe("v2 migration plan", () => {
     expect(() =>
       buildPlan(
         [
-          safeObservation("alice", "claude", { inputDigest: digest("changed") }),
+          safeObservation("alice", "claude", {
+            inputDigest: digest("changed"),
+          }),
           safeObservation("bob", "codex"),
         ],
         plan,
@@ -483,7 +499,9 @@ describe("v2 migration plan", () => {
     ]);
 
     expect(plan.records).toHaveLength(3);
-    expect(plan.records.every((record) => record.target.accountId.length >= 16)).toBe(true);
+    expect(
+      plan.records.every((record) => record.target.accountId.length >= 16),
+    ).toBe(true);
     expect(
       plan.records
         .filter((record) => record.source.name === "same")
@@ -492,11 +510,16 @@ describe("v2 migration plan", () => {
       { state: "quarantined", reasons: ["same_name_cross_runtime"] },
       { state: "quarantined", reasons: ["same_name_cross_runtime"] },
     ]);
-    expect(plan.records.find((record) => record.source.name === "missing")?.disposition).toEqual({
+    expect(
+      plan.records.find((record) => record.source.name === "missing")
+        ?.disposition,
+    ).toEqual({
       state: "quarantined",
       reasons: ["root_missing"],
     });
-    expect(plan.records.every((record) => record.binding === undefined)).toBe(true);
+    expect(plan.records.every((record) => record.binding === undefined)).toBe(
+      true,
+    );
   });
 
   test("quarantines distinct legacy names that resolve to the same verified root identity", () => {
@@ -513,7 +536,9 @@ describe("v2 migration plan", () => {
       { state: "quarantined", reasons: ["duplicate_verified_root"] },
       { state: "quarantined", reasons: ["duplicate_verified_root"] },
     ]);
-    expect(plan.records.every((record) => record.binding === undefined)).toBe(true);
+    expect(plan.records.every((record) => record.binding === undefined)).toBe(
+      true,
+    );
   });
 
   test("canonicalizes verified root aliases before duplicate physical-root quarantine", () => {
@@ -643,7 +668,9 @@ describe("v2 migration plan", () => {
       { state: "quarantined", reasons: ["duplicate_verified_root"] },
       { state: "quarantined", reasons: ["duplicate_verified_root"] },
     ]);
-    expect(plan.records.every((record) => record.binding === undefined)).toBe(true);
+    expect(plan.records.every((record) => record.binding === undefined)).toBe(
+      true,
+    );
   });
 
   test("canonicalizes numeric device and inode aliases before physical-root quarantine", () => {
@@ -716,24 +743,26 @@ describe("v2 migration plan", () => {
   });
 
   test("fails duplicate source observations rather than silently overwriting", () => {
-    expect(() => buildPlan([safeObservation("alice"), safeObservation("alice")])).toThrow(
-      "duplicate legacy source key",
-    );
+    expect(() =>
+      buildPlan([safeObservation("alice"), safeObservation("alice")]),
+    ).toThrow("duplicate legacy source key");
   });
 
   test("fails conflicting runtime definitions and incomplete census contracts", () => {
     expect(() =>
       buildPlan([
         safeObservation("alice"),
-        safeObservation("bob", "claude", { runtimeLabel: "Different Claude Runtime" }),
+        safeObservation("bob", "claude", {
+          runtimeLabel: "Different Claude Runtime",
+        }),
       ]),
     ).toThrow("conflicting runtime labels");
 
     expect(
       captureError(() =>
         buildMigrationPlan(planInput(), {
-        idFactory: (kind, seed) =>
-          kind === "account" ? "account_duplicate0000" : stableId(kind, seed),
+          idFactory: (kind, seed) =>
+            kind === "account" ? "account_duplicate0000" : stableId(kind, seed),
         }),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -741,7 +770,7 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildMigrationPlan(planInput([safeObservation("alice")]), {
-        idFactory: () => "shared_identifier_000000000001",
+          idFactory: () => "shared_identifier_000000000001",
         }),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -749,11 +778,11 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildMigrationPlan(
-        {
-          ...planInput([safeObservation("alice")]),
-          backup: { ...backupPlan(), requiredBytes: 2047 },
-        },
-        { idFactory: stableId },
+          {
+            ...planInput([safeObservation("alice")]),
+            backup: { ...backupPlan(), requiredBytes: 2047 },
+          },
+          { idFactory: stableId },
         ),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -761,11 +790,11 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildMigrationPlan(
-        {
-          ...planInput(),
-          cutoverEpoch: "2026-07-27T11:59:59.999Z",
-        },
-        { idFactory: stableId },
+          {
+            ...planInput(),
+            cutoverEpoch: "2026-07-27T11:59:59.999Z",
+          },
+          { idFactory: stableId },
         ),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -774,7 +803,10 @@ describe("v2 migration plan", () => {
     expect(
       migrationPlanSchema.safeParse({
         ...plan,
-        sourceDigests: { ...plan.sourceDigests, untrackedSource: digest("unknown") },
+        sourceDigests: {
+          ...plan.sourceDigests,
+          untrackedSource: digest("unknown"),
+        },
       }).success,
     ).toBe(false);
 
@@ -864,16 +896,16 @@ describe("v2 migration plan", () => {
     expect(
       captureError(() =>
         buildMigrationPlan(planInput(), {
-        existingPlan: {
-          ...plan,
-          records: [
-            {
-              ...plan.records[0],
-              runtimeLabel: "Forged but schema-valid label",
-            },
-            plan.records[1],
-          ],
-        },
+          existingPlan: {
+            ...plan,
+            records: [
+              {
+                ...plan.records[0],
+                runtimeLabel: "Forged but schema-valid label",
+              },
+              plan.records[1],
+            ],
+          },
         }),
       ).code,
     ).toBe("migration_invalid_plan_input");
@@ -937,9 +969,9 @@ describe("v2 migration plan", () => {
       expect(plan.records.map((record) => record.disposition.state)).toEqual(
         expectedDispositions,
       );
-      expect(new Set(plan.records.map((record) => record.target.runtimeId))).toEqual(
-        new Set([plan.records[0]!.target.runtimeId]),
-      );
+      expect(
+        new Set(plan.records.map((record) => record.target.runtimeId)),
+      ).toEqual(new Set([plan.records[0]!.target.runtimeId]));
       expect(migrationPlanSchema.safeParse(plan).success).toBe(true);
 
       const marker = `Bearer runtime definition ${expectedDispositions.join("-")}`;
@@ -958,7 +990,9 @@ describe("v2 migration plan", () => {
       expect(forgedPlan.planDigest).not.toBe(plan.planDigest);
       expect(migrationPlanSchema.safeParse(forgedPlan).success).toBe(false);
 
-      const sidecarError = captureError(() => createMigrationSidecar(forgedPlan));
+      const sidecarError = captureError(() =>
+        createMigrationSidecar(forgedPlan),
+      );
       expect(sidecarError.code).toBe("migration_invalid_sidecar_plan");
       expect(JSON.stringify(sidecarError)).not.toContain(marker);
       expect(String(sidecarError)).not.toContain(marker);
@@ -974,10 +1008,12 @@ describe("v2 migration plan", () => {
     ];
     const plan = buildPlan(observations);
     const remappedLabel = "Claude Code Remapped";
-    expect(new Set(plan.records.map((record) => record.target.runtimeId)).size).toBe(1);
-    expect(plan.records.every((record) => record.runtimeLabel === "Claude Code")).toBe(
-      true,
-    );
+    expect(
+      new Set(plan.records.map((record) => record.target.runtimeId)).size,
+    ).toBe(1);
+    expect(
+      plan.records.every((record) => record.runtimeLabel === "Claude Code"),
+    ).toBe(true);
     const remappedPlan = rehashPlanWithRecords(
       plan,
       plan.records.map((record) => ({
@@ -1009,6 +1045,48 @@ describe("v2 migration plan", () => {
     expect(JSON.stringify(trustedCensusError)).not.toContain(remappedLabel);
   });
 
+  test("requires frozen target identities when reusing a trusted existing plan", () => {
+    const observations = [safeObservation("alice")];
+    const plan = buildPlan(observations);
+    const forgedAccountId = "account_forged0000000000001";
+    const forgedRecords = plan.records.map((record, index) =>
+      index === 0
+        ? {
+            ...record,
+            target: {
+              ...record.target,
+              accountId: forgedAccountId,
+            },
+            ...(record.binding
+              ? {
+                  binding: {
+                    ...record.binding,
+                    accountId: forgedAccountId,
+                  },
+                }
+              : {}),
+          }
+        : record,
+    ) as MigrationPlan["records"];
+    const forgedPlan = rehashPlanWithRecords(plan, forgedRecords);
+
+    expect(forgedPlan.inputDigest).toBe(plan.inputDigest);
+    expect(forgedPlan.planDigest).not.toBe(plan.planDigest);
+    expect(migrationPlanSchema.safeParse(forgedPlan).success).toBe(true);
+
+    const trustedCensusError = captureError(() =>
+      buildMigrationPlan(planInput(observations), {
+        idFactory: stableId,
+        existingPlan: forgedPlan,
+      }),
+    );
+    expect(trustedCensusError).toBeInstanceOf(MigrationDriftError);
+    expect(trustedCensusError.code).toBe(
+      "migration_frozen_output_identity_changed",
+    );
+    expect(JSON.stringify(trustedCensusError)).not.toContain(forgedAccountId);
+  });
+
   test.each([
     ["case", "claude code"],
     ["noncanonical whitespace", "Claude  Code"],
@@ -1017,7 +1095,9 @@ describe("v2 migration plan", () => {
     "keeps builder and schema aligned for %s runtime-label variants",
     (_variant, conflictingLabel) => {
       const baseLabel =
-        conflictingLabel === "Claude Cafe\u0301" ? "Claude Café" : "Claude Code";
+        conflictingLabel === "Claude Cafe\u0301"
+          ? "Claude Café"
+          : "Claude Code";
       const observations = [
         safeObservation("alice", "claude", { runtimeLabel: baseLabel }),
         safeObservation("bob", "claude", {
@@ -1054,7 +1134,9 @@ describe("v2 migration plan", () => {
       }),
     ]);
 
-    expect(new Set(plan.records.map((record) => record.target.runtimeId)).size).toBe(1);
+    expect(
+      new Set(plan.records.map((record) => record.target.runtimeId)).size,
+    ).toBe(1);
     expect(migrationPlanSchema.parse(plan)).toEqual(plan);
     const conflictingRuntimeId = "runtime_distinct000000000001";
     const conflictingIdPlan = rehashPlanWithRecords(
@@ -1077,7 +1159,9 @@ describe("v2 migration plan", () => {
           : record,
       ) as MigrationPlan["records"],
     );
-    expect(migrationPlanSchema.safeParse(conflictingIdPlan).success).toBe(false);
+    expect(migrationPlanSchema.safeParse(conflictingIdPlan).success).toBe(
+      false,
+    );
 
     const marker = "Bearer conflicting runtime definition";
     const builderError = captureError(() =>
@@ -1114,7 +1198,8 @@ describe("v2 migration plan", () => {
       (record) => record.source.tool === "credential-token-runtime",
     )!;
     const sensitiveRecord = redacted.records.find(
-      (record) => record.target.accountId === sensitivePlanRecord.target.accountId,
+      (record) =>
+        record.target.accountId === sensitivePlanRecord.target.accountId,
     );
     const unsafeRecord = redacted.records.find(
       (record) => record.root.state === "unsafe",
@@ -1129,9 +1214,7 @@ describe("v2 migration plan", () => {
     expect(encoded).not.toContain("Codex CLI");
     expect(
       redacted.records.every(
-        (record) =>
-          !("runtimeLabel" in record) &&
-          !("tool" in record.source),
+        (record) => !("runtimeLabel" in record) && !("tool" in record.source),
       ),
     ).toBe(true);
     expect(sensitiveRecord?.source).not.toHaveProperty("tool");
@@ -1234,7 +1317,9 @@ describe("v2 migration plan", () => {
   test("returns stable diagnostic codes and opaque references without caller text", () => {
     const marker = "bearer-secret-diagnostic-marker";
     const duplicate = safeObservation(marker, marker);
-    const duplicateError = captureError(() => buildPlan([duplicate, duplicate]));
+    const duplicateError = captureError(() =>
+      buildPlan([duplicate, duplicate]),
+    );
     const runtimeError = captureError(() =>
       buildPlan([
         safeObservation("alice", marker, { runtimeLabel: `${marker}-one` }),
@@ -1243,14 +1328,14 @@ describe("v2 migration plan", () => {
     );
     const markerPlan = buildMigrationPlan(planInput(), {
       idFactory: (kind, seed) =>
-        kind === "plan"
-          ? `plan-${marker}`
-          : stableId(kind, seed),
+        kind === "plan" ? `plan-${marker}` : stableId(kind, seed),
     });
     const frozenPlanError = captureError(() =>
       buildMigrationPlan(
         planInput([
-          safeObservation("alice", "claude", { inputDigest: digest("changed") }),
+          safeObservation("alice", "claude", {
+            inputDigest: digest("changed"),
+          }),
           safeObservation("bob", "codex"),
         ]),
         { existingPlan: markerPlan },
@@ -1319,7 +1404,10 @@ describe("v2 migration plan", () => {
       { mode: 0o600 },
     );
     const loadError = captureError(() =>
-      new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy }).load(),
+      new MigrationSidecarStore({
+        sidecarPath,
+        legacyStorePath: legacy,
+      }).load(),
     );
     expect(loadError.message).not.toContain(marker);
     expect(loadError.code).toBe("migration_sidecar_parse_failed");
@@ -1513,7 +1601,9 @@ describe("v2 migration plan", () => {
       {
         [marker]: marker,
         async transaction() {
-          throw new Error("strict port parsing should reject before invocation");
+          throw new Error(
+            "strict port parsing should reject before invocation",
+          );
         },
       } as never,
     ).then(
@@ -1549,7 +1639,10 @@ describe("v2 migration plan", () => {
     expect(
       migrationPlanSchema.safeParse({
         ...plan,
-        records: [{ ...plan.records[0], transcript: "secret transcript" }, plan.records[1]],
+        records: [
+          { ...plan.records[0], transcript: "secret transcript" },
+          plan.records[1],
+        ],
       }).success,
     ).toBe(false);
   });
@@ -1559,10 +1652,14 @@ describe("backup, gates, aliases, and cutover states", () => {
   test("requires encrypted 0600 complete backup and restore contracts", () => {
     expect(backupRestorePlanSchema.parse(backupPlan())).toEqual(backupPlan());
     expect(
-      backupRestorePlanSchema.safeParse({ ...backupPlan(), manifestEncrypted: false }).success,
+      backupRestorePlanSchema.safeParse({
+        ...backupPlan(),
+        manifestEncrypted: false,
+      }).success,
     ).toBe(false);
     expect(
-      backupRestorePlanSchema.safeParse({ ...backupPlan(), fileMode: 0o644 }).success,
+      backupRestorePlanSchema.safeParse({ ...backupPlan(), fileMode: 0o644 })
+        .success,
     ).toBe(false);
     expect(
       backupRestorePlanSchema.safeParse({
@@ -1609,15 +1706,33 @@ describe("backup, gates, aliases, and cutover states", () => {
       ["active_writers", { ...base, activeWriters: ["accounts-supervisor"] }],
       [
         "input_digest_drift",
-        { ...base, observedDigests: { ...base.observedDigests, v1Registry: digest("drift") } },
+        {
+          ...base,
+          observedDigests: {
+            ...base.observedDigests,
+            v1Registry: digest("drift"),
+          },
+        },
       ],
-      ["insufficient_free_space", { ...base, availableBytes: plan.backup.requiredBytes - 1 }],
-      ["unknown_ledger_entry", { ...base, unknownLedgerEntries: ["future_migration"] }],
+      [
+        "insufficient_free_space",
+        { ...base, availableBytes: plan.backup.requiredBytes - 1 },
+      ],
+      [
+        "unknown_ledger_entry",
+        { ...base, unknownLedgerEntries: ["future_migration"] },
+      ],
       ["checksum_mismatch", { ...base, checksumMismatches: ["accounts_0005"] }],
-      ["catalog_skip", { ...base, unresolvedCatalogSkipDigests: [digest("skip")] }],
+      [
+        "catalog_skip",
+        { ...base, unresolvedCatalogSkipDigests: [digest("skip")] },
+      ],
       [
         "restore_unverified",
-        { ...base, backupRestore: { ...base.backupRestore, restoreDrillVerified: false } },
+        {
+          ...base,
+          backupRestore: { ...base.backupRestore, restoreDrillVerified: false },
+        },
       ],
       [
         "restore_after_cutover_epoch",
@@ -1706,8 +1821,8 @@ describe("backup, gates, aliases, and cutover states", () => {
     expect(
       captureError(() =>
         appendMigrationAlias(once, {
-        ...alias,
-        alias: "legacy:claude:cafe\u0301",
+          ...alias,
+          alias: "legacy:claude:cafe\u0301",
         }),
       ).code,
     ).toBe("migration_invalid_alias_input");
@@ -1728,10 +1843,13 @@ describe("backup, gates, aliases, and cutover states", () => {
       targetState: "partial_ready",
       sourceIntegrityDigest: initial.integrityDigest,
     });
-    expect(() => transitionMigrationSidecar(partialReady, "partial_applied")).toThrow(
-      "requires a committed scope-bound backfill receipt",
+    expect(() =>
+      transitionMigrationSidecar(partialReady, "partial_applied"),
+    ).toThrow("requires a committed scope-bound backfill receipt");
+    const partialBackfill = await applyScopedBackfill(
+      partialReady,
+      new RecordingBackfillPort(),
     );
-    const partialBackfill = await applyScopedBackfill(partialReady, new RecordingBackfillPort());
     const { digest: _receiptDigest, ...partialReceiptCore } =
       partialBackfill.receipt;
     const wrongScopeCore = {
@@ -1760,23 +1878,38 @@ describe("backup, gates, aliases, and cutover states", () => {
         backfillReceipt: partialBackfill.receipt,
       }),
     ).toThrow("does not bind the exact partial_ready predecessor");
-    const partialApplied = transitionMigrationSidecar(partialReady, "partial_applied", {
-      backfillReceipt: partialBackfill.receipt,
-    });
-    const finalReady = transitionMigrationSidecar(partialApplied, "final_ready", {
-      gateEvidence: passingEvidence(plan),
-    });
-    const finalBackfill = await applyScopedBackfill(finalReady, new RecordingBackfillPort());
-    const finalApplied = transitionMigrationSidecar(finalReady, "final_applied", {
-      backfillReceipt: finalBackfill.receipt,
-    });
+    const partialApplied = transitionMigrationSidecar(
+      partialReady,
+      "partial_applied",
+      {
+        backfillReceipt: partialBackfill.receipt,
+      },
+    );
+    const finalReady = transitionMigrationSidecar(
+      partialApplied,
+      "final_ready",
+      {
+        gateEvidence: passingEvidence(plan),
+      },
+    );
+    const finalBackfill = await applyScopedBackfill(
+      finalReady,
+      new RecordingBackfillPort(),
+    );
+    const finalApplied = transitionMigrationSidecar(
+      finalReady,
+      "final_applied",
+      {
+        backfillReceipt: finalBackfill.receipt,
+      },
+    );
 
     expect(finalApplied.state).toBe("final_applied");
     expect(finalApplied.gateReceipts).toHaveLength(2);
     expect(finalApplied.backfillReceipts).toHaveLength(2);
-    expect(() => transitionMigrationSidecar(finalApplied, "partial_applied")).toThrow(
-      "cannot move migration state backwards",
-    );
+    expect(() =>
+      transitionMigrationSidecar(finalApplied, "partial_applied"),
+    ).toThrow("cannot move migration state backwards");
 
     const quarantined = createMigrationSidecar(
       buildPlan([
@@ -1811,12 +1944,20 @@ describe("backup, gates, aliases, and cutover states", () => {
       sourceKey: initial.plan.records[0]!.sourceKey,
       targetId: initial.plan.records[0]!.target.accountId,
     });
-    const firstReady = transitionMigrationSidecar(firstPredecessor, "partial_ready", {
-      gateEvidence: passingEvidence(initial.plan),
-    });
-    const secondReady = transitionMigrationSidecar(secondPredecessor, "partial_ready", {
-      gateEvidence: passingEvidence(initial.plan),
-    });
+    const firstReady = transitionMigrationSidecar(
+      firstPredecessor,
+      "partial_ready",
+      {
+        gateEvidence: passingEvidence(initial.plan),
+      },
+    );
+    const secondReady = transitionMigrationSidecar(
+      secondPredecessor,
+      "partial_ready",
+      {
+        gateEvidence: passingEvidence(initial.plan),
+      },
+    );
     const {
       integrityDigest: _integrityDigest,
       gateReceipts: _gateReceipts,
@@ -1831,9 +1972,9 @@ describe("backup, gates, aliases, and cutover states", () => {
       integrityDigest: canonicalDigest(forgedCore),
     } as MigrationSidecar;
 
-    expect(() =>
-      transitionMigrationSidecar(forged, "partial_ready"),
-    ).toThrow("predecessor transition chain");
+    expect(() => transitionMigrationSidecar(forged, "partial_ready")).toThrow(
+      "predecessor transition chain",
+    );
   });
 });
 
@@ -1842,19 +1983,25 @@ class RecordingBackfillTransaction implements MigrationBackfillTransaction {
   failAt?: string;
   invalidResultAt?: string;
 
-  async ensureRuntime(runtime: ScopedBackfillRuntime): Promise<"created" | "adopted"> {
+  async ensureRuntime(
+    runtime: ScopedBackfillRuntime,
+  ): Promise<"created" | "adopted"> {
     this.events.push(`runtime:${runtime.id}`);
     this.maybeFail("runtime");
     return this.result("runtime");
   }
 
-  async ensureAccount(account: ScopedBackfillAccount): Promise<"created" | "adopted"> {
+  async ensureAccount(
+    account: ScopedBackfillAccount,
+  ): Promise<"created" | "adopted"> {
     this.events.push(`account:${account.id}`);
     this.maybeFail("account");
     return this.result("account");
   }
 
-  async ensureCrosswalk(crosswalk: ScopedBackfillCrosswalk): Promise<"created" | "adopted"> {
+  async ensureCrosswalk(
+    crosswalk: ScopedBackfillCrosswalk,
+  ): Promise<"created" | "adopted"> {
     this.events.push(`crosswalk:${crosswalk.sourceKey}`);
     this.maybeFail("crosswalk");
     return this.result("crosswalk");
@@ -1934,9 +2081,13 @@ describe("scoped transactional backfill hooks", () => {
     ]);
     const port = new RecordingBackfillPort();
     const result = await applyScopedBackfill(
-      transitionMigrationSidecar(createMigrationSidecar(plan), "partial_ready", {
-        gateEvidence: passingEvidence(plan),
-      }),
+      transitionMigrationSidecar(
+        createMigrationSidecar(plan),
+        "partial_ready",
+        {
+          gateEvidence: passingEvidence(plan),
+        },
+      ),
       port,
     );
 
@@ -1955,9 +2106,11 @@ describe("scoped transactional backfill hooks", () => {
         readyState: "partial_ready",
       }),
     });
-    expect(port.transactionImpl.events.filter((event) => event.startsWith("account:"))).toHaveLength(
-      1,
-    );
+    expect(
+      port.transactionImpl.events.filter((event) =>
+        event.startsWith("account:"),
+      ),
+    ).toHaveLength(1);
     expect(port.transactionImpl.events.at(-1)).toBe(`epoch:${plan.id}`);
   });
 
@@ -2024,10 +2177,11 @@ describe("scoped transactional backfill hooks", () => {
       () => {
         throw new Error("expected poisoned backfill result to reject");
       },
-      (caught) => caught as Error & {
-        code?: string;
-        cause?: unknown;
-      },
+      (caught) =>
+        caught as Error & {
+          code?: string;
+          cause?: unknown;
+        },
     );
     const exported = [
       error.message,
@@ -2411,7 +2565,11 @@ describe("durable sidecar WAL and repair", () => {
     const root = tempRoot();
     const legacy = join(root, "accounts.json");
     const error = captureError(
-      () => new MigrationSidecarStore({ sidecarPath: legacy, legacyStorePath: legacy }),
+      () =>
+        new MigrationSidecarStore({
+          sidecarPath: legacy,
+          legacyStorePath: legacy,
+        }),
     );
     expect(error.code).toBe("migration_store_path_rejected");
     expect(error.references).toEqual([
@@ -2620,7 +2778,10 @@ describe("durable sidecar WAL and repair", () => {
     symlinkSync(target, linked);
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
     const sidecarPath = join(linked, "nested", "migration-v2.json");
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
 
     const error = captureError(() =>
       store.install(createMigrationSidecar(buildPlan())),
@@ -2692,7 +2853,10 @@ describe("durable sidecar WAL and repair", () => {
       expect(error.code).toBe("migration_store_callback_failed");
       expect(error.message).not.toContain(`forced crash ${point}`);
 
-      const repaired = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+      const repaired = new MigrationSidecarStore({
+        sidecarPath,
+        legacyStorePath: legacy,
+      });
       expect(repaired.repair()).toEqual(sidecar);
       expect(repaired.load()).toEqual(sidecar);
       expect(existsSync(`${sidecarPath}.wal`)).toBe(false);
@@ -2716,9 +2880,14 @@ describe("durable sidecar WAL and repair", () => {
     expect(captureError(() => failing.install(sidecar)).code).toBe(
       "migration_store_callback_failed",
     );
-    writeFileSync(sidecarPath, JSON.stringify({ unexpected: "drift" }), { mode: 0o600 });
+    writeFileSync(sidecarPath, JSON.stringify({ unexpected: "drift" }), {
+      mode: 0o600,
+    });
 
-    const repaired = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const repaired = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     expect(() => repaired.repair()).toThrow(MigrationDriftError);
     expect(existsSync(`${sidecarPath}.wal`)).toBe(true);
   });
@@ -2728,7 +2897,10 @@ describe("durable sidecar WAL and repair", () => {
     const legacy = join(root, "accounts.json");
     const sidecarPath = join(root, "migration-v2.json");
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     const initial = createMigrationSidecar(buildPlan());
     store.install(initial);
 
@@ -2741,11 +2913,14 @@ describe("durable sidecar WAL and repair", () => {
     store.install(updated, { expectedPreviousDigest: initial.integrityDigest });
 
     expect(() =>
-      store.install(transitionMigrationSidecar(initial, "partial_ready", {
-        gateEvidence: passingEvidence(initial.plan),
-      }), {
-        expectedPreviousDigest: initial.integrityDigest,
-      }),
+      store.install(
+        transitionMigrationSidecar(initial, "partial_ready", {
+          gateEvidence: passingEvidence(initial.plan),
+        }),
+        {
+          expectedPreviousDigest: initial.integrityDigest,
+        },
+      ),
     ).toThrow("refusing a stale writer");
     expect(store.load()).toEqual(updated);
   });
@@ -2771,7 +2946,10 @@ describe("durable sidecar WAL and repair", () => {
     const second = createMigrationSidecar(
       buildPlan([safeObservation("charlie")]),
     );
-    const competing = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const competing = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     expect(() => competing.install(second)).toThrow("pending migration WAL");
     expect(readFileSync(`${sidecarPath}.wal`, "utf8")).toBe(walBefore);
     expect(competing.repair()).toEqual(first);
@@ -2783,7 +2961,10 @@ describe("durable sidecar WAL and repair", () => {
     const sidecarPath = join(root, "migration-v2.json");
     const walPath = `${sidecarPath}.wal`;
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     const initial = createMigrationSidecar(buildPlan());
     store.install(initial);
     const current = appendMigrationAlias(initial, {
@@ -2793,19 +2974,27 @@ describe("durable sidecar WAL and repair", () => {
       targetId: initial.plan.records[0]!.target.accountId,
     });
     store.install(current, { expectedPreviousDigest: initial.integrityDigest });
-    const truncatedSuccessor = transitionMigrationSidecar(initial, "partial_ready", {
-      gateEvidence: passingEvidence(initial.plan),
-    });
+    const truncatedSuccessor = transitionMigrationSidecar(
+      initial,
+      "partial_ready",
+      {
+        gateEvidence: passingEvidence(initial.plan),
+      },
+    );
     writeFileSync(
       walPath,
-      `${JSON.stringify({
-        schemaVersion: 1,
-        planId: initial.plan.id,
-        idempotencyKey: initial.plan.idempotencyKey,
-        previousDigest: current.integrityDigest,
-        nextDigest: truncatedSuccessor.integrityDigest,
-        nextSidecar: truncatedSuccessor,
-      }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          planId: initial.plan.id,
+          idempotencyKey: initial.plan.idempotencyKey,
+          previousDigest: current.integrityDigest,
+          nextDigest: truncatedSuccessor.integrityDigest,
+          nextSidecar: truncatedSuccessor,
+        },
+        null,
+        2,
+      )}\n`,
       { mode: 0o600 },
     );
 
@@ -2820,7 +3009,10 @@ describe("durable sidecar WAL and repair", () => {
     const sidecarPath = join(root, "migration-v2.json");
     const walPath = `${sidecarPath}.wal`;
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     const initial = createMigrationSidecar(buildPlan());
     const noncanonicalGenesis = appendMigrationAlias(initial, {
       kind: "legacy_account",
@@ -2830,14 +3022,18 @@ describe("durable sidecar WAL and repair", () => {
     });
     writeFileSync(
       walPath,
-      `${JSON.stringify({
-        schemaVersion: 1,
-        planId: initial.plan.id,
-        idempotencyKey: initial.plan.idempotencyKey,
-        previousDigest: null,
-        nextDigest: noncanonicalGenesis.integrityDigest,
-        nextSidecar: noncanonicalGenesis,
-      }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          planId: initial.plan.id,
+          idempotencyKey: initial.plan.idempotencyKey,
+          previousDigest: null,
+          nextDigest: noncanonicalGenesis.integrityDigest,
+          nextSidecar: noncanonicalGenesis,
+        },
+        null,
+        2,
+      )}\n`,
       { mode: 0o600 },
     );
 
@@ -2851,16 +3047,17 @@ describe("durable sidecar WAL and repair", () => {
     const legacy = join(root, "accounts.json");
     const sidecarPath = join(root, "migration-v2.json");
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     const initial = createMigrationSidecar(buildPlan());
     const legitimate = transitionMigrationSidecar(initial, "final_ready", {
       gateEvidence: passingEvidence(initial.plan),
     });
 
-    const {
-      integrityDigest: _initialIntegrityDigest,
-      ...initialCore
-    } = initial;
+    const { integrityDigest: _initialIntegrityDigest, ...initialCore } =
+      initial;
     const aliaslessGenesisCore = {
       ...initialCore,
       aliasJournal: [],
@@ -2890,10 +3087,8 @@ describe("durable sidecar WAL and repair", () => {
       ...forgedTransitionCore,
       digest: canonicalDigest(forgedTransitionCore),
     };
-    const {
-      integrityDigest: _legitimateIntegrityDigest,
-      ...legitimateCore
-    } = legitimate;
+    const { integrityDigest: _legitimateIntegrityDigest, ...legitimateCore } =
+      legitimate;
     const forgedCore = {
       ...legitimateCore,
       aliasJournal: [],
@@ -2916,7 +3111,10 @@ describe("durable sidecar WAL and repair", () => {
     const legacy = join(root, "accounts.json");
     const sidecarPath = join(root, "migration-v2.json");
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     const initial = createMigrationSidecar(buildPlan());
     store.install(initial);
 
@@ -2949,7 +3147,10 @@ describe("durable sidecar WAL and repair", () => {
     const lockPath = `${sidecarPath}.lock`;
     writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
     writeFileSync(lockPath, `${process.pid}\n`, { mode: 0o600 });
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
 
     expect(() => store.repair()).toThrow("another v2 migration writer");
     expect(readFileSync(lockPath, "utf8")).toBe(`${process.pid}\n`);
@@ -2967,7 +3168,10 @@ describe("durable sidecar WAL and repair", () => {
     writeFileSync(sidecarPath, "{}\n", { mode: 0o644 });
     chmodSync(sidecarPath, 0o644);
 
-    const store = new MigrationSidecarStore({ sidecarPath, legacyStorePath: legacy });
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
     const error = captureError(() => store.load());
     expect(error.message).toBe("migration store path was rejected");
     expect(error.code).toBe("migration_store_path_rejected");
