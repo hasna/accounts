@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { AccountsError } from "../types.js";
+import fixture from "../../test/fixtures/production-profile-dirs.json";
 import {
   assertRegistrableProfileDir,
+  builtinToolHomeRoots,
   classifyProfileDir,
+  classifyToolHomeDir,
   defaultProfileDirPolicy,
   resolveProfileDirPolicy,
 } from "./profile-dir-policy.js";
@@ -183,40 +186,139 @@ describe("resolveProfileDirPolicy", () => {
   });
 });
 
-describe("real-registry corpus", () => {
-  // Positive control: the policy must separate the 53 legitimate rows observed in
-  // the production registry from the 16 /tmp rows that leaked into it. A check
-  // that cannot produce both outcomes on real input is not evidence.
-  const legitimate = [
-    "/home/hasna/.hasna/accounts/profiles/claude/account003",
-    "/home/hasna/.hasna/accounts/profiles/codewith/account015",
-    "/home/hasna/.hasna/accounts/profiles/cursor/account024",
-    "/home/hasna/.codewith/auth_profiles/account009",
-    "/home/hasna/.claude",
-    "/home/hasna/.codewith",
-    "/Users/hasna/.hasna/accounts/profiles/codex-app/account002",
-    "/Users/andreihasna/.hasna/accounts/profiles/claude/account027",
+describe("agent worktrees, scratchpads and caches are refused (F1)", () => {
+  // These are the paths the earlier dot-directory rule admitted. They matter
+  // more than /tmp did: the global rules REQUIRE agents to work in
+  // $HOME/.hasna/repos/worktrees/<repo>/<name>, and the real leak lever is an
+  // ACCOUNTS_HOME override feeding profilesDir() — so an agent pointing
+  // ACCOUNTS_HOME at its own worktree reproduces the original leak one level in.
+  const refused = [
+    "/home/hasna/.hasna/repos/worktrees/open-accounts/e68bc8c7-registry-cleanup",
+    "/home/hasna/.hasna/repos/worktrees/open-accounts/x/profiles/claude/acct",
+    "/home/hasna/.hasna/projects/workspaces/wks_abc/scratchpad/accounts-home/profiles/claude/a",
+    "/home/hasna/.hasna/projects/workspaces/wks_abc/h2/prof-claude",
+    "/home/hasna/.cache/accounts-tests/worker-a/case-1/profiles/claude/acct",
+    "/home/hasna/.hasna/accounts",
+    "/home/hasna/.hasna",
+    "/home/hasna/.hasna/emails",
   ];
-  const leaked = [
-    "/tmp/accounts-login-cli-1ITud2/profiles/claude/acct",
-    "/tmp/accounts-test-dJ98ge/profiles/claude/copied",
-    "/tmp/import-src-ADyjrn",
-    "/tmp/tmp.qJnMsgXfli/profiles/codex/acct",
-    "/tmp/accounts-permissions-cli-wGAboW/profiles/codex/codexer",
-    "/tmp/accounts-review-state-shape-gva3Gg/profiles/review-state-shape/review",
-    "/tmp/claude-1000/-home-hasna/abc/scratchpad/h2/prof-broken",
-  ];
+  for (const dir of refused) {
+    test(`refuses ${dir}`, () => {
+      const result = classifyProfileDir(dir);
+      expect({ dir, ok: result.ok }).toEqual({ dir, ok: false });
+      if (result.ok) throw new Error("unreachable");
+      expect(result.reason.code).toBe("outside-profile-roots");
+    });
+  }
 
-  test("every legitimate dir is admitted", () => {
-    for (const dir of legitimate) {
-      expect({ dir, ...classifyProfileDir(dir) }).toEqual({ dir, ok: true });
+  test("but the managed profiles root beside them is still admitted", () => {
+    expect(classifyProfileDir("/home/hasna/.hasna/accounts/profiles/claude/account003")).toEqual({
+      ok: true,
+    });
+  });
+});
+
+describe("profile roots are derived from the tool table, not enumerated", () => {
+  test("every built-in tool home is a profile root", () => {
+    const roots = defaultProfileDirPolicy.profileRoots;
+    for (const rel of builtinToolHomeRoots()) {
+      expect({ rel, present: roots.includes(rel) }).toEqual({ rel, present: true });
     }
   });
 
-  test("every leaked dir is refused", () => {
-    for (const dir of leaked) {
-      const result = classifyProfileDir(dir);
+  test("the managed profiles root is included", () => {
+    expect(defaultProfileDirPolicy.profileRoots).toContain(".hasna/accounts/profiles");
+  });
+
+  test("a tool home nested two segments deep works (.config/opencode)", () => {
+    expect(classifyProfileDir("/home/hasna/.config/opencode")).toEqual({ ok: true });
+    // ...but .config itself is not a blanket root
+    const result = classifyProfileDir("/home/hasna/.config/something-unknown");
+    expect(result.ok).toBe(false);
+  });
+
+  test("a tool home admits nested profile dirs (.codewith/auth_profiles)", () => {
+    expect(classifyProfileDir("/home/hasna/.codewith/auth_profiles/account009")).toEqual({
+      ok: true,
+    });
+  });
+});
+
+describe("classifyToolHomeDir (F2 — POST /v1/tools defaultDir)", () => {
+  test("refuses the ephemeral paths that were previously accepted", () => {
+    for (const dir of ["/tmp/evil", "/dev/shm/x", "/var/folders/ab/cd/x"]) {
+      const result = classifyToolHomeDir(dir);
       expect({ dir, ok: result.ok }).toEqual({ dir, ok: false });
+      if (result.ok) throw new Error("unreachable");
+      expect(result.reason.code).toBe("ephemeral-root");
     }
+  });
+
+  test("refuses a bare relative string", () => {
+    const result = classifyToolHomeDir("relative");
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason.code).toBe("not-absolute");
+  });
+
+  test("admits a NEW tool home the built-in table does not know", () => {
+    // Custom tools exist to add config dirs without a code change, so tool
+    // homes deliberately do NOT get the profile-root allowlist.
+    expect(classifyToolHomeDir("/home/hasna/.config/aicopilot")).toEqual({ ok: true });
+    expect(classifyToolHomeDir("/home/hasna/.some-new-agent")).toEqual({ ok: true });
+  });
+
+  test("a path refused as a PROFILE dir can still be a valid tool home", () => {
+    const asProfile = classifyProfileDir("/home/hasna/.config/aicopilot");
+    const asToolHome = classifyToolHomeDir("/home/hasna/.config/aicopilot");
+    expect(asProfile.ok).toBe(false);
+    expect(asToolHome.ok).toBe(true);
+  });
+
+  test("non-string input is rejected, not thrown", () => {
+    expect(() => classifyToolHomeDir(42 as unknown as string)).not.toThrow();
+    const result = classifyToolHomeDir(42 as unknown as string);
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("real-registry corpus", () => {
+  // The 71-row production registry replayed through the policy. Previously this
+  // lived only in a throwaway script, so the strongest evidence for the rule was
+  // not a test and could not catch a regression. It is a committed fixture now:
+  // widen the rule and a leaked path starts passing; narrow it and a real row
+  // starts failing. Either way this fails.
+  const corpus = fixture as { capturedAt: string; dirs: { dir: string; expect: string }[] };
+
+  test("the fixture is the real thing, not a sample", () => {
+    const allow = corpus.dirs.filter((d) => d.expect === "allow").length;
+    const refuse = corpus.dirs.filter((d) => d.expect === "refuse").length;
+    expect({ allow, refuse, total: corpus.dirs.length }).toEqual({
+      allow: 48,
+      refuse: 16,
+      total: 64,
+    });
+  });
+
+  test("every dir the live registry legitimately held is admitted", () => {
+    const wrong = corpus.dirs
+      .filter((d) => d.expect === "allow")
+      .filter((d) => !classifyProfileDir(d.dir).ok)
+      .map((d) => d.dir);
+    expect(wrong).toEqual([]);
+  });
+
+  test("every leaked dir is refused", () => {
+    const wrong = corpus.dirs
+      .filter((d) => d.expect === "refuse")
+      .filter((d) => classifyProfileDir(d.dir).ok)
+      .map((d) => d.dir);
+    expect(wrong).toEqual([]);
+  });
+
+  test("all six macOS rows are admitted (the corpus is not Linux-only)", () => {
+    const mac = corpus.dirs.filter((d) => d.dir.startsWith("/Users/"));
+    expect(mac.length).toBe(6);
+    expect(mac.filter((d) => !classifyProfileDir(d.dir).ok).map((d) => d.dir)).toEqual([]);
   });
 });

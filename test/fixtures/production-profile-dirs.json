@@ -1,0 +1,262 @@
+{
+  "_comment": "Every distinct profile dir held by the production accounts registry on 2026-07-28, with the verdict the policy must give it. Captured from a live `accounts list --json` (71 rows; 2 had no dir and are omitted because an absent dir is not a path decision). Emails, identities and metadata are deliberately excluded \u2014 only the paths matter here. This is the corpus the policy was designed against: it must admit every legitimate row and refuse every leaked one, so a future change that widens or narrows the rule fails against real data rather than against invented examples.",
+  "capturedAt": "2026-07-28",
+  "dirs": [
+    {
+      "dir": "/Users/andreihasna/.codewith/auth_profiles/account020",
+      "expect": "allow"
+    },
+    {
+      "dir": "/Users/andreihasna/.hasna/accounts/profiles/claude/account027",
+      "expect": "allow"
+    },
+    {
+      "dir": "/Users/hasna/.hasna/accounts/profiles/claude/account01",
+      "expect": "allow"
+    },
+    {
+      "dir": "/Users/hasna/.hasna/accounts/profiles/codex-app/account001",
+      "expect": "allow"
+    },
+    {
+      "dir": "/Users/hasna/.hasna/accounts/profiles/codex-app/account002",
+      "expect": "allow"
+    },
+    {
+      "dir": "/Users/hasna/.hasna/accounts/profiles/codex-app/account01",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.claude",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account001",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account002",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account003",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account004",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account005",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account006",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account007",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account008",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account009",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account010",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account011",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account012",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account013",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account014",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account015",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account016",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.codewith/auth_profiles/account017",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/accoun002",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account00",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account001",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account002",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account003",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account004",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account005",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account006",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account009",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account010",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account022",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account024",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account028",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account029",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account030",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account031",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account032",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account033",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account088",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/account099",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/claude/default",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/codewith/account015",
+      "expect": "allow"
+    },
+    {
+      "dir": "/home/hasna/.hasna/accounts/profiles/cursor/account024",
+      "expect": "allow"
+    },
+    {
+      "dir": "/tmp/accounts-login-cli-1ITud2/profiles/claude/acct",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/accounts-login-cli-LUaTwJ/profiles/fake-variant/acct",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/accounts-login-cli-MEPYvG/profiles/fake-login/acct",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/accounts-login-cli-Mni0Fp/profiles/missing-review/acct",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/accounts-login-cli-ZdiBHg/profiles/cursor/acct",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/accounts-permissions-cli-wGAboW/profiles/codex/codexer",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/accounts-review-state-shape-gva3Gg/profiles/review-state-shape/review",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/accounts-test-dJ98ge/profiles/claude/copied",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/claude-1000/-home-hasna--hasna-projects-workspaces-wks-DUTgJ8GlGbTrylATiySHz/4a6f4e77-f061-4165-bbe8-3ab6c542e4e2/scratchpad/accounts-home/profiles/claude/swa-demo-a",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/claude-1000/-home-hasna--hasna-projects-workspaces-wks-DUTgJ8GlGbTrylATiySHz/4a6f4e77-f061-4165-bbe8-3ab6c542e4e2/scratchpad/accounts-home/profiles/claude/swa-demo-b",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/claude-1000/-home-hasna--hasna-projects-workspaces-wks-DUTgJ8GlGbTrylATiySHz/4a6f4e77-f061-4165-bbe8-3ab6c542e4e2/scratchpad/accounts-home/profiles/claude/swa-demo-dead",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/claude-1000/-home-hasna--hasna-projects-workspaces-wks-DUTgJ8GlGbTrylATiySHz/4a6f4e77-f061-4165-bbe8-3ab6c542e4e2/scratchpad/h2/prof-broken",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/claude-1000/-home-hasna--hasna-projects-workspaces-wks-DUTgJ8GlGbTrylATiySHz/4a6f4e77-f061-4165-bbe8-3ab6c542e4e2/scratchpad/h2/prof-claude",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/claude-1000/-home-hasna--hasna-projects-workspaces-wks-DUTgJ8GlGbTrylATiySHz/4a6f4e77-f061-4165-bbe8-3ab6c542e4e2/scratchpad/h2/prof-codex",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/import-src-ADyjrn",
+      "expect": "refuse"
+    },
+    {
+      "dir": "/tmp/tmp.qJnMsgXfli/profiles/codex/acct",
+      "expect": "refuse"
+    }
+  ]
+}

@@ -166,6 +166,63 @@ describe("POST /v1/accounts rejects ephemeral profile dirs", () => {
   });
 });
 
+describe("POST /v1/tools rejects ephemeral tool homes (F2)", () => {
+  // Same registry, same write scope: before this, accounts.dir=/tmp/evil was
+  // refused while tools.defaultDir=/tmp/evil sailed through — and the tool's
+  // defaultDir is consumed as a profile dir downstream.
+  const postTool = (defaultDir: string) => {
+    const { repo } = harness();
+    const ctx: ServiceContext = {
+      repo,
+      verifier: verifyApiKey({ app: "accounts", signingSecret: SIGNING_SECRET }),
+      health: async () => ({ ok: true }),
+      ready: async () => ({ ready: true }),
+      mode: "cloud",
+      version: "test",
+      close: async () => {},
+    };
+    const token = mintApiKey({
+      app: "accounts",
+      scopes: [SCOPES.read, SCOPES.write],
+      signingSecret: SIGNING_SECRET,
+    }).token;
+    return createHandler(ctx)(
+      new Request("http://localhost/v1/tools", {
+        method: "POST",
+        headers: { "x-api-key": token, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: "eviltool",
+          label: "Evil",
+          envVar: "EVIL_HOME",
+          defaultDir,
+          bin: "evil",
+        }),
+      }),
+    );
+  };
+
+  test("a /tmp tool home is refused with 400", async () => {
+    const res = await postTool("/tmp/evil");
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/ephemeral root/);
+  });
+
+  test("/dev/shm is refused", async () => {
+    expect((await postTool("/dev/shm/x")).status).toBe(400);
+  });
+
+  test("a bare relative string is refused", async () => {
+    expect((await postTool("relative")).status).toBe(400);
+  });
+
+  // POSITIVE CONTROL: a genuinely new tool home must still register, otherwise
+  // the 400s above would only prove the endpoint is broken.
+  test("a new tool home outside the built-in table is still accepted", async () => {
+    const res = await postTool("/home/hasna/.some-new-agent");
+    expect(res.status).toBe(201);
+  });
+});
+
 describe("PATCH /v1/accounts/:tool/:name rejects ephemeral profile dirs", () => {
   test("a stored account cannot be repointed at /tmp", async () => {
     const { repo, post, patch } = harness();

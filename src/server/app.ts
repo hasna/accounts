@@ -12,11 +12,11 @@ import {
   resolveStorageMode,
   checkHealth,
 } from "../generated/storage-kit/index.js";
-import { AccountsError, toolDefSchema } from "../types.js";
+import { AccountsError } from "../types.js";
 import { BUILTIN_TOOLS, isBuiltinTool } from "../lib/tools.js";
 import { AccountsRepo, type AccountsStore } from "./repo.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
-import { createAccountSchema, updateAccountSchema, renameAccountSchema, setCurrentSchema, toolIdSchema } from "./schema.js";
+import { createAccountSchema, createToolSchema, updateAccountSchema, renameAccountSchema, setCurrentSchema, toolIdSchema } from "./schema.js";
 import { APP_SLUG, API_KEYS_TABLE, SCOPES, resolveSigningSecret } from "./config.js";
 import { packageVersion } from "./version.js";
 
@@ -287,7 +287,7 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         if (denied) return denied;
         const parsedBody = await parseJson(req);
         if (!parsedBody.ok) return parsedBody.res;
-        const input = toolDefSchema.safeParse(parsedBody.value);
+        const input = createToolSchema.safeParse(parsedBody.value);
         if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
         if (isBuiltinTool(input.data.id)) {
           return json(errorBody(`"${input.data.id}" is a built-in tool and cannot be redefined`), 409);
