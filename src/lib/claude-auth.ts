@@ -23,6 +23,16 @@ import {
   writeClaudeKeychain,
 } from "./keychain.js";
 import { assertSafeWritePath, writeFileAtomic } from "./safe-path.js";
+import {
+  betterCredential,
+  centralCredentialsPathForProfile,
+  centralOAuthRecordForProfile,
+  credentialHealth,
+  type CredentialHealthPresent,
+  type SyncResult,
+  syncProfileSnapshotToCentral,
+} from "./auth-store.js";
+import { accountsHome } from "../storage.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -107,7 +117,11 @@ function profileHasOAuthAccount(profileDir: string, tool: ToolDef): boolean {
 }
 
 function profileHasCredentialPayload(profileDir: string): boolean {
-  return existsSync(profileCredentialFile(profileDir)) || existsSync(profileCredentialsSnapshot(profileDir));
+  return (
+    existsSync(profileCredentialFile(profileDir)) ||
+    existsSync(profileCredentialsSnapshot(profileDir)) ||
+    centralCredentialsPathForProfile(profileDir) !== undefined
+  );
 }
 
 export function assertRestorableProfileAuth(profileDir: string, tool: ToolDef, profileName?: string): void {
@@ -143,49 +157,33 @@ function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
   }
 }
 
-function credentialHealth(path: string):
-  | { exists: false }
-  | { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number } {
-  if (!existsSync(path)) return { exists: false };
-  const mtimeMs = statSync(path).mtimeMs;
-  const raw = readJsonFile(path);
-  const oauth = raw?.claudeAiOauth;
-  if (!oauth || typeof oauth !== "object") {
-    return { exists: true, expiresAt: 0, refreshTokenLength: 0, mtimeMs };
-  }
+// credentialHealth/betterCredential live in auth-store.ts (the lower layer)
+// so the central store and these read paths rank credentials identically.
 
-  const record = oauth as JsonRecord;
-  const expiresAtRaw = record.expiresAt;
-  const expiresAt =
-    typeof expiresAtRaw === "number"
-      ? expiresAtRaw
-      : typeof expiresAtRaw === "string"
-        ? Date.parse(expiresAtRaw)
-        : 0;
-  const refreshTokenLength = typeof record.refreshToken === "string" ? record.refreshToken.length : 0;
-  return {
-    exists: true,
-    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
-    refreshTokenLength,
-    mtimeMs,
-  };
-}
-
-function betterCredential(
-  a: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number },
-  b: { exists: true; expiresAt: number; refreshTokenLength: number; mtimeMs: number },
-): typeof a {
-  const now = Date.now();
-  const aHasRefresh = a.refreshTokenLength > 0;
-  const bHasRefresh = b.refreshTokenLength > 0;
-  if (aHasRefresh !== bHasRefresh) return aHasRefresh ? a : b;
-
-  const aUsable = aHasRefresh && a.expiresAt > now;
-  const bUsable = bHasRefresh && b.expiresAt > now;
-  if (aUsable !== bUsable) return aUsable ? a : b;
-  if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs > b.mtimeMs ? a : b;
-  if (a.expiresAt !== b.expiresAt) return a.expiresAt > b.expiresAt ? a : b;
-  return a.mtimeMs > b.mtimeMs ? a : b;
+/**
+ * Best restorable credential snapshot for a profile: the per-profile copy vs
+ * the central identity-keyed copy, `betterCredential` winner. Not "central
+ * first" — during the 0.2.15/0.2.16 window an old binary may have rotated a
+ * fresher token into the per-profile copy, and restoring a stale central one
+ * would log the account out. `stayUnder` is the containment root for source
+ * symlink checks on the winning path.
+ */
+function bestRestorableCredentialPath(
+  profileDir: string,
+  tool?: ToolDef,
+): { path: string; stayUnder: string } | undefined {
+  const candidates: { path: string; stayUnder: string }[] = [
+    { path: profileCredentialsSnapshot(profileDir), stayUnder: profileDir },
+  ];
+  const central = centralCredentialsPathForProfile(profileDir, tool);
+  if (central) candidates.push({ path: central, stayUnder: accountsHome() });
+  const existing = candidates
+    .filter((c) => existsSync(c.path) && !lstatSync(c.path).isSymbolicLink())
+    .map((c) => ({ ...c, health: credentialHealth(c.path) }))
+    .filter((c): c is typeof c & { health: CredentialHealthPresent } => c.health.exists);
+  if (existing.length === 0) return undefined;
+  const best = existing.reduce((a, b) => (betterCredential(a.health, b.health) === a.health ? a : b));
+  return { path: best.path, stayUnder: best.stayUnder };
 }
 
 export function liveCredentialShouldUpdateProfile(profileDir: string): boolean {
@@ -203,7 +201,11 @@ function sourceCredentialShouldUpdateProfile(sourceCredentialsFile: string, prof
 
   const profileRoot = credentialHealth(profileCredentialFile(profileDir));
   const profileSnapshot = credentialHealth(profileCredentialsSnapshot(profileDir));
-  const profileCreds = [profileRoot, profileSnapshot].filter((c): c is Exclude<typeof c, { exists: false }> => c.exists);
+  const centralPath = centralCredentialsPathForProfile(profileDir);
+  const profileCentral = centralPath ? credentialHealth(centralPath) : ({ exists: false } as const);
+  const profileCreds = [profileRoot, profileSnapshot, profileCentral].filter(
+    (c): c is Exclude<typeof c, { exists: false }> => c.exists,
+  );
   if (profileCreds.length === 0) return true;
 
   const bestProfileCred = profileCreds.reduce((best, candidate) => betterCredential(best, candidate));
@@ -309,6 +311,8 @@ export function snapshotLiveAuthToProfile(profileDir: string, _tool: ToolDef): v
       if (kc) writeJsonFile(profileKeychainSnapshot(profileDir), kc as unknown as JsonRecord, profileDir);
     }
   }
+
+  syncProfileSnapshotToCentral(profileDir, _tool);
 }
 
 /** @deprecated Use snapshotLiveAuthToProfile */
@@ -335,6 +339,8 @@ export function snapshotDirAuthToProfile(sourceDir: string, tool: ToolDef, profi
     assertSafeWritePath(dest, { mustStayUnder: profileDir });
     copyFileSync(sourceCredentials, dest);
   }
+
+  syncProfileSnapshotToCentral(profileDir, tool);
 }
 
 /**
@@ -353,17 +359,16 @@ export function restoreClaudeAuthIntoDir(
   ensureProfileAuthSnapshot(profileDir, tool);
   assertRestorableProfileAuth(profileDir, tool, profileName);
 
-  const oauthSnap = readJsonFile(profileOAuthSnapshot(profileDir));
   const oauth =
-    oauthSnap?.oauthAccount && typeof oauthSnap.oauthAccount === "object"
-      ? (oauthSnap.oauthAccount as JsonRecord)
-      : readSwitchedAccountMarker(profileDir)
-        ? undefined
-        : readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool));
+    readOAuthSnapshot(profileDir) ??
+    centralOAuthRecordForProfile(profileDir, tool) ??
+    (readSwitchedAccountMarker(profileDir)
+      ? undefined
+      : readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool)));
   if (!oauth) throw new AccountsError("profile has no OAuth account data to apply");
 
-  const credSnap = profileCredentialsSnapshot(profileDir);
-  if (!existsSync(credSnap)) {
+  const credSnap = bestRestorableCredentialPath(profileDir, tool);
+  if (!credSnap) {
     throw new AccountsError(
       `profile "${profileName ?? "NAME"}" has no restorable Claude credential snapshot`,
     );
@@ -378,7 +383,7 @@ export function restoreClaudeAuthIntoDir(
   const targetCredentials = join(targetDir, ".credentials.json");
   assertSafeWritePath(accountFile, { mustStayUnder: targetDir });
   assertSafeWritePath(targetCredentials, { mustStayUnder: targetDir });
-  const credentialBytes = readFileSync(credSnap);
+  const credentialBytes = readFileSync(credSnap.path);
 
   sanitizeSettingsFile(targetDir, targetDir);
   mergeOAuthInto([accountFile], oauth, false, targetDir);
@@ -427,7 +432,7 @@ export function ensureProfileAuthSnapshot(
   profileDir: string,
   tool: ToolDef,
   opts: { overwrite?: boolean } = {},
-): void {
+): SyncResult {
   const authDir = profileAuthDir(profileDir);
   assertSafeWritePath(join(authDir, OAUTH_SNAPSHOT), { mustStayUnder: profileDir });
   mkdirSync(authDir, { recursive: true });
@@ -448,7 +453,9 @@ export function ensureProfileAuthSnapshot(
       if (stale) clearSwitchedAccountMarker(profileDir);
       else {
         sanitizeClaudeOAuthProfileSettings(profileDir, tool);
-        return;
+        // The dir's live files belong to another account, but the profile's
+        // own snapshot is owner-true — still mirror it centrally.
+        return syncProfileSnapshotToCentral(profileDir, tool);
       }
     }
   }
@@ -467,6 +474,9 @@ export function ensureProfileAuthSnapshot(
   }
 
   sanitizeClaudeOAuthProfileSettings(profileDir, tool);
+  // Write-new half of the compat window: every per-profile snapshot write is
+  // mirrored into the central identity-keyed store.
+  return syncProfileSnapshotToCentral(profileDir, tool);
 }
 
 export function profileHasAuth(profileDir: string, tool: ToolDef): boolean {
@@ -578,10 +588,15 @@ export function claudeProfileAuthHealth(
   const oauthAccountPresent = profileHasOAuthAccount(profileDir, tool);
   // In restore view, a switched-away dir's root credential belongs to another
   // account — only the snapshot answers "can THIS profile's auth be restored".
+  const centralCredentialPath = centralCredentialsPathForProfile(profileDir, tool);
   const credentialPaths =
     opts.restoreView && readSwitchedAccountMarker(profileDir)
-      ? [profileCredentialsSnapshot(profileDir)]
-      : [profileCredentialFile(profileDir), profileCredentialsSnapshot(profileDir)];
+      ? [profileCredentialsSnapshot(profileDir), ...(centralCredentialPath ? [centralCredentialPath] : [])]
+      : [
+          profileCredentialFile(profileDir),
+          profileCredentialsSnapshot(profileDir),
+          ...(centralCredentialPath ? [centralCredentialPath] : []),
+        ];
   const credentials = credentialPaths.map((path) => credentialPayloadReadiness(path));
   const existingCredentials = credentials.filter((credential) => credential.exists);
   const credentialPayloadPresent = existingCredentials.length > 0;
@@ -636,10 +651,12 @@ function profileCredentialSource(path: string):
 
 function profileFileCredentialSecret(profileDir: string): string | undefined {
   // A switched-away dir's root credential belongs to another profile; only the
-  // snapshot still holds this profile's own tokens.
+  // snapshot (and the central copy of the profile's own account, whose binding
+  // resolves through that snapshot) still holds this profile's own tokens.
+  const central = centralCredentialsPathForProfile(profileDir);
   const paths = readSwitchedAccountMarker(profileDir)
-    ? [profileCredentialsSnapshot(profileDir)]
-    : [profileCredentialsSnapshot(profileDir), profileCredentialFile(profileDir)];
+    ? [profileCredentialsSnapshot(profileDir), ...(central ? [central] : [])]
+    : [profileCredentialsSnapshot(profileDir), profileCredentialFile(profileDir), ...(central ? [central] : [])];
   const sources = paths
     .map((path) => profileCredentialSource(path))
     .filter((source): source is NonNullable<typeof source> => !!source);
@@ -721,13 +738,12 @@ export function restoreClaudeAuthFromProfile(
   const liveRoot = liveClaudeBase();
   mkdirSync(live.configDir, { recursive: true });
 
-  const oauthSnap = readJsonFile(profileOAuthSnapshot(profileDir));
   const oauth =
-    oauthSnap?.oauthAccount && typeof oauthSnap.oauthAccount === "object"
-      ? (oauthSnap.oauthAccount as JsonRecord)
-      : readSwitchedAccountMarker(profileDir)
-        ? undefined
-        : readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool));
+    readOAuthSnapshot(profileDir) ??
+    centralOAuthRecordForProfile(profileDir, tool) ??
+    (readSwitchedAccountMarker(profileDir)
+      ? undefined
+      : readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool)));
 
   if (!oauth) {
     throw new AccountsError("profile has no OAuth account data to apply");
@@ -739,11 +755,11 @@ export function restoreClaudeAuthFromProfile(
   assertSafeWritePath(live.homeJson, { mustStayUnder: liveRoot });
   mergeOAuthInto([live.homeJson], oauth, false, liveRoot);
 
-  const credSnap = profileCredentialsSnapshot(profileDir);
-  if (existsSync(credSnap)) {
+  const credSnap = bestRestorableCredentialPath(profileDir, tool);
+  if (credSnap) {
     assertSafeWritePath(live.credentialsFile, { mustStayUnder: liveRoot });
-    assertSafeWritePath(credSnap, { mustStayUnder: profileDir });
-    copyFileSync(credSnap, live.credentialsFile);
+    assertSafeWritePath(credSnap.path, { mustStayUnder: credSnap.stayUnder });
+    copyFileSync(credSnap.path, live.credentialsFile);
     writeFileSync(live.credentialsFile, readFileSync(live.credentialsFile), { mode: 0o600 });
   } else if (existsSync(live.credentialsFile)) {
     if (!lstatSync(live.credentialsFile).isSymbolicLink()) unlinkSync(live.credentialsFile);

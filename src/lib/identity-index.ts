@@ -1,6 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { accountsHome } from "../storage.js";
 import type { ToolDef } from "../types.js";
 import {
   CREDENTIALS_SNAPSHOT,
@@ -9,6 +8,7 @@ import {
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
 } from "./claude-layout.js";
+import { centralAuthRoot } from "./auth-store.js";
 
 /**
  * UUID-keyed account enumeration. Directories are DOORS; accounts are the
@@ -56,14 +56,9 @@ export interface AccountIdentity {
   status: AccountStatus;
 }
 
-/** Central (post-migration) auth home for one account. */
-export function centralAuthRoot(): string {
-  return join(accountsHome(), "auth");
-}
-
-export function centralAuthDir(accountUuid: string): string {
-  return join(centralAuthRoot(), accountUuid);
-}
+// Central store paths are owned by auth-store.ts (which also validates uuids
+// on the write side); this module only re-exports them for its callers.
+export { centralAuthDir, centralAuthRoot } from "./auth-store.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -120,7 +115,15 @@ function credentialRef(path: string, source: CredentialSource): AccountCredentia
 
 const SOURCE_RANK: Record<CredentialSource, number> = { central: 3, "profile-snapshot": 2, "dir-live": 1 };
 
-/** Valid beats invalid; later expiry beats earlier; central store breaks ties. */
+/**
+ * Valid beats invalid; later expiry beats earlier; central store breaks ties.
+ *
+ * Deliberately DIFFERENT from auth-store's `betterCredential`: this ranking
+ * answers "which credential can a caller USE right now" (selection), while
+ * `betterCredential` answers "which bytes must SURVIVE a sync/restore"
+ * (refresh-token presence and write recency first, because restoring a
+ * rotated-out refresh token logs the account out). Do not unify them.
+ */
 function betterCredentialRef(a: AccountCredentialRef, b: AccountCredentialRef): AccountCredentialRef {
   if (a.valid !== b.valid) return a.valid ? a : b;
   if (a.expiresAt !== b.expiresAt) return a.expiresAt > b.expiresAt ? a : b;
@@ -184,7 +187,8 @@ export function buildIdentityIndex(
         continue;
       }
       const identity = oauthIdentityFrom(readJson(join(dir, OAUTH_SNAPSHOT)));
-      if (!identity || identity.accountUuid !== entry) continue;
+      // The store writes lowercased dir names; tolerate case-variant payloads.
+      if (!identity || identity.accountUuid.toLowerCase() !== entry.toLowerCase()) continue;
       record(byUuid, identity, undefined, credentialRef(join(dir, CREDENTIALS_SNAPSHOT), "central"));
     }
   }

@@ -26,11 +26,14 @@ import {
   accountsHome,
   getAccountsStorageStatus,
   loadAppliedMap,
+  loadStore,
   storagePull,
   storagePush,
   storageSync,
   storePath,
 } from "./storage.js";
+import { centralOAuthSnapshot, sweepCentralAuth, type SyncResult } from "./lib/auth-store.js";
+import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -1312,6 +1315,125 @@ program
         const val = p ? `${chalk.green.bold(p.name)}${p.email ? chalk.dim(" (" + p.email + ")") : ""}` : chalk.dim("(none)");
         const appliedVal = appliedName && appliedName !== p?.name ? chalk.magenta(` → applied: ${appliedName}`) : appliedName ? chalk.magenta(" (applied)") : "";
         console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}${appliedVal}`);
+      }
+    }),
+  );
+
+const auth = program
+  .command("auth")
+  .description(`central identity-keyed auth snapshot store (${join(accountsHome(), "auth")})`);
+
+auth
+  .command("status", { isDefault: true })
+  .description("list accounts known to this machine (central store first, then profile stores)")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { json?: boolean }) => {
+      // ONE enumerator: the same uuid-keyed identity index the usage-aware
+      // switcher consumes, annotated with central-store presence.
+      const store = loadStore();
+      const claudeProfiles = store.profiles
+        .filter((p) => p.tool === "claude")
+        .map((p) => ({ name: p.name, dir: p.dir }));
+      const index = buildIdentityIndex(claudeProfiles, getTool("claude"));
+      const rows = index.map((identity) => ({
+        ...identity,
+        central: existsSync(centralOAuthSnapshot(identity.accountUuid)),
+      }));
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log("no accounts known — run `accounts auth migrate` to populate the central store");
+        return;
+      }
+      for (const row of rows) {
+        const source = row.central ? chalk.green("central") : chalk.yellow("profile-only");
+        const profiles = [
+          ...new Set(row.doors.filter((d) => d.role === "own-identity" && d.profileName).map((d) => d.profileName)),
+        ];
+        const profilesNote = profiles.length ? chalk.dim(` profiles: ${profiles.join(", ")}`) : "";
+        console.log(
+          `${chalk.cyan(row.accountUuid)} ${row.email ?? chalk.dim("(no email)")} [${source}] ${row.status}${profilesNote}`,
+        );
+      }
+    }),
+  );
+
+auth
+  .command("migrate")
+  .description("mirror every claude profile's auth snapshot into the central store")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { json?: boolean }) => {
+      const store = loadStore();
+      type MigrateRow = { profile: string; dir: string; skipped?: string; error?: string } & Partial<SyncResult>;
+      const rows: MigrateRow[] = [];
+      let failures = 0;
+      for (const profile of store.profiles) {
+        if (profile.tool !== "claude") {
+          rows.push({ profile: profile.name, dir: profile.dir, skipped: `tool ${profile.tool} has no claude auth snapshot` });
+          continue;
+        }
+        if (!existsSync(profile.dir)) {
+          rows.push({ profile: profile.name, dir: profile.dir, skipped: "config dir missing" });
+          continue;
+        }
+        try {
+          const result = ensureProfileAuthSnapshot(profile.dir, getTool(profile.tool));
+          rows.push({ profile: profile.name, dir: profile.dir, ...result });
+        } catch (error) {
+          failures += 1;
+          rows.push({
+            profile: profile.name,
+            dir: profile.dir,
+            error: error instanceof AccountsError ? error.message : String(error),
+          });
+        }
+      }
+      if (opts.json) console.log(JSON.stringify(rows, null, 2));
+      else {
+        for (const row of rows) {
+          if (row.error) console.log(`${chalk.red("FAIL")} ${row.profile}: ${row.error}`);
+          else if (row.skipped) console.log(`${chalk.yellow("skip")} ${row.profile}: ${row.skipped}`);
+          else if (!row.synced) console.log(`${chalk.yellow("skip")} ${row.profile}: ${row.reason}`);
+          else
+            console.log(
+              `${chalk.green("ok")}   ${row.profile} → ${row.uuid}${row.email ? chalk.dim(" (" + row.email + ")") : ""} credentials=${row.credentials} oauth=${row.oauth}`,
+            );
+        }
+      }
+      if (failures > 0) process.exitCode = 1;
+    }),
+  );
+
+auth
+  .command("sweep")
+  .description("list central entries no registered profile references; --delete moves them to auth-trash")
+  .option("--json", "output JSON")
+  .option("--delete", "move orphaned entries to a timestamped dir under auth-trash (never destroys bytes)")
+  .action(
+    action((opts: { json?: boolean; delete?: boolean }) => {
+      const result = sweepCentralAuth({ delete: opts.delete });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      for (const u of result.unresolved) {
+        console.log(`${chalk.yellow("unresolved")} ${u.profile} (${u.dir}): ${u.reason}`);
+      }
+      if (result.orphans.length === 0) {
+        console.log(`no orphaned central auth entries (${result.referenced.length} referenced)`);
+        return;
+      }
+      for (const orphan of result.orphans) {
+        const suffix = orphan.trashedTo ? ` → ${orphan.trashedTo}` : "";
+        console.log(`${result.deleted ? chalk.yellow("trashed") : chalk.cyan("orphan")} ${orphan.uuid} ${orphan.email ?? ""}${suffix}`);
+      }
+      if (!result.deleted) console.log(chalk.dim("dry run — pass --delete to move these to auth-trash"));
+      if (result.unresolved.length > 0 && !result.deleted) {
+        console.log(chalk.yellow("note: unresolved profile bindings above will block --delete"));
       }
     }),
   );
