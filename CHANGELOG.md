@@ -8,6 +8,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ### Added
 
+- Profile-dir policy for the cloud registry (`src/lib/profile-dir-policy.ts`).
+  `POST /v1/accounts` and `PATCH /v1/accounts/:tool/:name` now refuse a `dir`
+  that sits under an ephemeral root (`/tmp`, `/var/tmp`, `/var/folders`,
+  `/dev/shm`, `/run`, and the macOS `/private` aliases), is not anchored under a
+  home root, or does not sit in a tool home directory. Previously any string was
+  accepted, which let test harnesses and agents write throwaway paths into the
+  shared registry. The check is deliberately filesystem-free — the service
+  validates dirs belonging to other machines and must judge them lexically — and
+  the ephemeral check runs before the home check, so widening
+  `HASNA_ACCOUNTS_PROFILE_DIR_ROOTS` for an unusual machine layout cannot
+  re-admit a temp path. Enforcement is server-side only: the cloud client also
+  talks to test doubles and non-production instances and cannot know which, so
+  it does not judge dirs locally.
+
 - Central identity-keyed auth snapshot store (`docs/auth-store.md`):
   `~/.hasna/accounts/auth/<accountUuid>/{credentials.json,oauth-account.json}`
   replaces the per-profile `.accounts-auth/` dirs as the canonical credential
