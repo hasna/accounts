@@ -178,6 +178,7 @@ function bestRestorableCredentialPath(
   const central = centralCredentialsPathForProfile(profileDir, tool);
   if (central) candidates.push({ path: central, stayUnder: accountsHome() });
   const existing = candidates
+    .filter((c) => existsSync(c.path) && !lstatSync(c.path).isSymbolicLink())
     .map((c) => ({ ...c, health: credentialHealth(c.path) }))
     .filter((c): c is typeof c & { health: CredentialHealthPresent } => c.health.exists);
   if (existing.length === 0) return undefined;

@@ -190,6 +190,7 @@ export type {
   SweptOrphan,
   SyncFileAction,
   SyncResult,
+  UnresolvedProfileBinding,
 } from "./lib/auth-store.js";
 export { withApplyLock } from "./lib/apply-lock.js";
 export { isSafeProfileName } from "./lib/hook.js";

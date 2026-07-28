@@ -1106,7 +1106,10 @@ auth
       const rows: MigrateRow[] = [];
       let failures = 0;
       for (const profile of store.profiles) {
-        if (profile.tool !== "claude") continue;
+        if (profile.tool !== "claude") {
+          rows.push({ profile: profile.name, dir: profile.dir, skipped: `tool ${profile.tool} has no claude auth snapshot` });
+          continue;
+        }
         if (!existsSync(profile.dir)) {
           rows.push({ profile: profile.name, dir: profile.dir, skipped: "config dir missing" });
           continue;
@@ -1151,6 +1154,9 @@ auth
         console.log(JSON.stringify(result, null, 2));
         return;
       }
+      for (const u of result.unresolved) {
+        console.log(`${chalk.yellow("unresolved")} ${u.profile} (${u.dir}): ${u.reason}`);
+      }
       if (result.orphans.length === 0) {
         console.log(`no orphaned central auth entries (${result.referenced.length} referenced)`);
         return;
@@ -1160,6 +1166,9 @@ auth
         console.log(`${result.deleted ? chalk.yellow("trashed") : chalk.cyan("orphan")} ${orphan.uuid} ${orphan.email ?? ""}${suffix}`);
       }
       if (!result.deleted) console.log(chalk.dim("dry run — pass --delete to move these to auth-trash"));
+      if (result.unresolved.length > 0 && !result.deleted) {
+        console.log(chalk.yellow("note: unresolved profile bindings above will block --delete"));
+      }
     }),
   );
 

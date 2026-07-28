@@ -70,6 +70,12 @@ accounts auth sweep            # dry-run: list orphaned central entries
 accounts auth sweep --delete   # MOVE them to ~/.hasna/accounts/auth-trash/<ts>/ (no rm)
 ```
 
+Sweep safety posture: it **refuses in api/cloud storage mode** (profile
+records live in the cloud registry there, so the local registry cannot prove
+non-reference), and a registered profile whose dir is missing — or whose dir
+carries auth material without a resolvable uuid — is reported as `unresolved`
+and **blocks `--delete`** entirely: unknown is not unreferenced.
+
 ## Import
 
 Both `accounts import` paths call `ensureProfileAuthSnapshot`, which now ends
@@ -89,8 +95,30 @@ accounts auth sweep [--delete]   # orphan handling, see above
 
 `listKnownAccounts()` (exported from the package root) is THE identity
 enumeration surface: central store first, per-profile bindings as fallback,
-deduped by uuid. Features that reason over accounts (e.g. usage-aware
-auto-switching) should consume it instead of walking profile dirs.
+deduped by (lowercased) uuid, each entry carrying `credentialsPresent` /
+`oauthPresent` so consumers can tell a usable account from a stub. Features
+that reason over accounts (e.g. usage-aware auto-switching) should consume it
+instead of walking profile dirs.
+
+Scope and semantics notes:
+
+- **Claude accounts only today.** The central layout has no tool dimension;
+  other tools have no account-uuid concept here yet. Extending to another
+  tool is a deliberate layout decision, not a drop-in.
+- **Profile bindings come from the machine-local registry.** In api/cloud
+  storage mode, cloud-registered profiles are not reflected in `profiles`.
+- **Switch markers fail closed.** Any existing `switched-account.json` file —
+  even one that no longer parses — excludes the dir's live files as identity
+  and credential sources; only the owner-true snapshot syncs.
+- **mtime ranks sync/copy recency, not token-rotation time.** The mtime tier
+  of `betterCredential` assumes the most recently written copy carries the
+  most recently rotated token. With two custodies both holding unexpired
+  tokens, a later sync of an older rotation can transiently win; the next
+  rotation self-corrects, and losing copies are never destroyed.
+- `claudeProfileAuthHealth().snapshotPresent` keeps its legacy meaning —
+  "a PER-PROFILE snapshot exists" — while `credentialPayloadPresent`/`status`
+  now also see the central store. A central-only profile reports
+  `status: "ok", snapshotPresent: false`.
 
 Out of scope here: `keychain.json` (macOS live-auth cache) and
 `switched-account.json` (live dir state, not account state) stay per-profile.

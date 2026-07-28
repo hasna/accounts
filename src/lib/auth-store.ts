@@ -23,9 +23,11 @@
 // This module is a lower layer than claude-auth.ts (which imports it); it must
 // not import claude-auth.ts.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { accountsHome, loadStore } from "../storage.js";
+import { resolveStore } from "./store.js";
+import { getTool } from "./tools.js";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import {
@@ -60,17 +62,19 @@ export function centralAuthRoot(): string {
 /**
  * The account uuid becomes a path segment, so it is validated strictly: a
  * hostile oauth-account.json must not be able to steer writes outside the
- * store (e.g. `accountUuid: "../../evil"`).
+ * store (e.g. `accountUuid: "../../evil"`). Normalized to lowercase so
+ * case-variant spellings of one account can never split into two entries.
  */
 function assertAccountUuid(accountUuid: string): string {
   if (!UUID_RE.test(accountUuid)) {
     throw new AccountsError(`invalid account uuid for central auth store: ${JSON.stringify(accountUuid)}`);
   }
-  return accountUuid;
+  return accountUuid.toLowerCase();
 }
 
 export function centralAuthDir(accountUuid: string): string {
-  return join(centralAuthRoot(), assertAccountUuid(accountUuid));
+  const segment = assertAccountUuid(accountUuid);
+  return join(centralAuthRoot(), segment);
 }
 
 export function centralOAuthSnapshot(accountUuid: string): string {
@@ -149,13 +153,25 @@ function oauthRecordFromSnapshot(profileDir: string): JsonRecord | undefined {
   return oauth && typeof oauth === "object" ? (oauth as JsonRecord) : undefined;
 }
 
+/**
+ * FAIL CLOSED on switch markers: any EXISTING marker file — including one that
+ * no longer parses — means the dir's live files may belong to another account,
+ * so they are excluded as identity/credential sources. This is credential
+ * data: a corrupt marker must restrict exactly like a valid one, or a
+ * switched-away dir's foreign tokens could be written into the dir-owner's
+ * central entry. (claude-auth's own flows clear stale markers; until they do,
+ * the snapshot remains the only owner-true source here.)
+ */
+function switchMarkerFilePresent(profileDir: string): boolean {
+  return existsSync(profileSwitchedAccountMarker(profileDir));
+}
+
 function oauthRecordFromAccountFiles(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
   // A switched-away dir's live account file carries ANOTHER profile's account;
   // binding from it would attach this profile to a foreign identity. The
   // snapshot (checked first by callers) stays owner-true; without one, a
   // marked dir simply has no resolvable binding.
-  const marker = readJsonFile(profileSwitchedAccountMarker(profileDir));
-  if (marker && typeof marker.profile === "string" && marker.profile) return undefined;
+  if (switchMarkerFilePresent(profileDir)) return undefined;
   const paths = tool ? profileAccountJsonPaths(profileDir, tool) : [join(profileDir, ".claude.json")];
   for (const p of paths) {
     const oauth = readJsonFile(p)?.oauthAccount;
@@ -166,7 +182,7 @@ function oauthRecordFromAccountFiles(profileDir: string, tool?: ToolDef): JsonRe
 
 function uuidFromOAuthRecord(oauth: JsonRecord | undefined): string | undefined {
   const uuid = oauth?.accountUuid;
-  return typeof uuid === "string" && UUID_RE.test(uuid) ? uuid : undefined;
+  return typeof uuid === "string" && UUID_RE.test(uuid) ? uuid.toLowerCase() : undefined;
 }
 
 /**
@@ -232,14 +248,14 @@ function syncOAuthFile(uuid: string, source: JsonRecord): SyncFileAction {
 
 function syncCredentialsFile(uuid: string, profileDir: string): SyncFileAction {
   // Candidates: the per-profile snapshot, plus the dir's live credential file
-  // when no switch marker claims it for another account. The best one competes
-  // against central; central is only ever replaced by a strict winner.
-  const marker = readJsonFile(profileSwitchedAccountMarker(profileDir));
-  const markerActive = Boolean(marker && typeof marker.profile === "string" && marker.profile);
-  const candidatePaths = markerActive
+  // when no switch-marker FILE claims it for another account (fail closed —
+  // see switchMarkerFilePresent). The best one competes against central;
+  // central is only ever replaced by a strict winner.
+  const candidatePaths = switchMarkerFilePresent(profileDir)
     ? [profileCredentialsSnapshot(profileDir)]
     : [profileCredentialsSnapshot(profileDir), join(profileDir, ".credentials.json")];
   const candidates = candidatePaths
+    .filter((path) => existsSync(path) && !lstatSync(path).isSymbolicLink())
     .map((path) => ({ path, health: credentialHealth(path) }))
     .filter((c): c is { path: string; health: CredentialHealthPresent } => c.health.exists);
   if (candidates.length === 0) return "none";
@@ -297,7 +313,7 @@ export interface CentralAccount {
 /** Accounts stored centrally, keyed by uuid (sorted for stable output). */
 export function listCentralAccounts(): CentralAccount[] {
   const root = centralAuthRoot();
-  if (!existsSync(root)) return [];
+  if (!existsSync(root) || !statSync(root).isDirectory()) return [];
   const accounts: CentralAccount[] = [];
   for (const entry of readdirSync(root).sort()) {
     if (!UUID_RE.test(entry)) continue;
@@ -317,17 +333,39 @@ export interface KnownAccount {
   uuid: string;
   email?: string;
   central: boolean;
-  /** Names of registered claude profiles bound to this account. */
+  /** Names of registered claude profiles bound to this account (LOCAL registry only). */
   profiles: string[];
+  /** A credential payload is retrievable on this machine (central or a bound profile). */
+  credentialsPresent: boolean;
+  /** An oauthAccount identity record is retrievable on this machine. */
+  oauthPresent: boolean;
+}
+
+function claudeTool(): ToolDef | undefined {
+  try {
+    return getTool("claude");
+  } catch {
+    return undefined;
+  }
+}
+
+function profileHasCredentialFile(dir: string): boolean {
+  return existsSync(profileCredentialsSnapshot(dir)) || existsSync(join(dir, ".credentials.json"));
 }
 
 /**
  * THE identity-enumeration accessor: every account known to this machine,
- * central store first, then per-profile bindings as fallback, deduped by uuid.
- * Consumers (e.g. usage-aware auto-switching) should reason over this list
- * instead of walking profile dirs themselves.
+ * central store first, then per-profile bindings as fallback, deduped by
+ * (lowercased) uuid. Consumers (e.g. usage-aware auto-switching) should
+ * reason over this list instead of walking profile dirs themselves.
+ *
+ * Scope caveats: CLAUDE accounts only today (the central layout has no tool
+ * dimension yet — other tools have no account uuid concept here), and the
+ * `profiles` bindings come from the machine-LOCAL registry; in api mode
+ * cloud-registered profiles are not reflected.
  */
 export function listKnownAccounts(): KnownAccount[] {
+  const tool = claudeTool();
   const byUuid = new Map<string, KnownAccount>();
   for (const account of listCentralAccounts()) {
     byUuid.set(account.uuid, {
@@ -335,25 +373,33 @@ export function listKnownAccounts(): KnownAccount[] {
       ...(account.email ? { email: account.email } : {}),
       central: true,
       profiles: [],
+      credentialsPresent: account.credentialsPresent,
+      oauthPresent: account.oauthPresent,
     });
   }
 
   const store = loadStore();
   for (const profile of store.profiles) {
     if (profile.tool !== "claude" || !existsSync(profile.dir)) continue;
-    const uuid = profileAccountUuid(profile.dir);
+    const uuid = profileAccountUuid(profile.dir, tool);
     if (!uuid) continue;
+    const oauth = oauthRecordFromSnapshot(profile.dir) ?? oauthRecordFromAccountFiles(profile.dir, tool);
     const known = byUuid.get(uuid);
     if (known) {
       known.profiles.push(profile.name);
-      if (!known.email) {
-        const oauth = oauthRecordFromSnapshot(profile.dir) ?? oauthRecordFromAccountFiles(profile.dir);
-        if (typeof oauth?.emailAddress === "string") known.email = oauth.emailAddress;
-      }
+      if (!known.email && typeof oauth?.emailAddress === "string") known.email = oauth.emailAddress;
+      known.credentialsPresent ||= profileHasCredentialFile(profile.dir);
+      known.oauthPresent ||= oauth !== undefined;
     } else {
-      const oauth = oauthRecordFromSnapshot(profile.dir) ?? oauthRecordFromAccountFiles(profile.dir);
       const email = typeof oauth?.emailAddress === "string" ? oauth.emailAddress : undefined;
-      byUuid.set(uuid, { uuid, ...(email ? { email } : {}), central: false, profiles: [profile.name] });
+      byUuid.set(uuid, {
+        uuid,
+        ...(email ? { email } : {}),
+        central: false,
+        profiles: [profile.name],
+        credentialsPresent: profileHasCredentialFile(profile.dir),
+        oauthPresent: oauth !== undefined,
+      });
     }
   }
   return [...byUuid.values()].sort((a, b) => a.uuid.localeCompare(b.uuid));
@@ -367,10 +413,29 @@ export interface SweptOrphan {
   trashedTo?: string;
 }
 
+export interface UnresolvedProfileBinding {
+  profile: string;
+  dir: string;
+  reason: string;
+}
+
 export interface SweepResult {
   deleted: boolean;
   orphans: SweptOrphan[];
   referenced: string[];
+  /** Registered claude profiles whose binding could not be resolved — these BLOCK `delete`. */
+  unresolved: UnresolvedProfileBinding[];
+}
+
+/** True when the dir carries any auth material a binding could hide behind. */
+function dirHasAuthMaterial(dir: string, tool?: ToolDef): boolean {
+  if (switchMarkerFilePresent(dir)) return true;
+  if (existsSync(profileOAuthSnapshot(dir)) || profileHasCredentialFile(dir)) return true;
+  const paths = tool ? profileAccountJsonPaths(dir, tool) : [join(dir, ".claude.json")];
+  return paths.some((p) => {
+    const oauth = readJsonFile(p)?.oauthAccount;
+    return Boolean(oauth && typeof oauth === "object");
+  });
 }
 
 /**
@@ -378,22 +443,56 @@ export interface SweepResult {
  * profile deliberately NEVER touches the central store (credential survival
  * across dir deletion is the store's whole point), so orphans accumulate only
  * through explicit removals — and are only ever cleaned by this explicit verb.
- * Dry-run by default; `delete` MOVES the entry to a timestamped dir under
- * `<accountsHome>/auth-trash/` rather than destroying credential bytes.
+ *
+ * Safety posture (this is credential data):
+ * - refuses outright in api/cloud storage mode — profile records live in the
+ *   cloud registry there, so the LOCAL registry cannot prove non-reference;
+ * - a registered claude profile whose dir is missing, or whose dir carries
+ *   auth material without a resolvable uuid, is UNRESOLVED — listed in the
+ *   result, and any unresolved binding blocks `delete` (unknown ≠ unreferenced);
+ * - dry-run by default; `delete` MOVES entries to a timestamped dir under
+ *   `<accountsHome>/auth-trash/` rather than destroying credential bytes.
  */
 export function sweepCentralAuth(opts: { delete?: boolean } = {}): SweepResult {
+  if (resolveStore().transport !== "local") {
+    throw new AccountsError(
+      "auth sweep requires local storage mode: in api mode profile records live in the cloud registry, so the local registry cannot prove a central entry is unreferenced",
+    );
+  }
+
+  const tool = claudeTool();
   const store = loadStore();
   const referencedUuids = new Set<string>();
+  const unresolved: UnresolvedProfileBinding[] = [];
   for (const profile of store.profiles) {
-    if (profile.tool !== "claude" || !existsSync(profile.dir)) continue;
-    const uuid = profileAccountUuid(profile.dir);
+    if (profile.tool !== "claude") continue;
+    if (!existsSync(profile.dir)) {
+      unresolved.push({ profile: profile.name, dir: profile.dir, reason: "config dir missing" });
+      continue;
+    }
+    const uuid = profileAccountUuid(profile.dir, tool);
     if (uuid) referencedUuids.add(uuid);
+    else if (dirHasAuthMaterial(profile.dir, tool)) {
+      unresolved.push({
+        profile: profile.name,
+        dir: profile.dir,
+        reason: "auth material present but no resolvable account uuid",
+      });
+    }
   }
 
   const orphans: SweptOrphan[] = [];
   for (const account of listCentralAccounts()) {
     if (referencedUuids.has(account.uuid)) continue;
     orphans.push({ uuid: account.uuid, ...(account.email ? { email: account.email } : {}) });
+  }
+
+  if (opts.delete && unresolved.length > 0) {
+    throw new AccountsError(
+      `refusing to delete central auth entries while ${unresolved.length} profile binding(s) are unresolvable (${unresolved
+        .map((u) => u.profile)
+        .join(", ")}) — unknown is not unreferenced`,
+    );
   }
 
   if (opts.delete && orphans.length > 0) {
@@ -415,5 +514,6 @@ export function sweepCentralAuth(opts: { delete?: boolean } = {}): SweepResult {
     deleted: Boolean(opts.delete),
     orphans,
     referenced: [...referencedUuids].sort(),
+    unresolved,
   };
 }

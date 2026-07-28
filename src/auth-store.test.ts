@@ -227,6 +227,104 @@ test("read prefers the better credential when per-profile and central diverge (o
   expect(restored.claudeAiOauth?.accessToken).toBe("rotated@example.com-access");
 });
 
+// --- mtime tier of betterCredential (the compat-window ordering) -------------
+// These two must fail against an expiry-ordered implementation: mtime recency
+// outranks expiresAt for usable credentials in BOTH directions.
+
+test("sync: a fresher-mtime candidate with SHORTER expiry replaces an older central with longer expiry", () => {
+  const dir = makeProfile("mtimesync", { uuid: UUID_A, email: "long@example.com", expiresInMs: 600_000 });
+  backdate(centralCredentialsSnapshot(UUID_A), 7200);
+  backdate(join(dir, ".credentials.json"), 3600);
+
+  writeFileSync(
+    profileCredentialsSnapshot(dir),
+    credentialJson({ uuid: UUID_A, email: "short@example.com", expiresInMs: 120_000 }),
+  );
+  const result = syncProfileSnapshotToCentral(dir, tool());
+  expect(result.credentials).toBe("updated");
+  expect(centralAccessToken(UUID_A)).toBe("short@example.com-access");
+});
+
+test("restore: a fresher-mtime central with SHORTER expiry beats an older per-profile snapshot with longer expiry", () => {
+  const dir = makeProfile("mtimerestore", { uuid: UUID_A, email: "profile@example.com", expiresInMs: 600_000 });
+  // Age everything the profile holds; then plant a fresher central rotation.
+  backdate(join(dir, ".credentials.json"), 7200);
+  backdate(profileCredentialsSnapshot(dir), 7200);
+  writeFileSync(
+    centralCredentialsSnapshot(UUID_A),
+    credentialJson({ uuid: UUID_A, email: "central@example.com", expiresInMs: 120_000 }),
+  );
+
+  const target = mkdtempSync(join(tmpdir(), "authstore-mtime-target-"));
+  restoreClaudeAuthIntoDir(dir, tool(), target, "mtimerestore");
+  const restored = readJson(join(target, ".credentials.json")) as { claudeAiOauth?: { accessToken?: string } };
+  expect(restored.claudeAiOauth?.accessToken).toBe("central@example.com-access");
+});
+
+// --- switch markers must not contaminate the central store -------------------
+
+function switchAwayDir(dir: string, marker: unknown): void {
+  // The dir's LIVE files now carry a foreign account's fresher identity.
+  writeFileSync(join(dir, ".accounts-auth", "switched-account.json"), JSON.stringify(marker));
+  writeFileSync(
+    join(dir, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: UUID_B, emailAddress: "foreign@example.com" } }),
+  );
+  writeFileSync(
+    join(dir, ".credentials.json"),
+    credentialJson({ uuid: UUID_B, email: "foreign@example.com", expiresInMs: 900_000 }),
+  );
+}
+
+test("a validly-marked switched-away dir never leaks foreign live tokens into central", () => {
+  const dir = makeProfile("marked", { uuid: UUID_A, email: "owner@example.com" });
+  const ownToken = centralAccessToken(UUID_A);
+  switchAwayDir(dir, { profile: "other", email: "foreign@example.com" });
+
+  const result = syncProfileSnapshotToCentral(dir, tool());
+  expect(result.uuid).toBe(UUID_A);
+  expect(centralAccessToken(UUID_A)).toBe(ownToken);
+  expect(existsSync(centralAuthDir(UUID_B))).toBe(false);
+});
+
+test("a CORRUPT marker fails closed: still no foreign contamination of central", () => {
+  const dir = makeProfile("corruptmarked", { uuid: UUID_A, email: "owner2@example.com" });
+  const ownToken = centralAccessToken(UUID_A);
+  switchAwayDir(dir, { profile: 42 });
+
+  const result = syncProfileSnapshotToCentral(dir, tool());
+  expect(result.uuid).toBe(UUID_A);
+  expect(centralAccessToken(UUID_A)).toBe(ownToken);
+  expect(existsSync(centralAuthDir(UUID_B))).toBe(false);
+});
+
+// --- literal {} payloads (exist on two live profiles) ------------------------
+
+test("a literal {} credentials payload never beats a real credential and is upgraded by one", () => {
+  const empty = mkdtempSync(join(tmpdir(), "authstore-empty-"));
+  mkdirSync(join(empty, ".accounts-auth"), { recursive: true });
+  writeFileSync(
+    join(empty, ".accounts-auth", "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: UUID_A, emailAddress: "empty@example.com" } }),
+  );
+  writeFileSync(join(empty, ".accounts-auth", "credentials.json"), "{}");
+  addProfile({ name: "empty", dir: empty });
+
+  // {} arrives first: stored as-is (identity preserved, no fake credential invented).
+  let result = syncProfileSnapshotToCentral(empty, tool());
+  expect(result.credentials).toBe("created");
+  expect(readFileSync(centralCredentialsSnapshot(UUID_A), "utf8")).toBe("{}");
+
+  // A real credential upgrades the {} central copy.
+  makeProfile("real", { uuid: UUID_A, email: "real@example.com" });
+  expect(centralAccessToken(UUID_A)).toBe("real@example.com-access");
+
+  // Re-syncing the {} profile never downgrades central back.
+  result = syncProfileSnapshotToCentral(empty, tool());
+  expect(result.credentials).toBe("kept");
+  expect(centralAccessToken(UUID_A)).toBe("real@example.com-access");
+});
+
 // --- purge policy ------------------------------------------------------------
 
 test("removeProfile --purge deletes the managed dir but never the central entry", async () => {
@@ -258,6 +356,7 @@ test("sweep lists orphaned central entries and only --delete moves them to trash
   const dryRun = sweepCentralAuth();
   expect(dryRun.orphans.map((o) => o.uuid)).toEqual([UUID_B]);
   expect(dryRun.deleted).toBe(false);
+  expect(dryRun.unresolved).toEqual([]);
   expect(existsSync(centralAuthDir(UUID_B))).toBe(true);
 
   const swept = sweepCentralAuth({ delete: true });
@@ -271,6 +370,38 @@ test("sweep lists orphaned central entries and only --delete moves them to trash
   expect(existsSync(join(trashed!, "credentials.json"))).toBe(true);
   // referenced entry untouched
   expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(true);
+});
+
+test("sweep refuses --delete while any registered profile's binding is unresolvable", () => {
+  makeProfile("resolved", { uuid: UUID_A, email: "resolved@example.com" });
+
+  // Registered profile whose dir vanished: its central entry must survive.
+  const gone = mkdtempSync(join(tmpdir(), "authstore-gone-"));
+  writeIdentity(gone, { uuid: UUID_B, email: "gone@example.com" });
+  addProfile({ name: "gone", dir: gone });
+  ensureProfileAuthSnapshot(gone, tool());
+  expect(existsSync(centralCredentialsSnapshot(UUID_B))).toBe(true);
+  rmSync(gone, { recursive: true, force: true });
+
+  const dry = sweepCentralAuth();
+  expect(dry.unresolved.map((u) => u.profile)).toEqual(["gone"]);
+  // Unknown is not unreferenced: delete is blocked entirely.
+  expect(() => sweepCentralAuth({ delete: true })).toThrow(AccountsError);
+  expect(existsSync(centralCredentialsSnapshot(UUID_B))).toBe(true);
+  expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(true);
+});
+
+test("sweep refuses outright in api storage mode", () => {
+  process.env.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
+  process.env.HASNA_ACCOUNTS_API_URL = "https://accounts.example.com";
+  process.env.HASNA_ACCOUNTS_API_KEY = "test-placeholder";
+  try {
+    expect(() => sweepCentralAuth()).toThrow(/local storage mode/);
+  } finally {
+    process.env.HASNA_ACCOUNTS_STORAGE_MODE = "local";
+    delete process.env.HASNA_ACCOUNTS_API_URL;
+    delete process.env.HASNA_ACCOUNTS_API_KEY;
+  }
 });
 
 // --- import ------------------------------------------------------------------
