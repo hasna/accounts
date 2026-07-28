@@ -4,6 +4,7 @@ import { accountsHome } from "../storage.js";
 import { AccountsError } from "../types.js";
 import type { AccountIdentity } from "./identity-index.js";
 import type { AccountUsage, UsageFetchError, UsageWindow } from "./usage.js";
+import { deriveWindowHealth, type AccountWindowHealth } from "./usage-windows.js";
 import { writeFileAtomic } from "./safe-path.js";
 
 /**
@@ -79,63 +80,211 @@ export interface SelectionEntry {
 export interface SwitchCandidate {
   accountUuid: string;
   email?: string;
+  /** Worst of the two windows — kept for reporting continuity. */
   headroom: number;
+  /** Headroom in the rolling 5-hour window (100 when none is reported). */
+  sessionHeadroom: number;
+  /** Headroom in the 7-day window (100 when none is reported). */
+  weeklyHeadroom: number;
+  windows: AccountWindowHealth;
   usage: AccountUsage;
   identity: AccountIdentity;
 }
 
 export type NoCandidateReason = "no-accounts" | "no-usage-data" | "all-limited";
 
+/**
+ * Why an account was not a candidate. The two exhaustion reasons are kept
+ * distinct on purpose: `weekly-exhausted` means unusable for days,
+ * `session-exhausted` means unusable for minutes-to-hours.
+ */
+export type ExclusionReason =
+  | "current-account"
+  | "credential"
+  | "no-usage-data"
+  | "weekly-exhausted"
+  | "session-exhausted"
+  | "window-exhausted"
+  | "cooldown"
+  | "insufficient-headroom";
+
+export interface ExcludedAccount {
+  accountUuid: string;
+  reason: ExclusionReason;
+  /** When the account becomes a candidate again, when that time is known. */
+  eligibleAt?: string;
+  sessionHeadroom?: number;
+  weeklyHeadroom?: number;
+}
+
 export interface SelectionResult {
   candidate?: SwitchCandidate;
   reason?: NoCandidateReason;
   /** Accounts that had headroom data but fell below the bar (for reporting). */
   considered: number;
+  /** Every account that was not selected, with the reason and recovery time. */
+  excluded: ExcludedAccount[];
 }
 
 export interface SelectionOptions {
   /** The uuid the session currently runs as — never a candidate (the no-op case). */
   currentUuid?: string;
-  /** Minimum headroom a target must have to be worth switching to. */
+  /** Minimum WEEKLY headroom a target must have to be worth switching to. */
   minHeadroom?: number;
+  /** Minimum SESSION headroom a target must have to be usable right now. */
+  minSessionHeadroom?: number;
+  /** uuid -> ISO time before which the account must not be re-selected. */
+  cooldowns?: ReadonlyMap<string, string>;
+  now?: Date;
 }
 
 export const DEFAULT_MIN_HEADROOM = 25;
 
 /**
- * Rank distinct ACCOUNTS (not directories) by headroom. Only accounts with a
- * valid credential and measured usage are eligible; the current account never
- * is — selecting it would be the silent-no-op failure this feature exists to
- * kill. Deterministic: headroom desc, then uuid asc.
+ * A target with less than this much of its 5-hour window left will re-breach
+ * almost immediately; the switch that follows is then blocked by the cooldown,
+ * stranding the session on an account that cannot serve it. Switching is only
+ * worth doing to somewhere with real immediate runway.
+ */
+export const DEFAULT_MIN_SESSION_HEADROOM = 10;
+
+/**
+ * The constraint that will bite first. Ranking on this rather than on either
+ * window alone keeps the selector from handing back an account with a great
+ * week and no runway for the next hour — that account re-breaches immediately
+ * and the cooldown then blocks the follow-up switch.
+ */
+function bindingHeadroom(windows: AccountWindowHealth): number {
+  return Math.min(windows.sessionHeadroom, windows.weeklyHeadroom);
+}
+
+/**
+ * Rank distinct ACCOUNTS (not directories) by headroom in BOTH rate-limit
+ * windows. Only accounts with a valid credential and measured usage are
+ * eligible; the current account never is — selecting it would be the
+ * silent-no-op failure this feature exists to kill.
+ *
+ * The two windows are never blended:
+ *
+ *   - a WEEKLY-exhausted account is excluded until its weekly reset, however
+ *     healthy its 5-hour number looks — it is dead for days;
+ *   - a SESSION-exhausted account is excluded only until its 5-hour window
+ *     rolls, after which it returns to candidacy with no new fetch needed;
+ *   - ranking leads with the BINDING window (whichever of the two will bite
+ *     first), then weekly headroom (the scarce resource that does not self-heal
+ *     within a session), then session headroom — which is what makes an
+ *     already-rolled 5-hour window win a tie — then uuid for determinism.
  */
 export function selectHealthiestAccount(
   entries: ReadonlyArray<SelectionEntry>,
   opts: SelectionOptions = {},
 ): SelectionResult {
+  const now = opts.now ?? new Date();
   const minHeadroom = opts.minHeadroom ?? DEFAULT_MIN_HEADROOM;
-  const eligible = entries.filter(
-    (e) => e.identity.status === "ok" && e.identity.accountUuid !== opts.currentUuid,
-  );
-  if (eligible.length === 0) return { reason: "no-accounts", considered: 0 };
+  const minSessionHeadroom = opts.minSessionHeadroom ?? DEFAULT_MIN_SESSION_HEADROOM;
 
-  const measured = eligible.filter((e): e is Required<SelectionEntry> => !!e.usage);
-  if (measured.length === 0) return { reason: "no-usage-data", considered: 0 };
+  const excluded: ExcludedAccount[] = [];
+  const eligible: Array<{ entry: Required<SelectionEntry>; windows: AccountWindowHealth }> = [];
+  let considered = 0;
+  let measurable = 0;
 
-  const ranked = [...measured].sort(
+  for (const entry of entries) {
+    const uuid = entry.identity.accountUuid;
+    if (uuid === opts.currentUuid) {
+      excluded.push({ accountUuid: uuid, reason: "current-account" });
+      continue;
+    }
+    if (entry.identity.status !== "ok") {
+      excluded.push({ accountUuid: uuid, reason: "credential" });
+      continue;
+    }
+    if (!entry.usage) {
+      measurable += 1;
+      excluded.push({ accountUuid: uuid, reason: "no-usage-data" });
+      continue;
+    }
+
+    considered += 1;
+    const windows = deriveWindowHealth(entry.usage, { now });
+    const base = {
+      accountUuid: uuid,
+      sessionHeadroom: windows.sessionHeadroom,
+      weeklyHeadroom: windows.weeklyHeadroom,
+    };
+
+    // Weekly first: it is the more severe verdict, and an account that is both
+    // weekly- and session-exhausted must be reported as the one that keeps it
+    // out for days, not the one that keeps it out for minutes.
+    if (windows.weekly?.exhausted) {
+      excluded.push({
+        ...base,
+        reason: "weekly-exhausted",
+        ...(windows.weekly.resetsAt ? { eligibleAt: windows.weekly.resetsAt } : {}),
+      });
+      continue;
+    }
+    const exhaustedUnknown = windows.unknown.find((w) => w.exhausted);
+    if (exhaustedUnknown) {
+      excluded.push({
+        ...base,
+        reason: "window-exhausted",
+        ...(exhaustedUnknown.resetsAt ? { eligibleAt: exhaustedUnknown.resetsAt } : {}),
+      });
+      continue;
+    }
+    if (windows.session?.exhausted) {
+      excluded.push({
+        ...base,
+        reason: "session-exhausted",
+        ...(windows.session.resetsAt ? { eligibleAt: windows.session.resetsAt } : {}),
+      });
+      continue;
+    }
+
+    const cooldownUntil = opts.cooldowns?.get(uuid);
+    if (cooldownUntil) {
+      const until = Date.parse(cooldownUntil);
+      if (Number.isFinite(until) && until > now.getTime()) {
+        excluded.push({ ...base, reason: "cooldown", eligibleAt: cooldownUntil });
+        continue;
+      }
+    }
+
+    if (windows.weeklyHeadroom < minHeadroom || windows.sessionHeadroom < minSessionHeadroom) {
+      excluded.push({ ...base, reason: "insufficient-headroom" });
+      continue;
+    }
+
+    eligible.push({ entry: entry as Required<SelectionEntry>, windows });
+  }
+
+  if (eligible.length === 0) {
+    if (considered > 0) return { reason: "all-limited", considered, excluded };
+    if (measurable > 0) return { reason: "no-usage-data", considered, excluded };
+    return { reason: "no-accounts", considered, excluded };
+  }
+
+  const ranked = [...eligible].sort(
     (a, b) =>
-      b.usage.headroom - a.usage.headroom || a.identity.accountUuid.localeCompare(b.identity.accountUuid),
+      bindingHeadroom(b.windows) - bindingHeadroom(a.windows) ||
+      b.windows.weeklyHeadroom - a.windows.weeklyHeadroom ||
+      b.windows.sessionHeadroom - a.windows.sessionHeadroom ||
+      a.entry.identity.accountUuid.localeCompare(b.entry.identity.accountUuid),
   );
   const best = ranked[0]!;
-  if (best.usage.headroom < minHeadroom) return { reason: "all-limited", considered: measured.length };
   return {
     candidate: {
-      accountUuid: best.identity.accountUuid,
-      ...(best.identity.email ? { email: best.identity.email } : {}),
-      headroom: best.usage.headroom,
-      usage: best.usage,
-      identity: best.identity,
+      accountUuid: best.entry.identity.accountUuid,
+      ...(best.entry.identity.email ? { email: best.entry.identity.email } : {}),
+      headroom: Math.min(best.windows.sessionHeadroom, best.windows.weeklyHeadroom),
+      sessionHeadroom: best.windows.sessionHeadroom,
+      weeklyHeadroom: best.windows.weeklyHeadroom,
+      windows: best.windows,
+      usage: best.entry.usage,
+      identity: best.entry.identity,
     },
-    considered: measured.length,
+    considered,
+    excluded,
   };
 }
 
@@ -147,12 +296,42 @@ export interface ThresholdResult {
 
 export const DEFAULT_SWITCH_THRESHOLD = 90;
 
-/** Breached when any UNSCOPED window is at/over the threshold percent used. */
-export function thresholdBreached(usage: AccountUsage, thresholdPercent: number): ThresholdResult {
-  const over = usage.windows
-    .filter((w) => !w.scoped && w.utilization >= thresholdPercent)
+/**
+ * Breached when any gating (unscoped, unrolled) window is at/over the threshold
+ * percent used.
+ *
+ * A window whose reset boundary has already passed is NOT a breach however high
+ * its cached number reads: the window has rolled and the account is healthy
+ * again. Acting on that stale number would switch the session away from a
+ * perfectly good account — a spurious switch, which is how a switch storm
+ * starts.
+ */
+export function thresholdBreached(
+  usage: AccountUsage,
+  thresholdPercent: number,
+  now: Date = new Date(),
+): ThresholdResult {
+  const health = deriveWindowHealth(usage, { now });
+  const gating = [
+    ...(health.session ? [health.session] : []),
+    ...(health.weekly ? [health.weekly] : []),
+    ...health.unknown,
+  ];
+  const over = gating
+    .filter((w) => !w.rolled && w.utilization >= thresholdPercent)
     .sort((a, b) => b.utilization - a.utilization);
-  return over.length > 0 ? { breached: true, window: over[0]! } : { breached: false };
+  const worst = over[0];
+  if (!worst) return { breached: false };
+  const original = usage.windows.find((w) => w.id === worst.id);
+  return {
+    breached: true,
+    window: original ?? {
+      id: worst.id,
+      utilization: worst.utilization,
+      scoped: false,
+      ...(worst.resetsAt ? { resetsAt: worst.resetsAt } : {}),
+    },
+  };
 }
 
 export interface AutoSwitchState {

@@ -6,6 +6,8 @@ import {
   type AutoSwitchState,
   type UsageCacheEntry,
 } from "./auto-switch.js";
+import { deriveWindowHealth } from "./usage-windows.js";
+import type { RecordExhaustionInput } from "./exhaustion-ledger.js";
 
 /**
  * UserPromptSubmit hook brain. Proactive by design: a limit arrives as a
@@ -27,8 +29,10 @@ export interface UsageHookOptions {
   configDir: string;
   /** Switch when any unscoped window is at/over this percent used. */
   thresholdPercent: number;
-  /** A target account must have at least this much headroom. */
+  /** A target account must have at least this much WEEKLY headroom. */
   minHeadroom: number;
+  /** A target account must have at least this much 5-hour headroom. */
+  minSessionHeadroom?: number;
   /** No second auto-switch (or retry of a failed one) within this window. */
   cooldownMs: number;
   /** Cached usage older than this is treated as absent. */
@@ -45,6 +49,14 @@ export interface UsageHookDeps {
   performSwitch(profileName: string, configDir: string): Promise<{ liveSessions: number }>;
   readState(): AutoSwitchState | undefined;
   writeState(state: AutoSwitchState): void;
+  /**
+   * Restart-durable per-account cooldowns. Optional so a caller can opt out;
+   * without them the selector still works, it just forgets exhaustion across
+   * restarts.
+   */
+  activeCooldowns?(now: Date): Map<string, string>;
+  recordExhaustion?(input: RecordExhaustionInput): void;
+  clearExhaustion?(accountUuid: string): void;
   now?: () => Date;
 }
 
@@ -101,11 +113,34 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     return { action: "refresh-triggered", reason: cached ? "cached entry has no usage" : "no fresh cache" };
   }
 
-  const breach = thresholdBreached(cached.usage, opts.thresholdPercent);
+  const clock = now();
+
+  // Durable record of THIS account's exhaustion, written before any switch
+  // decision. The usage cache expires and a refresh can fail; without a
+  // persisted note, a restarted hook re-reads an empty cache and walks straight
+  // back onto the account it just fled. Weekly is checked first so the recorded
+  // cooldown reflects the days-long verdict rather than the hours-long one.
+  const currentWindows = deriveWindowHealth(cached.usage, { now: clock });
+  const exhausted =
+    (currentWindows.weekly?.exhausted ? currentWindows.weekly : undefined) ??
+    currentWindows.unknown.find((w) => w.exhausted) ??
+    (currentWindows.session?.exhausted ? currentWindows.session : undefined);
+  if (exhausted) {
+    deps.recordExhaustion?.({
+      accountUuid: currentUuid,
+      windowClass: exhausted.windowClass,
+      ...(exhausted.resetsAt ? { resetsAt: exhausted.resetsAt } : {}),
+      now: clock,
+    });
+  } else {
+    deps.clearExhaustion?.(currentUuid);
+  }
+
+  const breach = thresholdBreached(cached.usage, opts.thresholdPercent, clock);
   if (!breach.breached) return { action: "none", reason: "headroom ok" };
 
   const state = deps.readState();
-  if (cooldownActive(state, opts.cooldownMs, now())) {
+  if (cooldownActive(state, opts.cooldownMs, clock)) {
     return { action: "none", reason: "cooldown" };
   }
 
@@ -117,6 +152,9 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
   const selection = selectHealthiestAccount(entries, {
     currentUuid,
     minHeadroom: opts.minHeadroom,
+    ...(opts.minSessionHeadroom !== undefined ? { minSessionHeadroom: opts.minSessionHeadroom } : {}),
+    now: clock,
+    ...(deps.activeCooldowns ? { cooldowns: deps.activeCooldowns(clock) } : {}),
   });
 
   const breachedWindow = breach.window!;
@@ -196,9 +234,12 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     liveSessions > 1
       ? ` ${liveSessions} live sessions share this config dir and ALL of them switched together.`
       : "";
+  // Report BOTH windows: "80% headroom" hides whether the new account has a
+  // healthy week or is one 5-hour roll away from the same wall.
   const message =
     `accounts: auto-switched this session from ${currentEmail} (${breachText}) ` +
-    `to ${targetEmail} (${pct(candidate.headroom)} headroom).${sessionsNote}`;
+    `to ${targetEmail} (${pct(candidate.sessionHeadroom)} session / ` +
+    `${pct(candidate.weeklyHeadroom)} weekly headroom).${sessionsNote}`;
   return {
     action: "switched",
     systemMessage: message,

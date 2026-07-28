@@ -27,8 +27,91 @@ kinds like `session`, `weekly_all`, `weekly_scoped`. There are at least **two
 independent caps** (session ≈ 5-hourly, weekly), and either can be the one that
 bites; `limits[]` is preferred because it labels them explicitly. Model-scoped
 windows never set overall headroom — a saturated Opus cap does not gate other
-models. Headroom = 100 − the worst *unscoped* window. Override the endpoint
+models. `usage.headroom` = 100 − the worst *unscoped* window, kept for
+reporting; **selection never ranks on it** (see below). Override the endpoint
 with `ACCOUNTS_CLAUDE_USAGE_URL` (tests, staging).
+
+## Two windows, two failure modes
+
+The two caps are independent and they fail differently. Collapsing them into a
+single "usage %" produces one of two wrong behaviours, and which one you get is
+luck:
+
+| | 5-hour session window | 7-day weekly window |
+| --- | --- | --- |
+| Exhausted means | unusable for **minutes to hours** | unusable for **days** |
+| Right response | switch away, take it back after the roll | switch away, do not return until reset |
+| Collapse failure | account abandoned though it would recover in minutes | session returns to an account that is dead until next week |
+
+So the model is two-axis throughout (`src/lib/usage-windows.ts`):
+
+- **Classification is data, not inference.** Every `limits[]` entry measured on
+  2026-07-28 across 8 live accounts carried a `group` discriminator —
+  `kind=session group=session`, `kind=weekly_all group=weekly`,
+  `kind=weekly_scoped group=weekly scoped`. `group` is read first, then `kind`.
+- **The reset-horizon fallback is asymmetric, deliberately.** A horizon longer
+  than the session window's 5-hour maximum life cannot be a session window, so
+  `> 5h ⇒ weekly`. The converse does **not** hold: a live `weekly_all` window
+  was measured **0.86h** from its reset, indistinguishable by horizon from a
+  session window. A short horizon therefore yields `unknown`, never `session` —
+  guessing "session" would let a weekly-dead account back into the pool hours
+  early. Horizon-derived classes are flagged `inferred: true`.
+- **A rolled window is re-read as recovered.** When a window's `resets_at` has
+  passed since the reading was taken, the cached utilization no longer describes
+  it and effective headroom becomes 100. This is INFERRED (`headroomInferred`) —
+  a window returns to zero consumption at its reset boundary by definition, and
+  the next refresh corrects it. It is what makes an account come *back*: without
+  it a stale 100%-weekly reading excludes an account forever. A `resets_at` that
+  was already past when the reading was taken is a malformed payload, not a
+  roll, and is not credited.
+- **Unclassifiable unscoped windows gate on the slow (weekly) axis.** The
+  optimistic error — assuming an unknown cap is short-lived — is the one that
+  strands a session on a dead account.
+
+### Selection
+
+`selectHealthiestAccount` excludes, then ranks. Exclusions carry a reason and,
+where known, an `eligibleAt`:
+
+| Reason | Recovers |
+| --- | --- |
+| `weekly-exhausted` | at the weekly reset — days |
+| `session-exhausted` | at the 5-hour roll — minutes to hours |
+| `window-exhausted` | unclassified cap, bounded backoff |
+| `cooldown` | at the ledger's `releaseAt` |
+| `insufficient-headroom` | when a refresh says otherwise |
+| `current-account`, `credential`, `no-usage-data` | n/a |
+
+Survivors rank by the **binding window** first — `min(session, weekly)`,
+whichever will bite soonest — then **weekly headroom** (the scarce resource that
+does not self-heal within a session), then **session headroom** (which is what
+makes an already-rolled 5-hour window win a tie), then uuid for determinism.
+Leading with the binding window is what stops the selector handing back an
+account with a great week and no runway for the next hour.
+
+A target must also clear both floors: `--min-headroom` on the weekly axis and
+`--min-session-headroom` on the session axis. The session floor exists because a
+target with almost no 5-hour runway re-breaches immediately, and the cooldown
+then blocks the follow-up switch — stranding the session on an account that
+cannot serve it.
+
+The trigger side is roll-aware too: a window whose reset has already passed is
+never a breach however high its cached number reads, so the hook cannot switch
+the session away from an account that has quietly recovered.
+
+### Cooldown ledger
+
+`cache/exhaustion-ledger.json` is the memory that survives process restarts. The
+usage cache expires and a refresh can fail; neither is a durable record of "this
+account told us it was out", and without one a restarted hook re-reads an empty
+cache and walks straight back onto the account it just fled.
+
+Each record carries the window class that died, its reset, a consecutive counter
+and a computed `releaseAt` = **later of** the reported reset and an exponential
+backoff (15 min base, doubling). Both caps are bounded — 5h for session/unknown,
+24h for weekly — so a misclassified window or a malformed payload can never
+retire an account permanently. It is a cooldown, not a blocklist: records go
+inert on their own and need no cleanup.
 
 ## Accounts, not directories
 
@@ -137,10 +220,17 @@ accounts usage --refresh --quiet
 | Knob | Flag | Env | Default |
 | --- | --- | --- | --- |
 | Switch trigger (percent used) | `--threshold` | `ACCOUNTS_USAGE_SWITCH_THRESHOLD` | 90 |
-| Minimum target headroom | `--min-headroom` | `ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM` | 25 |
+| Minimum target **weekly** headroom | `--min-headroom` | `ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM` | 25 |
+| Minimum target **session** headroom | `--min-session-headroom` | `ACCOUNTS_USAGE_SWITCH_MIN_SESSION_HEADROOM` | 10 |
 | Cooldown (seconds) | `--cooldown` | `ACCOUNTS_USAGE_SWITCH_COOLDOWN_S` | 600 |
 | Cache tolerance (seconds) | `--max-age` | `ACCOUNTS_USAGE_CACHE_MAX_AGE_S` | 300 |
 
 State lives under `~/.hasna/accounts/`: `cache/usage/<uuid>.json` (per-account
-usage), `cache/auto-switch-state.json` (cooldown), `logs/usage-hook.log`
-(size-capped decision log; never contains tokens).
+usage), `cache/auto-switch-state.json` (global anti-flap cooldown),
+`cache/exhaustion-ledger.json` (per-account cooldowns, restart-durable),
+`logs/usage-hook.log` (size-capped decision log; never contains tokens).
+
+The two cooldowns are different guards and both are needed: the global one
+bounds *switch rate* (one switch per window, no ping-pong), the per-account
+ledger bounds *where* a switch may land (never back onto an account that just
+reported exhaustion, even after a restart).

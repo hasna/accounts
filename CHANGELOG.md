@@ -45,6 +45,37 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
     `~/.hasna/accounts/auth/<accountUuid>/` first with per-profile
     `.accounts-auth/` fallback, ready for the auth-store migration.
 
+- Two-window (5-hour session vs 7-day weekly) rate-limit selection. Anthropic
+  enforces two independent limits that fail differently, and the selector
+  previously ranked accounts on a single blended headroom
+  (100 − worst unscoped window) — which scores an account whose 5-hour window
+  is spent but recovers in minutes identically to one that is dead until next
+  week. Both windows are now carried separately end to end:
+  - `src/lib/usage-windows.ts` classifies each window from the payload's
+    `group` discriminator (measured live 2026-07-28 across 8 accounts:
+    `kind=session group=session`, `kind=weekly_all group=weekly`,
+    `kind=weekly_scoped group=weekly scoped`), falling back to `kind` and then
+    to a deliberately ASYMMETRIC reset-horizon rule — a horizon over the
+    session window's 5-hour maximum implies weekly, but a short horizon does
+    NOT imply session (a live `weekly_all` window was measured 0.86h from its
+    reset). Horizon-derived classes are flagged `inferred`.
+  - `selectHealthiestAccount` excludes weekly-exhausted accounts until their
+    weekly reset and session-exhausted accounts only until their 5-hour roll,
+    reporting a per-account reason and `eligibleAt`; survivors rank by weekly
+    headroom, then session headroom, then uuid. A window whose `resets_at` has
+    passed since the reading is re-read as recovered (INFERRED), which is what
+    lets an account return without a fresh fetch; a `resets_at` already past at
+    read time is treated as a malformed payload, not a roll. New
+    `--min-session-headroom` / `ACCOUNTS_USAGE_SWITCH_MIN_SESSION_HEADROOM`
+    floor (default 10) keeps switches off targets with no immediate runway.
+  - `cache/exhaustion-ledger.json` — restart-durable per-account cooldowns
+    with exponential backoff (15 min base, doubling), released at the later of
+    the reported reset and the backoff step, capped at 5h (session/unknown) and
+    24h (weekly) so a misclassified window can never retire an account
+    permanently. Corrupt or path-hostile entries degrade to "no cooldown".
+  - The switch announcement now reports both windows rather than one blended
+    percentage.
+
 - `accounts switch-account [name]` — switch the CURRENT Claude Code session's
   account in place, with no restart and the conversation intact. Measured on
   Claude Code 2.1.220: a running session re-reads `<configDir>/.credentials.json`

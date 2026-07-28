@@ -54,11 +54,18 @@ import { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
 import {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_MIN_HEADROOM,
+  DEFAULT_MIN_SESSION_HEADROOM,
   DEFAULT_SWITCH_THRESHOLD,
   readAutoSwitchState,
   readUsageCache,
   writeAutoSwitchState,
 } from "./lib/auto-switch.js";
+import {
+  activeCooldowns,
+  clearExhaustion,
+  readExhaustionLedger,
+  recordExhaustion,
+} from "./lib/exhaustion-ledger.js";
 import {
   collectAccountsUsage,
   DEFAULT_USAGE_CACHE_MAX_AGE_MS,
@@ -992,7 +999,8 @@ program
   .option("-t, --tool <tool>", "tool id", DEFAULT_TOOL)
   .option("--dir <path>", "session config dir (default: $CLAUDE_CONFIG_DIR, else the live default)")
   .option("--threshold <percent>", "switch when any unscoped usage window is at/over this percent used")
-  .option("--min-headroom <percent>", "a switch target must have at least this much headroom")
+  .option("--min-headroom <percent>", "a switch target must have at least this much WEEKLY headroom")
+  .option("--min-session-headroom <percent>", "a switch target must have at least this much 5-hour headroom")
   .option("--cooldown <seconds>", "minimum time between auto-switch attempts")
   .option("--max-age <seconds>", "usage cache tolerance for decisions")
   .option("--print-install", "print the settings.json snippet that enables the hook, then exit")
@@ -1002,6 +1010,7 @@ program
       dir?: string;
       threshold?: string;
       minHeadroom?: string;
+      minSessionHeadroom?: string;
       cooldown?: string;
       maxAge?: string;
       printInstall?: boolean;
@@ -1021,6 +1030,11 @@ program
             configDir,
             thresholdPercent: hookNumber(opts.threshold, "ACCOUNTS_USAGE_SWITCH_THRESHOLD", DEFAULT_SWITCH_THRESHOLD),
             minHeadroom: hookNumber(opts.minHeadroom, "ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM", DEFAULT_MIN_HEADROOM),
+            minSessionHeadroom: hookNumber(
+              opts.minSessionHeadroom,
+              "ACCOUNTS_USAGE_SWITCH_MIN_SESSION_HEADROOM",
+              DEFAULT_MIN_SESSION_HEADROOM,
+            ),
             cooldownMs: hookNumber(opts.cooldown, "ACCOUNTS_USAGE_SWITCH_COOLDOWN_S", DEFAULT_COOLDOWN_MS / 1000) * 1000,
             cacheMaxAgeMs:
               hookNumber(opts.maxAge, "ACCOUNTS_USAGE_CACHE_MAX_AGE_S", DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000) * 1000,
@@ -1049,6 +1063,11 @@ program
             },
             readState: () => readAutoSwitchState(),
             writeState: (state) => writeAutoSwitchState(state),
+            activeCooldowns: (at) => activeCooldowns(readExhaustionLedger(), at),
+            recordExhaustion: (input) => {
+              recordExhaustion(input);
+            },
+            clearExhaustion: (accountUuid) => clearExhaustion(accountUuid),
           },
         );
         usageHookLog(`${outcome.action}${outcome.reason ? ` reason=${JSON.stringify(outcome.reason)}` : ""}`);
