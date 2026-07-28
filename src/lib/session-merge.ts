@@ -752,7 +752,9 @@ function linkIsGood(profileDir: string, sharedHome: string, entry: string): bool
     return false;
   }
   // A link that resolves to an empty corpus is the failure this check exists for.
-  if (stat.isDirectory()) return countTranscripts(realTarget) > 0 || readdirSync(realTarget).length > 0;
+  // Cheap check first: a full recursive census of the shared corpus runs once
+  // per profile, and the top-level listing already answers "is it empty".
+  if (stat.isDirectory()) return readdirSync(realTarget).length > 0 || countTranscripts(realTarget) > 0;
   return stat.size > 0;
 }
 
@@ -824,8 +826,11 @@ function linkSource(
     return { state: "rolled-back", errors };
   }
 
-  if (moved.length === 0) return { state: "already-linked", errors };
-  return { state: "linked", retainedAt, errors };
+  const newlyLinked = entries.filter(
+    (entry) => result.linked.includes(entry) || result.repaired.includes(entry),
+  );
+  if (moved.length === 0 && newlyLinked.length === 0) return { state: "already-linked", errors };
+  return { state: "linked", ...(moved.length > 0 ? { retainedAt } : {}), errors };
 }
 
 // --- entry point ------------------------------------------------------------
@@ -883,7 +888,8 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
     errors: [],
   };
 
-  const historySources: string[][] = [readHistoryLines(sharedHistoryPath)];
+  const sharedHistoryBefore = readHistoryLines(sharedHistoryPath);
+  const historySources: string[][] = [sharedHistoryBefore];
   for (const source of sources) {
     const merged = mergeOneSource(source, tool, sharedHome, { dryRun, cutoff });
     report.sources.push(merged.report);
@@ -894,7 +900,11 @@ export function mergeClaudeSessions(options: SessionMergeOptions = {}): SessionM
   report.history.recordsAfter = union.lines.length;
   report.history.unparsedPreserved = union.unparsed;
   report.history.ascending = isAscending(union.lines);
-  if (!dryRun && union.lines.length > report.history.recordsBefore) {
+  // Ordering matters as much as membership: the tool navigates history by its
+  // ascending timestamps, so a same-length but out-of-order file still has to be
+  // rewritten. Comparing the whole document keeps the re-run a no-op.
+  const historyChanged = union.lines.join("\n") !== sharedHistoryBefore.join("\n");
+  if (!dryRun && historyChanged) {
     try {
       writeFileAtomic(sharedHistoryPath, union.lines.join("\n") + "\n", {
         mode: 0o600,

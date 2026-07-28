@@ -657,3 +657,29 @@ test("the corpus floor notices transcripts deleted deep inside the session tree"
   const damaged = sharedCapabilityHealth(dir, getTool("claude"));
   expect(damaged.problems.join("\n")).toContain("projects corpus has shrunk");
 });
+
+test("repairs history that is out of ascending timestamp order", () => {
+  // The tool navigates history by its ascending timestamps, so ordering is part
+  // of the file being correct — not only which records it holds.
+  const dir = registerProfile("alpha");
+  writeHistory(sharedHome, [historyLine(uuid(48), 3000, "late"), historyLine(uuid(49), 1000, "early")]);
+  writeHistory(dir, [historyLine(uuid(48), 3000, "late")]);
+
+  const report = mergeClaudeSessions({ link: false });
+
+  expect(report.history.recordsAfter).toBe(2);
+  expect(report.history.ascending).toBe(true);
+  expect(readHistory(sharedHome)).toEqual([historyLine(uuid(49), 1000, "early"), historyLine(uuid(48), 3000, "late")]);
+});
+
+test("history is not rewritten when the union already matches the file", () => {
+  const dir = registerProfile("alpha");
+  const lines = [historyLine(uuid(50), 1000, "a"), historyLine(uuid(51), 2000, "b")];
+  writeHistory(sharedHome, lines);
+  writeHistory(dir, [lines[0]!]);
+  const before = treeDigest(sharedHome);
+
+  mergeClaudeSessions({ link: false });
+
+  expect(treeDigest(sharedHome)).toEqual(before);
+});
