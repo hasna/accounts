@@ -45,10 +45,61 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
     `~/.hasna/accounts/auth/<accountUuid>/` first with per-profile
     `.accounts-auth/` fallback, ready for the auth-store migration.
 
+- Two-window (5-hour session vs 7-day weekly) rate-limit selection. Anthropic
+  enforces two independent limits that fail differently, and the selector
+  previously ranked accounts on a single blended headroom
+  (100 − worst unscoped window) — which scores an account whose 5-hour window
+  is spent but recovers in minutes identically to one that is dead until next
+  week. Both windows are now carried separately end to end:
+  - `src/lib/usage-windows.ts` classifies each window from the payload's
+    `group` discriminator (measured live 2026-07-28 across 8 accounts:
+    `kind=session group=session`, `kind=weekly_all group=weekly`,
+    `kind=weekly_scoped group=weekly scoped`), falling back to `kind` and then
+    to a deliberately ASYMMETRIC reset-horizon rule — a horizon over the
+    session window's 5-hour maximum implies weekly, but a short horizon does
+    NOT imply session (a live `weekly_all` window was measured 0.86h from its
+    reset). Horizon-derived classes are flagged `inferred`.
+  - `selectHealthiestAccount` excludes weekly-exhausted accounts until their
+    weekly reset and session-exhausted accounts only until their 5-hour roll,
+    reporting a per-account reason and `eligibleAt`; survivors rank by weekly
+    headroom, then session headroom, then uuid. A window whose `resets_at` has
+    passed since the reading is re-read as recovered (INFERRED), which is what
+    lets an account return without a fresh fetch; a `resets_at` already past at
+    read time is treated as a malformed payload, not a roll. New
+    `--min-session-headroom` / `ACCOUNTS_USAGE_SWITCH_MIN_SESSION_HEADROOM`
+    floor (default 10) keeps switches off targets with no immediate runway.
+  - `state/exhaustion-ledger.json` — restart-durable per-account cooldowns
+    with exponential backoff (15 min base, doubling), released at the later of
+    the reported reset and the backoff step, capped at 5h (session/unknown) and
+    24h (weekly) so a misclassified window can never retire an account
+    permanently. Corrupt or path-hostile entries degrade to "no cooldown".
+  - The switch announcement and `accounts usage` now report both windows rather
+    than one blended percentage. `accounts usage` labels each window with its
+    class and marks a window whose reset has passed as reset rather than
+    printing a stale "100% used" the selector disagrees with.
+  - `accounts pick --healthiest` reads the same exhaustion ledger the hook
+    writes, so the CLI and the hook no longer disagree about the pool.
+  - Exhaustion is decided by utilization alone; `severity` is not consulted.
+    Measured in the Claude Code 2.1.220 bundle (binary-safe): `severity:"normal"`
+    0, `severity:"critical"` 0, `severity:"exhausted"` 0, against positive
+    controls on the same file of `severity:"error"` 27, `"warning"` 22,
+    `"fatal"` 6 and bare `severity` 295. The reference client reads `kind`,
+    `scope`, `percent`, `resets_at` and `extra_usage.*` off a limit entry and
+    never reads `severity` from the usage payload.
+  - The ledger lives under `state/`, not `cache/` — a store whose purpose is
+    surviving restarts must not sit in a directory whose name licenses
+    deletion. (Motivated by a live observation that
+    `cache/auto-switch-state.json` is absent despite two switches 60s apart
+    under a 10-minute cooldown; the cause of that loss is NOT established and
+    is tracked separately.) No migration: nothing was ever released writing
+    the old path.
+
 - `accounts switch-account [name]` — switch the CURRENT Claude Code session's
   account in place, with no restart and the conversation intact. Measured on
-  Claude Code 2.1.220: a running session re-reads `<configDir>/.credentials.json`
-  from disk on every API request, so installing another profile's credentials +
+  Claude Code 2.1.220: a running session `stat()`s `<configDir>/.credentials.json`
+  on every API request and re-reads it when the mtime changes (the stat sits
+  above the token-still-valid early return, inside the per-request client
+  factory) — so installing another profile's credentials +
   `oauthAccount` into the session's config dir flips its identity on the next
   message. The verb snapshots the dir's outgoing credentials back to their owning
   profile first, records a `switched-account` marker so snapshot machinery never

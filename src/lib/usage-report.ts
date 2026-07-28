@@ -14,6 +14,7 @@ import {
   type SelectionResult,
 } from "./auto-switch.js";
 import { fetchAccountUsage, type AccountUsage, type UsageFetchError } from "./usage.js";
+import { activeCooldowns, readExhaustionLedger } from "./exhaustion-ledger.js";
 
 /**
  * `accounts usage` collector: one usage query per distinct ACCOUNT (uuid),
@@ -129,6 +130,7 @@ export async function pickHealthiestAccount(
   const profiles = (await store.listProfiles(toolId)).map((p) => ({ name: p.name, dir: p.dir }));
   const identities = buildIdentityIndex(profiles, tool);
   const byUuid = new Map(identities.map((i) => [i.accountUuid, i]));
+  const now = opts.now ?? new Date();
 
   const selection = selectHealthiestAccount(
     entries
@@ -140,6 +142,14 @@ export async function pickHealthiestAccount(
     {
       ...(opts.currentUuid ? { currentUuid: opts.currentUuid } : {}),
       ...(opts.minHeadroom !== undefined ? { minHeadroom: opts.minHeadroom } : {}),
+      ...(opts.minSessionHeadroom !== undefined
+        ? { minSessionHeadroom: opts.minSessionHeadroom }
+        : {}),
+      now,
+      // Default to the same durable ledger the hook writes. Without this,
+      // `accounts pick --healthiest` happily recommends the account the hook
+      // just fled, and the CLI and the hook disagree about the same pool.
+      cooldowns: opts.cooldowns ?? activeCooldowns(readExhaustionLedger(), now),
     },
   );
 
