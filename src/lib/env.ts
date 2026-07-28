@@ -1,6 +1,7 @@
 import type { Profile, ToolDef } from "../types.js";
 import { CLAUDE_API_AUTH_ENV_KEYS, sanitizeClaudeProfileApiSettings } from "./claude-auth.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
+import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
 function renderTemplate(value: string, profile: Profile): string {
   return value.replaceAll("{profileDir}", profile.dir).replaceAll("{profileName}", profile.name).replaceAll("{toolId}", profile.tool);
@@ -13,6 +14,9 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
   for (const [name, value] of Object.entries(tool.extraEnv ?? {})) {
     env[name] = renderTemplate(value, profile);
   }
+  // Every launch surface goes through here, so profiles created before shared
+  // capabilities existed are repaired the next time they are used.
+  ensureSharedCapabilities(profile.dir, tool);
   if (tool.id === "claude") {
     sanitizeClaudeProfileApiSettings(profile.dir, tool);
     for (const key of CLAUDE_API_AUTH_ENV_KEYS) env[key] = "";

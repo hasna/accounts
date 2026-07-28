@@ -15,6 +15,21 @@ export {
   permissionArgsFor,
 } from "./lib/tools.js";
 export { profileEnv, formatEnvAssignments, formatExportLines } from "./lib/env.js";
+export {
+  ensureSharedCapabilities,
+  resetCapabilityBaseline,
+  sharedCapabilityHealth,
+  sharedHomeFor,
+  toolSharesCapabilities,
+} from "./lib/shared-capabilities.js";
+export type {
+  SharedCapabilitiesResult,
+  SharedCapabilityConfigHealth,
+  SharedCapabilityEntryHealth,
+  SharedCapabilityFloor,
+  SharedCapabilityHealth,
+  SharedEntryStatus,
+} from "./lib/shared-capabilities.js";
 export { detectEmail } from "./lib/detect.js";
 export {
   expandPath,

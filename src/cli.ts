@@ -12,9 +12,11 @@ import {
   DEFAULT_TOOL,
   getTool,
   isBuiltinTool,
+  listTools,
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./lib/tools.js";
+import { resetCapabilityBaseline, sharedCapabilityHealth } from "./lib/shared-capabilities.js";
 import {
   expandPath,
   type ProfileMetadata,
@@ -1328,10 +1330,18 @@ tools
 program
   .command("doctor")
   .description("check the store and profile dirs for problems (exits 1 if any)")
+  .option(
+    "--accept-capability-baseline",
+    "accept the current size of every shared capability corpus as the new floor (use after an intentional deletion)",
+  )
   .action(
-    action(async () => {
+    action(async (opts: { acceptCapabilityBaseline?: boolean }) => {
       console.log(chalk.bold(`store: ${storePath()}`));
       const store = resolveStore();
+      if (opts.acceptCapabilityBaseline) {
+        for (const tool of listTools()) resetCapabilityBaseline(tool);
+        console.log(chalk.dim("  capability corpus floors re-recorded at their current size"));
+      }
       const profiles = await store.listProfiles();
       // `current` is the shared, cloud-owned selection in api mode — read it
       // through the Store, never the local file. `applied` is machine-local.
@@ -1340,6 +1350,7 @@ program
       );
       const applied = loadAppliedMap();
       let problems = 0;
+      let capabilityHintNeeded = false;
       for (const p of profiles) {
         const missing = !existsSync(p.dir);
         const noEmail = !p.email;
@@ -1353,6 +1364,23 @@ program
         } else {
           console.log(chalk.yellow(`  ! ${p.name}: no email recorded`));
         }
+        if (missing) continue;
+        // Capability check: a profile that carries none of the machine's skills,
+        // subagents, or MCP servers is broken even when its auth is perfect.
+        const tool = listTools().find((t) => t.id === p.tool);
+        if (!tool) continue;
+        const capabilities = sharedCapabilityHealth(p.dir, tool);
+        for (const problem of capabilities.problems) {
+          console.log(chalk.red(`    ✗ ${p.name}: ${problem}`));
+          problems++;
+          capabilityHintNeeded = true;
+        }
+        for (const warning of capabilities.warnings) {
+          console.log(chalk.yellow(`    ! ${p.name}: ${warning}`));
+        }
+      }
+      if (capabilityHintNeeded) {
+        console.log(chalk.dim("\n  shared capabilities are materialized on launch — run `accounts env <name>` to repair now"));
       }
       for (const [toolId, appliedName] of Object.entries(applied)) {
         if (!profiles.some((p) => p.name === appliedName && p.tool === toolId)) {

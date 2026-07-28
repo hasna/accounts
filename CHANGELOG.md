@@ -6,6 +6,51 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- Share capabilities across profiles instead of isolating them. A profile is an
+  isolated config dir, so pointing Claude Code at a freshly created one gave it
+  none of the machine's skills, subagents, or MCP servers — only credentials are
+  meant to be per-profile. `skills/` and `agents/` are now linked to the tool's
+  shared home and user-scope `mcpServers` are merged into the profile's account
+  file, both idempotently, on profile creation and on every launch (so profiles
+  created by earlier versions are repaired the next time they are used). Which
+  entries and keys are shared is per-tool data (`ToolDef.sharedEntries` /
+  `ToolDef.sharedConfig`), not a hard-coded Claude mapping.
+
+- Never rebuild a profile's account file from an unreadable one. A `.claude.json`
+  that exists but does not parse is now reported and left byte-for-byte intact;
+  previously it was treated as an empty object and replaced by the merge result,
+  destroying `oauthAccount`, `userID` and `machineID`.
+- Write the merged account file atomically (temp file, `fsync`, `rename`, explicit
+  `chmod`) instead of truncating a ~200 KB credential-bearing file in place. The
+  shared primitive now backs `saveStore` too. `writeFileSync`'s `mode` does not
+  tighten a pre-existing file, so the mode is applied after the rename.
+- Take shared MCP server definitions from rendered config before templated
+  config, union members across all declared sources instead of letting the first
+  non-empty file win outright, and drop any server whose definition still carries
+  an unsubstituted `{{PLACEHOLDER}}`. `secrets` is excluded from sharing.
+- Materialize shared capabilities from `accounts switch` as well. In applied mode
+  it skips `profileEnv`, so the headline way to change Claude profiles used to
+  leave the profile dir unrepaired for later isolated launches.
+
+### Changed
+
+- `accounts doctor` now checks capability sharing by realpath, so a profile with
+  no skills, no subagents, no MCP servers, or a dangling capability link is
+  reported as a problem instead of a green check.
+- `accounts doctor` also fails when a shared corpus has shrunk below the size
+  recorded when it was linked. Realpath equality only proves the pointer is
+  correct; it says nothing about whether a write-through delete emptied the
+  corpus. `accounts doctor --accept-capability-baseline` accepts a deliberate
+  deletion as the new floor.
+- Tool definitions may not declare credential artifacts (`.credentials.json`,
+  `auth.json`, `keychain.json`, …) as shared entries or as a merge target, may not
+  share credential-bearing config keys (`oauthAccount`, `customApiKeyResponses`,
+  …), and may not contain control characters in shared paths. Tool definitions can
+  arrive from a registry, so this is enforced in the schema rather than by
+  convention.
+
 ## [0.2.12] - 2026-07-27
 
 ### Added

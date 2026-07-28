@@ -31,6 +31,34 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     },
     accountFile: ".claude.json",
     emailPath: ["oauthAccount", "emailAddress"],
+    // Measured on Claude Code 2.1.220: the user-scope skill root is
+    // `<CLAUDE_CONFIG_DIR>/skills` and the subagent root is
+    // `<CLAUDE_CONFIG_DIR>/agents`, so a profile with an empty config dir has
+    // neither.
+    //
+    // `rules`/`CLAUDE.md` are NOT handled here and the current arrangement is
+    // not by design: memory is discovered by walking the working directory's
+    // ancestors, so a copy inside a config dir would be inert, and the shared
+    // files load today only because the working directory happens to sit under
+    // the home dir that contains them. A cwd outside it loses them silently.
+    sharedEntries: ["skills", "agents"],
+    // Also measured: user-scope MCP servers are read only from
+    // `<CLAUDE_CONFIG_DIR>/.claude.json`; `settings.json` and `mcp.json` inside
+    // the config dir are not consulted. That file also holds OAuth state, so it
+    // is merged rather than linked.
+    //
+    // The account file is read at runtime but is not necessarily the rendered
+    // one — on a machine whose config is templated it can carry unsubstituted
+    // `{{PLACEHOLDER}}` commands. Rendered files are listed first so their
+    // definitions win, and placeholder-bearing members are dropped entirely.
+    sharedConfig: {
+      target: ".claude.json",
+      sources: ["settings.json", "mcp.json", "../.claude.json"],
+      keys: ["mcpServers"],
+      // A vault-retrieval server is the closest thing to sharing tokens without
+      // literally doing so; the user drew the line at "only tokens should not".
+      exclude: ["secrets"],
+    },
   },
   {
     id: "codex-app",
