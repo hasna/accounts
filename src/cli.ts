@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +40,23 @@ import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
-import { switchAccount } from "./lib/switch-account.js";
+import { resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+import { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+import {
+  DEFAULT_COOLDOWN_MS,
+  DEFAULT_MIN_HEADROOM,
+  DEFAULT_SWITCH_THRESHOLD,
+  readAutoSwitchState,
+  readUsageCache,
+  writeAutoSwitchState,
+} from "./lib/auto-switch.js";
+import {
+  collectAccountsUsage,
+  DEFAULT_USAGE_CACHE_MAX_AGE_MS,
+  pickHealthiestAccount,
+  type AccountUsageEntry,
+} from "./lib/usage-report.js";
+import { hookOutputJson, runUsageHook } from "./lib/usage-hook.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -619,9 +635,68 @@ program
   .option("-t, --tool <tool>", "filter by tool", DEFAULT_TOOL)
   .option("--env", "print env export after selection instead of apply")
   .option("--no-act", "only mark active (store current); do not apply or print env")
+  .option("--healthiest", "non-interactive: pick the ACCOUNT with the most usage headroom (never the current one)")
+  .option("--min-headroom <percent>", "healthiest: targets must have at least this headroom", String(DEFAULT_MIN_HEADROOM))
+  .option("--refresh", "healthiest: ignore the usage cache and query the endpoint")
+  .option("--json", "healthiest: output JSON")
   .action(
-    action(async (opts: { tool: string; env?: boolean; act?: boolean }) => {
+    action(async (opts: {
+      tool: string;
+      env?: boolean;
+      act?: boolean;
+      healthiest?: boolean;
+      minHeadroom: string;
+      refresh?: boolean;
+      json?: boolean;
+    }) => {
       const store = resolveStore();
+      if (opts.healthiest) {
+        const tool = getTool(opts.tool);
+        // The account this SESSION currently runs as is never a candidate —
+        // "switching" to it is the silent no-op this selector exists to avoid.
+        const sessionDir = resolveSessionConfigDir(tool);
+        const currentUuid = dirAccountUuid(sessionDir, tool);
+        const picked = await pickHealthiestAccount(
+          {
+            tool: opts.tool,
+            ...(opts.refresh ? { refresh: true } : {}),
+            ...(currentUuid ? { currentUuid } : {}),
+            minHeadroom: Number.parseInt(opts.minHeadroom, 10),
+          },
+          store,
+        );
+        if (opts.json) {
+          console.log(JSON.stringify(picked, null, 2));
+          if (!picked.selection.candidate) process.exitCode = 1;
+          return;
+        }
+        const candidate = picked.selection.candidate;
+        if (!candidate || !picked.profileName) {
+          die(
+            picked.selection.reason === "all-limited"
+              ? `every account with usage data is below ${opts.minHeadroom}% headroom — nothing worth switching to`
+              : picked.selection.reason === "no-usage-data"
+                ? "no account has usage data yet — run `accounts usage --refresh` first"
+                : "no eligible account (valid credentials, not the current one) was found",
+          );
+        }
+        console.log(
+          chalk.green(
+            `✓ healthiest: ${chalk.bold(picked.profileName)} (${candidate.email ?? candidate.accountUuid}, ${Math.round(candidate.headroom)}% headroom)`,
+          ),
+        );
+        const mode = resolvePickMode(opts);
+        if (mode === "apply") {
+          await store.useProfile(picked.profileName, opts.tool);
+          await applyProfile(picked.profileName, opts.tool, store);
+          console.log(chalk.dim("  applied to live Claude paths"));
+        } else if (mode === "env") {
+          const profile = await store.getProfile(picked.profileName, opts.tool);
+          prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
+          console.log(formatExportLines(profileEnv(profile, tool)));
+        }
+        return;
+      }
       const result = await pickProfile({ tool: opts.tool, mode: resolvePickMode(opts) }, store);
       if (!result) return;
       await store.useProfile(result.profile.name, result.profile.tool);
@@ -799,6 +874,182 @@ program
         console.log(chalk.dim("  verify: the session's next reply runs as the new account; /status shows the email"));
       },
     ),
+  );
+
+function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): string {
+  const who = entry.email ?? entry.accountUuid;
+  const marker = entry.accountUuid === currentUuid ? chalk.cyan(" (this session)") : "";
+  const lines: string[] = [];
+  if (entry.status !== "ok") {
+    lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.yellow(entry.status)}`);
+  } else if (entry.error) {
+    lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.red(`${entry.error.kind}: ${entry.error.message}`)}`);
+  } else if (entry.usage) {
+    const headroom = Math.round(entry.usage.headroom);
+    const color = headroom <= 10 ? chalk.red : headroom <= 25 ? chalk.yellow : chalk.green;
+    lines.push(`  ${chalk.bold(who)}${marker} — ${color(`${headroom}% headroom`)} ${chalk.dim(`(${entry.source})`)}`);
+    for (const w of entry.usage.windows) {
+      const reset = w.resetsAt ? ` resets ${w.resetsAt}` : "";
+      const active = w.isActive ? chalk.yellow(" [active]") : "";
+      lines.push(chalk.dim(`      ${w.id}${w.scoped ? " (scoped)" : ""}: ${Math.round(w.utilization)}% used${reset}`) + active);
+    }
+  }
+  const doors: string[] = [];
+  if (entry.profiles.length) doors.push(`profiles: ${entry.profiles.join(", ")}`);
+  if (entry.occupies.length) doors.push(`running in: ${entry.occupies.join(", ")}`);
+  if (doors.length) lines.push(chalk.dim(`      ${doors.join(" · ")}`));
+  return lines.join("\n");
+}
+
+program
+  .command("usage")
+  .description("usage per ACCOUNT from Claude's /api/oauth/usage — one query per distinct account, however many dirs hold it")
+  .option("-t, --tool <tool>", "tool id (usage is Claude-only today)", DEFAULT_TOOL)
+  .option("--refresh", "ignore the cache and query the endpoint for every account")
+  .option("--max-age <seconds>", "accept cached usage up to this old", String(DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000))
+  .option("--json", "output JSON")
+  .option("--quiet", "no output — refresh the cache and exit (used by the usage hook)")
+  .action(
+    action(async (opts: { tool: string; refresh?: boolean; maxAge: string; json?: boolean; quiet?: boolean }) => {
+      const entries = await collectAccountsUsage(
+        {
+          tool: opts.tool,
+          ...(opts.refresh ? { refresh: true } : {}),
+          maxAgeMs: Number.parseInt(opts.maxAge, 10) * 1000,
+        },
+        resolveStore(),
+      );
+      if (opts.quiet) return;
+      const tool = getTool(opts.tool);
+      const currentUuid = dirAccountUuid(resolveSessionConfigDir(tool), tool);
+      if (opts.json) {
+        console.log(JSON.stringify({ ...(currentUuid ? { currentUuid } : {}), accounts: entries }, null, 2));
+        return;
+      }
+      if (entries.length === 0) {
+        console.log(chalk.yellow("no Claude accounts found across profiles"));
+        return;
+      }
+      console.log("");
+      for (const entry of entries) console.log(formatUsageEntry(entry, currentUuid));
+      console.log("");
+    }),
+  );
+
+/** Flag > env var > default, for the usage-hook knobs. */
+function hookNumber(flag: string | undefined, envVar: string, fallback: number): number {
+  const raw = flag ?? process.env[envVar];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+  const parsed = Number.parseFloat(String(raw));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const USAGE_HOOK_INSTALL_SNIPPET = `Merge into ~/.claude/settings.json (or the profile's settings.json) — ADD to any
+existing "UserPromptSubmit" hooks, do not replace them:
+
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "accounts usage-hook", "timeout": 15 }
+        ]
+      }
+    ]
+  }
+}
+
+Tuning (env or flags): ACCOUNTS_USAGE_SWITCH_THRESHOLD (default ${DEFAULT_SWITCH_THRESHOLD}),
+ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM (${DEFAULT_MIN_HEADROOM}), ACCOUNTS_USAGE_SWITCH_COOLDOWN_S (${DEFAULT_COOLDOWN_MS / 1000}),
+ACCOUNTS_USAGE_CACHE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000}).
+Decisions use cached usage only; warm it with a cron/loop running: accounts usage --refresh --quiet`;
+
+function usageHookLog(line: string): void {
+  try {
+    const dir = join(accountsHome(), "logs");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "usage-hook.log");
+    // Cap growth: a per-prompt hook must not fill a disk. One rotation kept.
+    if (existsSync(path) && statSync(path).size > 1_000_000) renameSync(path, `${path}.old`);
+    appendFileSync(path, `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // Logging must never break the hook.
+  }
+}
+
+program
+  .command("usage-hook")
+  .description("Claude Code UserPromptSubmit hook: auto-switch this session to the healthiest account when limits near (not installed automatically — see --print-install)")
+  .option("-t, --tool <tool>", "tool id", DEFAULT_TOOL)
+  .option("--dir <path>", "session config dir (default: $CLAUDE_CONFIG_DIR, else the live default)")
+  .option("--threshold <percent>", "switch when any unscoped usage window is at/over this percent used")
+  .option("--min-headroom <percent>", "a switch target must have at least this much headroom")
+  .option("--cooldown <seconds>", "minimum time between auto-switch attempts")
+  .option("--max-age <seconds>", "usage cache tolerance for decisions")
+  .option("--print-install", "print the settings.json snippet that enables the hook, then exit")
+  .action(
+    async (opts: {
+      tool: string;
+      dir?: string;
+      threshold?: string;
+      minHeadroom?: string;
+      cooldown?: string;
+      maxAge?: string;
+      printInstall?: boolean;
+    }) => {
+      if (opts.printInstall) {
+        console.log(USAGE_HOOK_INSTALL_SNIPPET);
+        return;
+      }
+      // NOT wrapped in action(): this runs before every prompt and must FAIL
+      // OPEN — any error lets the message through, exit 0 always.
+      try {
+        const tool = getTool(opts.tool);
+        const store = resolveStore();
+        const configDir = resolveSessionConfigDir(tool, opts.dir ? { dir: opts.dir } : {});
+        const outcome = await runUsageHook(
+          {
+            configDir,
+            thresholdPercent: hookNumber(opts.threshold, "ACCOUNTS_USAGE_SWITCH_THRESHOLD", DEFAULT_SWITCH_THRESHOLD),
+            minHeadroom: hookNumber(opts.minHeadroom, "ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM", DEFAULT_MIN_HEADROOM),
+            cooldownMs: hookNumber(opts.cooldown, "ACCOUNTS_USAGE_SWITCH_COOLDOWN_S", DEFAULT_COOLDOWN_MS / 1000) * 1000,
+            cacheMaxAgeMs:
+              hookNumber(opts.maxAge, "ACCOUNTS_USAGE_CACHE_MAX_AGE_S", DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000) * 1000,
+          },
+          {
+            currentAccountUuid: (dir) => dirAccountUuid(dir, tool),
+            readCache: (uuid, maxAgeMs) => readUsageCache(uuid, maxAgeMs),
+            listIdentities: async () =>
+              buildIdentityIndex(
+                (await store.listProfiles(opts.tool)).map((p) => ({ name: p.name, dir: p.dir })),
+                tool,
+              ),
+            triggerRefresh: () => {
+              const cliPath = process.argv[1];
+              if (!cliPath) return;
+              // Detached cache warmer: the decision above already happened
+              // from cache; this only makes the NEXT prompt's data fresh.
+              spawn(process.execPath, [cliPath, "usage", "--tool", opts.tool, "--refresh", "--quiet"], {
+                detached: true,
+                stdio: "ignore",
+              }).unref();
+            },
+            performSwitch: async (profileName, dir) => {
+              const result = await switchAccount(profileName, { tool: opts.tool, dir, yes: true }, store);
+              return { liveSessions: result.liveSessions };
+            },
+            readState: () => readAutoSwitchState(),
+            writeState: (state) => writeAutoSwitchState(state),
+          },
+        );
+        usageHookLog(`${outcome.action}${outcome.reason ? ` reason=${JSON.stringify(outcome.reason)}` : ""}`);
+        const output = hookOutputJson(outcome);
+        if (output) console.log(output);
+      } catch (error) {
+        usageHookLog(`fail-open error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+      }
+      process.exitCode = 0;
+    },
   );
 
 const hook = program.command("hook").description("install a shell wrapper for claude");
