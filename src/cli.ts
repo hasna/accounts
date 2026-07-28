@@ -40,6 +40,7 @@ import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
+import { switchAccount } from "./lib/switch-account.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -749,6 +750,53 @@ addConfigsOptions(program
           if (res.error) die(`failed to launch ${bin}: ${res.error.message}`);
           process.exit(res.status ?? 0);
         }
+      },
+    ),
+  );
+
+program
+  .command("switch-account")
+  .argument("[name]", "profile name (interactive picker when omitted)")
+  .description("switch the CURRENT session's account in place — no restart; the next message runs as the new account")
+  .option("-t, --tool <tool>", "tool id (in-place switching supports claude only)", DEFAULT_TOOL)
+  .option("--dir <path>", "session config dir (default: $CLAUDE_CONFIG_DIR, else the live default)")
+  .option("--yes", "proceed even when several live sessions share the config dir")
+  .option("--json", "output JSON")
+  .action(
+    action(
+      async (
+        name: string | undefined,
+        opts: { tool?: string; dir?: string; yes?: boolean; json?: boolean },
+      ) => {
+        let target = name;
+        if (!target) {
+          const picked = await pickProfile({ tool: opts.tool ?? DEFAULT_TOOL, mode: "none" });
+          if (!picked) return;
+          target = picked.profile.name;
+        }
+        const result = await switchAccount(target, {
+          tool: opts.tool,
+          dir: opts.dir,
+          yes: opts.yes,
+        });
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        if (result.alreadyActive) {
+          console.log(chalk.yellow(`• ${result.message}`));
+          return;
+        }
+        console.log(chalk.green(`✓ ${result.message}`));
+        console.log(chalk.dim(`  config dir: ${result.configDir} (${result.dirKind})`));
+        if (result.previousEmail) {
+          console.log(chalk.dim(`  identity: ${result.previousEmail} → ${result.profile.email ?? result.profile.name}`));
+        }
+        if (result.snapshotBackProfile) {
+          console.log(chalk.dim(`  outgoing credentials snapshotted to ${result.snapshotBackProfile}`));
+        }
+        for (const warning of result.warnings) console.log(chalk.yellow(`  ! ${warning}`));
+        console.log(chalk.dim("  verify: the session's next reply runs as the new account; /status shows the email"));
       },
     ),
   );

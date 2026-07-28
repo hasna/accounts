@@ -72,6 +72,13 @@ export type {
 } from "./lib/login.js";
 export { switchProfile } from "./lib/switch.js";
 export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
+export { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+export type {
+  DirSessionInfo,
+  SessionDirKind,
+  SwitchAccountOptions,
+  SwitchAccountResult,
+} from "./lib/switch-account.js";
 export {
   codexAppBinaryExists,
   codexAppMenuState,
