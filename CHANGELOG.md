@@ -68,18 +68,35 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
     read time is treated as a malformed payload, not a roll. New
     `--min-session-headroom` / `ACCOUNTS_USAGE_SWITCH_MIN_SESSION_HEADROOM`
     floor (default 10) keeps switches off targets with no immediate runway.
-  - `cache/exhaustion-ledger.json` — restart-durable per-account cooldowns
+  - `state/exhaustion-ledger.json` — restart-durable per-account cooldowns
     with exponential backoff (15 min base, doubling), released at the later of
     the reported reset and the backoff step, capped at 5h (session/unknown) and
     24h (weekly) so a misclassified window can never retire an account
     permanently. Corrupt or path-hostile entries degrade to "no cooldown".
-  - The switch announcement now reports both windows rather than one blended
-    percentage.
+  - The switch announcement and `accounts usage` now report both windows rather
+    than one blended percentage. `accounts usage` labels each window with its
+    class and marks a window whose reset has passed as reset rather than
+    printing a stale "100% used" the selector disagrees with.
+  - `accounts pick --healthiest` reads the same exhaustion ledger the hook
+    writes, so the CLI and the hook no longer disagree about the pool.
+  - Exhaustion is decided by utilization alone. `severity` is not consulted:
+    the complete vocabulary observed live is `normal` (n=23, utilization 0–72)
+    and `critical` (n=1, utilization 100), and one sample of one non-normal
+    value cannot distinguish "at the cap" from "approaching the cap" — reading
+    it as exhaustion would hard-exclude a weekly window for days on an account
+    that may still have headroom.
+  - The ledger lives under `state/`, not `cache/`. Measured on this fleet:
+    `cache/auto-switch-state.json` was written by two live switches and is
+    absent from the filesystem, with `cache/` carrying an mtime later than
+    both — a store that must survive restarts cannot sit where something
+    treats data as disposable.
 
 - `accounts switch-account [name]` — switch the CURRENT Claude Code session's
   account in place, with no restart and the conversation intact. Measured on
-  Claude Code 2.1.220: a running session re-reads `<configDir>/.credentials.json`
-  from disk on every API request, so installing another profile's credentials +
+  Claude Code 2.1.220: a running session `stat()`s `<configDir>/.credentials.json`
+  on every API request and re-reads it when the mtime changes (the stat sits
+  above the token-still-valid early return, inside the per-request client
+  factory) — so installing another profile's credentials +
   `oauthAccount` into the session's config dir flips its identity on the next
   message. The verb snapshots the dir's outgoing credentials back to their owning
   profile first, records a `switched-account` marker so snapshot machinery never

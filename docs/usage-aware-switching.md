@@ -208,12 +208,26 @@ not replace them):
 }
 ```
 
-Keep the cache warm so the hook always has data (optional but recommended):
+### Keep the cache warm — this is REQUIRED, not optional
+
+The hook decides from cache only, and cached usage older than `--max-age`
+(default 300s) is treated as absent. With no warmer running, the first prompt
+after any idle gap longer than the TTL logs `refresh-triggered` and decides
+NOTHING; the switch can only land on the **second** prompt. Measured in
+production on this fleet 2026-07-28 — `logs/usage-hook.log` shows exactly that
+`refresh-triggered` / decide-nothing pattern after idle gaps.
+
+For an unattended session that is the difference between switching before the
+wall and hitting it, so install a warmer alongside the hook:
 
 ```bash
 # cron / loop, every few minutes
 accounts usage --refresh --quiet
 ```
+
+Verify one is actually scheduled — a warmer that was recommended but never
+installed looks identical to one that is running, right up until the session
+stalls.
 
 ### Tuning
 
@@ -234,3 +248,20 @@ The two cooldowns are different guards and both are needed: the global one
 bounds *switch rate* (one switch per window, no ping-pong), the per-account
 ledger bounds *where* a switch may land (never back onto an account that just
 reported exhaustion, even after a restart).
+
+## Limitations (read before relying on this unattended)
+
+**The hook only fires on `UserPromptSubmit`.** Claude Code exposes no
+pre-request hook, and `StopFailure` fires after the turn has already failed
+with no ability to recover it (it is monitoring-only). Consequences:
+
+- **A long autonomous run is not protected.** An agent that burns through the
+  5-hour window across many tool calls inside a single turn generates no
+  prompt events, so nothing is evaluated and nothing switches. Protection
+  applies between messages, not within one.
+- The limit can still arrive mid-turn. The hook makes that rarer by switching
+  before a message is processed; it cannot make it impossible.
+
+Covering long autonomous runs needs an out-of-band watcher (a loop that polls
+`accounts usage` and calls `accounts switch-account` on its own schedule)
+rather than a `UserPromptSubmit` hook. That watcher does not exist yet.

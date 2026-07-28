@@ -188,25 +188,43 @@ test("the worse of two windows of the same class wins", () => {
   expect(health.weeklyHeadroom).toBe(35);
 });
 
-test("severity `exhausted` is honoured even below the percent cap", () => {
-  const usage = parseUsageResponse(
-    {
-      limits: [
-        { kind: "weekly_all", group: "weekly", percent: 61, severity: "exhausted", resets_at: at(days(2)) },
-      ],
-    },
-    NOW,
-  );
-  const health = deriveWindowHealth(usage, { now: NOW });
-  expect(health.weekly?.exhausted).toBe(true);
+test("no severity string declares exhaustion below the utilization cap", () => {
+  // MEASURED 2026-07-28 across the live usage cache, the ENTIRE observed
+  // severity vocabulary is:
+  //     severity="normal"    n=23  utilization 0-72
+  //     severity="critical"  n=1   utilization 100
+  // "exhausted" appears in ZERO live samples. Two samples of one non-normal
+  // value cannot distinguish "at the cap" from "approaching the cap", and
+  // reading it as exhaustion would hard-exclude a WEEKLY window for days on an
+  // account that still has headroom. Exhaustion is therefore decided by
+  // utilization only, which is unambiguous and measured.
+  for (const severity of ["critical", "exhausted", "warning", "anything-else"]) {
+    const health = deriveWindowHealth(
+      parseUsageResponse(
+        { limits: [{ kind: "weekly_all", group: "weekly", percent: 61, severity, resets_at: at(days(2)) }] },
+        NOW,
+      ),
+      { now: NOW },
+    );
+    expect(health.weekly?.exhausted).toBe(false);
+  }
+});
 
-  // Positive control: same percent, ordinary severity -> not exhausted.
-  const normal = deriveWindowHealth(
+test("the live `critical` reading is still caught, by utilization", () => {
+  // POSITIVE CONTROL for the test above: dropping the severity branch must not
+  // lose the one real exhausted window in the live cache (weekly_all at 100%,
+  // severity "critical"). The utilization path catches it, so nothing regresses.
+  const health = deriveWindowHealth(
     parseUsageResponse(
-      { limits: [{ kind: "weekly_all", group: "weekly", percent: 61, severity: "normal" }] },
+      {
+        limits: [
+          { kind: "weekly_all", group: "weekly", percent: 100, severity: "critical", resets_at: at(days(2)) },
+        ],
+      },
       NOW,
     ),
     { now: NOW },
   );
-  expect(normal.weekly?.exhausted).toBe(false);
+  expect(health.weekly?.exhausted).toBe(true);
+  expect(health.weeklyHeadroom).toBe(0);
 });

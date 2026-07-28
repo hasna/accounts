@@ -17,7 +17,21 @@ import { writeFileAtomic } from "./safe-path.js";
  * cleaned up for an account to come back.
  */
 
-const CACHE_DIR = "cache";
+/**
+ * Durable state, NOT cache. Measured on this machine 2026-07-28: two `switched`
+ * events at 14:08:30 and 14:09:30 appear in `logs/usage-hook.log` (written to
+ * the real accounts home, so the home resolved correctly) while
+ * `cache/auto-switch-state.json` does not exist anywhere on the filesystem, and
+ * `cache/` carries an mtime of 17:09 — after both switches. INFERRED from that:
+ * `cache/` was wiped between the two switches and now, taking the cooldown with
+ * it, which is consistent with two switches 60s apart under a 10-minute
+ * cooldown. Something on this machine treats `cache/` as disposable, which is
+ * exactly what the name licenses.
+ *
+ * A ledger whose whole purpose is surviving restarts therefore must not live
+ * under `cache/`.
+ */
+const STATE_DIR = "state";
 const LEDGER_FILE = "exhaustion-ledger.json";
 
 /** Account uuids are used as object keys only, but they arrive from JSON. */
@@ -59,7 +73,7 @@ export const WEEKLY_BACKOFF_CAP_MS = 24 * 60 * 60 * 1000;
 export const STREAK_WINDOW_MS = 30 * 60 * 1000;
 
 export function exhaustionLedgerPath(): string {
-  return join(accountsHome(), CACHE_DIR, LEDGER_FILE);
+  return join(accountsHome(), STATE_DIR, LEDGER_FILE);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,12 +121,24 @@ export function readExhaustionLedger(): ExhaustionLedger {
   return ledger;
 }
 
-export function writeExhaustionLedger(ledger: ExhaustionLedger): void {
-  mkdirSync(join(accountsHome(), CACHE_DIR), { recursive: true });
-  writeFileAtomic(exhaustionLedgerPath(), JSON.stringify(ledger, null, 2) + "\n", {
-    mode: 0o600,
-    mustStayUnder: accountsHome(),
-  });
+/**
+ * Never throws. The ledger is an optimization, not a gate: if it cannot be
+ * persisted (unwritable dir, `state` occupied by a file, full disk) the correct
+ * outcome is a switch that forgets its cooldown, NOT a hook that fails open and
+ * leaves the session on an exhausted account. Returns whether it persisted so
+ * callers can tell the difference.
+ */
+export function writeExhaustionLedger(ledger: ExhaustionLedger): boolean {
+  try {
+    mkdirSync(join(accountsHome(), STATE_DIR), { recursive: true });
+    writeFileAtomic(exhaustionLedgerPath(), JSON.stringify(ledger, null, 2) + "\n", {
+      mode: 0o600,
+      mustStayUnder: accountsHome(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function backoffCap(windowClass: ExhaustedWindowClass): number {

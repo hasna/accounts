@@ -1,7 +1,7 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import {
   activeCooldowns,
   backoffMs,
@@ -166,7 +166,7 @@ test("an already-past reset still yields a bounded cooldown, not an instant retr
 // ---------------------------------------------------------------------------
 
 test("a corrupt ledger reads as no cooldowns instead of throwing", () => {
-  mkdirSync(join(home, "cache"), { recursive: true });
+  mkdirSync(join(home, "state"), { recursive: true });
   writeFileSync(exhaustionLedgerPath(), "{ not json at all");
   expect(() => readExhaustionLedger()).not.toThrow();
   expect(readExhaustionLedger()).toEqual({});
@@ -202,8 +202,45 @@ test("clearing an account removes its cooldown", () => {
   expect(() => clearExhaustion("never-recorded")).not.toThrow();
 });
 
+test("the ledger lives in durable state, never under cache/", () => {
+  // Measured 2026-07-28: cache/auto-switch-state.json was written by two live
+  // switches and then vanished (cache/ mtime postdates both), which is
+  // consistent with two switches 60s apart under a 10-minute cooldown. A store
+  // whose only job is surviving restarts cannot sit in a directory the system
+  // treats as disposable.
+  recordExhaustion({ accountUuid: "acct", windowClass: "session", now: T0 });
+  const path = exhaustionLedgerPath();
+  expect(path.includes(`${sep}cache${sep}`)).toBe(false);
+  expect(path.endsWith(join("state", "exhaustion-ledger.json"))).toBe(true);
+
+  // POSITIVE CONTROL: the record really is retrievable from that path, so the
+  // assertions above are about a live store and not a path that nothing uses.
+  expect(readExhaustionLedger()["acct"]).toBeDefined();
+});
+
 test("the ledger file is written owner-only", () => {
   recordExhaustion({ accountUuid: "acct", windowClass: "session", now: T0 });
   const { statSync } = require("node:fs") as typeof import("node:fs");
   expect(statSync(exhaustionLedgerPath()).mode & 0o777).toBe(0o600);
+});
+
+test("an unpersistable ledger degrades to no-cooldown instead of throwing", () => {
+  // A ledger that cannot be written must not become a gate: the right outcome
+  // is a switch that forgets its cooldown, never a hook that fails open and
+  // strands the session on an exhausted account.
+  rmSync(join(home, "state"), { recursive: true, force: true });
+  writeFileSync(join(home, "state"), "not a directory");
+
+  expect(() =>
+    recordExhaustion({ accountUuid: "acct", windowClass: "weekly", now: T0 }),
+  ).not.toThrow();
+  expect(() => readExhaustionLedger()).not.toThrow();
+  expect(activeCooldowns(readExhaustionLedger(), T0).size).toBe(0);
+
+  // POSITIVE CONTROL: with the obstruction removed the very same call DOES
+  // persist, so the no-op above is the failure being absorbed and not
+  // recordExhaustion being inert.
+  rmSync(join(home, "state"), { force: true });
+  recordExhaustion({ accountUuid: "acct", windowClass: "weekly", now: T0 });
+  expect(activeCooldowns(readExhaustionLedger(), T0).has("acct")).toBe(true);
 });

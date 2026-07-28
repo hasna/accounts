@@ -66,6 +66,7 @@ import {
   readExhaustionLedger,
   recordExhaustion,
 } from "./lib/exhaustion-ledger.js";
+import { deriveWindowHealth } from "./lib/usage-windows.js";
 import {
   collectAccountsUsage,
   DEFAULT_USAGE_CACHE_MAX_AGE_MS,
@@ -901,13 +902,34 @@ function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): strin
   } else if (entry.error) {
     lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.red(`${entry.error.kind}: ${entry.error.message}`)}`);
   } else if (entry.usage) {
-    const headroom = Math.round(entry.usage.headroom);
-    const color = headroom <= 10 ? chalk.red : headroom <= 25 ? chalk.yellow : chalk.green;
-    lines.push(`  ${chalk.bold(who)}${marker} — ${color(`${headroom}% headroom`)} ${chalk.dim(`(${entry.source})`)}`);
+    // Report the two windows the SELECTOR ranks on, not the collapsed
+    // single-scalar headroom — a display that shows one number contradicts the
+    // thing making the decision as soon as the windows disagree.
+    const health = deriveWindowHealth(entry.usage);
+    const paint = (value: number) =>
+      (value <= 10 ? chalk.red : value <= 25 ? chalk.yellow : chalk.green)(`${Math.round(value)}%`);
+    lines.push(
+      `  ${chalk.bold(who)}${marker} — ${paint(health.sessionHeadroom)} session / ` +
+        `${paint(health.weeklyHeadroom)} weekly headroom ${chalk.dim(`(${entry.source})`)}`,
+    );
+    const classOf = new Map<string, string>();
+    for (const w of [health.session, health.weekly, ...health.unknown]) {
+      if (w) classOf.set(w.id, w.windowClass);
+    }
     for (const w of entry.usage.windows) {
       const reset = w.resetsAt ? ` resets ${w.resetsAt}` : "";
       const active = w.isActive ? chalk.yellow(" [active]") : "";
-      lines.push(chalk.dim(`      ${w.id}${w.scoped ? " (scoped)" : ""}: ${Math.round(w.utilization)}% used${reset}`) + active);
+      const cls = w.scoped ? "scoped" : (classOf.get(w.id) ?? "unknown");
+      // A window whose reset has passed is stale, not saturated. Saying "100%
+      // used" for a window the selector treats as recovered is the exact
+      // contradiction this line exists to avoid.
+      const rolled = [health.session, health.weekly, ...health.unknown].some(
+        (h) => h?.id === w.id && h.rolled,
+      );
+      const used = rolled
+        ? `${Math.round(w.utilization)}% used at last read — window has since RESET`
+        : `${Math.round(w.utilization)}% used`;
+      lines.push(chalk.dim(`      ${w.id} [${cls}]: ${used}${reset}`) + active);
     }
   }
   const doors: string[] = [];

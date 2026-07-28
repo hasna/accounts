@@ -31,10 +31,20 @@ export const SESSION_WINDOW_MAX_MS = 5 * 60 * 60 * 1000;
 /**
  * Utilization at which a window is treated as exhausted rather than merely
  * low. Kept at the cap: the near-cap band is handled by the headroom floors in
- * selection, so nothing here depends on an invented threshold. `severity` is
- * also honoured, but only for the exact value "exhausted" — the rest of that
- * vocabulary is unobserved (every live sample read "normal") and is not
- * guessed at.
+ * selection, so nothing here depends on an invented threshold.
+ *
+ * `severity` is deliberately NOT used to decide exhaustion. The complete
+ * vocabulary observed in the live usage cache (2026-07-28) is:
+ *
+ *     severity="normal"    n=23  utilization 0–72
+ *     severity="critical"  n=1   utilization 100
+ *
+ * One sample of one non-normal value cannot distinguish "at the cap" from
+ * "approaching the cap". Reading it as exhaustion would hard-exclude a WEEKLY
+ * window for days on an account that may still have headroom, and the only
+ * live `critical` window is at 100% anyway — so the utilization path already
+ * catches it and the severity branch would buy nothing it could not also get
+ * wrong. Utilization is the measured, unambiguous signal; it decides alone.
  */
 export const DEFAULT_EXHAUSTION_PERCENT = 100;
 
@@ -152,8 +162,7 @@ function toHealth(
     rolled,
     effectiveHeadroom: rolled ? 100 : clampHeadroom(100 - window.utilization),
     headroomInferred: rolled,
-    exhausted:
-      !rolled && (window.utilization >= exhaustionPercent || window.severity === "exhausted"),
+    exhausted: !rolled && window.utilization >= exhaustionPercent,
   };
 }
 
