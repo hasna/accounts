@@ -207,9 +207,21 @@ What the merge guarantees:
 - **`--from <dir>` merges extra read-only trees**, such as a backup taken before
   the migration, so a transcript deleted from the live tree since the backup is
   restored rather than lost.
-- **It verifies before it links.** Transcript counts are taken recursively before
-  and after, and a profile is only linked when everything under it is
-  demonstrably in the shared home.
+- **It verifies before *and after* it links.** Transcript counts are taken
+  recursively on the shared side — adding the sources back in would double-count
+  every hardlink — and the shared tree must have grown by exactly the transcripts
+  the run placed. The count is re-taken after the link step, because that is the
+  only part of the run that can destroy anything. A profile is linked only when
+  everything under it is demonstrably in the shared home, and anything written to
+  it during the run is merged out of the retained tree before the swap is
+  accepted.
+- **Symlinks inside the tree are reproduced, not discarded.** Claude Code creates
+  them for forked and resumed subagent transcripts. They are rewritten relative
+  so the shared corpus stays portable; a link pointing out of the tree is refused
+  with guidance rather than followed.
+- **A dry run reports bounds, not exact counts.** It places nothing, so each
+  source is compared against a shared tree that never received the earlier ones:
+  merge counts are an upper bound and collision counts a lower bound.
 
 `<profile>/sessions` is deliberately *not* shared: it holds one file per running
 process, with a status heartbeat, and each instance reaps entries whose process it
