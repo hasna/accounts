@@ -18,18 +18,22 @@ import { writeFileAtomic } from "./safe-path.js";
  */
 
 /**
- * Durable state, NOT cache. Measured on this machine 2026-07-28: two `switched`
- * events at 14:08:30 and 14:09:30 appear in `logs/usage-hook.log` (written to
- * the real accounts home, so the home resolved correctly) while
- * `cache/auto-switch-state.json` does not exist anywhere on the filesystem, and
- * `cache/` carries an mtime of 17:09 — after both switches. INFERRED from that:
- * `cache/` was wiped between the two switches and now, taking the cooldown with
- * it, which is consistent with two switches 60s apart under a 10-minute
- * cooldown. Something on this machine treats `cache/` as disposable, which is
- * exactly what the name licenses.
+ * Durable state, NOT cache. This holds on naming grounds alone: a store whose
+ * entire purpose is surviving restarts must not live in a directory named
+ * `cache`, because that name licenses deletion by anything that wants space.
  *
- * A ledger whose whole purpose is surviving restarts therefore must not live
- * under `cache/`.
+ * There is a supporting observation, but it is weaker than a root cause and is
+ * recorded here at its true strength. On 2026-07-28 two `switched` events 60s
+ * apart (14:08:30, 14:09:30) appear in `logs/usage-hook.log` under a 10-minute
+ * cooldown, while `cache/auto-switch-state.json` exists nowhere on the
+ * filesystem — and `writeAutoSwitchState` plus `cooldownActive` both verify
+ * correct in isolation. Something is losing that file; WHAT is not established.
+ *
+ * An earlier version of this note also cited the `cache/` mtime as evidence of
+ * a wipe. It is not evidence: the second switch writing the file into `cache/`
+ * would set the same mtime, so the datum is equally expected under the benign
+ * story and does not discriminate. Tracked separately — this module does not
+ * depend on the answer.
  */
 const STATE_DIR = "state";
 const LEDGER_FILE = "exhaustion-ledger.json";

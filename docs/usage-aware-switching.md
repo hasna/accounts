@@ -113,6 +113,23 @@ backoff (15 min base, doubling). Both caps are bounded — 5h for session/unknow
 retire an account permanently. It is a cooldown, not a blocklist: records go
 inert on their own and need no cleanup.
 
+**A record is written only at 100% utilization, but switches fire from 90%.**
+That gap is deliberate — writing a days-long weekly cooldown for an account at
+91% would exclude one that still has real headroom — but it has a consequence
+worth stating plainly: in the **90–99% band, where most switches actually fire,
+no ledger record is written at all.** The ledger therefore does **not** backstop
+the global anti-flap cooldown in the common case. The two guards are
+complementary but not redundant:
+
+| Guard | Stored at | Covers |
+| --- | --- | --- |
+| Global anti-flap (`cache/auto-switch-state.json`) | `cache/` | switch *rate*, every switch |
+| Per-account ledger (`state/exhaustion-ledger.json`) | `state/` | switch *destination*, only at 100% |
+
+So if `cache/` is cleared, the anti-flap guard is lost and back-to-back switches
+remain possible, with no ledger substitute in the band where switching normally
+happens. Bounded residual risk, tracked separately.
+
 ## Accounts, not directories
 
 Profile **directories are doors; accounts are the thing.** Several dirs

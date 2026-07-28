@@ -189,15 +189,14 @@ test("the worse of two windows of the same class wins", () => {
 });
 
 test("no severity string declares exhaustion below the utilization cap", () => {
-  // MEASURED 2026-07-28 across the live usage cache, the ENTIRE observed
-  // severity vocabulary is:
-  //     severity="normal"    n=23  utilization 0-72
-  //     severity="critical"  n=1   utilization 100
-  // "exhausted" appears in ZERO live samples. Two samples of one non-normal
-  // value cannot distinguish "at the cap" from "approaching the cap", and
-  // reading it as exhaustion would hard-exclude a WEEKLY window for days on an
-  // account that still has headroom. Exhaustion is therefore decided by
-  // utilization only, which is unambiguous and measured.
+  // MEASURED in the Claude Code 2.1.220 bundle (binary-safe grep -a):
+  //     severity:"normal" 0, severity:"critical" 0, severity:"exhausted" 0
+  // Positive controls on the same file by the same method: severity:"error" 27,
+  // severity:"warning" 22, severity:"fatal" 6, bare severity 295 — so the zeros
+  // discriminate. The reference client reads kind, scope, percent, resets_at
+  // and extra_usage.* off a limit entry and never reads severity from the usage
+  // payload. Branching on it means branching on a string with no evidence of
+  // existing; utilization is the field the client itself acts on.
   for (const severity of ["critical", "exhausted", "warning", "anything-else"]) {
     const health = deriveWindowHealth(
       parseUsageResponse(

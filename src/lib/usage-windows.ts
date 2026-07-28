@@ -33,18 +33,26 @@ export const SESSION_WINDOW_MAX_MS = 5 * 60 * 60 * 1000;
  * low. Kept at the cap: the near-cap band is handled by the headroom floors in
  * selection, so nothing here depends on an invented threshold.
  *
- * `severity` is deliberately NOT used to decide exhaustion. The complete
- * vocabulary observed in the live usage cache (2026-07-28) is:
+ * `severity` is deliberately NOT used to decide exhaustion — there is no
+ * evidence the values one might branch on exist at all.
  *
- *     severity="normal"    n=23  utilization 0–72
- *     severity="critical"  n=1   utilization 100
+ * MEASURED in the Claude Code 2.1.220 bundle
+ * (`/home/hasna/.local/share/claude/versions/2.1.220`, binary-safe `grep -a`):
  *
- * One sample of one non-normal value cannot distinguish "at the cap" from
- * "approaching the cap". Reading it as exhaustion would hard-exclude a WEEKLY
- * window for days on an account that may still have headroom, and the only
- * live `critical` window is at 100% anyway — so the utilization path already
- * catches it and the severity branch would buy nothing it could not also get
- * wrong. Utilization is the measured, unambiguous signal; it decides alone.
+ *     severity:"normal"     0
+ *     severity:"critical"   0
+ *     severity:"exhausted"  0
+ *
+ * with positive controls by the same method on the same file proving the search
+ * discriminates rather than silently matching nothing: `severity:"error"` 27,
+ * `severity:"warning"` 22, `severity:"fatal"` 6, bare `severity` 295. The
+ * reference client reads `kind`, `scope`, `percent`, `resets_at` and
+ * `extra_usage.*` off a limit entry and never reads `severity` from the usage
+ * payload at all.
+ *
+ * Utilization is the field the client itself acts on, so it decides alone here.
+ * (The live usage cache does carry `severity="critical"` on a `weekly_all`
+ * window at 100% — caught by utilization regardless.)
  */
 export const DEFAULT_EXHAUSTION_PERCENT = 100;
 

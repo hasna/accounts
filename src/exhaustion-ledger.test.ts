@@ -203,11 +203,11 @@ test("clearing an account removes its cooldown", () => {
 });
 
 test("the ledger lives in durable state, never under cache/", () => {
-  // Measured 2026-07-28: cache/auto-switch-state.json was written by two live
-  // switches and then vanished (cache/ mtime postdates both), which is
-  // consistent with two switches 60s apart under a 10-minute cooldown. A store
-  // whose only job is surviving restarts cannot sit in a directory the system
-  // treats as disposable.
+  // Holds on naming grounds alone: a store whose only job is surviving restarts
+  // cannot sit in a directory named `cache`, which licenses deletion. (A live
+  // observation motivated the check — cache/auto-switch-state.json is absent
+  // despite two switches 60s apart under a 10-minute cooldown — but the cause
+  // is not established, so the test rests on the naming argument, not on it.)
   recordExhaustion({ accountUuid: "acct", windowClass: "session", now: T0 });
   const path = exhaustionLedgerPath();
   expect(path.includes(`${sep}cache${sep}`)).toBe(false);

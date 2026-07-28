@@ -79,17 +79,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
     printing a stale "100% used" the selector disagrees with.
   - `accounts pick --healthiest` reads the same exhaustion ledger the hook
     writes, so the CLI and the hook no longer disagree about the pool.
-  - Exhaustion is decided by utilization alone. `severity` is not consulted:
-    the complete vocabulary observed live is `normal` (n=23, utilization 0–72)
-    and `critical` (n=1, utilization 100), and one sample of one non-normal
-    value cannot distinguish "at the cap" from "approaching the cap" — reading
-    it as exhaustion would hard-exclude a weekly window for days on an account
-    that may still have headroom.
-  - The ledger lives under `state/`, not `cache/`. Measured on this fleet:
-    `cache/auto-switch-state.json` was written by two live switches and is
-    absent from the filesystem, with `cache/` carrying an mtime later than
-    both — a store that must survive restarts cannot sit where something
-    treats data as disposable.
+  - Exhaustion is decided by utilization alone; `severity` is not consulted.
+    Measured in the Claude Code 2.1.220 bundle (binary-safe): `severity:"normal"`
+    0, `severity:"critical"` 0, `severity:"exhausted"` 0, against positive
+    controls on the same file of `severity:"error"` 27, `"warning"` 22,
+    `"fatal"` 6 and bare `severity` 295. The reference client reads `kind`,
+    `scope`, `percent`, `resets_at` and `extra_usage.*` off a limit entry and
+    never reads `severity` from the usage payload.
+  - The ledger lives under `state/`, not `cache/` — a store whose purpose is
+    surviving restarts must not sit in a directory whose name licenses
+    deletion. (Motivated by a live observation that
+    `cache/auto-switch-state.json` is absent despite two switches 60s apart
+    under a 10-minute cooldown; the cause of that loss is NOT established and
+    is tracked separately.) No migration: nothing was ever released writing
+    the old path.
 
 - `accounts switch-account [name]` — switch the CURRENT Claude Code session's
   account in place, with no restart and the conversation intact. Measured on
