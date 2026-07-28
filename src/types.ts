@@ -10,6 +10,41 @@ const slugSchema = z
 /** Profile name validator. */
 export const profileNameSchema = slugSchema;
 
+const reservedJsonKeys = new Set(["__proto__", "prototype", "constructor"]);
+
+/** A single path segment under a tool's home — never a nested or escaping path. */
+const pathSegmentSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine((v) => !/[\\/]/.test(v) && v !== "." && v !== "..", "must be a single path segment")
+  .refine((v) => !reservedJsonKeys.has(v), "must not be a reserved name");
+
+/** A top-level JSON key shared between the tool's home and a profile. */
+const sharedConfigKeySchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z_][A-Za-z0-9_-]*$/, "must look like a JSON config key")
+  .refine((v) => !reservedJsonKeys.has(v), "must not be a reserved key");
+
+/**
+ * A shared-home-relative JSON file. At most one leading `..` is allowed, so a
+ * tool may read the sibling account file (`~/.claude.json` next to `~/.claude`)
+ * without being able to walk anywhere else on the machine.
+ */
+const sharedConfigSourceSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .refine((v) => !/^([\\/]|[A-Za-z]:)/.test(v), "must be relative to the tool's shared home")
+  .refine((v) => {
+    const parts = v.split(/[\\/]/).filter(Boolean);
+    if (parts.length === 0) return false;
+    if (parts.includes(".")) return false;
+    return parts.every((part, index) => part !== ".." || index === 0);
+  }, "may only ascend one level above the tool's shared home");
+
 /** Validator for a (custom) tool definition stored in the registry. */
 export const toolDefSchema = z.object({
   id: slugSchema,
@@ -27,6 +62,26 @@ export const toolDefSchema = z.object({
   launchArgs: z.array(z.string()).optional(),
   accountFile: z.string().optional(),
   emailPath: z.array(z.string()).optional(),
+  /**
+   * Capability directories (skills, subagents, …) that belong to the human, not
+   * to the account: linked from the tool's shared home into every profile so one
+   * corpus serves all of them. Credentials are never listed here.
+   */
+  sharedEntries: z.array(pathSegmentSchema).max(32).optional(),
+  /**
+   * Capability configuration that cannot be linked because the profile's own
+   * file is rewritten in place (Claude Code stores MCP servers alongside OAuth
+   * state). The listed keys are merged member-by-member instead.
+   */
+  sharedConfig: z
+    .object({
+      /** Profile-relative JSON file the keys are merged into. */
+      target: pathSegmentSchema,
+      /** Shared-home-relative JSON files read for those keys; first hit per key wins. */
+      sources: z.array(sharedConfigSourceSchema).min(1).max(8),
+      keys: z.array(sharedConfigKeySchema).min(1).max(16),
+    })
+    .optional(),
 });
 
 /**

@@ -31,6 +31,21 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     },
     accountFile: ".claude.json",
     emailPath: ["oauthAccount", "emailAddress"],
+    // Measured on Claude Code 2.1.220: the user-scope skill root is
+    // `<CLAUDE_CONFIG_DIR>/skills` and the subagent root is
+    // `<CLAUDE_CONFIG_DIR>/agents`, so a profile with an empty config dir has
+    // neither. `rules`/`CLAUDE.md` are deliberately absent: memory is a
+    // cwd-ancestor walk, so a copy inside a config dir would be inert.
+    sharedEntries: ["skills", "agents"],
+    // Also measured: user-scope MCP servers are read only from
+    // `<CLAUDE_CONFIG_DIR>/.claude.json`; `settings.json` and `mcp.json` inside
+    // the config dir are not consulted. That file also holds OAuth state, so it
+    // is merged rather than linked.
+    sharedConfig: {
+      target: ".claude.json",
+      sources: ["../.claude.json", "settings.json", "mcp.json"],
+      keys: ["mcpServers"],
+    },
   },
   {
     id: "codex-app",

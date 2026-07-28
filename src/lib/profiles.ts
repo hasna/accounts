@@ -5,6 +5,7 @@ import { type Profile, type Store, AccountsError, profileNameSchema } from "../t
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
+import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
 export type ProfileMetadata = Record<string, ProfileMetadataValue>;
@@ -174,6 +175,9 @@ export function addProfile(opts: AddOptions): Profile {
     throw new AccountsError(`a profile already uses config dir ${dir}`);
   }
   mkdirSync(dir, { recursive: true });
+  // A new profile starts with the machine's shared skills/subagents/MCP servers;
+  // only credentials stay per-profile.
+  ensureSharedCapabilities(dir, tool);
 
   const email = opts.email ?? detectEmail(dir, tool);
   if (opts.cardLast4) assertCardLast4(opts.cardLast4);

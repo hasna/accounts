@@ -12,9 +12,11 @@ import {
   DEFAULT_TOOL,
   getTool,
   isBuiltinTool,
+  listTools,
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./lib/tools.js";
+import { sharedCapabilityHealth } from "./lib/shared-capabilities.js";
 import {
   expandPath,
   type ProfileMetadata,
@@ -1340,6 +1342,7 @@ program
       );
       const applied = loadAppliedMap();
       let problems = 0;
+      let capabilityHintNeeded = false;
       for (const p of profiles) {
         const missing = !existsSync(p.dir);
         const noEmail = !p.email;
@@ -1353,6 +1356,23 @@ program
         } else {
           console.log(chalk.yellow(`  ! ${p.name}: no email recorded`));
         }
+        if (missing) continue;
+        // Capability check: a profile that carries none of the machine's skills,
+        // subagents, or MCP servers is broken even when its auth is perfect.
+        const tool = listTools().find((t) => t.id === p.tool);
+        if (!tool) continue;
+        const capabilities = sharedCapabilityHealth(p.dir, tool);
+        for (const problem of capabilities.problems) {
+          console.log(chalk.red(`    ✗ ${p.name}: ${problem}`));
+          problems++;
+          capabilityHintNeeded = true;
+        }
+        for (const warning of capabilities.warnings) {
+          console.log(chalk.yellow(`    ! ${p.name}: ${warning}`));
+        }
+      }
+      if (capabilityHintNeeded) {
+        console.log(chalk.dim("\n  shared capabilities are materialized on launch — run `accounts env <name>` to repair now"));
       }
       for (const [toolId, appliedName] of Object.entries(applied)) {
         if (!profiles.some((p) => p.name === appliedName && p.tool === toolId)) {
