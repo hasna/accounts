@@ -210,3 +210,39 @@ test("a fresher profile credential beats a stale central one — validity outran
   expect(index[0]!.status).toBe("ok");
   expect(accessTokenForAccount(index[0]!)).toBe("profile-token");
 });
+
+test("case-variant payload uuids collapse into ONE identity (central uppercase vs snapshot lowercase)", () => {
+  const UP = "ABCDABCD-1234-4ABC-8ABC-ABCDABCD1234";
+  const low = UP.toLowerCase();
+
+  const central = centralAuthDir(low);
+  mkdirSync(central, { recursive: true });
+  writeFileSync(
+    join(central, "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: UP, emailAddress: "case@example.com" } }),
+  );
+  writeFileSync(
+    join(central, "credentials.json"),
+    credentialJson({ uuid: UP, email: "case@example.com", accessToken: "central-token" }),
+  );
+
+  const dir = makeDir("case");
+  writeSnapshot(dir, { uuid: low, email: "case@example.com", accessToken: "profile-token" });
+
+  const index = buildIdentityIndex([{ name: "case", dir }], tool());
+  expect(index).toHaveLength(1);
+  expect(index[0]!.accountUuid).toBe(low);
+});
+
+test("central scan skips non-UUID directory names (parity with listCentralAccounts)", () => {
+  const evil = join(home, "auth", "not-a-uuid");
+  mkdirSync(evil, { recursive: true });
+  writeFileSync(
+    join(evil, "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: "not-a-uuid", emailAddress: "evil@example.com" } }),
+  );
+  writeFileSync(join(evil, "credentials.json"), credentialJson({ uuid: "not-a-uuid", email: "evil@example.com" }));
+
+  const index = buildIdentityIndex([], tool());
+  expect(index).toHaveLength(0);
+});

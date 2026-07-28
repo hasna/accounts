@@ -8,7 +8,7 @@ import {
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
 } from "./claude-layout.js";
-import { centralAuthRoot } from "./auth-store.js";
+import { centralAuthRoot, isAccountUuid } from "./auth-store.js";
 
 /**
  * UUID-keyed account enumeration. Directories are DOORS; accounts are the
@@ -83,7 +83,11 @@ function oauthIdentityFrom(record: JsonRecord | undefined): OAuthIdentity | unde
   const { accountUuid, emailAddress } = oauth as JsonRecord;
   if (typeof accountUuid !== "string" || !accountUuid) return undefined;
   return {
-    accountUuid,
+    // Lowercase well-formed uuids so case-variant spellings of one account
+    // dedupe into a single identity; malformed values pass through as-is —
+    // they are still shown to diagnostics, but must never reach the central
+    // path helpers (which throw): guard with isAccountUuid first.
+    accountUuid: isAccountUuid(accountUuid) ? accountUuid.toLowerCase() : accountUuid,
     ...(typeof emailAddress === "string" && emailAddress ? { email: emailAddress } : {}),
   };
 }
@@ -180,6 +184,10 @@ export function buildIdentityIndex(
   const centralRoot = centralAuthRoot();
   if (existsSync(centralRoot)) {
     for (const entry of readdirSync(centralRoot)) {
+      // Strict-uuid parity with listCentralAccounts: a planted non-uuid dir
+      // must not become an identity (and must never reach path helpers that
+      // throw on malformed uuids).
+      if (!isAccountUuid(entry)) continue;
       const dir = join(centralRoot, entry);
       try {
         if (!statSync(dir).isDirectory()) continue;
@@ -188,7 +196,7 @@ export function buildIdentityIndex(
       }
       const identity = oauthIdentityFrom(readJson(join(dir, OAUTH_SNAPSHOT)));
       // The store writes lowercased dir names; tolerate case-variant payloads.
-      if (!identity || identity.accountUuid.toLowerCase() !== entry.toLowerCase()) continue;
+      if (!identity || identity.accountUuid !== entry.toLowerCase()) continue;
       record(byUuid, identity, undefined, credentialRef(join(dir, CREDENTIALS_SNAPSHOT), "central"));
     }
   }
