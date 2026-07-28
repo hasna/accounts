@@ -170,6 +170,27 @@ export {
   CLAUDE_API_AUTH_ENV_KEYS,
 } from "./lib/claude-auth.js";
 export type { ClaudeProfileAuthHealth, ClaudeProfileAuthStatus } from "./lib/claude-auth.js";
+export {
+  centralAuthRoot,
+  centralAuthDir,
+  centralOAuthSnapshot,
+  centralCredentialsSnapshot,
+  centralCredentialsPathForProfile,
+  centralOAuthRecordForProfile,
+  profileAccountUuid,
+  syncProfileSnapshotToCentral,
+  listCentralAccounts,
+  listKnownAccounts,
+  sweepCentralAuth,
+} from "./lib/auth-store.js";
+export type {
+  CentralAccount,
+  KnownAccount,
+  SweepResult,
+  SweptOrphan,
+  SyncFileAction,
+  SyncResult,
+} from "./lib/auth-store.js";
 export { withApplyLock } from "./lib/apply-lock.js";
 export { isSafeProfileName } from "./lib/hook.js";
 export { readClaudeKeychain, keychainSupported } from "./lib/keychain.js";
