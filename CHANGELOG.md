@@ -8,6 +8,16 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ### Added
 
+- Central identity-keyed auth snapshot store (`docs/auth-store.md`):
+  `~/.hasna/accounts/auth/<accountUuid>/{credentials.json,oauth-account.json}`
+  replaces the per-profile `.accounts-auth/` dirs as the canonical credential
+  home, with a read-both/write-new compatibility window for <= 0.2.15
+  binaries (writes mirrored to both stores, reads pick the `betterCredential`
+  winner, nothing deleted). New CLI: `accounts auth status | migrate | sweep`
+  (sweep is dry-run by default, refuses in api storage mode, and only ever
+  MOVES orphaned entries to `auth-trash/`). `buildIdentityIndex()` and the
+  central-store surface are exported from the package root.
+
 - Usage-aware automatic account switching (`docs/usage-aware-switching.md`):
   - `accounts usage` — per-ACCOUNT usage from Claude's `/api/oauth/usage`
     (`Authorization: Bearer <accessToken>` + `anthropic-beta: oauth-2025-04-20`),
