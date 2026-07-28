@@ -141,6 +141,28 @@ export const toolDefSchema = z.object({
       exclude: z.array(sharedConfigMemberSchema).max(64).optional(),
     })
     .optional(),
+  /**
+   * Where the tool keeps conversation history, so a session started under one
+   * profile can be resumed under another. These are shared entries too, but
+   * they are named separately because — unlike a skills corpus — every existing
+   * profile already owns a real, populated directory at the target path, which
+   * `ensureSharedCapabilities` will (correctly) refuse to replace. They can only
+   * be linked after `accounts sessions merge` has unioned their contents into
+   * the shared home, so `sharedEntriesFor` derives the link list from here
+   * rather than the list being restated in `sharedEntries`.
+   *
+   * Live per-process state (Claude's PID-keyed `sessions/`) is deliberately not
+   * describable here: it is runtime bookkeeping for a running process, not
+   * history, and two profiles sharing it would each prune the other's records.
+   */
+  sessions: z
+    .object({
+      /** Profile-relative directory holding transcripts, at any nesting depth. */
+      transcripts: pathSegmentSchema,
+      /** Profile-relative JSONL file of prompt history records. */
+      history: pathSegmentSchema,
+    })
+    .optional(),
 });
 
 /**
