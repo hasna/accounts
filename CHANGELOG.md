@@ -8,6 +8,33 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ### Added
 
+- Usage-aware automatic account switching (`docs/usage-aware-switching.md`):
+  - `accounts usage` — per-ACCOUNT usage from Claude's `/api/oauth/usage`
+    (`Authorization: Bearer <accessToken>` + `anthropic-beta: oauth-2025-04-20`),
+    keyed on `oauthAccount.accountUuid` and deduplicated across profile dirs —
+    one query per distinct account however many dirs hold it. Reports session
+    and weekly windows (structured `limits[]` preferred), headroom
+    (100 − worst unscoped window), expired/credential-less accounts as states
+    (never crashes), and caches per uuid under `cache/usage/`.
+  - `accounts pick --healthiest` — non-interactive selector: the account with
+    the most headroom, never the one the session currently runs as (the
+    silent-no-op case), resolved to a profile door; reports "all limited"
+    honestly instead of flapping. No identity exclusions (user-ratified
+    2026-07-28: switching across all client identities is fine).
+  - `accounts usage-hook` — a Claude Code `UserPromptSubmit` handler that
+    auto-switches the session in place (via `switch-account`) when any
+    unscoped window crosses the threshold (default 90% used). Cached-only
+    decisions with a detached background refresh (never blocks a prompt),
+    fail-open on every error, cooldown against flapping, loud `systemMessage`
+    announcements for switches AND failed switches, and a mandatory
+    post-switch assertion that the active `accountUuid` actually changed.
+    NOT installed automatically — `--print-install` prints the settings.json
+    snippet for operator opt-in.
+  - Identity enumeration lives behind one accessor
+    (`buildIdentityIndex()`), reading the future central auth home
+    `~/.hasna/accounts/auth/<accountUuid>/` first with per-profile
+    `.accounts-auth/` fallback, ready for the auth-store migration.
+
 - `accounts switch-account [name]` — switch the CURRENT Claude Code session's
   account in place, with no restart and the conversation intact. Measured on
   Claude Code 2.1.220: a running session re-reads `<configDir>/.credentials.json`
