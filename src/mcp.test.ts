@@ -46,6 +46,7 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
 
   try {
     await client.connect(transport);
+    const mcpProjectKey = ["sk", "proj", "mcp-positional-secret"].join("-");
     const response = await client.callTool({
       name: "switch_profile",
       arguments: {
@@ -84,10 +85,17 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
           "--api-key",
           "--",
           "--client-key",
-          "keep-mcp-positional-client-value",
-          "--api-key=keep-mcp-positional-attached-value",
-          "-k",
-          "keep-mcp-positional-short-value",
+          "keep-mcp-positional-plain-value",
+          "--api-key=mcp-positional-attached-secret",
+          "env=--client-key",
+          "",
+          "mcp-positional-wrapper-split-secret",
+          "keep-mcp-positional-wrapper-split",
+          "url=urn:authorization:public",
+          "keep-mcp-positional-urn",
+          "Authorization: Bearer mcp-positional-bearer-secret",
+          mcpProjectKey,
+          "keep-mcp-positional-control",
         ],
       },
     });
@@ -103,6 +111,10 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
       "mcp-malformed-underscore-secret",
       "mcp-malformed-fullwidth-secret",
       "mcp-malformed-minus-secret",
+      "mcp-positional-attached-secret",
+      "mcp-positional-wrapper-split-secret",
+      "mcp-positional-bearer-secret",
+      mcpProjectKey,
     ]) {
       expect(text).not.toContain(secret);
     }
@@ -151,10 +163,17 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
       "--api-key",
       "--",
       "--client-key",
-      "keep-mcp-positional-client-value",
-      "--api-key=keep-mcp-positional-attached-value",
-      "-k",
-      "keep-mcp-positional-short-value",
+      "keep-mcp-positional-plain-value",
+      "--api-key=[REDACTED]",
+      "env=--client-key",
+      "",
+      "[REDACTED]",
+      "keep-mcp-positional-wrapper-split",
+      "url=urn:authorization:public",
+      "keep-mcp-positional-urn",
+      "Authorization: [REDACTED]",
+      "[REDACTED]",
+      "[REDACTED]",
     ]);
     expect(output.commandLine).toContain(
       "'--api-key' '--client-key' '[REDACTED]'",
@@ -178,11 +197,18 @@ test("MCP switch_profile redacts chained sensitive argv in command and commandLi
       );
     }
     expect(output.commandLine).toContain(
-      "'--api-key' '--' '--client-key' 'keep-mcp-positional-client-value'",
+      "'--api-key' '--' '--client-key' 'keep-mcp-positional-plain-value'",
     );
     expect(output.commandLine).toContain(
-      "'--api-key=keep-mcp-positional-attached-value' '-k' 'keep-mcp-positional-short-value'",
+      "'env=--client-key' '' '[REDACTED]' 'keep-mcp-positional-wrapper-split'",
     );
+    expect(output.commandLine).toContain(
+      "'url=urn:authorization:public' 'keep-mcp-positional-urn'",
+    );
+    expect(output.commandLine).toContain(
+      "'Authorization: [REDACTED]' '[REDACTED]' '[REDACTED]'",
+    );
+    expect(output.commandLine).not.toContain("keep-mcp-positional-control");
   } finally {
     await client.close();
   }

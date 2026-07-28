@@ -458,37 +458,169 @@ test("argument redaction preserves supported option grammar around credential ch
   ]);
 });
 
-test("argument redaction honors exact end-of-options markers in ordinary and pending states", () => {
+test("argument redaction stops option parsing after exact markers but redacts each positional", () => {
+  const ordinaryProjectKey = ["sk", "proj", "ordinary-positional-secret"].join("-");
+  const pendingProjectKey = ["sk", "proj", "pending-positional-secret"].join("-");
   const afterOrdinaryMarker = [
     "provider",
     "--",
     "--api-key",
-    "keep-positional-api-value",
-    "--client-key=keep-positional-attached-value",
-    "-k",
-    "keep-positional-short-value",
+    "keep-positional-plain-value",
+    "--client-key=ordinary-positional-attached-secret",
+    "X-API-Key:",
+    "",
+    "ordinary-split-positional-api-secret",
+    "keep-after-split-api-key",
+    ordinaryProjectKey,
+    "keep-ordinary-positional-control",
+    "Authorization:",
+    "Bearer",
+    "ordinary-split-positional-bearer-secret",
+    "",
+    "redact-after-split-authorization",
   ];
-  expect(redactArgv(afterOrdinaryMarker)).toEqual(afterOrdinaryMarker);
+  expect(redactArgv(afterOrdinaryMarker)).toEqual([
+    "provider",
+    "--",
+    "--api-key",
+    "keep-positional-plain-value",
+    "--client-key=[REDACTED]",
+    "X-API-Key:",
+    "",
+    "[REDACTED]",
+    "keep-after-split-api-key",
+    "[REDACTED]",
+    "keep-ordinary-positional-control",
+    "Authorization:",
+    "[REDACTED]",
+    "[REDACTED]",
+    "",
+    "[REDACTED]",
+  ]);
 
   const afterPendingMarker = [
     "provider",
     "--api-key",
     "--",
     "--client-key",
-    "keep-pending-marker-client-value",
-    "--api-key=keep-pending-marker-attached-value",
-    "-vk",
-    "keep-pending-marker-short-value",
+    "keep-pending-marker-plain-value",
+    "--api-key=pending-positional-attached-secret",
+    "Authorization:Bearer",
+    "pending-split-positional-bearer-secret",
+    "",
+    "keep-after-attached-authorization-scheme",
+    pendingProjectKey,
+    "keep-pending-positional-control",
   ];
-  expect(redactArgv(afterPendingMarker)).toEqual(afterPendingMarker);
+  expect(redactArgv(afterPendingMarker)).toEqual([
+    "provider",
+    "--api-key",
+    "--",
+    "--client-key",
+    "keep-pending-marker-plain-value",
+    "--api-key=[REDACTED]",
+    "Authorization:[REDACTED]",
+    "[REDACTED]",
+    "",
+    "[REDACTED]",
+    "[REDACTED]",
+    "[REDACTED]",
+  ]);
 });
 
-test("argument end-of-options preservation stays linear across large positional payloads", () => {
+test("post-marker authorization state preserves empty padding and fails closed through the tail", () => {
+  const cases: Array<[string[], string[]]> = [
+    [
+      ["provider", "--", "Authorization:", "", "Bearer", "", "plain-bearer-secret", "tail"],
+      ["provider", "--", "Authorization:", "", "[REDACTED]", "", "[REDACTED]", "[REDACTED]"],
+    ],
+    [
+      [
+        "provider",
+        "--",
+        "Authorization:",
+        "Digest",
+        "username=alice,",
+        "realm=example,",
+        "response=plain-digest-secret",
+        "tail",
+      ],
+      [
+        "provider",
+        "--",
+        "Authorization:",
+        "[REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+      ],
+    ],
+    [
+      [
+        "provider",
+        "--",
+        "Authorization: AWS4-HMAC-SHA256",
+        "Credential=access/example,",
+        "SignedHeaders=host;x-date,",
+        "Signature=plain-aws-secret",
+        "tail",
+      ],
+      [
+        "provider",
+        "--",
+        "Authorization: [REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+        "[REDACTED]",
+      ],
+    ],
+    [
+      ["provider", "--", "Proxy-Authorization:", "Custom+Proof", "secret", "tail"],
+      ["provider", "--", "Proxy-Authorization:", "[REDACTED]", "[REDACTED]", "[REDACTED]"],
+    ],
+  ];
+
+  for (const [input, expected] of cases) {
+    expect(redactArgv(input)).toEqual(expected);
+  }
+});
+
+test("post-marker single-value credential fields preserve empty padding without widening their extent", () => {
+  expect(
+    redactArgv([
+      "provider",
+      "--",
+      "X-API-Key:",
+      "",
+      "plain-api-secret",
+      "keep-after-api-key",
+      "Cookie:",
+      "",
+      "session=plain-cookie-secret; other=plain-cookie-secret-two",
+      "keep-after-cookie",
+    ]),
+  ).toEqual([
+    "provider",
+    "--",
+    "X-API-Key:",
+    "",
+    "[REDACTED]",
+    "keep-after-api-key",
+    "Cookie:",
+    "",
+    "[REDACTED]",
+    "keep-after-cookie",
+  ]);
+});
+
+test("argument end-of-options positional redaction stays linear at scale", () => {
   const positional = Array.from(
     { length: 200_000 },
     (_, index) => index % 2 === 0
-      ? `--api-key=keep-positional-${index}`
-      : `-k-keep-positional-${index}`,
+      ? `--api-key=large-positional-secret-${index}`
+      : `keep-large-positional-${index}`,
   );
   const input = ["provider", "--api-key", "--", ...positional];
 
@@ -496,8 +628,370 @@ test("argument end-of-options preservation stays linear across large positional 
   const redacted = redactArgv(input);
   const elapsedMs = performance.now() - startedAt;
 
-  expect(redacted).toEqual(input);
+  expect(redacted).toHaveLength(input.length);
+  expect(redacted.slice(0, 3)).toEqual(["provider", "--api-key", "--"]);
+  expect(redacted[3]).toBe("--api-key=[REDACTED]");
+  expect(redacted[4]).toBe("keep-large-positional-1");
+  expect(redacted.at(-2)).toBe("--api-key=[REDACTED]");
+  expect(redacted.at(-1)).toBe("keep-large-positional-199999");
   expect(elapsedMs).toBeLessThan(1_500);
+
+  const authorizationTail = Array.from(
+    { length: 100_000 },
+    (_, index) => index % 2 === 0 ? "" : `authorization-tail-${index}`,
+  );
+  const authorizationStartedAt = performance.now();
+  const authorizationRedacted = redactArgv([
+    "provider",
+    "--",
+    "Authorization:",
+    ...authorizationTail,
+  ]);
+  const authorizationElapsedMs = performance.now() - authorizationStartedAt;
+
+  expect(authorizationRedacted).toHaveLength(authorizationTail.length + 3);
+  expect(authorizationRedacted.slice(0, 5)).toEqual([
+    "provider",
+    "--",
+    "Authorization:",
+    "",
+    "[REDACTED]",
+  ]);
+  expect(authorizationRedacted.at(-2)).toBe("");
+  expect(authorizationRedacted.at(-1)).toBe("[REDACTED]");
+  expect(authorizationElapsedMs).toBeLessThan(1_500);
+});
+
+test("captured command strings redact credential-aware positional tails after exact markers", () => {
+  const input =
+    "claude -- --api-key=command-positional-attached-secret " +
+    "Authorization: Bearer command-positional-bearer-secret " +
+    "keep-command-positional-control";
+  const expected =
+    "claude -- --api-key=[REDACTED] " +
+    "Authorization: [REDACTED] [REDACTED] [REDACTED]";
+
+  expect(redactText(input)).toBe(expected);
+  expect(redactPublicValue({ command: input })).toEqual({
+    command: expected,
+  });
+  expect(
+    redactText(`${input}\nstatus=ok keep-next-command-record`),
+  ).toBe(
+    `${expected}\nstatus=ok keep-next-command-record`,
+  );
+});
+
+test("captured post-marker single-value fields consume one nonempty logical token", () => {
+  const cases = [
+    {
+      input:
+        "provider -- X-API-Key: positional-single-secret " +
+        "keep-after-positional-single",
+      secret: "positional-single-secret",
+      retained: "keep-after-positional-single",
+    },
+    {
+      input:
+        'provider -- Client-Secret: "positional quoted secret" ' +
+        "keep-after-positional-quoted",
+      secret: "positional quoted secret",
+      retained: "keep-after-positional-quoted",
+    },
+    {
+      input:
+        String.raw`provider -- Auth-Token: positional\ escaped\ secret ` +
+        "keep-after-positional-escaped",
+      secret: String.raw`positional\ escaped\ secret`,
+      retained: "keep-after-positional-escaped",
+    },
+    {
+      input:
+        'provider -- Cookie: "" session=positional-cookie-secret ' +
+        "keep-after-positional-empty-padding",
+      secret: "session=positional-cookie-secret",
+      retained: "keep-after-positional-empty-padding",
+    },
+  ];
+
+  for (const sample of cases) {
+    const redacted = redactText(sample.input);
+    expect(redacted, sample.input).not.toContain(sample.secret);
+    expect(redacted, sample.input).toContain(sample.retained);
+  }
+});
+
+test("post-marker wrapper delimiters cannot hide positional credential fields", () => {
+  const input =
+    "provider -- env=--api-key=wrapped-api-secret " +
+    "wrapper:--client-key=wrapped-client-secret keep-before-wrapped-auth " +
+    "env=Authorization:Bearer wrapped-bearer-secret keep-wrapped-auth-tail";
+  const redactedText = redactText(input);
+  expect(redactedText).toContain("env=--api-key=[REDACTED]");
+  expect(redactedText).toContain("wrapper:--client-key=[REDACTED]");
+  expect(redactedText).toContain("keep-before-wrapped-auth");
+  expect(redactedText).toContain("env=Authorization:[REDACTED]");
+  expect(redactedText).not.toContain("wrapped-api-secret");
+  expect(redactedText).not.toContain("wrapped-client-secret");
+  expect(redactedText).not.toContain("wrapped-bearer-secret");
+  expect(redactedText).not.toContain("keep-wrapped-auth-tail");
+  expect(redactPublicValue({ command: input })).toEqual({
+    command: redactedText,
+  });
+  expect(
+    redactText(
+      "provider -- env=X-API-Key: wrapped-next-secret " +
+      "keep-after-wrapped-next",
+    ),
+  ).toBe(
+    "provider -- env=X-API-Key: [REDACTED] keep-after-wrapped-next",
+  );
+  expect(
+    redactText("provider -- env=keyboard:visible keep-wrapper-near-miss"),
+  ).toBe("provider -- env=keyboard:visible keep-wrapper-near-miss");
+  expect(
+    redactText(
+      "provider -- wrapper=(--api-key=wrapped-parenthesized-secret) " +
+      "keep-after-wrapped-parenthesized",
+    ),
+  ).toBe(
+    "provider -- wrapper=(--api-key=[REDACTED]) " +
+    "keep-after-wrapped-parenthesized",
+  );
+  expect(
+    redactArgv([
+      "provider",
+      "--",
+      "env=--api-key=wrapped-argv-api-secret",
+      "wrapper:--client-key=wrapped-argv-client-secret",
+      "env=X-API-Key:",
+      "",
+      "wrapped-argv-next-secret",
+      "keep-after-wrapped-argv-next",
+      "keep-before-wrapped-argv-auth",
+      "env=Authorization:Bearer",
+      "wrapped-argv-bearer-secret",
+      "keep-wrapped-argv-auth-tail",
+    ]),
+  ).toEqual([
+    "provider",
+    "--",
+    "env=--api-key=[REDACTED]",
+    "wrapper:--client-key=[REDACTED]",
+    "env=X-API-Key:",
+    "",
+    "[REDACTED]",
+    "keep-after-wrapped-argv-next",
+    "keep-before-wrapped-argv-auth",
+    "env=Authorization:[REDACTED]",
+    "[REDACTED]",
+    "[REDACTED]",
+  ]);
+  expect(
+    redactPublicValue({
+      argv: [
+        "provider",
+        "--",
+        "wrap/Authorization:Bearer",
+        "wrapped-slash-bearer-secret",
+        "keep-wrapped-slash-auth-tail",
+      ],
+    }),
+  ).toEqual({
+    argv: [
+      "provider",
+      "--",
+      "wrap/Authorization:[REDACTED]",
+      "[REDACTED]",
+      "[REDACTED]",
+    ],
+  });
+  expect(
+    redactArgv([
+      "provider",
+      "--",
+      "x|Proxy-Authorization:Digest",
+      "wrapped-pipe-proxy-secret",
+      "keep-wrapped-pipe-auth-tail",
+    ]),
+  ).toEqual([
+    "provider",
+    "--",
+    "x|Proxy-Authorization:[REDACTED]",
+    "[REDACTED]",
+    "[REDACTED]",
+  ]);
+  expect(
+    redactArgv([
+      "provider",
+      "--",
+      "url=urn:authorization:public",
+      "keep-after-urn",
+    ]),
+  ).toEqual([
+    "provider",
+    "--",
+    "url=urn:authorization:public",
+    "keep-after-urn",
+  ]);
+});
+
+test("post-marker wrapper-bound split options preserve syntax and one pending value", () => {
+  const cases = [
+    {
+      token: "env=--api-key",
+      secret: "wrapped-split-api-secret",
+      retained: "keep-after-wrapped-split-api",
+    },
+    {
+      token: "wrapper:--client-key",
+      secret: "wrapped-split-client-secret",
+      retained: "keep-after-wrapped-split-client",
+    },
+    {
+      token: "outer=(env=--master-key)",
+      secret: "nested-wrapped-split-master-secret",
+      retained: "keep-after-nested-wrapped-split-master",
+    },
+  ];
+
+  for (const sample of cases) {
+    const argv = [
+      "provider",
+      "--",
+      sample.token,
+      "",
+      sample.secret,
+      sample.retained,
+    ];
+    expect(redactArgv(argv), sample.token).toEqual([
+      "provider",
+      "--",
+      sample.token,
+      "",
+      "[REDACTED]",
+      sample.retained,
+    ]);
+
+    const command =
+      `provider -- ${sample.token} "" ${sample.secret} ${sample.retained}`;
+    const redacted = redactText(command);
+    expect(redacted, sample.token).toContain(sample.token);
+    expect(redacted, sample.token).not.toContain(sample.secret);
+    expect(redacted, sample.token).toContain(sample.retained);
+    expect(
+      redactPublicValue({ argv, command }),
+      sample.token,
+    ).toEqual({
+      argv: [
+        "provider",
+        "--",
+        sample.token,
+        "",
+        "[REDACTED]",
+        sample.retained,
+      ],
+      command: redacted,
+    });
+  }
+});
+
+test("structured colon values cannot create positional credential state", () => {
+  const nearMisses = [
+    "urn:authorization:public",
+    "https://example.test/authorization:public",
+    "mailto:person@example.test:authorization:public",
+    "file:///tmp/authorization:public",
+    "url=urn:authorization:public",
+    "url=https://example.test/authorization:public",
+    "urn:example:--api-key",
+    "mailto:person@example.test:--client-key",
+    "C:/safe/path:--master-key",
+    String.raw`C:\safe\path:--api-key`,
+    String.raw`C:\safe\authorization:public`,
+  ];
+
+  for (const token of nearMisses) {
+    const retained = `keep-after-${nearMisses.indexOf(token)}`;
+    const command = `provider -- ${token} ${retained}`;
+    expect(redactText(command), token).toBe(command);
+    expect(redactArgv(["provider", "--", token, retained]), token).toEqual([
+      "provider",
+      "--",
+      token,
+      retained,
+    ]);
+    expect(redactPublicValue({ command, argv: ["provider", "--", token, retained] })).toEqual({
+      command,
+      argv: ["provider", "--", token, retained],
+    });
+  }
+
+  for (const sensitive of [
+    "Authorization:https://example.test/credential",
+    "Authorization:user@example.test",
+    "message=Authorization:user@example.test",
+  ]) {
+    const redacted = redactText(sensitive);
+    expect(redacted, sensitive).not.toBe(sensitive);
+    expect(redacted, sensitive).toContain("[REDACTED]");
+  }
+});
+
+test("quoted diagnostic command payloads retain wrapper split state across empty quotes", () => {
+  const secret = "quoted-diagnostic-wrapper-split-secret";
+  for (const suffix of ["", " (ENOENT)", ", code=ENOENT"]) {
+    const input =
+      'Executable not found in $PATH: "provider -- outer=(env=--api-key) ' +
+      `"" ${secret} keep-quoted-diagnostic-split ` +
+      `url=urn:authorization:public keep-quoted-diagnostic-urn"${suffix}`;
+    const redacted = redactText(input);
+
+    expect(redacted, suffix).not.toContain(secret);
+    expect(redacted, suffix).toContain('outer=(env=--api-key) "" [REDACTED]');
+    expect(redacted, suffix).toContain("keep-quoted-diagnostic-split");
+    expect(redacted, suffix).toContain("url=urn:authorization:public");
+    expect(redacted, suffix).toContain("keep-quoted-diagnostic-urn");
+    expect(redacted, suffix).toEndWith(suffix);
+  }
+});
+
+test("wrapper-bound split positional redaction stays linear at scale", () => {
+  const positional = Array.from(
+    { length: 100_000 },
+    (_, index) =>
+      index % 2 === 0
+        ? `env=--api-key`
+        : `wrapped-scale-secret-${index}`,
+  );
+  const startedAt = performance.now();
+  const redacted = redactArgv(["provider", "--", ...positional]);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).toHaveLength(positional.length + 2);
+  expect(redacted.slice(2, 6)).toEqual([
+    "env=--api-key",
+    "[REDACTED]",
+    "env=--api-key",
+    "[REDACTED]",
+  ]);
+  expect(redacted.at(-1)).toBe("[REDACTED]");
+  expect(elapsedMs).toBeLessThan(1_500);
+});
+
+test("generic structured-colon suppression stays linear on dense near misses", () => {
+  const samples = [2_000, 4_000, 8_000].map((count) =>
+    `urn:${"authorization:public:".repeat(count)}`);
+  const elapsed: number[] = [];
+
+  for (const sample of samples) {
+    const startedAt = performance.now();
+    expect(redactText(sample)).toBe(sample);
+    elapsed.push(performance.now() - startedAt);
+  }
+
+  expect(elapsed[2]!).toBeLessThan(1_000);
+  expect(elapsed[2]!).toBeLessThan(elapsed[0]! * 8 + 50);
 });
 
 test("captured command end-of-options requires one exact raw ASCII token", () => {
@@ -1358,6 +1852,49 @@ test("recursive public redaction uses prototype-safe objects", () => {
   expect(JSON.stringify(redacted)).not.toContain("prototype-secret");
   expect(JSON.stringify(redacted)).not.toContain("nested-secret");
   expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+});
+
+test("recursive public redaction keeps state across command argument arrays", () => {
+  const redacted = redactPublicValue({
+    argv: [
+      "provider",
+      "--",
+      "--api-key",
+      "keep-positional-plain-value",
+      "Authorization:",
+      "Custom+Proof",
+      "split-public-authorization-secret",
+      "keep-public-control",
+    ],
+  }) as { argv: string[] };
+
+  expect(redacted.argv).toEqual([
+    "provider",
+    "--",
+    "--api-key",
+    "keep-positional-plain-value",
+    "Authorization:",
+    "[REDACTED]",
+    "[REDACTED]",
+    "[REDACTED]",
+  ]);
+});
+
+test("malformed command argument arrays fail closed without evaluating accessors", () => {
+  let getterCount = 0;
+  const argv = ["provider", "--", "Authorization:"] as string[];
+  Object.defineProperty(argv, "3", {
+    get() {
+      getterCount++;
+      return "getter-secret";
+    },
+    enumerable: true,
+  });
+  argv.length = 4;
+
+  const redacted = redactPublicValue({ argv }) as { argv: unknown[] };
+  expect(redacted.argv).toEqual(["[TRUNCATED]"]);
+  expect(getterCount).toBe(0);
 });
 
 test("recursive public redaction never evaluates accessors or proxy traps", () => {

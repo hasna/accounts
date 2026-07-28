@@ -334,6 +334,13 @@ describe("configs prelaunch", () => {
         secret: "prelaunch-short-secret",
         retained: "--color keep-short-color",
       },
+      {
+        output:
+          'provider -- outer=(env=--api-key) "" ' +
+          "prelaunch-wrapper-split-secret keep-prelaunch-wrapper-split",
+        secret: "prelaunch-wrapper-split-secret",
+        retained: "keep-prelaunch-wrapper-split",
+      },
     ];
 
     for (const sample of cases) {
@@ -353,6 +360,32 @@ describe("configs prelaunch", () => {
       expect(message).not.toContain(sample.secret);
       expect(message).toContain(sample.retained);
     }
+  });
+
+  test("prelaunch captured command text preserves structured authorization near misses", () => {
+    const p = profile("codex");
+    const output =
+      "provider -- url=urn:authorization:public keep-prelaunch-urn " +
+      "url=https://example.test/authorization:public keep-prelaunch-url";
+    let message = "";
+    try {
+      runConfigsPrelaunch(p, getTool("codex"), {
+        runner: () => ({
+          status: 2,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(output),
+        }),
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain("url=urn:authorization:public");
+    expect(message).toContain("keep-prelaunch-urn");
+    expect(message).toContain(
+      "url=https://example.test/authorization:public",
+    );
+    expect(message).toContain("keep-prelaunch-url");
   });
 
   test("prelaunch AccountsError recovers credential syntax after unterminated quotes", () => {

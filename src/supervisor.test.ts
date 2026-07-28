@@ -182,6 +182,33 @@ test("supervisor start and failure logs recover credentials after unmatched quot
   expect(logs.some((message) => message.includes("failed to start"))).toBe(true);
 });
 
+test("supervisor start and failure logs redact wrapper-bound split credentials without widening URIs", async () => {
+  const secret = "supervisor-wrapper-split-log-secret";
+  const profile = addProfile({ name: "wrapper-split-log", tool: "codex" });
+  const tool = {
+    ...getTool("codex"),
+    bin:
+      `missing-supervisor -- outer=(env=--client-key) "" ${secret} ` +
+      "keep-supervisor-wrapper-split-log " +
+      "url=urn:authorization:public keep-supervisor-urn-log",
+  };
+  const logs: string[] = [];
+
+  const exitCode = await runSupervisedTool(profile, tool, [], {
+    stdio: "ignore",
+    configsPrelaunch: { mode: "skip" },
+    log: (message) => logs.push(message),
+  });
+  const projected = logs.join("\n");
+
+  expect(exitCode).toBe(1);
+  expect(projected).not.toContain(secret);
+  expect(projected).toContain("outer=(env=--client-key)");
+  expect(projected).toContain("keep-supervisor-wrapper-split-log");
+  expect(projected).toContain("url=urn:authorization:public");
+  expect(projected).toContain("keep-supervisor-urn-log");
+});
+
 test("runSupervisedTool restarts a child under the requested profile", async () => {
   const logPath = join(home, "fake-agent.log");
   const scriptPath = join(home, "fake-agent.mjs");
@@ -407,11 +434,11 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
   const one = addProfile({ name: "one", tool: "credentialgrammar" });
   const two = addProfile({ name: "two", tool: "credentialgrammar" });
   const initialSecrets = Array.from(
-    { length: 23 },
+    { length: 27 },
     (_, index) => `supervisor-initial-credential-${index}`,
   );
   const switchedSecrets = Array.from(
-    { length: 23 },
+    { length: 27 },
     (_, index) => `supervisor-switched-credential-${index}`,
   );
   const malformedOptionSyntax = [
@@ -483,10 +510,17 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     "--api-key",
     "--",
     "--client-key",
-    "keep-supervisor-positional-client-value",
-    "--api-key=keep-supervisor-positional-attached-value",
-    "-k",
-    "keep-supervisor-positional-short-value",
+    "keep-supervisor-positional-plain-value",
+    `--api-key=${secrets[23]}`,
+    "env=--client-key",
+    "",
+    secrets[26]!,
+    "keep-supervisor-positional-wrapper-split",
+    "url=urn:authorization:public",
+    "keep-supervisor-positional-urn",
+    `Authorization: Bearer ${secrets[24]}`,
+    `sk-proj-${secrets[25]}`,
+    "keep-supervisor-positional-control",
   ];
   const previousFakeLog = process.env.FAKE_LOG;
   process.env.FAKE_LOG = logPath;
@@ -543,9 +577,14 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     }
     expect(initialPublic).toContain("keep-after-opaque-bound-value");
     expect(initialPublic).toContain("keep-after-complete-token-value");
-    expect(initialPublic).toContain("keep-supervisor-positional-client-value");
-    expect(initialPublic).toContain("--api-key=keep-supervisor-positional-attached-value");
-    expect(initialPublic).toContain("keep-supervisor-positional-short-value");
+    expect(initialPublic).toContain("keep-supervisor-positional-plain-value");
+    expect(initialPublic).toContain("--api-key=[REDACTED]");
+    expect(initialPublic).toContain("env=--client-key");
+    expect(initialPublic).toContain("keep-supervisor-positional-wrapper-split");
+    expect(initialPublic).toContain("url=urn:authorization:public");
+    expect(initialPublic).toContain("keep-supervisor-positional-urn");
+    expect(initialPublic).toContain("Authorization: [REDACTED]");
+    expect(initialPublic).not.toContain("keep-supervisor-positional-control");
 
     const response = await sendSupervisorRequest("credentialgrammar", {
       type: "switch_profile",
@@ -562,9 +601,14 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
       expect(responseJson).toContain(retained);
     }
     expect(responseJson).toContain("keep-after-complete-token-value");
-    expect(responseJson).toContain("keep-supervisor-positional-client-value");
-    expect(responseJson).toContain("--api-key=keep-supervisor-positional-attached-value");
-    expect(responseJson).toContain("keep-supervisor-positional-short-value");
+    expect(responseJson).toContain("keep-supervisor-positional-plain-value");
+    expect(responseJson).toContain("--api-key=[REDACTED]");
+    expect(responseJson).toContain("env=--client-key");
+    expect(responseJson).toContain("keep-supervisor-positional-wrapper-split");
+    expect(responseJson).toContain("url=urn:authorization:public");
+    expect(responseJson).toContain("keep-supervisor-positional-urn");
+    expect(responseJson).toContain("Authorization: [REDACTED]");
+    expect(responseJson).not.toContain("keep-supervisor-positional-control");
     await waitFor(() =>
       readLog(logPath).find((entry) =>
         switchedSecrets.every((secret) => entry.args.some((arg) => arg.includes(secret))),
@@ -609,9 +653,14 @@ test("supervisor redacts normalized, clustered, and Unicode credential arguments
     }
     expect(switchedPublic).toContain("keep-after-opaque-bound-value");
     expect(switchedPublic).toContain("keep-after-complete-token-value");
-    expect(switchedPublic).toContain("keep-supervisor-positional-client-value");
-    expect(switchedPublic).toContain("--api-key=keep-supervisor-positional-attached-value");
-    expect(switchedPublic).toContain("keep-supervisor-positional-short-value");
+    expect(switchedPublic).toContain("keep-supervisor-positional-plain-value");
+    expect(switchedPublic).toContain("--api-key=[REDACTED]");
+    expect(switchedPublic).toContain("env=--client-key");
+    expect(switchedPublic).toContain("keep-supervisor-positional-wrapper-split");
+    expect(switchedPublic).toContain("url=urn:authorization:public");
+    expect(switchedPublic).toContain("keep-supervisor-positional-urn");
+    expect(switchedPublic).toContain("Authorization: [REDACTED]");
+    expect(switchedPublic).not.toContain("keep-supervisor-positional-control");
 
     await sendSupervisorRequest("credentialgrammar", { type: "stop" });
     expect(await running).toBe(0);

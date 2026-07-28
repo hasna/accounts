@@ -170,8 +170,18 @@ awaiting a value, the new option is redacted as syntax and becomes the pending
 option instead of being consumed as the earlier value. Credential-shaped
 fragments inside opaque or non-option dash-leading argv items remain bound
 values. An exact `--` marker ends argv option interpretation in ordinary or
-pending state, and later positional arguments remain unchanged as positional
-values in the public command and rendered handoff. The same
+pending state. Later positional arguments remain positional values, but each is
+independently passed through generic text redaction before the public command
+or rendered handoff is emitted. Attached credential fields are redacted in
+place. Empty-value credential fields redact their next non-empty positional
+value without consuming empty padding. Because authorization schemes may span
+multiple argv items, `Authorization` and `Proxy-Authorization` fail closed by
+redacting every later non-empty positional item; empty items remain empty.
+Wrapper-bound separate options such as `env=--api-key` preserve their wrapper
+syntax and carry exactly one pending positional value across empty padding.
+Structured URL, URN, email, and drive-path values remain data even when an
+interior segment is named `authorization`, so later safe tokens remain
+visible. Other benign values remain unchanged. The same
 bounded, quote-aware option scanner redacts command-shaped values embedded in
 captured stdout, stderr, and error strings. A separate credential option keeps
 one pending value across LF, CRLF, or bare CR and consumes the next syntactic
@@ -409,7 +419,7 @@ per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CL
 | `accounts hook install` | Install `claude()` wrapper — see [docs/hook.md](docs/hook.md). |
 | `accounts hook uninstall` | Remove hook script. |
 | `accounts hook path` | Print hook script path. |
-| `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). Provider records and process command lines are recursively projected through the public redaction boundary before human or JSON output. `--background`, `--profile <name>`, `--json`. |
+| `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). Provider records and process command lines are recursively projected through the public redaction boundary before human or JSON output. Live process attribution requires the kernel-reported PID executable to match the configured direct executable, its exact current `PATH` target/real path, or the native version root. Node/Bun wrapper rows fail closed because the kernel executable proves only the mutable interpreter, not the child script; missing PID identity also fails closed. `--background`, `--profile <name>`, `--json`. |
 | `accounts sessions` (`sessions list`) | Read-only catalog of root Claude sessions owned by registered local profiles. `--profile`, `--project`, `--uuid`, `--json`. |
 | `accounts health` (`readiness`) | Print the sanitized account/provider readiness contract. Use `--json` for automation. |
 | `accounts detect <name>` | Re-detect email from config dir. |

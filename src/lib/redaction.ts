@@ -261,6 +261,8 @@ function sensitiveRecordValueEnd(
 function redactSensitiveFields(value: string): string {
   let cursor = 0;
   let output = "";
+  const structuredContext = commandSegmentContext();
+  let structuredCursor = 0;
   CREDENTIAL_FIELD_PATTERN.lastIndex = 0;
 
   for (
@@ -273,13 +275,27 @@ function redactSensitiveFields(value: string): string {
       match.index +
       (match[1]?.length ?? 0) +
       (match[2]?.length ?? 0);
+    while (structuredCursor < keyStart) {
+      observeCommandSegmentChar(
+        structuredContext,
+        value[structuredCursor]!,
+        value[structuredCursor + 1],
+        value[structuredCursor + 2],
+      );
+      structuredCursor++;
+    }
     const terminalFieldToken = match[3]!.trim().split(/[ \t]+/).at(-1) ?? "";
     if (
       value[keyStart - 1] === "-" ||
-      normalizeCommandToken(terminalFieldToken).startsWith("-")
+      normalizeCommandToken(terminalFieldToken).startsWith("-") ||
+      /(^|[ \t])--(?=[ \t]|$)/.test(match[3]!)
     ) {
       // Command-shaped options are handled by the quote-aware command scanner,
       // which can retain later options and diagnostics on the same line.
+      CREDENTIAL_FIELD_PATTERN.lastIndex = valueStart;
+      continue;
+    }
+    if (isStructuredCommandSegment(structuredContext)) {
       CREDENTIAL_FIELD_PATTERN.lastIndex = valueStart;
       continue;
     }
@@ -520,6 +536,7 @@ interface CommandSegmentContext {
   startsWithWww: boolean;
   schemeCandidate: boolean;
   mailtoCandidate: boolean;
+  urnCandidate: boolean;
   wwwCandidate: boolean;
   outerClosures: string[];
   structuredClosures: string[];
@@ -555,6 +572,7 @@ function commandSegmentContext(): CommandSegmentContext {
     startsWithWww: false,
     schemeCandidate: true,
     mailtoCandidate: true,
+    urnCandidate: true,
     wwwCandidate: true,
     outerClosures: [],
     structuredClosures: [],
@@ -568,6 +586,7 @@ function resetCommandSegmentContext(context: CommandSegmentContext): void {
   context.startsWithWww = false;
   context.schemeCandidate = true;
   context.mailtoCandidate = true;
+  context.urnCandidate = true;
   context.wwwCandidate = true;
 }
 
@@ -611,7 +630,9 @@ function observeCommandSegmentChar(
     position > 0 &&
     (
       (next === "/" && afterNext === "/") ||
-      (context.mailtoCandidate && position === "mailto".length)
+      (context.mailtoCandidate && position === "mailto".length) ||
+      (context.urnCandidate && position === "urn".length) ||
+      (position === 1 && (next === "/" || next === "\\"))
     )
   ) {
     context.isUrl = true;
@@ -627,6 +648,12 @@ function observeCommandSegmentChar(
     char.toLowerCase() !== "mailto"[position]
   ) {
     context.mailtoCandidate = false;
+  }
+  if (
+    position >= "urn".length ||
+    char.toLowerCase() !== "urn"[position]
+  ) {
+    context.urnCandidate = false;
   }
   if (position >= "www.".length || char.toLowerCase() !== "www."[position]) {
     context.wwwCandidate = false;
@@ -1083,6 +1110,91 @@ interface CommandValueContinuation {
   crossedLine: boolean;
 }
 
+interface PositionalCredentialField {
+  prefix: string;
+  value: string;
+  suffix: string;
+  authorization: boolean;
+}
+
+function isDriveLikeCommandValue(value: string): boolean {
+  return /(?:^|[=:([{<])[A-Za-z]:[\\/]/.test(value);
+}
+
+function positionalCredentialField(
+  value: string,
+  rawValue = value,
+): PositionalCredentialField | undefined {
+  if (isDriveLikeCommandValue(rawValue)) return undefined;
+
+  const embeddedOption = commandOptionView(value);
+  if (embeddedOption?.option?.kind === "attached") {
+    const marker = embeddedOption.option.redactedToken.indexOf("[REDACTED]");
+    const optionToken = value.slice(
+      embeddedOption.prefix.length,
+      value.length - embeddedOption.suffix.length,
+    );
+    const separator = optionToken.search(/[=:]/);
+    if (marker >= 0 && separator > 0) {
+      return {
+        prefix:
+          embeddedOption.prefix +
+          embeddedOption.option.redactedToken.slice(0, marker),
+        value: optionToken.slice(separator + 1),
+        suffix: embeddedOption.suffix,
+        authorization: false,
+      };
+    }
+  }
+  if (
+    embeddedOption?.option?.kind === "separate" &&
+    embeddedOption.prefix
+  ) {
+    return {
+      prefix:
+        embeddedOption.prefix +
+        embeddedOption.option.redactedToken,
+      value: "",
+      suffix: embeddedOption.suffix,
+      authorization: false,
+    };
+  }
+
+  let keyStart = 0;
+  const structuredContext = commandSegmentContext();
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index]!;
+    if (char === "=" || char === ":") {
+      const key = value.slice(keyStart, index);
+      const keyTokens = semanticKeyTokens(key);
+      const authorization = keyTokens.at(-1) === "authorization";
+      if (
+        !isStructuredCommandSegment(structuredContext) &&
+        (authorization || isSensitiveCredentialKey(key))
+      ) {
+        let valueStart = index + 1;
+        while (value[valueStart] === " " || value[valueStart] === "\t") {
+          valueStart++;
+        }
+        return {
+          prefix: value.slice(0, valueStart),
+          value: value.slice(valueStart),
+          suffix: "",
+          authorization,
+        };
+      }
+      keyStart = index + 1;
+    }
+    observeCommandSegmentChar(
+      structuredContext,
+      char,
+      value[index + 1],
+      value[index + 2],
+    );
+  }
+  return undefined;
+}
+
 /**
  * Continue one already-bound sensitive logical value. Once continuation state
  * exists, every character through the next unquoted whitespace belongs to that
@@ -1162,6 +1274,8 @@ function redactCommandTokens(
   let redactNext = false;
   let pendingCrossedLine = false;
   let endOfOptions = false;
+  let positionalCredentialPending = false;
+  let redactAuthorizationTail = false;
   let valueContinuation: CommandValueContinuation | undefined;
 
   while (lineStart < value.length) {
@@ -1283,7 +1397,54 @@ function redactCommandTokens(
       }
 
       pendingCrossedLine = false;
-      if (!endOfOptions && exactEndOfOptions) {
+      if (endOfOptions) {
+        if (redactAuthorizationTail) {
+          if (item.decoded.length > 0) {
+            parts.push(
+              value.slice(outputCursor, item.start),
+              replaceCommandValue(raw, item.quoted || item.escaped),
+            );
+            outputCursor = item.end;
+          }
+          tokenCursor = item.end;
+          continue;
+        }
+        if (positionalCredentialPending) {
+          if (item.decoded.length === 0) {
+            tokenCursor = item.end;
+            continue;
+          }
+          parts.push(
+            value.slice(outputCursor, item.start),
+            replaceCommandValue(raw, item.quoted || item.escaped),
+          );
+          outputCursor = item.end;
+          positionalCredentialPending = false;
+          tokenCursor = item.end;
+          continue;
+        }
+
+        const field = positionalCredentialField(item.decoded, raw);
+        if (field) {
+          if (field.value.trim()) {
+            parts.push(
+              value.slice(outputCursor, item.start),
+              replaceCommandToken(
+                raw,
+                `${field.prefix}[REDACTED]${field.suffix}`,
+              ),
+            );
+            outputCursor = item.end;
+          } else if (field.authorization) {
+            redactAuthorizationTail = true;
+          } else {
+            positionalCredentialPending = true;
+          }
+          if (field.authorization) redactAuthorizationTail = true;
+          tokenCursor = item.end;
+          continue;
+        }
+      } else if (exactEndOfOptions) {
         endOfOptions = true;
       } else if (optionView?.option) {
         if (optionView.option.kind === "attached") {
@@ -1357,6 +1518,8 @@ function redactCommandTokens(
 
     if (lineEnd >= value.length) break;
     endOfOptions = false;
+    positionalCredentialPending = false;
+    redactAuthorizationTail = false;
     if (redactNext) pendingCrossedLine = true;
     if (valueContinuation) valueContinuation.crossedLine = true;
     lineStart = lineBreakEnd(value, lineEnd);
@@ -1418,8 +1581,65 @@ function redactQuotedCommandSegments(value: string): string {
   return parts.join("");
 }
 
+function redactDiagnosticQuotedCommands(value: string): string {
+  const parts: string[] = [];
+  let outputCursor = 0;
+  let found = false;
+  let lineStart = 0;
+
+  while (lineStart < value.length) {
+    const lineEnd = physicalLineEnd(value, lineStart);
+    const line = value.slice(lineStart, lineEnd);
+    const opener = /(?:^|[:=])[ \t]*(["'])/g;
+    for (
+      let match = opener.exec(line);
+      match;
+      match = opener.exec(line)
+    ) {
+      const quote = match[1]!;
+      const open = lineStart + match.index + match[0].lastIndexOf(quote);
+      let close = -1;
+      for (let index = open + 1; index < lineEnd; index++) {
+        if (value[index] === "\\") {
+          index++;
+          continue;
+        }
+        if (value[index] === quote) close = index;
+      }
+      if (close < 0) continue;
+
+      const inner = value.slice(open + 1, close);
+      const redacted = redactCommandTokens(inner);
+      if (redacted !== inner) {
+        parts.push(
+          redactOrdinaryCommandText(value.slice(outputCursor, open)),
+          quote,
+          redacted,
+          quote,
+        );
+        outputCursor = close + 1;
+        found = true;
+      }
+      break;
+    }
+    lineStart = lineEnd < value.length
+      ? lineBreakEnd(value, lineEnd)
+      : value.length;
+  }
+
+  if (!found) return redactOrdinaryCommandText(value);
+  parts.push(redactOrdinaryCommandText(value.slice(outputCursor)));
+  return parts.join("");
+}
+
+function redactOrdinaryCommandText(value: string): string {
+  return redactQuotedCommandSegments(
+    redactCommandTokens(value),
+  );
+}
+
 function redactCommandText(value: string): string {
-  return redactQuotedCommandSegments(redactCommandTokens(value));
+  return redactDiagnosticQuotedCommands(value);
 }
 
 /** Redact values that follow credential-bearing command-line flags. */
@@ -1427,9 +1647,45 @@ export function redactArgv(argv: string[]): string[] {
   const redacted: string[] = [];
   let redactNext = false;
   let endOfOptions = false;
-  for (const arg of argv) {
+  let positionalCredentialPending = false;
+  let redactAuthorizationTail = false;
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
     if (endOfOptions) {
-      redacted.push(arg);
+      if (redactAuthorizationTail) {
+        redacted.push(arg ? "[REDACTED]" : arg);
+        continue;
+      }
+      if (positionalCredentialPending) {
+        if (!arg) {
+          redacted.push(arg);
+          continue;
+        }
+        redacted.push("[REDACTED]");
+        positionalCredentialPending = false;
+        continue;
+      }
+
+      const field = positionalCredentialField(arg);
+      if (field) {
+        if (field.authorization) {
+          redacted.push(
+            field.value.trim()
+              ? `${field.prefix}[REDACTED]${field.suffix}`
+              : field.prefix,
+          );
+          redactAuthorizationTail = true;
+          continue;
+        }
+        if (!field.value.trim()) {
+          redacted.push(`${field.prefix}${field.suffix}`);
+          positionalCredentialPending = true;
+          continue;
+        }
+        redacted.push(`${field.prefix}[REDACTED]${field.suffix}`);
+        continue;
+      }
+      redacted.push(redactText(arg));
       continue;
     }
     if (arg === "--") {
@@ -1475,10 +1731,17 @@ const PUBLIC_VALUE_TRUNCATED_KEY = "[TRUNCATED]";
 const MAX_PUBLIC_VALUE_DEPTH = 64;
 const MAX_PUBLIC_VALUE_OBJECTS = 10_000;
 const MAX_PUBLIC_VALUE_ENTRIES = 10_000;
+const COMMAND_ARGUMENT_ARRAY_KEYS = new Set([
+  "args",
+  "arguments",
+  "argv",
+  "command",
+]);
 
 interface PublicValueFrame {
   value: unknown;
   depth: number;
+  key?: string;
   assign: (projected: unknown) => void;
 }
 
@@ -1556,6 +1819,34 @@ function publicValue(value: unknown): unknown {
         continue;
       }
       const boundedLength = Math.min(length, MAX_PUBLIC_VALUE_ENTRIES);
+      if (
+        frame.key &&
+        COMMAND_ARGUMENT_ARRAY_KEYS.has(frame.key.toLowerCase())
+      ) {
+        const argv: string[] = [];
+        let completeArgv = true;
+        for (let index = 0; index < boundedLength; index++) {
+          const descriptor = descriptors[String(index)];
+          if (
+            !descriptor?.enumerable ||
+            !("value" in descriptor) ||
+            typeof descriptor.value !== "string"
+          ) {
+            completeArgv = false;
+            break;
+          }
+          argv.push(descriptor.value);
+        }
+        if (completeArgv) {
+          const result: unknown[] = redactArgv(argv);
+          if (length > boundedLength) result.push(PUBLIC_VALUE_TRUNCATED);
+          frame.assign(result);
+          continue;
+        }
+        frame.assign([PUBLIC_VALUE_TRUNCATED]);
+        continue;
+      }
+
       const result: unknown[] = [];
       result.length = boundedLength + (length > boundedLength ? 1 : 0);
       if (length > boundedLength) {
@@ -1626,6 +1917,7 @@ function publicValue(value: unknown): unknown {
       stack.push({
         value: nested,
         depth: frame.depth + 1,
+        key,
         assign: (projected) => {
           result[key] = projected;
         },

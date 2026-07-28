@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir, platform } from "node:os";
+import { delimiter, join, resolve } from "node:path";
 import type { Profile } from "../types.js";
 import { controlledProbeEnv } from "./env.js";
 import { redactPublicValue, redactText } from "./redaction.js";
@@ -94,21 +103,23 @@ function shellQuote(value: string): string {
 }
 
 const MAX_AGENT_JSON_NESTING = 32_768;
+const MAX_AGENT_JSON_QUARANTINE_CONTAINERS = MAX_AGENT_JSON_NESTING * 2;
 const MAX_AGENT_JSON_FALLBACK_CANDIDATES = 32;
 const MAX_AGENT_JSON_CANDIDATE_BYTES = 1024 * 1024;
 
 interface AgentJsonCandidate {
   start: number;
-  depth: number;
+  containers: Array<"]" | "}">;
   inString: boolean;
   escaped: boolean;
   byteLength: number;
 }
 
 interface InvalidAgentJsonRegion {
-  depth: number;
+  containers: Array<"]" | "}">;
   inString: boolean;
   escaped: boolean;
+  overflowed: boolean;
 }
 
 function utf8ByteWidthAt(text: string, index: number): number {
@@ -126,8 +137,8 @@ function utf8ByteWidthAt(text: string, index: number): number {
   return 3;
 }
 
-function advanceArrayScanState(
-  state: Pick<AgentJsonCandidate, "depth" | "inString" | "escaped">,
+function advanceJsonContainerScanState(
+  state: Pick<AgentJsonCandidate, "containers" | "inString" | "escaped">,
   char: string,
 ): boolean {
   if (state.inString) {
@@ -137,9 +148,26 @@ function advanceArrayScanState(
     return false;
   }
   if (char === '"') state.inString = true;
-  else if (char === "[") state.depth++;
-  else if (char === "]") state.depth--;
-  return state.depth === 0;
+  else if (char === "[") state.containers.push("]");
+  else if (char === "{") state.containers.push("}");
+  else if (
+    (char === "]" || char === "}") &&
+    state.containers.at(-1) === char
+  ) {
+    state.containers.pop();
+  }
+  return state.containers.length === 0;
+}
+
+function invalidAgentJsonRegion(
+  state: Pick<AgentJsonCandidate, "containers" | "inString" | "escaped">,
+): InvalidAgentJsonRegion {
+  return {
+    containers: [...state.containers],
+    inString: state.inString,
+    escaped: state.escaped,
+    overflowed: false,
+  };
 }
 
 function stripTerminalControlSequences(raw: string): string {
@@ -285,7 +313,20 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
   for (let index = 0; index < text.length; index++) {
     const char = text[index]!;
     if (invalidRegion) {
-      if (advanceArrayScanState(invalidRegion, char)) invalidRegion = undefined;
+      if (!invalidRegion.overflowed) {
+        const closed = advanceJsonContainerScanState(invalidRegion, char);
+        if (
+          invalidRegion.containers.length >
+          MAX_AGENT_JSON_QUARANTINE_CONTAINERS
+        ) {
+          invalidRegion.containers.length = 0;
+          invalidRegion.inString = false;
+          invalidRegion.escaped = false;
+          invalidRegion.overflowed = true;
+        } else if (closed) {
+          invalidRegion = undefined;
+        }
+      }
       continue;
     }
 
@@ -295,12 +336,12 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
       candidate.byteLength += byteWidth;
       if (candidate.byteLength > MAX_AGENT_JSON_CANDIDATE_BYTES) {
         const root = active[0]!;
-        const region: InvalidAgentJsonRegion = {
-          depth: root.depth,
-          inString: root.inString,
-          escaped: root.escaped,
-        };
-        invalidRegion = advanceArrayScanState(region, char) ? undefined : region;
+        const region = invalidAgentJsonRegion(root);
+        invalidRegion =
+          region.overflowed ||
+          !advanceJsonContainerScanState(region, char)
+            ? region
+            : undefined;
         if (completed && completed.start > root.start) completed = undefined;
         if (emptyCompleted && emptyCompleted.start > root.start) emptyCompleted = undefined;
         active.length = 0;
@@ -314,16 +355,14 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
         else if (char === "\n") active.splice(candidateIndex, 1);
         continue;
       }
-      const closed = advanceArrayScanState(candidate, char);
-      if (candidate.depth > MAX_AGENT_JSON_NESTING) {
+      const closed = advanceJsonContainerScanState(candidate, char);
+      if (candidate.containers.length > MAX_AGENT_JSON_NESTING) {
         const root = active[0]!;
-        const region: InvalidAgentJsonRegion = {
-          depth: root.depth,
-          inString: root.inString,
-          escaped: root.escaped,
-        };
+        const region = invalidAgentJsonRegion(root);
         invalidRegion =
-          candidateIndex === 0 || !advanceArrayScanState(region, char)
+          candidateIndex === 0 ||
+          region.overflowed ||
+          !advanceJsonContainerScanState(region, char)
             ? region
             : undefined;
         if (completed && completed.start > root.start) completed = undefined;
@@ -350,7 +389,7 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
       }
       active.push({
         start: index,
-        depth: 1,
+        containers: ["]"],
         inString: false,
         escaped: false,
         byteLength: 1,
@@ -419,9 +458,14 @@ interface CommandToken {
 interface InterpreterOptionSchema {
   optionsWithValues: ReadonlySet<string>;
   detachedOnlyValueOptions: ReadonlySet<string>;
+  attachedOnlyValueOptions: ReadonlySet<string>;
+  optionsRejectingOptionValues: ReadonlySet<string>;
   optionsWithOptionalAttachedValues: ReadonlySet<string>;
   optionsWithoutValues: ReadonlySet<string>;
   executionModeOptions: ReadonlySet<string>;
+  passthroughCommands: ReadonlySet<string>;
+  passthroughOptionsWithValues: ReadonlySet<string>;
+  passthroughOptionsWithoutValues: ReadonlySet<string>;
   attachedShortValueOptions: readonly string[];
 }
 
@@ -489,10 +533,24 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--use-largepages",
     "--v8-pool-size",
     "--max-http-header-size",
+    "--max-old-space-size",
+    "--max-semi-space-size",
+    "--stack-trace-limit",
     "--dns-result-order",
     "--unhandled-rejections",
+    "--allow-fs-read",
+    "--allow-fs-write",
   ]),
   detachedOnlyValueOptions: new Set(["-r", "-C"]),
+  attachedOnlyValueOptions: new Set([
+    "--max-old-space-size",
+    "--max-semi-space-size",
+    "--stack-trace-limit",
+  ]),
+  optionsRejectingOptionValues: new Set([
+    "--allow-fs-read",
+    "--allow-fs-write",
+  ]),
   optionsWithOptionalAttachedValues: new Set([
     "--inspect",
     "--inspect-brk",
@@ -500,18 +558,63 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
   ]),
   optionsWithoutValues: new Set([
     "--abort-on-uncaught-exception",
+    "--allow-addons",
+    "--allow-child-process",
+    "--allow-wasi",
+    "--allow-worker",
     "--cpu-prof",
+    "--disable-sigusr1",
+    "--disable-wasm-trap-handler",
     "--disallow-code-generation-from-strings",
+    "--enable-etw-stack-walking",
+    "--enable-fips",
+    "--enable-network-family-autoselection",
     "--enable-source-maps",
+    "--entry-url",
+    "--experimental-addon-modules",
+    "--experimental-async-context-frame",
+    "--experimental-default-config-file",
+    "--experimental-eventsource",
+    "--experimental-import-meta-resolve",
+    "--experimental-inspector-network-resource",
+    "--experimental-network-inspection",
+    "--experimental-permission",
+    "--permission",
+    "--experimental-print-required-tla",
+    "--experimental-test-coverage",
+    "--experimental-test-module-mocks",
+    "--experimental-transform-types",
+    "--experimental-vm-modules",
+    "--experimental-webstorage",
+    "--experimental-worker-inspection",
     "--expose-gc",
     "--force-context-aware",
+    "--force-fips",
+    "--force-node-api-uncaught-exceptions-policy",
     "--frozen-intrinsics",
     "--heap-prof",
+    "--huge-max-old-generation-size",
     "--insecure-http-parser",
+    "--interpreted-frames-native-stack",
     "--jitless",
     "--no-addons",
     "--no-deprecation",
+    "--no-experimental-detect-module",
+    "--no-experimental-fetch",
+    "--no-experimental-global-customevent",
+    "--no-experimental-global-navigator",
+    "--no-experimental-global-webcrypto",
+    "--no-experimental-repl-await",
+    "--no-experimental-require-module",
+    "--no-experimental-sqlite",
+    "--no-experimental-strip-types",
+    "--no-experimental-websocket",
+    "--no-extra-info-on-fatal-exception",
+    "--no-force-async-hooks-checks",
+    "--no-global-search-paths",
+    "--no-network-family-autoselection",
     "--no-warnings",
+    "--node-memory-debug",
     "--openssl-legacy-provider",
     "--openssl-shared-config",
     "--pending-deprecation",
@@ -524,7 +627,17 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--report-on-fatalerror",
     "--report-on-signal",
     "--report-uncaught-exception",
+    "--test-force-exit",
+    "--test-only",
+    "--test-update-snapshots",
     "--throw-deprecation",
+    "--tls-max-v1.2",
+    "--tls-max-v1.3",
+    "--tls-min-v1.0",
+    "--tls-min-v1.1",
+    "--tls-min-v1.2",
+    "--tls-min-v1.3",
+    "--trace-atomics-wait",
     "--trace-deprecation",
     "--trace-env",
     "--trace-env-js-stack",
@@ -538,6 +651,7 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--trace-warnings",
     "--track-heap-objects",
     "--use-bundled-ca",
+    "--use-env-proxy",
     "--use-openssl-ca",
     "--use-system-ca",
     "--watch",
@@ -568,6 +682,9 @@ const NODE_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--version",
     "--v8-options",
   ]),
+  passthroughCommands: new Set(),
+  passthroughOptionsWithValues: new Set(),
+  passthroughOptionsWithoutValues: new Set(),
   attachedShortValueOptions: [],
 };
 
@@ -575,6 +692,8 @@ const BUN_OPTION_SCHEMA: InterpreterOptionSchema = {
   optionsWithValues: new Set([
     "-r",
     "-c",
+    "-d",
+    "-l",
     "--preload",
     "--require",
     "--import",
@@ -600,8 +719,21 @@ const BUN_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--env-file",
     "--cwd",
     "--config",
+    "--main-fields",
+    "--extension-order",
+    "--tsconfig-override",
+    "--define",
+    "--drop",
+    "--feature",
+    "--loader",
+    "--jsx-factory",
+    "--jsx-fragment",
+    "--jsx-import-source",
+    "--jsx-runtime",
   ]),
   detachedOnlyValueOptions: new Set(),
+  attachedOnlyValueOptions: new Set(),
+  optionsRejectingOptionValues: new Set(),
   optionsWithOptionalAttachedValues: new Set([
     "--inspect",
     "--inspect-brk",
@@ -626,6 +758,7 @@ const BUN_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--no-env-file",
     "--no-exit-on-error",
     "--no-install",
+    "--no-macros",
     "--no-orphans",
     "--prefer-latest",
     "--prefer-offline",
@@ -635,6 +768,8 @@ const BUN_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--silent",
     "--smol",
     "--sql-preconnect",
+    "--jsx-side-effects",
+    "--ignore-dce-annotations",
     "--throw-deprecation",
     "--use-bundled-ca",
     "--use-openssl-ca",
@@ -659,7 +794,14 @@ const BUN_OPTION_SCHEMA: InterpreterOptionSchema = {
     "--version",
     "--workspaces",
   ]),
-  attachedShortValueOptions: ["-r", "-c", "-F"],
+  passthroughCommands: new Set(["run"]),
+  passthroughOptionsWithValues: new Set(["-F", "--filter", "--shell"]),
+  passthroughOptionsWithoutValues: new Set([
+    "--parallel",
+    "--sequential",
+    "--workspaces",
+  ]),
+  attachedShortValueOptions: ["-r", "-c", "-d", "-l", "-F"],
 };
 
 const CLAUDE_OPTIONS_WITH_VALUES = new Set([
@@ -798,7 +940,6 @@ const CLAUDE_NON_SESSION_COMMANDS = new Set([
   "agents",
   "auth",
   "auto-mode",
-  "daemon",
   "doctor",
   "gateway",
   "install",
@@ -806,12 +947,37 @@ const CLAUDE_NON_SESSION_COMMANDS = new Set([
   "plugin",
   "plugins",
   "project",
-  "rc",
-  "remote-control",
   "setup-token",
   "ultrareview",
   "update",
   "upgrade",
+]);
+
+const CLAUDE_BRIDGE_COMMANDS = new Set([
+  "remote-control",
+  "rc",
+  "remote",
+  "sync",
+  "bridge",
+]);
+
+const CLAUDE_BACKGROUND_CONTROL_COMMANDS = new Set([
+  "logs",
+  "attach",
+  "stop",
+  "kill",
+  "respawn",
+  "rm",
+]);
+
+const CLAUDE_BACKGROUND_LAUNCHER_FLAGS = new Set([
+  "--bg",
+  "--background",
+]);
+
+const CLAUDE_DAEMON_PREFIX_FLAGS = new Set([
+  "--dangerously-skip-permissions",
+  "--allow-dangerously-skip-permissions",
 ]);
 
 function commandBasename(value: string): string {
@@ -825,6 +991,83 @@ function hasPathComponent(value: string): boolean {
 function normalizeExecutablePath(value: string): string {
   const normalized = value.replaceAll("\\", "/");
   return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+function resolvedBareExecutablePaths(configured: string): ReadonlySet<string> {
+  const pathValue = process.env.PATH ?? "";
+  const pathExt = process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD";
+  const paths = new Set<string>();
+  const names =
+    platform() === "win32" && !/\.[A-Za-z0-9]+$/.test(configured)
+      ? pathExt
+          .split(";")
+          .filter(Boolean)
+          .map((extension) => `${configured}${extension.toLowerCase()}`)
+      : [configured];
+  for (const entry of pathValue.split(delimiter)) {
+    const root = resolve(entry || ".");
+    let found = false;
+    for (const name of names) {
+      const candidate = join(root, name);
+      try {
+        if (!statSync(candidate).isFile()) continue;
+        accessSync(candidate, constants.X_OK);
+      } catch {
+        continue;
+      }
+      found = true;
+      paths.add(normalizeExecutablePath(candidate));
+      try {
+        paths.add(normalizeExecutablePath(realpathSync(candidate)));
+      } catch {
+        // The PATH entry itself is still the exact configured target.
+      }
+    }
+    if (found) break;
+  }
+  return paths;
+}
+
+function executableIdentityPaths(value: string): ReadonlySet<string> {
+  const paths = new Set<string>([normalizeExecutablePath(value)]);
+  try {
+    paths.add(normalizeExecutablePath(realpathSync(value)));
+  } catch {
+    // A process may exit between ps and identity verification. The observed
+    // path remains useful only when it exactly matches a trusted identity.
+  }
+  return paths;
+}
+
+function processExecutableMatchesInterpreter(
+  processExecutable: string | undefined,
+  interpreter: string,
+): boolean {
+  if (!processExecutable) return false;
+  const trusted = resolvedBareExecutablePaths(interpreter);
+  if (trusted.size === 0) return false;
+  for (const identity of executableIdentityPaths(processExecutable)) {
+    if (trusted.has(identity)) return true;
+  }
+  return false;
+}
+
+function processExecutableMatchesDirectTool(
+  processExecutable: string | undefined,
+  observed: string,
+  configured: string,
+): boolean {
+  if (!processExecutable) return false;
+  const trusted = hasPathComponent(configured)
+    ? executableIdentityPaths(configured)
+    : hasPathComponent(observed)
+      ? executableIdentityPaths(observed)
+      : resolvedBareExecutablePaths(configured);
+  if (trusted.size === 0) return false;
+  for (const identity of executableIdentityPaths(processExecutable)) {
+    if (trusted.has(identity)) return true;
+  }
+  return false;
 }
 
 function readCommandToken(command: string, offset: number): CommandToken | undefined {
@@ -869,8 +1112,39 @@ function executableTokenMatches(
     return normalizeExecutablePath(observed) === normalizeExecutablePath(configured);
   }
   if (configuredHasPath) return false;
-  return commandBasename(observed) === commandBasename(configured);
+  if (!observedHasPath) {
+    if (platform() === "win32") {
+      return (
+        observed.replace(/\.exe$/i, "").toLowerCase() ===
+        configured.replace(/\.exe$/i, "").toLowerCase()
+      );
+    }
+    return observed === configured;
+  }
+  return resolvedBareExecutablePaths(configured).has(
+    normalizeExecutablePath(observed),
+  );
 }
+
+function resolvedBareExecutableTokenMatches(
+  observed: string,
+  configured: string,
+): boolean {
+  if (hasPathComponent(configured)) return false;
+  const resolved = resolvedBareExecutablePaths(configured);
+  if (resolved.size === 0) return false;
+  if (hasPathComponent(observed)) {
+    return resolved.has(normalizeExecutablePath(observed));
+  }
+  return executableTokenMatches(observed, configured);
+}
+
+const STRICT_SEMVER_PATTERN = new RegExp(
+  "^(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)" +
+    "(?:-(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)" +
+    "(?:\\.(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*))*)?" +
+    "(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+);
 
 function isVersionedToolBuild(observed: string, configured: string): boolean {
   if (hasPathComponent(configured)) return false;
@@ -883,7 +1157,7 @@ function isVersionedToolBuild(observed: string, configured: string): boolean {
   const version = normalizedObserved.slice(trustedRoot.length + 1);
   return (
     !version.includes("/") &&
-    /^\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/.test(version)
+    STRICT_SEMVER_PATTERN.test(version)
   );
 }
 
@@ -891,6 +1165,7 @@ function matchExecutableAt(
   command: string,
   offset: number,
   configured: string,
+  requireResolvedBare = false,
 ): { end: number } | undefined {
   let start = offset;
   while (start < command.length && /\s/.test(command[start]!)) start++;
@@ -909,7 +1184,18 @@ function matchExecutableAt(
   const token = readCommandToken(command, start);
   if (!token) return undefined;
   if (
-    executableTokenMatches(token.value, configured) ||
+    (
+      requireResolvedBare
+        ? (
+            hasPathComponent(configured)
+              ? executableTokenMatches(token.value, configured)
+              : (
+                  hasPathComponent(token.value) &&
+                  resolvedBareExecutableTokenMatches(token.value, configured)
+                )
+          )
+        : executableTokenMatches(token.value, configured)
+    ) ||
     isVersionedToolBuild(token.value, configured)
   ) {
     return { end: token.end };
@@ -925,17 +1211,34 @@ function optionName(value: string): string {
 function resolveInterpreterOption(
   value: string,
   schema: InterpreterOptionSchema,
-): { name: string; hasAttachedValue: boolean } {
-  const name = optionName(value);
-  const hasAttachedValue = name !== value;
-  if (hasAttachedValue) return { name, hasAttachedValue };
-
+): {
+  name: string;
+  hasAttachedValue: boolean;
+  hasNonemptyAttachedValue: boolean;
+} {
   for (const shortName of schema.attachedShortValueOptions) {
     if (value.startsWith(shortName) && value.length > shortName.length) {
-      return { name: shortName, hasAttachedValue: true };
+      return {
+        name: shortName,
+        hasAttachedValue: true,
+        hasNonemptyAttachedValue: true,
+      };
     }
   }
-  return { name, hasAttachedValue: false };
+  const name = optionName(value);
+  const hasAttachedValue = name !== value;
+  if (hasAttachedValue) {
+    return {
+      name,
+      hasAttachedValue,
+      hasNonemptyAttachedValue: value.length > name.length + 1,
+    };
+  }
+  return {
+    name,
+    hasAttachedValue: false,
+    hasNonemptyAttachedValue: false,
+  };
 }
 
 function interpreterChildOffset(
@@ -945,8 +1248,14 @@ function interpreterChildOffset(
   schema: InterpreterOptionSchema,
 ): number | undefined {
   let cursor = offset;
+  let enteredPassthrough = false;
   while (true) {
-    const executable = matchExecutableAt(command, cursor, configured);
+    const executable = matchExecutableAt(
+      command,
+      cursor,
+      configured,
+      true,
+    );
     if (executable) {
       let start = cursor;
       while (start < command.length && /\s/.test(command[start]!)) start++;
@@ -955,24 +1264,64 @@ function interpreterChildOffset(
 
     const token = readCommandToken(command, cursor);
     if (!token) return undefined;
+    if (schema.passthroughCommands.has(token.value)) {
+      if (enteredPassthrough) return undefined;
+      enteredPassthrough = true;
+      cursor = token.end;
+      continue;
+    }
     if (token.value === "--") {
       const child = readCommandToken(command, token.end);
-      return child && matchExecutableAt(command, child.start, configured)
+      return child && matchExecutableAt(
+        command,
+        child.start,
+        configured,
+        true,
+      )
         ? child.start
         : undefined;
     }
     if (!token.value.startsWith("-") || token.value === "-") return undefined;
 
     cursor = token.end;
-    const { name, hasAttachedValue } = resolveInterpreterOption(token.value, schema);
+    const {
+      name,
+      hasAttachedValue,
+      hasNonemptyAttachedValue,
+    } = resolveInterpreterOption(token.value, schema);
+    if (enteredPassthrough && schema.passthroughOptionsWithValues.has(name)) {
+      if (hasAttachedValue) {
+        if (!hasNonemptyAttachedValue) return undefined;
+        continue;
+      }
+      const value = readCommandToken(command, cursor);
+      if (!value || value.value.startsWith("-")) return undefined;
+      cursor = value.end;
+      continue;
+    }
+    if (
+      enteredPassthrough &&
+      schema.passthroughOptionsWithoutValues.has(name)
+    ) {
+      if (hasAttachedValue) return undefined;
+      continue;
+    }
     if (schema.executionModeOptions.has(name)) return undefined;
     if (schema.optionsWithValues.has(name)) {
       if (hasAttachedValue) {
         if (schema.detachedOnlyValueOptions.has(name)) return undefined;
+        if (!hasNonemptyAttachedValue) return undefined;
         continue;
       }
+      if (schema.attachedOnlyValueOptions.has(name)) return undefined;
       const value = readCommandToken(command, cursor);
       if (!value) return undefined;
+      if (
+        schema.optionsRejectingOptionValues.has(name) &&
+        value.value.startsWith("-")
+      ) {
+        return undefined;
+      }
       cursor = value.end;
       continue;
     }
@@ -1047,13 +1396,65 @@ function classifyClaudeArguments(args: string[]): {
   return { helper: false, terminal: false, mode };
 }
 
-export function isToolSessionCommand(command: string, bin: string): boolean {
+function claudeFastPath(args: string[]): "session" | "control" | undefined {
+  if (
+    CLAUDE_BRIDGE_COMMANDS.has(args[0] ?? "") ||
+    CLAUDE_BACKGROUND_CONTROL_COMMANDS.has(args[0] ?? "")
+  ) {
+    return "control";
+  }
+  let index = 0;
+  while (CLAUDE_DAEMON_PREFIX_FLAGS.has(args[index] ?? "")) index++;
+  if (args[index] === "daemon") return "control";
+  if (args.some((arg) => CLAUDE_BACKGROUND_LAUNCHER_FLAGS.has(arg))) {
+    return "control";
+  }
+  return undefined;
+}
+
+export function isToolSessionCommand(
+  command: string,
+  bin: string,
+  toolId = commandBasename(bin).toLowerCase().replace(/\.exe$/, ""),
+  processExecutable?: string,
+  requireKernelAttribution = false,
+): boolean {
   const first = readCommandToken(command, 0);
   if (!first) return false;
 
-  let executableOffset = first.start;
-  const interpreter = commandBasename(first.value).toLowerCase().replace(/\.exe$/, "");
-  if (interpreter === "node" || interpreter === "nodejs" || interpreter === "bun") {
+  let executable = matchExecutableAt(command, first.start, bin);
+  if (
+    executable &&
+    requireKernelAttribution &&
+    !processExecutableMatchesDirectTool(
+      processExecutable,
+      first.value,
+      bin,
+    )
+  ) {
+    return false;
+  }
+  if (!executable) {
+    const interpreter = commandBasename(first.value)
+      .toLowerCase()
+      .replace(/\.exe$/, "");
+    if (interpreter !== "node" && interpreter !== "nodejs" && interpreter !== "bun") {
+      return false;
+    }
+    if (!resolvedBareExecutableTokenMatches(first.value, interpreter)) {
+      return false;
+    }
+    if (!processExecutableMatchesInterpreter(processExecutable, interpreter)) {
+      return false;
+    }
+    if (requireKernelAttribution) {
+      // The kernel executable proves only Node/Bun itself. Both runtimes allow
+      // a same-user process to rewrite argv/process.title after startup, and
+      // Linux exposes no durable script identity once the runtime closes it.
+      // A live process scan therefore cannot prove the wrapped child and must
+      // fail closed instead of trusting mutable command text.
+      return false;
+    }
     const childOffset = interpreterChildOffset(
       command,
       first.end,
@@ -1061,17 +1462,17 @@ export function isToolSessionCommand(command: string, bin: string): boolean {
       interpreter === "bun" ? BUN_OPTION_SCHEMA : NODE_OPTION_SCHEMA,
     );
     if (childOffset === undefined) return false;
-    executableOffset = childOffset;
+    executable = matchExecutableAt(command, childOffset, bin, true);
   }
-
-  const executable = matchExecutableAt(command, executableOffset, bin);
   if (!executable) return false;
 
-  if (commandBasename(bin).toLowerCase().replace(/\.exe$/, "") !== "claude") {
+  if (toolId !== "claude") {
     return true;
   }
 
   const args = commandArguments(command, executable.end);
+  const fastPath = claudeFastPath(args);
+  if (fastPath) return fastPath === "session";
   const classification = classifyClaudeArguments(args);
   if (classification.helper || classification.terminal || classification.invalid) return false;
   if (
@@ -1101,11 +1502,32 @@ export function scanToolProcesses(toolId = "claude"): ProcessInfo[] {
     const ppid = Number(m[2]);
     const command = m[3]!.trim();
     if (pid === process.pid) continue;
-    if (!isToolSessionCommand(command, bin)) continue;
+    if (
+      !isToolSessionCommand(
+        command,
+        bin,
+        toolId,
+        readProcessExecutable(pid),
+        true,
+      )
+    ) {
+      continue;
+    }
     const configDir = readProcessEnvVar(pid, tool.envVar);
     out.push({ pid, ppid, command, ...(configDir ? { configDir } : {}) });
   }
   return out;
+}
+
+/** Read the kernel-owned executable identity for a process (Linux /proc only). */
+function readProcessExecutable(pid: number): string | undefined {
+  try {
+    return readlinkSync(`/proc/${pid}/exe`) || undefined;
+  } catch {
+    // Unsupported platform, inaccessible process, or process exited. Wrapper
+    // attribution must fail closed when the executable cannot be proven.
+    return undefined;
+  }
 }
 
 /** Best-effort read of one env var from a running process (Linux /proc only). */

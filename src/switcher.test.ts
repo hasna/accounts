@@ -209,8 +209,9 @@ test("profileEnv clears Claude API auth environment variables", async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("public switch projection preserves positional arguments after exact end-of-options", async () => {
+test("public switch projection redacts credential-bearing positional tails after exact end-of-options", async () => {
   addProfile({ name: "marker", tool: "codex" });
+  const publicProjectKey = ["sk", "proj", "public-positional-secret"].join("-");
   const internal = await switchProfile("marker", {
     tool: "codex",
     mode: "active",
@@ -218,30 +219,36 @@ test("public switch projection preserves positional arguments after exact end-of
       "--api-key",
       "--",
       "--client-key",
-      "keep-public-positional-client-value",
-      "--api-key=keep-public-positional-attached-value",
-      "-k",
-      "keep-public-positional-short-value",
+      "keep-public-positional-plain-value",
+      "--api-key=public-positional-attached-secret",
+      "Authorization: Bearer public-positional-bearer-secret",
+      publicProjectKey,
+      "keep-public-positional-control",
     ],
   });
 
   const output = publicSwitchResult(internal);
 
-  expect(output.command.slice(-7)).toEqual([
+  expect(JSON.stringify(output)).not.toContain("public-positional-attached-secret");
+  expect(JSON.stringify(output)).not.toContain("public-positional-bearer-secret");
+  expect(JSON.stringify(output)).not.toContain(publicProjectKey);
+  expect(output.command.slice(-8)).toEqual([
     "--api-key",
     "--",
     "--client-key",
-    "keep-public-positional-client-value",
-    "--api-key=keep-public-positional-attached-value",
-    "-k",
-    "keep-public-positional-short-value",
+    "keep-public-positional-plain-value",
+    "--api-key=[REDACTED]",
+    "Authorization: [REDACTED]",
+    "[REDACTED]",
+    "[REDACTED]",
   ]);
   expect(output.commandLine).toContain(
-    "'--api-key' '--' '--client-key' 'keep-public-positional-client-value'",
+    "'--api-key' '--' '--client-key' 'keep-public-positional-plain-value'",
   );
   expect(output.commandLine).toContain(
-    "'--api-key=keep-public-positional-attached-value' '-k' 'keep-public-positional-short-value'",
+    "'--api-key=[REDACTED]' 'Authorization: [REDACTED]' '[REDACTED]' '[REDACTED]'",
   );
+  expect(output.commandLine).not.toContain("keep-public-positional-control");
 });
 
 test("public switch projection redacts pending opaque tokens with internal punctuation", async () => {
@@ -265,6 +272,48 @@ test("public switch projection redacts pending opaque tokens with internal punct
   ]);
   expect(output.commandLine).toContain(
     "'--api-key' '[REDACTED]' 'keep-public-complete-token'",
+  );
+});
+
+test("public switch projection carries wrapper-bound split state without widening structured values", async () => {
+  addProfile({ name: "wrapper-split", tool: "codex" });
+  const internal = await switchProfile("wrapper-split", {
+    tool: "codex",
+    mode: "active",
+    args: [
+      "--",
+      "env=--api-key",
+      "",
+      "public-wrapper-split-secret",
+      "keep-public-wrapper-split",
+      "url=urn:authorization:public",
+      "keep-public-urn",
+      "url=https://example.test/authorization:public",
+      "keep-public-url",
+    ],
+  });
+
+  const output = publicSwitchResult(internal);
+  expect(JSON.stringify(output)).not.toContain("public-wrapper-split-secret");
+  expect(output.command.slice(-9)).toEqual([
+    "--",
+    "env=--api-key",
+    "",
+    "[REDACTED]",
+    "keep-public-wrapper-split",
+    "url=urn:authorization:public",
+    "keep-public-urn",
+    "url=https://example.test/authorization:public",
+    "keep-public-url",
+  ]);
+  expect(output.commandLine).toContain(
+    "'env=--api-key' '' '[REDACTED]' 'keep-public-wrapper-split'",
+  );
+  expect(output.commandLine).toContain(
+    "'url=urn:authorization:public' 'keep-public-urn'",
+  );
+  expect(output.commandLine).toContain(
+    "'url=https://example.test/authorization:public' 'keep-public-url'",
   );
 });
 

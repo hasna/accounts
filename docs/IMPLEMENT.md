@@ -110,9 +110,21 @@ an attached value is redacted immediately, while a separate-value option takes
 over the pending state. Credential-shaped fragments inside opaque or
 non-option dash-leading argv items remain the prior option's value. An exact
 `--` ends argv option interpretation even while a credential option is
-pending, and every later positional item is preserved verbatim for public
-command and command-line fidelity. Captured
-command text uses that same policy through
+pending. Every later positional item is still passed through independent
+generic text redaction before it crosses a public boundary. Attached
+credential fields are redacted in place. Empty-value credential fields keep
+one pending value across empty argv padding and redact the next non-empty item.
+Because authorization schemes can span multiple argv items,
+`Authorization` and `Proxy-Authorization` fail closed by redacting every later
+non-empty positional item while preserving empty items. Other benign
+positional values retain command and command-line fidelity. A separate
+credential option discovered behind a recognized wrapper boundary (for
+example `env=--api-key`, `wrapper:--client-key`, or a nested balanced wrapper)
+preserves that syntax and binds exactly one later non-empty positional value.
+URI schemes with `//`, URNs, mail addresses, and drive-like paths remain
+structured data in both the command scanner and the later generic field pass;
+an interior `authorization:` segment cannot create sensitive tail state or
+consume the next safe token. Captured command text uses that same policy through
 a quote-aware, forward-only token scanner that emits physical-newline and
 quoted/escaped-origin metadata. A separate option's single pending value
 survives LF, CRLF, or bare CR and consumes the next syntactic value; quoted or
@@ -185,32 +197,62 @@ entries, and unsafe object shapes cannot cross that output boundary. Provider
 records are limited to known agent kinds, malformed PIDs are discarded before
 process accounting, process scans are bound to the requested tool, and human
 rendering reads only validated scalar fields without coercing provider values.
-Configured and observed executable paths must match in full whenever both are
-available; neither direct nor Node/Bun-wrapped processes can borrow the identity
-of a different or unresolved same-named executable. Versioned native builds
+Configured absolute executables must match observed paths exactly. A configured
+bare executable accepts its literal bare invocation, the exact executable
+resolved from `PATH` (including its real path), or a native versioned build;
+neither direct nor Node/Bun-wrapped processes can borrow the identity of a
+different or unresolved same-named executable. Versioned native builds
 must live under the current user's exact
-`~/.local/share/<tool>/versions/<semver>` root. Exact helper options, terminal
+`~/.local/share/<tool>/versions/<semver>` root and use strict SemVer 2.0.0
+syntax. Exact helper options, terminal
 help/version flags, and known Claude non-session subcommands are excluded
-without substring matching. Tool argument scanning honors required, optional,
-and mandatory-first variadic option arities from the installed Claude root
-command grammar, including hidden options and pre-parser exit paths, before
-treating a positional token as a subcommand. That grammar is scoped to Claude;
-arbitrary custom tools do not inherit Claude terminal, helper, or option
-semantics. Interpreter wrappers use separate Node and Bun option schemas,
-recognize only documented option arities, and fail closed on unknown or
-execution-mode options before accepting a later executable-shaped argument.
+without substring matching. The Claude 2.1.220 pre-parser grammar is modeled
+before the root command grammar: bridge commands and background-control
+commands are recognized only in their fast-path positions, with first-token
+background-control dispatch taking precedence over later flags. Otherwise,
+exact `--bg` and `--background` select the native background path anywhere in
+argv; their transient launcher processes are excluded from session results.
+`daemon` is a control command only at token zero after any leading exact
+dangerous-permission flags. Root argument scanning then honors required,
+optional, and mandatory-first variadic option arities, including hidden
+options, helper modes, terminal modes, and `--handle-uri`, before treating a
+positional token as a subcommand. That grammar is selected from the registered
+tool identity, not the executable basename; arbitrary custom tools named
+`claude`, `node`, or `bun` do not inherit Claude or wrapper semantics. Codex App
+keeps its direct executable behavior. Interpreter wrappers use explicit Node
+22.22.3 and Bun 1.3.14 option schemas, including their attached-versus-separate
+value rules and Bun's exact `run` passthrough after validated global
+non-execution options. Required-value schema entries reject an empty attached
+`--name=` value before child attribution even where Bun currently tolerates
+that spelling; this classifier is a fail-closed trust boundary, not a
+byte-for-byte runtime parser. Optional attached-value entries remain distinct
+and may accept an empty suffix. The syntax-only classifier requires an
+interpreter token to resolve to the current `PATH` executable (or that exact
+resolved path) and a wrapped child to use its explicit resolved path. Live
+process attribution is stricter: a direct process must have a kernel-reported
+PID executable matching the configured executable, its exact current `PATH`
+target/real path, or the accepted native version path. Node/Bun wrapper rows
+fail closed even when the kernel executable matches the trusted interpreter.
+Both runtimes allow a same-user process to rewrite argv/process-title text
+after startup, and the kernel executable proves only the interpreter after the
+child script is closed. Missing or inaccessible PID identity also fails closed.
+Unknown or execution-mode options fail closed before accepting a later
+executable-shaped argument.
 Provider projection is iterative and bounded by explicit depth, object, and
 entry limits; truncated branches use a deterministic `[TRUNCATED]` marker.
 Pseudo-TTY JSON extraction removes CSI/OSC terminal controls before a bounded
 single-pass candidate scan. It preserves the earliest possible root while
 rolling a fixed number of fallback candidates, recovers a later agent-record
-array after malformed or unterminated wrapper noise, enforces the candidate
-limit in UTF-8 bytes, and never retries from every opening bracket. Non-empty
-payloads must contain a known background or interactive agent kind. When a
-containing candidate exceeds its byte or nesting bound, its region is
-quarantined through the matching close so a nested fallback cannot replace the
-bounded-out payload's identity; scanning can resume for later independent
-output.
+array after malformed or unterminated wrapper noise, counts both object and
+array containers toward the nesting bound, enforces the candidate limit in
+UTF-8 bytes, and never retries from every opening bracket. Non-empty payloads
+must contain a known background or interactive agent kind. When a containing
+candidate exceeds its byte or nesting bound, its full mixed-container region
+is quarantined through the matching close so a nested fallback cannot replace
+the bounded-out payload's identity. Scanning resumes for later independent
+output after a normally bounded quarantine closes. If quarantine nesting itself
+exceeds twice the parser nesting limit, its container stack is discarded and
+the remainder of that output is quarantined through EOF to keep memory bounded.
 
 Supervisor arguments remain raw only in memory long enough to spawn the
 provider child. State files, legacy-state reads, switch responses, and

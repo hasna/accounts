@@ -1,6 +1,15 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, listProfiles } from "./lib/profiles.js";
@@ -10,15 +19,18 @@ import {
   listAgentsAcrossProfiles,
   projectAgentEntries,
   runClaudeAgentsJson,
+  scanToolProcesses,
   type AgentsRunner,
   type ProcessInfo,
 } from "./lib/agents.js";
 import { addCustomTool } from "./lib/tools.js";
 
 let home: string;
+let pathBeforeTest: string | undefined;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-agents-test-"));
+  pathBeforeTest = process.env.PATH;
   process.env.ACCOUNTS_HOME = home;
   delete process.env.ACCOUNTS_STORE_PATH;
 });
@@ -26,7 +38,52 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
+  if (pathBeforeTest === undefined) delete process.env.PATH;
+  else process.env.PATH = pathBeforeTest;
 });
+
+interface TrustedInterpreterPaths {
+  node: string;
+  nodejs: string;
+  bun: string;
+}
+
+function trustInterpreters(): TrustedInterpreterPaths {
+  const binDir = join(home, "trusted-interpreters");
+  mkdirSync(binDir, { recursive: true });
+  for (const name of ["node", "nodejs", "bun"]) {
+    const executable = join(binDir, name);
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+  }
+
+  process.env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
+  return {
+    node: join(binDir, "node"),
+    nodejs: join(binDir, "nodejs"),
+    bun: join(binDir, "bun"),
+  };
+}
+
+function wrapperProcessIdentity(
+  command: string,
+  trusted: TrustedInterpreterPaths,
+): string | undefined {
+  const first = command.match(/^(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  const observed = first?.[1] ?? first?.[2] ?? first?.[3];
+  const name = observed?.replaceAll("\\", "/").split("/").pop();
+  return name === "node" || name === "nodejs" || name === "bun"
+    ? trusted[name]
+    : undefined;
+}
+
+const classifyWithProcessIdentity = isToolSessionCommand as (
+  command: string,
+  bin: string,
+  toolId?: string,
+  processExecutable?: string,
+  requireKernelAttribution?: boolean,
+) => boolean;
 
 test("extractJsonArray parses a clean JSON array", () => {
   expect(extractJsonArray('[{"kind":"background","pid":1}]')).toEqual([
@@ -161,10 +218,43 @@ test("extractJsonArray fails closed on nested fallbacks inside bounded-out roots
     extractJsonArray(`${oversized}\n[{"kind":"background","pid":42}]`),
   ).toEqual([{ kind: "background", pid: 42 }]);
 
+  const mismatchedCloser =
+    `[${"x".repeat(1_100_000)}}${nestedAgent}]`;
+  expect(extractJsonArray(mismatchedCloser)).toBeUndefined();
+  expect(
+    extractJsonArray(
+      `${mismatchedCloser}\n[{"kind":"interactive","pid":43}]`,
+    ),
+  ).toEqual([{ kind: "interactive", pid: 43 }]);
+
+  const overflowedQuarantine =
+    `[${"x".repeat(1_100_000)}${"[".repeat(65_537)}` +
+    `${"]".repeat(65_537)}]\n[{"kind":"interactive","pid":44}]`;
+  expect(extractJsonArray(overflowedQuarantine)).toBeUndefined();
+
   const tooDeep =
     `[{"kind":"background","nested":${"[".repeat(32_769)}` +
     `${nestedAgent}${"]".repeat(32_769)}}]`;
   expect(extractJsonArray(tooDeep)).toBeUndefined();
+});
+
+test("extractJsonArray counts object and mixed containers before parsing", () => {
+  const nestedAgent = '[{"kind":"background","pid":999}]';
+  const deepObject =
+    `[{"kind":"background","nested":${'{"nested":'.repeat(32_769)}` +
+    `${nestedAgent}${"}".repeat(32_769)}}]`;
+  expect(extractJsonArray(deepObject)).toBeUndefined();
+  expect(
+    extractJsonArray(`${deepObject}\n[{"kind":"background","pid":42}]`),
+  ).toEqual([{ kind: "background", pid: 42 }]);
+
+  const mixed =
+    `[{"kind":"background","nested":${'{"nested":['.repeat(16_385)}` +
+    `${nestedAgent}${"]}".repeat(16_385)}}]`;
+  expect(extractJsonArray(mixed)).toBeUndefined();
+  expect(
+    extractJsonArray(`${mixed}\n[{"kind":"interactive","pid":43}]`),
+  ).toEqual([{ kind: "interactive", pid: 43 }]);
 });
 
 test("extractJsonArray stays linear on dense malformed bracket noise", () => {
@@ -394,6 +484,25 @@ test("(untracked) section is omitted when everything is accounted for or a profi
 });
 
 test("isToolSessionCommand matches real session processes and rejects helpers", () => {
+  const trustedBinDir = join(home, "session-bin");
+  const trustedClaude = join(trustedBinDir, "claude");
+  mkdirSync(trustedBinDir, { recursive: true });
+  for (const executable of [
+    trustedClaude,
+    join(trustedBinDir, "node"),
+    join(trustedBinDir, "nodejs"),
+    join(trustedBinDir, "bun"),
+  ]) {
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+  }
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${trustedBinDir}:${previousPath ?? ""}`;
+  const trustedInterpreters: TrustedInterpreterPaths = {
+    node: join(trustedBinDir, "node"),
+    nodejs: join(trustedBinDir, "nodejs"),
+    bun: join(trustedBinDir, "bun"),
+  };
   const versionedClaude = join(
     homedir(),
     ".local",
@@ -404,15 +513,15 @@ test("isToolSessionCommand matches real session processes and rejects helpers", 
   );
   const cases: Array<[string, boolean]> = [
     ["claude", true],
-    ["/home/u/.local/bin/claude --resume abc --allow-dangerously-skip-permissions", true],
-    ["node /home/u/.local/bin/claude --dangerously-skip-permissions", true],
+    [`${trustedClaude} --resume abc --allow-dangerously-skip-permissions`, true],
+    [`node ${trustedClaude} --dangerously-skip-permissions`, true],
     [`${versionedClaude} --session-id abc`, true],
     ["/tmp/evil/claude/versions/2.1.170 --session-id abc", false],
     ["/tmp/not-claude/claude/versions/helper --session-id abc", false],
     [`${versionedClaude} --bg-pty-host /tmp/x.sock 79 74`, false],
     [`${versionedClaude} --bg-spare /tmp/y.sock`, false],
-    ["/home/u/.local/bin/claude daemon run --origin transient", false],
-    ["/home/u/.local/bin/claude --debug daemon run --origin transient", true],
+    [`${trustedClaude} daemon run --origin transient`, false],
+    [`${trustedClaude} --debug daemon run --origin transient`, true],
     ["claude agents --json", false],
     ["claude auth", false],
     ["claude auto-mode", false],
@@ -431,8 +540,8 @@ test("isToolSessionCommand matches real session processes and rejects helpers", 
     ["claude --version", false],
     ["claude --config /tmp agents --json", false],
     ["claude --debug-file /dev/null agents --json", false],
-    ["claude --debug-file /dev/null daemon run", false],
-    ["claude --debug api daemon run", false],
+    ["claude --debug-file /dev/null daemon run", true],
+    ["claude --debug api daemon run", true],
     ["claude --debug gateway", true],
     ["claude --resume gateway", true],
     ["claude --from-pr gateway", true],
@@ -474,9 +583,446 @@ test("isToolSessionCommand matches real session processes and rejects helpers", 
     ["/bin/bash -c source /home/u/profiles/claude/acct1/shell-snapshots/snap.sh", false],
     ["script -qefc claude agents --json /dev/null", false],
   ];
-  for (const [command, expected] of cases) {
-    expect(isToolSessionCommand(command, "claude")).toBe(expected);
+  try {
+    for (const [command, expected] of cases) {
+      expect(
+        isToolSessionCommand(
+          command,
+          "claude",
+          "claude",
+          wrapperProcessIdentity(command, trustedInterpreters),
+        ),
+        command,
+      ).toBe(expected);
+    }
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
   }
+});
+
+test("bare configured executables trust only the bare token, PATH target, and native version root", () => {
+  const directoryBin = join(home, "directory-bin");
+  const directoryNamedClaude = join(directoryBin, "claude");
+  const binDir = join(home, "trusted-bin");
+  const resolvedClaude = join(binDir, "claude");
+  mkdirSync(directoryNamedClaude, { recursive: true });
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(resolvedClaude, "#!/bin/sh\nexit 0\n");
+  chmodSync(resolvedClaude, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${directoryBin}:${binDir}:${previousPath ?? ""}`;
+
+  try {
+    const versionedClaude = join(
+      homedir(),
+      ".local",
+      "share",
+      "claude",
+      "versions",
+      "2.1.220",
+    );
+    const prereleaseClaude = join(
+      homedir(),
+      ".local",
+      "share",
+      "claude",
+      "versions",
+      "2.1.220-beta.1+build.7",
+    );
+    for (const command of [
+      "claude --session-id abc",
+      `${resolvedClaude} --session-id abc`,
+      `${versionedClaude} --session-id abc`,
+      `${prereleaseClaude} --session-id abc`,
+    ]) {
+      expect(isToolSessionCommand(command, "claude", "claude"), command).toBe(true);
+    }
+    for (const command of [
+      `${directoryNamedClaude} --session-id abc`,
+      "/tmp/evil/claude --session-id abc",
+      "node /tmp/evil/claude --session-id abc",
+      "bun /tmp/evil/claude --session-id abc",
+      join(homedir(), ".local", "share", "claude", "versions", "2.1"),
+      join(homedir(), ".local", "share", "claude", "versions", "02.1.3"),
+      join(homedir(), ".local", "share", "claude", "versions", "2.01.3"),
+      join(homedir(), ".local", "share", "claude", "versions", "2.1.03"),
+      join(homedir(), ".local", "share", "claude", "versions", "2.1.3-01"),
+      join(homedir(), ".local", "share", "claude", "versions", "2.1.3-.."),
+      join(
+        homedir(),
+        ".local",
+        "share",
+        "claude",
+        "versions",
+        "2.1.3-alpha..1",
+      ),
+    ]) {
+      expect(isToolSessionCommand(command, "claude", "claude"), command).toBe(false);
+    }
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+});
+
+test("interpreter wrappers require PATH-trusted interpreter and child identities", () => {
+  const binDir = join(home, "wrapper-bin");
+  const trustedNode = join(binDir, "node");
+  const trustedBun = join(binDir, "bun");
+  const trustedChild = join(binDir, "custom-agent");
+  const evilDir = join(home, "evil-wrapper-bin");
+  const evilNode = join(evilDir, "node");
+  const evilBun = join(evilDir, "bun");
+  const evilChild = join(evilDir, "custom-agent");
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(evilDir, { recursive: true });
+  for (const executable of [
+    trustedNode,
+    trustedBun,
+    trustedChild,
+    evilNode,
+    evilBun,
+    evilChild,
+  ]) {
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+  }
+
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${evilDir}`;
+  const trustedInterpreters: TrustedInterpreterPaths = {
+    node: trustedNode,
+    nodejs: join(binDir, "nodejs"),
+    bun: trustedBun,
+  };
+  try {
+    for (const command of [
+      `${trustedNode} ${trustedChild} --resume abc`,
+      `${trustedBun} ${trustedChild} --resume abc`,
+      `node ${trustedChild} --resume abc`,
+      `bun ${trustedChild} --resume abc`,
+    ]) {
+      expect(
+        isToolSessionCommand(
+          command,
+          "custom-agent",
+          "custom-agent",
+          wrapperProcessIdentity(command, trustedInterpreters),
+        ),
+        command,
+      ).toBe(true);
+    }
+
+    for (const command of [
+      `${evilNode} ${trustedChild} --resume abc`,
+      `${evilBun} ${trustedChild} --resume abc`,
+      `${trustedNode} ${evilChild} --resume abc`,
+      `${trustedBun} ${evilChild} --resume abc`,
+      "node custom-agent --resume abc",
+      "bun custom-agent --resume abc",
+      "node missing-agent --resume abc",
+      "bun missing-agent --resume abc",
+    ]) {
+      expect(
+        isToolSessionCommand(
+          command,
+          "custom-agent",
+          "custom-agent",
+          wrapperProcessIdentity(command, trustedInterpreters),
+        ),
+        command,
+      ).toBe(false);
+    }
+
+    rmSync(trustedNode);
+    expect(
+      isToolSessionCommand(
+        `${trustedNode} ${trustedChild} --resume abc`,
+        "custom-agent",
+        "custom-agent",
+        trustedNode,
+      ),
+    ).toBe(false);
+    expect(
+      isToolSessionCommand(
+        `${evilNode} ${trustedChild} --resume abc`,
+        "custom-agent",
+        "custom-agent",
+        evilNode,
+      ),
+    ).toBe(true);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+});
+
+test("interpreter wrappers fail closed without a verified process executable identity", () => {
+  const binDir = join(home, "identity-wrapper-bin");
+  const trustedNode = join(binDir, "node");
+  const trustedChild = join(binDir, "custom-agent");
+  const untrustedNode = join(home, "untrusted-node");
+  mkdirSync(binDir, { recursive: true });
+  for (const executable of [trustedNode, trustedChild, untrustedNode]) {
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+  }
+
+  const previousPath = process.env.PATH;
+  process.env.PATH = binDir;
+  try {
+    const command = `node ${trustedChild} --resume abc`;
+    expect(
+      classifyWithProcessIdentity(command, trustedChild, "custom-agent"),
+    ).toBe(false);
+    expect(
+      classifyWithProcessIdentity(
+        command,
+        trustedChild,
+        "custom-agent",
+        trustedNode,
+      ),
+    ).toBe(true);
+    expect(
+      classifyWithProcessIdentity(
+        command,
+        trustedChild,
+        "custom-agent",
+        untrustedNode,
+      ),
+    ).toBe(false);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+});
+
+test.skipIf(process.platform !== "linux")(
+  "process attribution verifies direct PID executables and fails closed on wrapper argv",
+  async () => {
+    const binDir = join(home, "pid-identity-bin");
+    const trustedNode = join(binDir, "node");
+    const trustedChild = join(binDir, "pid-identity-agent");
+    const titleForger = join(binDir, "title-forger.mjs");
+    const nodeExecutable = [
+      process.env.NODE,
+      join(homedir(), ".hermes", "node", "bin", "node"),
+      "/usr/bin/node",
+      "/bin/node",
+    ].find((candidate): candidate is string =>
+      typeof candidate === "string" && existsSync(candidate)
+    );
+    if (!nodeExecutable) return;
+    mkdirSync(binDir, { recursive: true });
+    symlinkSync(nodeExecutable!, trustedNode);
+    symlinkSync("/bin/sleep", trustedChild);
+    writeFileSync(
+      titleForger,
+      [
+        "process.title = process.argv[2];",
+        "setInterval(() => {}, 1_000);",
+        "",
+      ].join("\n"),
+    );
+    process.env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
+
+    const genuine = spawn(
+      trustedChild,
+      ["30"],
+      {
+        stdio: "ignore",
+      },
+    );
+    const forged = spawn(
+      "/bin/sleep",
+      ["30"],
+      {
+        argv0: `node ${trustedChild} --resume forged`,
+        stdio: "ignore",
+      },
+    );
+    const forgedTrustedInterpreter = spawn(
+      trustedNode,
+      [
+        titleForger,
+        `node ${trustedChild} --resume forged-trusted-interpreter`,
+      ],
+      {
+        argv0: "node",
+        stdio: "ignore",
+      },
+    );
+    await Promise.all([
+      new Promise<void>((resolve, reject) => {
+        genuine.once("spawn", resolve);
+        genuine.once("error", reject);
+      }),
+      new Promise<void>((resolve, reject) => {
+        forged.once("spawn", resolve);
+        forged.once("error", reject);
+      }),
+      new Promise<void>((resolve, reject) => {
+        forgedTrustedInterpreter.once("spawn", resolve);
+        forgedTrustedInterpreter.once("error", reject);
+      }),
+    ]);
+
+    try {
+      let forgedTitleObserved = false;
+      let genuineCommand = "";
+      let forgedCommand = "";
+      let forgedTrustedCommand = "";
+      const deadline = Date.now() + 2_000;
+      do {
+        genuineCommand = spawnSync(
+          "ps",
+          ["-p", String(genuine.pid), "-o", "args="],
+          { encoding: "utf8" },
+        ).stdout.trim();
+        forgedCommand = spawnSync(
+          "ps",
+          ["-p", String(forged.pid), "-o", "args="],
+          { encoding: "utf8" },
+        ).stdout.trim();
+        forgedTrustedCommand = spawnSync(
+          "ps",
+          ["-p", String(forgedTrustedInterpreter.pid), "-o", "args="],
+          { encoding: "utf8" },
+        ).stdout.trim();
+        forgedTitleObserved ||= forgedTrustedCommand.startsWith(
+          `node ${trustedChild} --resume forged-trusted-interpreter`,
+        );
+        if (
+          forgedTitleObserved &&
+          genuineCommand &&
+          forgedCommand
+        ) {
+          break;
+        }
+        await Bun.sleep(10);
+      } while (Date.now() < deadline);
+      expect(forgedTitleObserved).toBe(true);
+      expect(
+        classifyWithProcessIdentity(
+          genuineCommand,
+          trustedChild,
+          "pid-identity-agent",
+          readlinkSync(`/proc/${genuine.pid}/exe`),
+          true,
+        ),
+      ).toBe(true);
+      expect(
+        classifyWithProcessIdentity(
+          forgedCommand,
+          trustedChild,
+          "pid-identity-agent",
+          readlinkSync(`/proc/${forged.pid}/exe`),
+          true,
+        ),
+      ).toBe(false);
+      expect(
+        classifyWithProcessIdentity(
+          forgedTrustedCommand,
+          trustedChild,
+          "pid-identity-agent",
+          readlinkSync(`/proc/${forgedTrustedInterpreter.pid}/exe`),
+          true,
+        ),
+      ).toBe(false);
+    } finally {
+      genuine.kill("SIGKILL");
+      forged.kill("SIGKILL");
+      forgedTrustedInterpreter.kill("SIGKILL");
+      await Promise.all([
+        new Promise<void>((resolve) => genuine.once("close", () => resolve())),
+        new Promise<void>((resolve) => forged.once("close", () => resolve())),
+        new Promise<void>((resolve) =>
+          forgedTrustedInterpreter.once("close", () => resolve())
+        ),
+      ]);
+    }
+  },
+);
+
+test("tool identity, not executable basename, selects Claude and wrapper grammar", () => {
+  expect(isToolSessionCommand("claude daemon", "claude", "custom-claude")).toBe(true);
+  expect(isToolSessionCommand("claude --help", "claude", "custom-claude")).toBe(true);
+  expect(isToolSessionCommand("claude daemon", "claude", "claude")).toBe(false);
+
+  expect(isToolSessionCommand("node --future-option value", "node", "custom-node")).toBe(true);
+  expect(isToolSessionCommand("bun --future-option value", "bun", "custom-bun")).toBe(true);
+
+  const codexAppBin = "/Applications/Codex.app/Contents/MacOS/Codex";
+  expect(
+    isToolSessionCommand(
+      `${codexAppBin} --user-data-dir=/safe`,
+      codexAppBin,
+      "codex-app",
+    ),
+  ).toBe(true);
+});
+
+test("Claude 2.1.220 control grammar excludes exact non-session commands and daemon positions", () => {
+  for (const command of [
+    "remote",
+    "sync",
+    "bridge",
+    "logs",
+    "attach",
+    "stop",
+    "kill",
+    "respawn",
+    "rm",
+  ]) {
+    expect(
+      isToolSessionCommand(`claude ${command}`, "claude", "claude"),
+      command,
+    ).toBe(false);
+  }
+
+  for (const command of [
+    "claude daemon run",
+    "claude --dangerously-skip-permissions daemon run",
+    "claude --allow-dangerously-skip-permissions daemon run",
+    "claude logs --bg",
+    "claude daemon --bg",
+    "claude --dangerously-skip-permissions daemon --background",
+  ]) {
+    expect(isToolSessionCommand(command, "claude", "claude"), command).toBe(false);
+  }
+  for (const command of [
+    "claude --debug-file /dev/null daemon run",
+    "claude --permission-mode bypassPermissions daemon run",
+    "claude --debug remote",
+    "claude --debug sync",
+    "claude --debug bridge",
+    "claude --debug logs",
+    "claude logs-extra",
+    "claude prompt daemon run",
+  ]) {
+    expect(isToolSessionCommand(command, "claude", "claude"), command).toBe(true);
+  }
+
+  for (const command of [
+    "claude --bg",
+    "claude --background",
+    "claude -- --bg",
+    "claude --bg --help",
+    "claude -- --background --version",
+  ]) {
+    expect(isToolSessionCommand(command, "claude", "claude"), command).toBe(false);
+  }
+  for (const command of [
+    "claude --backgrounded",
+    "claude --bg=worker",
+    "claude prompt-with---background-suffix",
+  ]) {
+    expect(isToolSessionCommand(command, "claude", "claude"), command).toBe(true);
+  }
+  expect(
+    isToolSessionCommand("claude --bg-spare /tmp/spare.sock", "claude", "claude"),
+  ).toBe(false);
 });
 
 test("isToolSessionCommand enforces every required scalar tool option arity", () => {
@@ -739,6 +1285,7 @@ test("isToolSessionCommand excludes Claude pre-parser and positional exit modes"
 });
 
 test("isToolSessionCommand matches absolute tool bins and interpreter wrappers", () => {
+  const trustedInterpreters = trustInterpreters();
   const customBin = "/opt/acme/bin/custom-agent";
   for (const command of [
     `${customBin} --resume abc`,
@@ -771,7 +1318,15 @@ test("isToolSessionCommand matches absolute tool bins and interpreter wrappers",
     `node ${customBin} --preload`,
     `bun ${customBin} --daemon-worker`,
   ]) {
-    expect(isToolSessionCommand(command, customBin), command).toBe(true);
+    expect(
+      isToolSessionCommand(
+        command,
+        customBin,
+        "custom-agent",
+        wrapperProcessIdentity(command, trustedInterpreters),
+      ),
+      command,
+    ).toBe(true);
   }
   for (const command of [
     "/tmp/other/custom-agent --resume abc",
@@ -808,18 +1363,30 @@ test("isToolSessionCommand matches absolute tool bins and interpreter wrappers",
     "node --env-file-if-exists /dev/null /tmp/other-entrypoint.js",
     "bun --cpu-prof-name /dev/null /tmp/other-entrypoint.js",
   ]) {
-    expect(isToolSessionCommand(command, customBin), command).toBe(false);
+    expect(
+      isToolSessionCommand(
+        command,
+        customBin,
+        "custom-agent",
+        wrapperProcessIdentity(command, trustedInterpreters),
+      ),
+      command,
+    ).toBe(false);
   }
   expect(
     isToolSessionCommand(
       "node --env-file-if-exists /dev/null /tmp/other-entrypoint.js",
       "/dev/null",
+      "dev-null",
+      trustedInterpreters.node,
     ),
   ).toBe(false);
   expect(
     isToolSessionCommand(
       "bun --cpu-prof-name /dev/null /tmp/other-entrypoint.js",
       "/dev/null",
+      "dev-null",
+      trustedInterpreters.bun,
     ),
   ).toBe(false);
   expect(isToolSessionCommand("custom-agent --resume abc", customBin)).toBe(false);
@@ -847,7 +1414,119 @@ test("isToolSessionCommand matches absolute tool bins and interpreter wrappers",
     `node ${spacedBin} --resume abc`,
     `bun "${spacedBin}" --resume abc`,
   ]) {
-    expect(isToolSessionCommand(command, spacedBin), command).toBe(true);
+    expect(
+      isToolSessionCommand(
+        command,
+        spacedBin,
+        "custom-agent",
+        wrapperProcessIdentity(command, trustedInterpreters),
+      ),
+      command,
+    ).toBe(true);
+  }
+});
+
+test("Node 22.22.3 and Bun 1.3.14 wrapper option schemas are explicit and fail closed", () => {
+  const trustedInterpreters = trustInterpreters();
+  const customBin = "/opt/acme/bin/custom-agent";
+  // This classifier is a trust boundary, not a byte-for-byte runtime parser:
+  // Bun 1.3.14 tolerates some empty `--name=` forms, but required-value schema
+  // entries still fail closed here because no meaningful wrapper value was
+  // proven. Optional attached-value entries such as `--inspect=` remain valid.
+  const accepted = [
+    `node --allow-child-process ${customBin}`,
+    `node --allow-fs-read=/tmp ${customBin}`,
+    `node --allow-fs-read /tmp ${customBin}`,
+    `node --experimental-permission ${customBin}`,
+    `node --use-env-proxy ${customBin}`,
+    `node --max-old-space-size=2048 ${customBin}`,
+    `node --max-semi-space-size=64 ${customBin}`,
+    `node --stack-trace-limit=100 ${customBin}`,
+    `node --inspect= ${customBin}`,
+    `bun --main-fields module ${customBin}`,
+    `bun --main-fields=module ${customBin}`,
+    `bun --extension-order .tsx,.ts ${customBin}`,
+    `bun --tsconfig-override tsconfig.json ${customBin}`,
+    `bun --define DEBUG=true ${customBin}`,
+    `bun -dDEBUG=true ${customBin}`,
+    `bun --drop console ${customBin}`,
+    `bun --feature shell ${customBin}`,
+    `bun --loader ts ${customBin}`,
+    `bun -lts ${customBin}`,
+    `bun --jsx-factory h ${customBin}`,
+    `bun --jsx-fragment Fragment ${customBin}`,
+    `bun --jsx-import-source preact ${customBin}`,
+    `bun --jsx-runtime automatic ${customBin}`,
+    `bun --no-macros ${customBin}`,
+    `bun --jsx-side-effects ${customBin}`,
+    `bun --ignore-dce-annotations ${customBin}`,
+    `bun --conditions custom ${customBin}`,
+    `bun --conditions=custom ${customBin}`,
+    `bun --inspect= ${customBin}`,
+    `bun run ${customBin}`,
+    `bun --silent run ${customBin}`,
+    `bun --cwd /tmp run ${customBin}`,
+    `bun --cwd=/tmp run ${customBin}`,
+    `bun --smol run ${customBin}`,
+    `bun run --silent ${customBin}`,
+    `bun run --cwd /tmp ${customBin}`,
+    `bun run --main-fields module ${customBin}`,
+    `bun run --filter workspace-a ${customBin}`,
+    `bun run --filter=workspace-a ${customBin}`,
+    `bun run -Fworkspace-a ${customBin}`,
+    `bun run --shell=bun ${customBin}`,
+    `bun run --workspaces ${customBin}`,
+    `bun run --parallel ${customBin}`,
+    `bun run --sequential ${customBin}`,
+    `bun run -- ${customBin}`,
+  ];
+  const rejected = [
+    `node --conditions= ${customBin}`,
+    `node '--conditions=' ${customBin}`,
+    `node --title= ${customBin}`,
+    `node --allow-fs-read= ${customBin}`,
+    `node --allow-fs-read --future-separated value ${customBin}`,
+    `node --max-old-space-size 2048 ${customBin}`,
+    `node --max-semi-space-size 64 ${customBin}`,
+    `node --stack-trace-limit 100 ${customBin}`,
+    "node --max-old-space-size",
+    "node --max-semi-space-size",
+    "node --stack-trace-limit",
+    `node --future-separated value ${customBin}`,
+    `bun --conditions= ${customBin}`,
+    `bun --title= ${customBin}`,
+    `bun --cwd= run ${customBin}`,
+    `bun --main-fields= ${customBin}`,
+    `bun run --filter= ${customBin}`,
+    `bun --future-separated value ${customBin}`,
+    `bun --future-separated value run ${customBin}`,
+    `bun --eval console.log(1) run ${customBin}`,
+    `bun run run ${customBin}`,
+    `bun run --future-separated value ${customBin}`,
+    `bun run --eval console.log(1) ${customBin}`,
+  ];
+
+  for (const command of accepted) {
+    expect(
+      isToolSessionCommand(
+        command,
+        customBin,
+        "custom-agent",
+        wrapperProcessIdentity(command, trustedInterpreters),
+      ),
+      command,
+    ).toBe(true);
+  }
+  for (const command of rejected) {
+    expect(
+      isToolSessionCommand(
+        command,
+        customBin,
+        "custom-agent",
+        wrapperProcessIdentity(command, trustedInterpreters),
+      ),
+      command,
+    ).toBe(false);
   }
 });
 
@@ -1031,6 +1710,7 @@ test("agents library projections redact provider payloads and untracked process 
   addProfile({ name: "acct1", tool: "claude" });
   let processGetterCount = 0;
   let processProxyTrapCount = 0;
+  const providerProjectKey = ["sk", "proj", "provider-positional-token"].join("-");
   const runner: AgentsRunner = () => ({
     ok: true,
     raw: JSON.stringify([
@@ -1038,6 +1718,21 @@ test("agents library projections redact provider payloads and untracked process 
         kind: "background",
         pid: 10,
         sessionId: "session-safe",
+        argv: [
+          "claude",
+          "--",
+          "wrapper=(--client-key=provider-positional-attached-secret)",
+          "outer=(env=--api-key)",
+          "",
+          "provider-positional-wrapper-split-secret",
+          "keep-provider-positional-wrapper-split",
+          "url=urn:authorization:public",
+          "keep-provider-positional-urn",
+          "wrap/Authorization:Bearer",
+          "provider-positional-bearer-secret",
+          providerProjectKey,
+          "keep-provider-positional-control",
+        ],
         metadata: {
           token: "provider-token-secret",
           message: "provider --api-key provider-message-secret --trace keep-provider-message",
@@ -1051,7 +1746,15 @@ test("agents library projections redact provider payloads and untracked process 
     ppid: { value: 1, enumerable: true },
     command: {
       value:
-        "claude --resume safe-session --client-key process-command-secret --trace keep-process-command",
+        "claude --resume safe-session -- " +
+        "env=--client-key=process-command-secret " +
+        "wrapper:--api-key=process-command-wrapper-secret " +
+        "outer=(env=--master-key) \"\" process-command-wrapper-split-secret " +
+        "keep-process-wrapper-split url=https://example.test/authorization:public " +
+        "keep-process-url " +
+        "keep-before-process-command-auth " +
+        "env=Authorization:Bearer process-command-bearer-secret " +
+        "keep-process-command",
       enumerable: true,
     },
     configDir: { value: "/profiles/safe", enumerable: true },
@@ -1102,12 +1805,27 @@ test("agents library projections redact provider payloads and untracked process 
   expect(processProxyTrapCount).toBe(0);
   expect(serialized).not.toContain("provider-token-secret");
   expect(serialized).not.toContain("provider-message-secret");
+  expect(serialized).not.toContain("provider-positional-attached-secret");
+  expect(serialized).not.toContain("provider-positional-wrapper-split-secret");
+  expect(serialized).not.toContain("provider-positional-bearer-secret");
+  expect(serialized).not.toContain(providerProjectKey);
   expect(serialized).not.toContain("process-command-secret");
+  expect(serialized).not.toContain("process-command-wrapper-secret");
+  expect(serialized).not.toContain("process-command-wrapper-split-secret");
+  expect(serialized).not.toContain("process-command-bearer-secret");
   expect(serialized).not.toContain("process-getter-secret");
   expect(serialized).not.toContain("process-coercion-secret");
   expect(serialized).not.toContain("process-proxy-secret");
   expect(serialized).toContain("keep-provider-message");
-  expect(serialized).toContain("keep-process-command");
+  expect(serialized).toContain("keep-provider-positional-wrapper-split");
+  expect(serialized).toContain("url=urn:authorization:public");
+  expect(serialized).toContain("keep-provider-positional-urn");
+  expect(serialized).not.toContain("keep-provider-positional-control");
+  expect(serialized).toContain("keep-process-wrapper-split");
+  expect(serialized).toContain("url=https://example.test/authorization:public");
+  expect(serialized).toContain("keep-process-url");
+  expect(serialized).toContain("keep-before-process-command-auth");
+  expect(serialized).not.toContain("keep-process-command");
   expect(results[0]?.agents[0]).toMatchObject({
     kind: "background",
     pid: 10,

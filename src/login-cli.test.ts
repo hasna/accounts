@@ -592,7 +592,7 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
   expect(runCli("add", "acct", "--tool", "argv-grammar").status).toBe(0);
 
   const secrets = Array.from(
-    { length: 24 },
+    { length: 28 },
     (_, index) => `actual-switch-credential-${index}`,
   );
   const malformedOptionSyntax = [
@@ -665,10 +665,17 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     "--api-key",
     "--",
     "--client-key",
-    "keep-switch-positional-client-value",
-    "--api-key=keep-switch-positional-attached-value",
-    "-k",
-    "keep-switch-positional-short-value",
+    "keep-switch-positional-plain-value",
+    `--api-key=${secrets[24]}`,
+    "env=--client-key",
+    "",
+    secrets[27]!,
+    "keep-switch-positional-wrapper-split",
+    "url=urn:authorization:public",
+    "keep-switch-positional-urn",
+    `Authorization: Bearer ${secrets[25]}`,
+    `sk-proj-${secrets[26]}`,
+    "keep-switch-positional-control",
   ];
 
   for (const surfaceArgs of [
@@ -699,9 +706,11 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     expect(result.stdout).toContain("[REDACTED]");
     expect(result.stdout).toContain("keep-after-opaque-bound-value");
     expect(result.stdout).toContain("keep-after-complete-token-value");
-    expect(result.stdout).toContain("keep-switch-positional-client-value");
-    expect(result.stdout).toContain("--api-key=keep-switch-positional-attached-value");
-    expect(result.stdout).toContain("keep-switch-positional-short-value");
+    expect(result.stdout).toContain("keep-switch-positional-plain-value");
+    expect(result.stdout).toContain("keep-switch-positional-wrapper-split");
+    expect(result.stdout).toContain("url=urn:authorization:public");
+    expect(result.stdout).toContain("keep-switch-positional-urn");
+    expect(result.stdout).not.toContain("keep-switch-positional-control");
     if (surfaceArgs.includes("--json")) {
       const output = JSON.parse(result.stdout) as {
         command: string[];
@@ -722,11 +731,26 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
         expect(output.command).toContain(retained);
         expect(output.commandLine).toContain(`'${retained}'`);
       }
-      expect(output.command).toContain("keep-switch-positional-client-value");
-      expect(output.command).toContain("--api-key=keep-switch-positional-attached-value");
-      expect(output.command).toContain("keep-switch-positional-short-value");
+      expect(output.command).toContain("keep-switch-positional-plain-value");
+      expect(output.command).toContain("--api-key=[REDACTED]");
+      expect(output.command).toContain("env=--client-key");
+      expect(output.command).toContain("keep-switch-positional-wrapper-split");
+      expect(output.command).toContain("url=urn:authorization:public");
+      expect(output.command).toContain("keep-switch-positional-urn");
+      expect(output.command).toContain("Authorization: [REDACTED]");
+      expect(output.command).toContain("[REDACTED]");
+      expect(output.command).not.toContain("keep-switch-positional-control");
       expect(output.commandLine).toContain(
-        "'--api-key' '--' '--client-key' 'keep-switch-positional-client-value'",
+        "'--api-key' '--' '--client-key' 'keep-switch-positional-plain-value'",
+      );
+      expect(output.commandLine).toContain(
+        "'env=--client-key' '' '[REDACTED]' 'keep-switch-positional-wrapper-split'",
+      );
+      expect(output.commandLine).toContain(
+        "'url=urn:authorization:public' 'keep-switch-positional-urn'",
+      );
+      expect(output.commandLine).toContain(
+        "'Authorization: [REDACTED]' '[REDACTED]' '[REDACTED]'",
       );
     }
   }
@@ -748,11 +772,15 @@ test("switch surfaces redact normalized, clustered, and Unicode credential argum
     expect(`${launched.stdout}${launched.stderr}`).not.toContain(secret);
     expect(readLogEntries().at(-1)?.args).toContain(secret);
   }
-  expect(readLogEntries().at(-1)?.args).toContain("keep-switch-positional-client-value");
+  expect(readLogEntries().at(-1)?.args).toContain("keep-switch-positional-plain-value");
+  expect(readLogEntries().at(-1)?.args).toContain(`--api-key=${secrets[24]}`);
   expect(readLogEntries().at(-1)?.args).toContain(
-    "--api-key=keep-switch-positional-attached-value",
+    `Authorization: Bearer ${secrets[25]}`,
   );
-  expect(readLogEntries().at(-1)?.args).toContain("keep-switch-positional-short-value");
+  expect(readLogEntries().at(-1)?.args).toContain(`sk-proj-${secrets[26]}`);
+  expect(readLogEntries().at(-1)?.args).toContain(secrets[27]!);
+  expect(readLogEntries().at(-1)?.args).toContain("url=urn:authorization:public");
+  expect(readLogEntries().at(-1)?.args).toContain("keep-switch-positional-control");
 });
 
 test("accounts shell removes request debugging while preserving same-binding environment", () => {
