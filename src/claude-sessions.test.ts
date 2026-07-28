@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { delimiter, join, sep } from "node:path";
 import type { Profile } from "./types.js";
 import {
   CLAUDE_SESSION_METADATA_MAX_BYTES,
@@ -760,6 +760,13 @@ describe("accounts sessions CLI", () => {
     };
   }
 
+  function cliEnvWith(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return {
+      ...cliEnv(),
+      ...extra,
+    };
+  }
+
   function runCliEntrypoint(entrypointArgs: string[], ...args: string[]) {
     return spawnSync(process.execPath, [...entrypointArgs, ...args], {
       cwd: process.cwd(),
@@ -771,6 +778,15 @@ describe("accounts sessions CLI", () => {
 
   function runCli(...args: string[]) {
     return runCliEntrypoint(["run", "src/cli.ts"], ...args);
+  }
+
+  function runCliWithEnv(extra: NodeJS.ProcessEnv, ...args: string[]) {
+    return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+      env: cliEnvWith(extra),
+    });
   }
 
   function parseCatalog(result: ReturnType<typeof runCli>): Array<Record<string, unknown>> {
@@ -788,6 +804,63 @@ describe("accounts sessions CLI", () => {
         }`,
       );
     }
+  }
+
+  function fakeClaudeEnv(): { env: NodeJS.ProcessEnv; logPath: string } {
+    const binDir = join(root, "bin");
+    const logPath = join(root, "fake-claude-log.jsonl");
+    const scriptPath = join(root, "fake-claude.js");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(
+      scriptPath,
+      [
+        'import { appendFileSync } from "node:fs";',
+        "appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({",
+        "  args: process.argv.slice(2),",
+        "  cwd: process.cwd(),",
+        "  configDir: process.env.CLAUDE_CONFIG_DIR,",
+        "  telegramStateDir: process.env.TELEGRAM_STATE_DIR,",
+        "  awsProfile: process.env.AWS_PROFILE,",
+        "  nodeDebug: process.env.NODE_DEBUG,",
+        "  bunVerboseFetch: process.env.BUN_CONFIG_VERBOSE_FETCH,",
+        "}) + '\\n');",
+      ].join("\n"),
+    );
+    const executable = join(binDir, process.platform === "win32" ? "claude.cmd" : "claude");
+    if (process.platform === "win32") {
+      writeFileSync(
+        executable,
+        "@echo off\r\n\"%BUN_EXECUTABLE%\" \"%FAKE_CLAUDE_SCRIPT%\" %*\r\n",
+      );
+    } else {
+      writeFileSync(
+        executable,
+        "#!/bin/sh\nexec \"$BUN_EXECUTABLE\" \"$FAKE_CLAUDE_SCRIPT\" \"$@\"\n",
+        { mode: 0o755 },
+      );
+      chmodSync(executable, 0o755);
+    }
+    const inheritedPath = process.env.PATH ?? "";
+    const pathValue = `${binDir}${delimiter}${inheritedPath}`;
+    return {
+      logPath,
+      env: {
+        FAKE_CLAUDE_LOG: logPath,
+        FAKE_CLAUDE_SCRIPT: scriptPath,
+        BUN_EXECUTABLE: process.execPath,
+        PATH: pathValue,
+        Path: pathValue,
+      },
+    };
+  }
+
+  function readJsonl(path: string): Array<Record<string, unknown>> {
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
   }
 
   test("renders a concise table by default and structured filtered JSON for both command forms", () => {
@@ -850,6 +923,154 @@ describe("accounts sessions CLI", () => {
     const directJson = runCli("sessions", "--profile", "personal", "--json");
     expect(directJson.status).toBe(0);
     expect(JSON.parse(directJson.stdout)).toHaveLength(1);
+  });
+
+  test("dry-runs same-binding explicit resume from a catalog reference", () => {
+    const owner = profile("owner");
+    const alias = {
+      ...profile("alias", owner.dir),
+      identity: "identity://same-binding-alias",
+    };
+    const project = join(root, "repo-resume");
+    mkdirSync(project, { recursive: true });
+    writeSession(owner.dir, "-repo-resume", UUID_A, project, "RESUME_SECRET_MUST_NOT_ESCAPE");
+    writeStore([alias, owner]);
+
+    const catalog = parseCatalog(runCli("sessions", "--json")) as Array<{
+      catalogRef: string;
+      uuid: string;
+    }>;
+    expect(catalog).toHaveLength(1);
+    const result = runCli(
+      "sessions",
+      "resume",
+      catalog[0]!.catalogRef,
+      "--account",
+      "alias",
+      "--session-id",
+      UUID_A,
+      "--dry-run",
+      "--json",
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    const plan = JSON.parse(result.stdout) as {
+      schema: string;
+      mode: string;
+      profile: { name: string; tool: string };
+      session: { catalogRef: string; sessionId: string; ownerProfiles: string[] };
+      cwd: string;
+      command: string[];
+    };
+    expect(plan).toMatchObject({
+      schema: "hasna.accounts.claude-session-resume/v1",
+      mode: "same-binding",
+      profile: { name: "alias", tool: "claude" },
+      session: {
+        catalogRef: catalog[0]!.catalogRef,
+        sessionId: UUID_A,
+        ownerProfiles: ["alias", "owner"],
+      },
+      cwd: canonicalPath(project),
+      command: ["claude", "--resume", UUID_A],
+    });
+    expect(result.stdout).not.toContain("RESUME_SECRET_MUST_NOT_ESCAPE");
+  });
+
+  test("launches same-binding resume with native argv and inherited routing policy", () => {
+    const owner = profile("owner");
+    const alias = {
+      ...profile("alias", owner.dir),
+      identity: "identity://same-binding-alias",
+    };
+    const project = join(root, "repo-resume-launch");
+    mkdirSync(project, { recursive: true });
+    writeSession(owner.dir, "-repo-resume-launch", UUID_A, project);
+    writeStore([alias, owner]);
+    const catalog = parseCatalog(runCli("sessions", "--json")) as Array<{ catalogRef: string }>;
+    const fake = fakeClaudeEnv();
+
+    const result = runCliWithEnv(
+      {
+        ...fake.env,
+        AWS_PROFILE: "same-binding-route",
+        NODE_DEBUG: "http",
+        BUN_CONFIG_VERBOSE_FETCH: "1",
+      },
+      "sessions",
+      "resume",
+      catalog[0]!.catalogRef,
+      "--account",
+      "alias",
+      "--session-id",
+      UUID_A,
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("");
+    const launches = readJsonl(fake.logPath);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).toMatchObject({
+      args: ["--resume", UUID_A],
+      cwd: canonicalPath(project),
+      configDir: owner.dir,
+      telegramStateDir: join(owner.dir, "channels", "telegram"),
+      awsProfile: "same-binding-route",
+    });
+    expect(launches[0]?.nodeDebug).toBeUndefined();
+    expect(launches[0]?.bunVerboseFetch).toBeUndefined();
+    expect(existsSync(join(alias.dir, "projects", "-resume-target-seed"))).toBe(false);
+  });
+
+  test("fails closed for cross-binding targets, UUID refs, and mismatched explicit IDs", () => {
+    const owner = profile("owner");
+    const other = profile("other");
+    const project = join(root, "repo-resume-reject");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(other.dir, { recursive: true });
+    writeSession(owner.dir, "-repo-resume-reject", UUID_A, project);
+    writeStore([owner, other]);
+    const catalog = parseCatalog(runCli("sessions", "--json")) as Array<{ catalogRef: string }>;
+
+    const crossBinding = runCli(
+      "sessions",
+      "resume",
+      catalog[0]!.catalogRef,
+      "--account",
+      "other",
+      "--session-id",
+      UUID_A,
+      "--dry-run",
+    );
+    expect(crossBinding.status).not.toBe(0);
+    expect(crossBinding.stderr).toContain("cross-binding session transfer is unsupported");
+    expect(existsSync(join(other.dir, "projects"))).toBe(false);
+
+    const bareUuid = runCli(
+      "sessions",
+      "resume",
+      UUID_A,
+      "--account",
+      "owner",
+      "--session-id",
+      UUID_A,
+      "--dry-run",
+    );
+    expect(bareUuid.status).not.toBe(0);
+    expect(bareUuid.stderr).toContain("requires an opaque catalogRef");
+
+    const mismatchedId = runCli(
+      "sessions",
+      "resume",
+      catalog[0]!.catalogRef,
+      "--account",
+      "owner",
+      "--session-id",
+      UUID_B,
+      "--dry-run",
+    );
+    expect(mismatchedId.status).not.toBe(0);
+    expect(mismatchedId.stderr).toContain("explicit --session-id does not match");
   });
 
   test("keeps managed and default-root sessions stable through real accounts rename commands", () => {

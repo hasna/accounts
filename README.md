@@ -295,6 +295,7 @@ per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CL
 | `accounts hook path` | Print hook script path. |
 | `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). `--background`, `--profile <name>`, `--json`. |
 | `accounts sessions` (`sessions list`) | Read-only catalog of root Claude sessions owned by registered local profiles. `--profile`, `--project`, `--uuid`, `--json`. |
+| `accounts sessions resume <catalogRef>` | Same-binding native Claude resume. Requires `--account <name>` and `--session-id <uuid>`; rejects cross-binding transfer and supports `--dry-run --json`. |
 | `accounts health` (`readiness`) | Print the sanitized account/provider readiness contract. Use `--json` for automation. |
 | `accounts detect <name>` | Re-detect email from config dir. |
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
@@ -333,6 +334,17 @@ transaction rather than treating an alias change as a second request. The
 bounded metadata scan is discovery only and does not assert that the whole
 transcript is valid; continuation brokers must validate the complete source
 strictly.
+
+`accounts sessions resume <catalogRef> --account <name> --session-id <uuid>`
+is deliberately narrower than cross-account transfer. It validates that the
+current catalog reference still resolves, that the explicit UUID matches the
+resolved session and its bounded metadata check, and that the target account is
+a current representation of that exact same local Claude profile root. If those
+same-binding gates pass, Accounts launches native `claude --resume <uuid>` in
+the cataloged project cwd using the target profile's normal launch environment.
+It creates no copied transcript, continuation transaction, or target seed, and
+it rejects attempts to resume into another profile binding. Use
+`--dry-run --json` to inspect the validated launch plan without starting Claude.
 
 `--uuid` requires canonical hexadecimal `8-4-4-4-12` UUID syntax. A valid UUID
 with no match returns an empty result successfully; malformed syntax exits
