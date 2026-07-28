@@ -329,17 +329,11 @@ export function listCentralAccounts(): CentralAccount[] {
   return accounts;
 }
 
-export interface KnownAccount {
-  uuid: string;
-  email?: string;
-  central: boolean;
-  /** Names of registered claude profiles bound to this account (LOCAL registry only). */
-  profiles: string[];
-  /** A credential payload is retrievable on this machine (central or a bound profile). */
-  credentialsPresent: boolean;
-  /** An oauthAccount identity record is retrievable on this machine. */
-  oauthPresent: boolean;
-}
+// NOTE: identity ENUMERATION deliberately does not live here. The one
+// uuid-keyed account enumerator is `buildIdentityIndex()` in
+// identity-index.ts (central store first, per-profile stores as fallback,
+// per-layer identity/credential pairing). This module owns the central
+// store's layout, write path (sync/merge) and lifecycle (sweep) only.
 
 function claudeTool(): ToolDef | undefined {
   try {
@@ -351,58 +345,6 @@ function claudeTool(): ToolDef | undefined {
 
 function profileHasCredentialFile(dir: string): boolean {
   return existsSync(profileCredentialsSnapshot(dir)) || existsSync(join(dir, ".credentials.json"));
-}
-
-/**
- * THE identity-enumeration accessor: every account known to this machine,
- * central store first, then per-profile bindings as fallback, deduped by
- * (lowercased) uuid. Consumers (e.g. usage-aware auto-switching) should
- * reason over this list instead of walking profile dirs themselves.
- *
- * Scope caveats: CLAUDE accounts only today (the central layout has no tool
- * dimension yet — other tools have no account uuid concept here), and the
- * `profiles` bindings come from the machine-LOCAL registry; in api mode
- * cloud-registered profiles are not reflected.
- */
-export function listKnownAccounts(): KnownAccount[] {
-  const tool = claudeTool();
-  const byUuid = new Map<string, KnownAccount>();
-  for (const account of listCentralAccounts()) {
-    byUuid.set(account.uuid, {
-      uuid: account.uuid,
-      ...(account.email ? { email: account.email } : {}),
-      central: true,
-      profiles: [],
-      credentialsPresent: account.credentialsPresent,
-      oauthPresent: account.oauthPresent,
-    });
-  }
-
-  const store = loadStore();
-  for (const profile of store.profiles) {
-    if (profile.tool !== "claude" || !existsSync(profile.dir)) continue;
-    const uuid = profileAccountUuid(profile.dir, tool);
-    if (!uuid) continue;
-    const oauth = oauthRecordFromSnapshot(profile.dir) ?? oauthRecordFromAccountFiles(profile.dir, tool);
-    const known = byUuid.get(uuid);
-    if (known) {
-      known.profiles.push(profile.name);
-      if (!known.email && typeof oauth?.emailAddress === "string") known.email = oauth.emailAddress;
-      known.credentialsPresent ||= profileHasCredentialFile(profile.dir);
-      known.oauthPresent ||= oauth !== undefined;
-    } else {
-      const email = typeof oauth?.emailAddress === "string" ? oauth.emailAddress : undefined;
-      byUuid.set(uuid, {
-        uuid,
-        ...(email ? { email } : {}),
-        central: false,
-        profiles: [profile.name],
-        credentialsPresent: profileHasCredentialFile(profile.dir),
-        oauthPresent: oauth !== undefined,
-      });
-    }
-  }
-  return [...byUuid.values()].sort((a, b) => a.uuid.localeCompare(b.uuid));
 }
 
 // --- orphan sweep ------------------------------------------------------------

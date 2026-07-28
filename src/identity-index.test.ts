@@ -146,21 +146,21 @@ test("identity files without credentials report no-credentials; dirs with neithe
 test("the central auth home is read FIRST and enumerates accounts with no profile door", () => {
   // Future layout from the .accounts-auth migration (task 7840d1da):
   // ~/.hasna/accounts/auth/<accountUuid>/{oauth-account.json,credentials.json}.
-  const central = centralAuthDir("uuid-central");
-  expect(central).toBe(join(home, "auth", "uuid-central"));
+  const central = centralAuthDir("cccccccc-1111-4111-8111-cccccccc1111");
+  expect(central).toBe(join(home, "auth", "cccccccc-1111-4111-8111-cccccccc1111"));
   mkdirSync(central, { recursive: true });
   writeFileSync(
     join(central, "oauth-account.json"),
-    JSON.stringify({ oauthAccount: { accountUuid: "uuid-central", emailAddress: "central@example.com" } }),
+    JSON.stringify({ oauthAccount: { accountUuid: "cccccccc-1111-4111-8111-cccccccc1111", emailAddress: "central@example.com" } }),
   );
   writeFileSync(
     join(central, "credentials.json"),
-    credentialJson({ uuid: "uuid-central", email: "central@example.com", accessToken: "central-token" }),
+    credentialJson({ uuid: "cccccccc-1111-4111-8111-cccccccc1111", email: "central@example.com", accessToken: "central-token" }),
   );
 
   const index = buildIdentityIndex([], tool());
   expect(index).toHaveLength(1);
-  expect(index[0]!.accountUuid).toBe("uuid-central");
+  expect(index[0]!.accountUuid).toBe("cccccccc-1111-4111-8111-cccccccc1111");
   expect(index[0]!.status).toBe("ok");
   expect(index[0]!.credential?.source).toBe("central");
   expect(accessTokenForAccount(index[0]!)).toBe("central-token");
@@ -168,18 +168,18 @@ test("the central auth home is read FIRST and enumerates accounts with no profil
 
 test("when central and profile stores both know an account, the central credential wins ties", () => {
   const dir = makeDir("dup");
-  writeLive(dir, { uuid: "uuid-dup", email: "dup@example.com", accessToken: "profile-token" });
-  writeSnapshot(dir, { uuid: "uuid-dup", email: "dup@example.com", accessToken: "profile-token" });
+  writeLive(dir, { uuid: "dddddddd-2222-4222-8222-dddddddd2222", email: "dup@example.com", accessToken: "profile-token" });
+  writeSnapshot(dir, { uuid: "dddddddd-2222-4222-8222-dddddddd2222", email: "dup@example.com", accessToken: "profile-token" });
 
-  const central = centralAuthDir("uuid-dup");
+  const central = centralAuthDir("dddddddd-2222-4222-8222-dddddddd2222");
   mkdirSync(central, { recursive: true });
   writeFileSync(
     join(central, "oauth-account.json"),
-    JSON.stringify({ oauthAccount: { accountUuid: "uuid-dup", emailAddress: "dup@example.com" } }),
+    JSON.stringify({ oauthAccount: { accountUuid: "dddddddd-2222-4222-8222-dddddddd2222", emailAddress: "dup@example.com" } }),
   );
   writeFileSync(
     join(central, "credentials.json"),
-    credentialJson({ uuid: "uuid-dup", email: "dup@example.com", accessToken: "central-token" }),
+    credentialJson({ uuid: "dddddddd-2222-4222-8222-dddddddd2222", email: "dup@example.com", accessToken: "central-token" }),
   );
 
   const index = buildIdentityIndex([{ name: "dup", dir }], tool());
@@ -191,18 +191,18 @@ test("when central and profile stores both know an account, the central credenti
 
 test("a fresher profile credential beats a stale central one — validity outranks location", () => {
   const dir = makeDir("fresh");
-  writeLive(dir, { uuid: "uuid-fresh", email: "fresh@example.com", accessToken: "profile-token" });
-  writeSnapshot(dir, { uuid: "uuid-fresh", email: "fresh@example.com", accessToken: "profile-token" });
+  writeLive(dir, { uuid: "ffffffff-3333-4333-8333-ffffffff3333", email: "fresh@example.com", accessToken: "profile-token" });
+  writeSnapshot(dir, { uuid: "ffffffff-3333-4333-8333-ffffffff3333", email: "fresh@example.com", accessToken: "profile-token" });
 
-  const central = centralAuthDir("uuid-fresh");
+  const central = centralAuthDir("ffffffff-3333-4333-8333-ffffffff3333");
   mkdirSync(central, { recursive: true });
   writeFileSync(
     join(central, "oauth-account.json"),
-    JSON.stringify({ oauthAccount: { accountUuid: "uuid-fresh", emailAddress: "fresh@example.com" } }),
+    JSON.stringify({ oauthAccount: { accountUuid: "ffffffff-3333-4333-8333-ffffffff3333", emailAddress: "fresh@example.com" } }),
   );
   writeFileSync(
     join(central, "credentials.json"),
-    credentialJson({ uuid: "uuid-fresh", email: "fresh@example.com", accessToken: "stale-token", expiresInMs: -60_000 }),
+    credentialJson({ uuid: "ffffffff-3333-4333-8333-ffffffff3333", email: "fresh@example.com", accessToken: "stale-token", expiresInMs: -60_000 }),
   );
 
   const index = buildIdentityIndex([{ name: "fresh", dir }], tool());

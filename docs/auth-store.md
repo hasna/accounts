@@ -93,12 +93,21 @@ accounts auth sweep [--delete]   # orphan handling, see above
 
 ## Library accessor
 
-`listKnownAccounts()` (exported from the package root) is THE identity
-enumeration surface: central store first, per-profile bindings as fallback,
-deduped by (lowercased) uuid, each entry carrying `credentialsPresent` /
-`oauthPresent` so consumers can tell a usable account from a stub. Features
-that reason over accounts (e.g. usage-aware auto-switching) should consume it
-instead of walking profile dirs.
+`buildIdentityIndex()` (identity-index.ts, exported from the package root) is
+THE identity enumeration surface: uuid-keyed, central store first, per-profile
+stores as compat fallback, with per-layer identity/credential pairing and
+door/role attribution. The usage-aware auto-switcher and `accounts auth
+status` both consume it; features that reason over accounts must too, instead
+of walking profile dirs. This module (auth-store.ts) deliberately owns only
+the central store's layout, write path and lifecycle.
+
+Two credential rankings exist ON PURPOSE — they answer different questions:
+
+- `betterCredential` (auth-store.ts): which BYTES survive a sync/restore —
+  refresh-token presence and write recency first, because restoring a
+  rotated-out refresh token logs the account out.
+- `betterCredentialRef` (identity-index.ts): which credential a caller can
+  USE right now — validity and expiry first, for selection.
 
 Scope and semantics notes:
 

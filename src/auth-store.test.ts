@@ -10,13 +10,14 @@ import {
   centralCredentialsSnapshot,
   centralOAuthSnapshot,
   listCentralAccounts,
-  listKnownAccounts,
   profileAccountUuid,
   sweepCentralAuth,
   syncProfileSnapshotToCentral,
 } from "./lib/auth-store.js";
+import { buildIdentityIndex } from "./lib/identity-index.js";
 import { importProfile } from "./lib/import-profile.js";
 import { getTool } from "./lib/tools.js";
+import { loadStore } from "./storage.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -416,9 +417,12 @@ test("import --copy registers an unknown account in the central store", async ()
   expect(centralAccessToken(UUID_B)).toBe("imported@example.com-access");
 });
 
-// --- enumeration accessor ----------------------------------------------------
+// --- enumeration -------------------------------------------------------------
+// Full enumeration semantics live in identity-index.test.ts (buildIdentityIndex
+// is THE accessor); here we cover the store-scan primitive and that the store
+// this module writes is what the index reads.
 
-test("listCentralAccounts and listKnownAccounts enumerate identities central-then-fallback", () => {
+test("listCentralAccounts scans the store and buildIdentityIndex reads the same entries", () => {
   makeProfile("enum1", { uuid: UUID_A, email: "one@example.com" });
 
   // Profile with a snapshot but (artificially) no central entry: fallback source.
@@ -431,13 +435,16 @@ test("listCentralAccounts and listKnownAccounts enumerate identities central-the
   const central = listCentralAccounts();
   expect(central.map((a) => a.uuid)).toEqual([UUID_A]);
   expect(central[0]?.email).toBe("one@example.com");
+  expect(central[0]?.credentialsPresent).toBe(true);
 
-  const known = listKnownAccounts();
-  const byUuid = new Map(known.map((a) => [a.uuid, a]));
-  expect(byUuid.size).toBe(2);
-  expect(byUuid.get(UUID_A)?.central).toBe(true);
-  expect(byUuid.get(UUID_A)?.profiles).toEqual(["enum1"]);
-  expect(byUuid.get(UUID_B)?.central).toBe(false);
-  expect(byUuid.get(UUID_B)?.profiles).toEqual(["enum2"]);
-  expect(byUuid.get(UUID_B)?.email).toBe("two@example.com");
+  // The index sees the centrally-stored account AND the fallback-only one.
+  const index = buildIdentityIndex(
+    [
+      { name: "enum1", dir: loadStore().profiles.find((p) => p.name === "enum1")!.dir },
+      { name: "enum2", dir },
+    ],
+    tool(),
+  );
+  expect(index.map((i) => i.accountUuid)).toEqual([UUID_A, UUID_B]);
+  expect(index[0]?.credential?.source).toBe("central");
 });

@@ -180,18 +180,28 @@ export {
   profileAccountUuid,
   syncProfileSnapshotToCentral,
   listCentralAccounts,
-  listKnownAccounts,
   sweepCentralAuth,
 } from "./lib/auth-store.js";
 export type {
   CentralAccount,
-  KnownAccount,
   SweepResult,
   SweptOrphan,
   SyncFileAction,
   SyncResult,
   UnresolvedProfileBinding,
 } from "./lib/auth-store.js";
+// THE uuid-keyed account enumerator (central store first, per-profile stores
+// as compat fallback). Consumers must reason over this instead of walking
+// profile dirs themselves.
+export { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+export type {
+  AccountDoor,
+  AccountDoorRole,
+  AccountIdentity,
+  AccountCredentialRef,
+  AccountStatus,
+  CredentialSource,
+} from "./lib/identity-index.js";
 export { withApplyLock } from "./lib/apply-lock.js";
 export { isSafeProfileName } from "./lib/hook.js";
 export { readClaudeKeychain, keychainSupported } from "./lib/keychain.js";

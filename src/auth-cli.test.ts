@@ -52,11 +52,16 @@ test("auth migrate populates the central store and auth status reports it", () =
 
   const status = runCli("auth", "status", "--json");
   expect(status.status).toBe(0);
-  const accounts = JSON.parse(status.stdout) as Array<Record<string, unknown>>;
-  const account = accounts.find((a) => a.uuid === UUID);
+  const accounts = JSON.parse(status.stdout) as Array<{
+    accountUuid: string;
+    email?: string;
+    central: boolean;
+    doors: Array<{ role: string; profileName?: string }>;
+  }>;
+  const account = accounts.find((a) => a.accountUuid === UUID);
   expect(account?.central).toBe(true);
   expect(account?.email).toBe("cli@example.com");
-  expect(account?.profiles).toEqual(["cliprof"]);
+  expect(account?.doors.some((d) => d.role === "own-identity" && d.profileName === "cliprof")).toBe(true);
 });
 
 test("auth sweep dry-runs by default and only --delete trashes orphans", () => {

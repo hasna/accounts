@@ -32,7 +32,7 @@ import {
   storageSync,
   storePath,
 } from "./storage.js";
-import { listKnownAccounts, sweepCentralAuth, type SyncResult } from "./lib/auth-store.js";
+import { centralOAuthSnapshot, sweepCentralAuth, type SyncResult } from "./lib/auth-store.js";
 import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
@@ -1325,23 +1325,38 @@ const auth = program
 
 auth
   .command("status", { isDefault: true })
-  .description("list accounts known to this machine (central store first, then profile bindings)")
+  .description("list accounts known to this machine (central store first, then profile stores)")
   .option("--json", "output JSON")
   .action(
     action((opts: { json?: boolean }) => {
-      const accounts = listKnownAccounts();
+      // ONE enumerator: the same uuid-keyed identity index the usage-aware
+      // switcher consumes, annotated with central-store presence.
+      const store = loadStore();
+      const claudeProfiles = store.profiles
+        .filter((p) => p.tool === "claude")
+        .map((p) => ({ name: p.name, dir: p.dir }));
+      const index = buildIdentityIndex(claudeProfiles, getTool("claude"));
+      const rows = index.map((identity) => ({
+        ...identity,
+        central: existsSync(centralOAuthSnapshot(identity.accountUuid)),
+      }));
       if (opts.json) {
-        console.log(JSON.stringify(accounts, null, 2));
+        console.log(JSON.stringify(rows, null, 2));
         return;
       }
-      if (accounts.length === 0) {
+      if (rows.length === 0) {
         console.log("no accounts known — run `accounts auth migrate` to populate the central store");
         return;
       }
-      for (const account of accounts) {
-        const source = account.central ? chalk.green("central") : chalk.yellow("profile-only");
-        const profiles = account.profiles.length ? chalk.dim(` profiles: ${account.profiles.join(", ")}`) : "";
-        console.log(`${chalk.cyan(account.uuid)} ${account.email ?? chalk.dim("(no email)")} [${source}]${profiles}`);
+      for (const row of rows) {
+        const source = row.central ? chalk.green("central") : chalk.yellow("profile-only");
+        const profiles = [
+          ...new Set(row.doors.filter((d) => d.role === "own-identity" && d.profileName).map((d) => d.profileName)),
+        ];
+        const profilesNote = profiles.length ? chalk.dim(` profiles: ${profiles.join(", ")}`) : "";
+        console.log(
+          `${chalk.cyan(row.accountUuid)} ${row.email ?? chalk.dim("(no email)")} [${source}] ${row.status}${profilesNote}`,
+        );
       }
     }),
   );
