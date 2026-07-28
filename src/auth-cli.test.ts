@@ -85,3 +85,37 @@ test("auth sweep dry-runs by default and only --delete trashes orphans", () => {
   expect(existsSync(orphanDir)).toBe(false);
   expect(existsSync(join(delResult.orphans[0]!.trashedTo!, "credentials.json"))).toBe(true);
 });
+
+test("auth status survives a profile with a malformed accountUuid and still lists healthy accounts", () => {
+  // Vector 1: malformed uuid in the profile SNAPSHOT.
+  const bad = join(home, "bad-profile");
+  mkdirSync(join(bad, ".accounts-auth"), { recursive: true });
+  writeFileSync(
+    join(bad, ".accounts-auth", "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: "not-a-uuid", emailAddress: "bad@example.com" } }),
+  );
+  expect(runCli("add", "badprof", "--dir", bad, "--email", "bad@example.com").status).toBe(0);
+
+  // Vector 2: malformed uuid in the dir's LIVE .claude.json (Claude's own file).
+  const worse = join(home, "worse-profile");
+  mkdirSync(worse, { recursive: true });
+  writeFileSync(
+    join(worse, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: "corrupted-value", emailAddress: "worse@example.com" } }),
+  );
+  expect(runCli("add", "worseprof", "--dir", worse, "--email", "worse@example.com").status).toBe(0);
+
+  const good = join(home, "good-profile");
+  writeIdentity(good, UUID, "good@example.com");
+  expect(runCli("add", "goodprof", "--dir", good, "--email", "good@example.com").status).toBe(0);
+  expect(runCli("auth", "migrate", "--json").status).toBe(0);
+
+  const status = runCli("auth", "status", "--json");
+  expect(status.status).toBe(0);
+  const rows = JSON.parse(status.stdout) as Array<{ accountUuid: string; central: boolean }>;
+  expect(rows.some((r) => r.accountUuid === UUID && r.central)).toBe(true);
+  // Malformed identities are shown (not hidden, not fatal) and never claim central.
+  const malformed = rows.filter((r) => r.accountUuid === "not-a-uuid" || r.accountUuid === "corrupted-value");
+  expect(malformed.length).toBe(2);
+  expect(malformed.every((r) => r.central === false)).toBe(true);
+});

@@ -60,6 +60,17 @@ export function centralAuthRoot(): string {
 }
 
 /**
+ * True when a string is a well-formed account uuid — the only shape the
+ * central store keys on. Callers annotating or path-building from FOREIGN
+ * data (e.g. a dir's `.claude.json`, which Claude Code owns and can corrupt)
+ * must check this before calling any central path helper, which THROW on
+ * malformed input by design.
+ */
+export function isAccountUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+/**
  * The account uuid becomes a path segment, so it is validated strictly: a
  * hostile oauth-account.json must not be able to steer writes outside the
  * store (e.g. `accountUuid: "../../evil"`). Normalized to lowercase so

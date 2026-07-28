@@ -177,6 +177,7 @@ export {
   centralCredentialsSnapshot,
   centralCredentialsPathForProfile,
   centralOAuthRecordForProfile,
+  isAccountUuid,
   profileAccountUuid,
   syncProfileSnapshotToCentral,
   listCentralAccounts,

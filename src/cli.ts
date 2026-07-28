@@ -32,7 +32,13 @@ import {
   storageSync,
   storePath,
 } from "./storage.js";
-import { centralOAuthSnapshot, sweepCentralAuth, type SyncResult } from "./lib/auth-store.js";
+import {
+  centralCredentialsSnapshot,
+  centralOAuthSnapshot,
+  isAccountUuid,
+  sweepCentralAuth,
+  type SyncResult,
+} from "./lib/auth-store.js";
 import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
@@ -1338,7 +1344,14 @@ auth
       const index = buildIdentityIndex(claudeProfiles, getTool("claude"));
       const rows = index.map((identity) => ({
         ...identity,
-        central: existsSync(centralOAuthSnapshot(identity.accountUuid)),
+        // Guarded: accountUuid can come from a corrupt .claude.json (Claude's
+        // file, not ours) — the path helpers throw on malformed uuids, and a
+        // diagnostic verb must list the corrupt state, not die on it. A
+        // credentials-only central entry (partial write) still counts.
+        central:
+          isAccountUuid(identity.accountUuid) &&
+          (existsSync(centralOAuthSnapshot(identity.accountUuid)) ||
+            existsSync(centralCredentialsSnapshot(identity.accountUuid))),
       }));
       if (opts.json) {
         console.log(JSON.stringify(rows, null, 2));
