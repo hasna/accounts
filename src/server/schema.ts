@@ -6,6 +6,7 @@
 
 import { z } from "zod";
 import { profileNameSchema } from "../types.js";
+import { classifyProfileDir } from "../lib/profile-dir-policy.js";
 
 /** Tool id: same slug grammar as the core (lowercase alnum/hyphen). */
 export const toolIdSchema = z
@@ -39,10 +40,21 @@ export const metadataSchema = z
 
 const optionalNonBlank = (label: string) =>
   z.string().refine((v) => v.trim().length > 0, `${label} must not be empty`);
-const profileDirSchema = z
-  .string()
-  .min(1)
-  .refine((value) => !value.includes("\0") && !/[\r\n]/.test(value), "dir contains invalid characters");
+/**
+ * A profile dir the cloud registry will store.
+ *
+ * The registry is shared across the whole fleet, so an unconstrained `dir`
+ * lets any caller holding an API key write a throwaway path into production —
+ * which is exactly how 16 `/tmp` rows accumulated. `classifyProfileDir` is
+ * filesystem-free by design: these paths belong to other machines, so they can
+ * only be judged lexically, never by stat-ing them here.
+ */
+const profileDirSchema = z.string().min(1).superRefine((value, ctx) => {
+  const verdict = classifyProfileDir(value);
+  if (!verdict.ok) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: verdict.reason.message });
+  }
+});
 
 export const createAccountSchema = z.object({
   name: profileNameSchema,
