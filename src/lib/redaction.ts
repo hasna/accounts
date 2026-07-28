@@ -2,8 +2,12 @@ import { types as utilTypes } from "node:util";
 
 const SECRET_PATTERN =
   /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[oprsu]_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b/g;
+const TEXT_REDACTION_HINT_PATTERN =
+  /[:=?#"'\r\n\\]|sk-(?:ant-|proj-)?|gh[oprsu]_|AKIA[A-Z0-9]/i;
 const CREDENTIAL_FIELD_PATTERN =
   /(^|[^A-Za-z0-9_. -])(["']?)([A-Za-z][A-Za-z0-9_. -]{0,63}?)\2[ \t]*[:=][ \t]*/gim;
+const PRECOLLAPSIBLE_RECORD_HINT_PATTERN =
+  /(?:^|[\r\n{,\[])[ \t]*["']?(?:proxy-authorization|authorization|set-cookie|cookie)["']?[ \t]*[:=]/i;
 const SERIALIZED_FIELD_PATTERN =
   /(^|[,{])([ \t]*)(("(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\r\n])*")|('(?:\\(?:['"\\/bfnrt]|u[0-9A-Fa-f]{4})|[^'\\\r\n])*'))[ \t]*:[ \t]*/gm;
 const HEADER_LINE_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:/;
@@ -320,6 +324,70 @@ function redactSensitiveFields(value: string): string {
   return cursor === 0 ? value : output + value.slice(cursor);
 }
 
+function isRecordBoundarySensitiveField(
+  value: string,
+  keyStart: number,
+): boolean {
+  if (keyStart === 0) return true;
+  const boundary = value[keyStart - 1];
+  return boundary === "\r" ||
+    boundary === "\n" ||
+    boundary === "{" ||
+    boundary === "," ||
+    boundary === "[";
+}
+
+function isPrecollapsibleRecordKey(value: string): boolean {
+  const compact = semanticKeyTokens(value).join("");
+  return compact === "authorization" ||
+    compact === "proxyauthorization" ||
+    compact === "cookie" ||
+    compact === "setcookie";
+}
+
+function redactRecordBoundarySensitiveFields(value: string): string {
+  if (!PRECOLLAPSIBLE_RECORD_HINT_PATTERN.test(value)) return value;
+
+  let cursor = 0;
+  let output = "";
+  CREDENTIAL_FIELD_PATTERN.lastIndex = 0;
+
+  for (
+    let match = CREDENTIAL_FIELD_PATTERN.exec(value);
+    match;
+    match = CREDENTIAL_FIELD_PATTERN.exec(value)
+  ) {
+    const valueStart = CREDENTIAL_FIELD_PATTERN.lastIndex;
+    const keyStart =
+      match.index +
+      (match[1]?.length ?? 0) +
+      (match[2]?.length ?? 0);
+    if (!isRecordBoundarySensitiveField(value, keyStart)) continue;
+
+    const terminalFieldToken = match[3]!.trim().split(/[ \t]+/).at(-1) ?? "";
+    if (
+      value[keyStart - 1] === "-" ||
+      normalizeCommandToken(terminalFieldToken).startsWith("-") ||
+      /(^|[ \t])--(?=[ \t]|$)/.test(match[3]!)
+    ) {
+      continue;
+    }
+    if (!isPrecollapsibleRecordKey(match[3]!)) continue;
+
+    const valueEnd = sensitiveRecordValueEnd(
+      value,
+      valueStart,
+      isSerializedKey(value, match, valueStart),
+    );
+    if (valueEnd === valueStart) continue;
+    output += value.slice(cursor, valueStart) + "[REDACTED]";
+    cursor = valueEnd;
+    CREDENTIAL_FIELD_PATTERN.lastIndex = valueEnd;
+  }
+
+  return cursor === 0 ? value : output + value.slice(cursor);
+}
+
 function redactEscapedSerializedFields(value: string): string {
   let cursor = 0;
   let output = "";
@@ -393,9 +461,13 @@ function decodeSerializedKey(encoded: string): string | undefined {
 }
 
 function redactPlainText(value: string): string {
-  return redactSensitiveFields(
-    redactEscapedSerializedFields(
-      redactCommandText(value),
+  return redactUrlCredentialParameters(
+    redactSensitiveFields(
+      redactEscapedSerializedFields(
+        redactCommandText(
+          redactRecordBoundarySensitiveFields(value),
+        ),
+      ),
     ),
   ).replace(SECRET_PATTERN, "[REDACTED]");
 }
@@ -686,6 +758,238 @@ function observeCommandSegmentChar(
 
 function isStructuredCommandSegment(context: CommandSegmentContext): boolean {
   return context.hasAt || context.isUrl || context.startsWithWww;
+}
+
+const QUERY_PARAMETER_SEPARATORS = new Set(["&", ";"]);
+const URL_QUERY_HINT_PATTERN = /[?#]/;
+const URL_KNOWN_QUERY_SCHEMES = new Set([
+  "file",
+  "ftp",
+  "http",
+  "https",
+  "mailto",
+  "ws",
+  "wss",
+]);
+
+function decodeQueryKey(value: string): string {
+  return value
+    .replace(/\+/g, " ")
+    .replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16)),
+    );
+}
+
+function urlLikeCandidateStart(value: string, start: number): number {
+  for (let index = start; index < value.length; index++) {
+    const char = value[index]!;
+    if (
+      (char === "w" || char === "W") &&
+      value.slice(index, index + 4).toLowerCase() === "www."
+    ) {
+      return index;
+    }
+
+    if (!/[A-Za-z]/.test(char)) continue;
+
+    let schemeEnd = index + 1;
+    while (
+      schemeEnd < value.length &&
+      /[A-Za-z0-9+.-]/.test(value[schemeEnd]!)
+    ) {
+      schemeEnd++;
+    }
+    if (value[schemeEnd] !== ":") {
+      index = schemeEnd;
+      continue;
+    }
+
+    const scheme = value.slice(index, schemeEnd).toLowerCase();
+    if (
+      scheme.length > 1 &&
+      scheme !== "urn" &&
+      (
+        value.slice(schemeEnd + 1, schemeEnd + 3) === "//" ||
+        URL_KNOWN_QUERY_SCHEMES.has(scheme)
+      )
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function trimExternalQueryValueEnd(
+  value: string,
+  valueStart: number,
+  valueEnd: number,
+): number {
+  let end = valueEnd;
+  while (end > valueStart) {
+    const char = value[end - 1]!;
+    if (char !== ")" && char !== "]" && char !== "}" && char !== ">" && char !== "'" && char !== '"') {
+      break;
+    }
+    const opener =
+      char === ")" ? "(" :
+      char === "]" ? "[" :
+      char === "}" ? "{" :
+      char === ">" ? "<" :
+      char;
+    const beforeValue = value.lastIndexOf(opener, valueStart - 1);
+    const insideValue = value.lastIndexOf(opener, end - 2);
+    if (insideValue >= valueStart || beforeValue < 0) break;
+    end--;
+  }
+  return end;
+}
+
+function redactQueryParametersInRange(
+  value: string,
+  start: number,
+  end: number,
+): string | undefined {
+  let cursor = start;
+  let output = "";
+  let outputCursor = start;
+  let changed = false;
+
+  while (cursor < end) {
+    let parameterEnd = cursor;
+    let equals = -1;
+    while (
+      parameterEnd < end &&
+      !QUERY_PARAMETER_SEPARATORS.has(value[parameterEnd]!)
+    ) {
+      if (equals < 0 && value[parameterEnd] === "=") equals = parameterEnd;
+      parameterEnd++;
+    }
+
+    if (equals >= cursor && equals < parameterEnd) {
+      const key = decodeQueryKey(value.slice(cursor, equals));
+      if (isSensitiveCredentialKey(key)) {
+        const valueStart = equals + 1;
+        const redactedEnd = trimExternalQueryValueEnd(
+          value,
+          valueStart,
+          parameterEnd,
+        );
+        output +=
+          value.slice(outputCursor, valueStart) +
+          "[REDACTED]" +
+          value.slice(redactedEnd, parameterEnd);
+        outputCursor = parameterEnd;
+        changed = true;
+      }
+    }
+
+    cursor = parameterEnd < end ? parameterEnd + 1 : end;
+  }
+
+  return changed ? output + value.slice(outputCursor, end) : undefined;
+}
+
+function redactFragmentQueryParameters(
+  value: string,
+  start: number,
+  end: number,
+): string | undefined {
+  const direct = redactQueryParametersInRange(value, start, end);
+  if (direct) return direct;
+
+  const query = value.indexOf("?", start);
+  if (query < 0 || query >= end) return undefined;
+  const nested = redactQueryParametersInRange(value, query + 1, end);
+  return nested === undefined
+    ? undefined
+    : value.slice(start, query + 1) + nested;
+}
+
+function redactUrlLikeToken(value: string): string {
+  let cursor = 0;
+  let output = "";
+  let outputCursor = 0;
+  let changed = false;
+
+  for (
+    let candidate = urlLikeCandidateStart(value, 0);
+    candidate >= 0;
+    candidate = urlLikeCandidateStart(value, cursor)
+  ) {
+    if (candidate < cursor) break;
+    const query = value.indexOf("?", candidate);
+    const fragment = value.indexOf("#", candidate);
+    const firstQuery =
+      query >= 0 && (fragment < 0 || query < fragment) ? query : -1;
+    const firstParameterStart =
+      firstQuery >= 0 ? firstQuery + 1 : fragment >= 0 ? fragment + 1 : -1;
+    if (firstParameterStart < 0) break;
+
+    const parameterEnd = fragment >= 0 && firstQuery >= 0 && fragment > firstQuery
+      ? fragment
+      : value.length;
+    const searchRedacted = firstQuery >= 0
+      ? redactQueryParametersInRange(value, firstQuery + 1, parameterEnd)
+      : undefined;
+    const fragmentRedacted = fragment >= 0
+      ? redactFragmentQueryParameters(value, fragment + 1, value.length)
+      : undefined;
+
+    if (searchRedacted || fragmentRedacted) {
+      output += value.slice(
+        outputCursor,
+        firstQuery >= 0 ? firstQuery + 1 : fragment + 1,
+      );
+      if (firstQuery >= 0) {
+        output += searchRedacted ?? value.slice(firstQuery + 1, parameterEnd);
+      }
+      if (fragment >= 0) {
+        output += value.slice(parameterEnd, fragment + 1);
+        output += fragmentRedacted ?? value.slice(fragment + 1);
+      } else {
+        output += value.slice(parameterEnd);
+      }
+      changed = true;
+      outputCursor = value.length;
+      cursor = value.length;
+      break;
+    }
+
+    cursor = firstParameterStart;
+  }
+
+  return changed ? output + value.slice(outputCursor) : value;
+}
+
+function redactUrlCredentialParameters(value: string): string {
+  if (!URL_QUERY_HINT_PATTERN.test(value)) return value;
+
+  let output = "";
+  let cursor = 0;
+  let outputCursor = 0;
+  let changed = false;
+  while (cursor < value.length) {
+    while (cursor < value.length && /\s/.test(value[cursor]!)) {
+      cursor++;
+    }
+    if (cursor >= value.length) break;
+
+    const tokenStart = cursor;
+    while (cursor < value.length && !/\s/.test(value[cursor]!)) {
+      cursor++;
+    }
+    const token = value.slice(tokenStart, cursor);
+    if (!URL_QUERY_HINT_PATTERN.test(token)) continue;
+
+    const redacted = redactUrlLikeToken(token);
+    if (redacted !== token) {
+      output += value.slice(outputCursor, tokenStart) + redacted;
+      outputCursor = cursor;
+      changed = true;
+    }
+  }
+
+  return changed ? output + value.slice(outputCursor) : value;
 }
 
 function isArithmeticOptionBoundary(value: string, start: number): boolean {
@@ -1642,6 +1946,10 @@ function redactCommandText(value: string): string {
   return redactDiagnosticQuotedCommands(value);
 }
 
+function redactSimpleArgText(value: string): string {
+  return TEXT_REDACTION_HINT_PATTERN.test(value) ? redactText(value) : value;
+}
+
 /** Redact values that follow credential-bearing command-line flags. */
 export function redactArgv(argv: string[]): string[] {
   const redacted: string[] = [];
@@ -1685,7 +1993,7 @@ export function redactArgv(argv: string[]): string[] {
         redacted.push(`${field.prefix}[REDACTED]${field.suffix}`);
         continue;
       }
-      redacted.push(redactText(arg));
+      redacted.push(redactSimpleArgText(arg));
       continue;
     }
     if (arg === "--") {
@@ -1720,7 +2028,7 @@ export function redactArgv(argv: string[]): string[] {
       redactNext = true;
       continue;
     }
-    redacted.push(redactText(arg));
+    redacted.push(redactSimpleArgText(arg));
   }
   return redacted;
 }

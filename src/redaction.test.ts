@@ -938,6 +938,67 @@ test("structured colon values cannot create positional credential state", () => 
   }
 });
 
+test("sensitive URL query values redact across public positional surfaces", () => {
+  const urls = [
+    "https://example.test/callback?api_key=url-query-secret&visible=keep#section",
+    "https://example.test/callback?API_KEY=case-query-secret&x-api-key=repeat-query-secret-a&x-api-key=repeat-query-secret-b",
+    "https://example.test/callback?client%5Fsecret=encoded-query-secret&visible=keep",
+    "https://example.test/callback#access_token=fragment-query-secret&state=keep",
+    "https://example.test/callback#/return?token=fragment-route-query-secret&state=keep",
+    "mailto:person@example.test?token=mailto-query-secret&subject=keep",
+    "www.example.test/callback?x%2Dapi%2Dkey=www-query-secret&visible=keep",
+    "url=https://example.test/callback?key=assigned-query-secret&visible=keep",
+  ];
+  const argv = ["provider", "--", ...urls, "keep-after-url-query"];
+  const command = argv.join(" ");
+  const providerJson = JSON.stringify({
+    argv,
+    command,
+    commandLine: command,
+    processOutput: `untracked process ${urls[0]} keep-process-output`,
+  });
+
+  const textRedacted = redactText(command);
+  const argvRedacted = redactArgv(argv);
+  const publicRedacted = redactPublicValue({
+    argv,
+    command,
+    commandLine: command,
+    provider: providerJson,
+  });
+  const serializedPublic = JSON.stringify(publicRedacted);
+
+  for (const redacted of [
+    textRedacted,
+    JSON.stringify(argvRedacted),
+    serializedPublic,
+  ]) {
+    for (const secret of [
+      "url-query-secret",
+      "case-query-secret",
+      "repeat-query-secret-a",
+      "repeat-query-secret-b",
+      "encoded-query-secret",
+      "fragment-query-secret",
+      "fragment-route-query-secret",
+      "mailto-query-secret",
+      "www-query-secret",
+      "assigned-query-secret",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain("api_key=[REDACTED]&visible=keep#section");
+    expect(redacted).toContain("API_KEY=[REDACTED]&x-api-key=[REDACTED]&x-api-key=[REDACTED]");
+    expect(redacted).toContain("client%5Fsecret=[REDACTED]&visible=keep");
+    expect(redacted).toContain("#access_token=[REDACTED]&state=keep");
+    expect(redacted).toContain("#/return?token=[REDACTED]&state=keep");
+    expect(redacted).toContain("mailto:person@example.test?token=[REDACTED]&subject=keep");
+    expect(redacted).toContain("x%2Dapi%2Dkey=[REDACTED]&visible=keep");
+    expect(redacted).toContain("key=[REDACTED]&visible=keep");
+    expect(redacted).toContain("keep-after-url-query");
+  }
+});
+
 test("quoted diagnostic command payloads retain wrapper split state across empty quotes", () => {
   const secret = "quoted-diagnostic-wrapper-split-secret";
   for (const suffix of ["", " (ENOENT)", ", code=ENOENT"]) {
@@ -2937,6 +2998,31 @@ test("folded redaction scaling stays linear across newline styles and multi-mega
     expect(elapsed[1]!).toBeLessThan(400);
     expect(elapsed[2]!).toBeLessThan(800);
   }
+});
+
+test("large folded credential records collapse before command-token scanning", () => {
+  const folded = Array.from(
+    { length: 150_000 },
+    (_, index) => ` extension-${index}=credential-fragment-${index},`,
+  );
+  const input = [
+    "Authorization: Custom seed=credential-seed,",
+    ...folded,
+    " final-extension=credential-tail",
+    "status=429 keep-after-precollapsed-record",
+  ].join("\n");
+  expect(input.length).toBeGreaterThan(6 * 1024 * 1024);
+
+  const startedAt = performance.now();
+  const redacted = redactText(input);
+  const elapsedMs = performance.now() - startedAt;
+
+  expect(redacted).not.toContain("credential-seed");
+  expect(redacted).not.toContain("credential-fragment-149999");
+  expect(redacted).not.toContain("credential-tail");
+  expect(redacted).toContain("status=429 keep-after-precollapsed-record");
+  expect(redacted.match(/\[REDACTED\]/g)?.length).toBe(1);
+  expect(elapsedMs).toBeLessThan(1_500);
 });
 
 test("command-text option redaction stays bounded on multi-megabyte captured output", () => {
