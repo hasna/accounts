@@ -33,16 +33,24 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 | `src/storage.ts` | `ACCOUNTS_HOME`, atomic temp+rename saves, pruned local reads, raw machine-pointer reads |
 | `src/lib/store.ts` | Local/API registry routing, cloud custom-tool hydration, API path cleanup |
 | `src/lib/profiles.ts` | CRUD, profile metadata/identity/card-last4 validation, `useProfile` → `current`, rename/remove pointer hygiene |
+| `src/lib/profile-dir-policy.ts` | Cloud registry path allowlist and custom-tool home validation |
 | `src/lib/tools.ts` | Built-in and custom tool registry |
 | `src/lib/env.ts` | Per-tool env rendering (`{profileDir}`, `{profileName}`, `{toolId}` templates), including Claude channel state |
 | `src/lib/codex-app.ts` | Codex App profile preparation, including file-based credential cache defaults |
 | `src/lib/codex-app-menu.ts` | macOS Codex App menu-bar state, switch, safe quit/relaunch, and Swift status-item launcher |
 | `src/lib/apply.ts` | `applyProfile`, `applied` pointer, live path sync |
+| `src/lib/auth-store.ts`, `identity-index.ts` | UUID-keyed auth custody and account enumeration |
 | `src/lib/claude-auth.ts` | Auth snapshots under `<profile>/.accounts-auth/` |
 | `src/lib/import-profile.ts` | `import` / `login` |
-| `src/lib/pick.ts` | Interactive picker |
+| `src/lib/pick.ts`, `usage*.ts`, `auto-switch.ts` | Interactive and usage-aware account selection |
 | `src/lib/hook.ts` | `claude-hook.sh` generator |
+| `src/lib/claude-sessions*.ts`, `session-merge.ts` | Read-only catalog and verified transcript union/linking |
+| `src/server/*`, `src/sdk/*` | Postgres HTTP runtime, migrations, OpenAPI document, and generated client |
 | `src/cli.ts` | Commander CLI |
+
+For user-facing command details, see [CLI reference](./cli-reference.md). For the
+service boundary, see [HTTP API and SDK](./http-api.md) and
+[profile directory policy](./profile-directories.md).
 
 ## Apply safety
 
@@ -57,8 +65,11 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 
 - A profile config dir is missing
 - `applied.<tool>` or `current.<tool>` points at a removed profile
+- A configured shared capability link/merge is broken or its recorded corpus floor shrank
 
-Warnings (exit 0): no email, no auth snapshot, active ≠ applied drift.
+Warnings (exit 0): no email, no usable Claude auth, active ≠ applied drift,
+and non-fatal shared capability conditions. Intentional corpus shrinkage can be
+accepted with `--accept-capability-baseline`.
 
 ## Profile metadata
 

@@ -1,22 +1,24 @@
 # @hasna/accounts
 
 > Manage and switch between multiple AI coding tool profiles/accounts on one
-> machine — Claude Code, Takumi, Codex CLI, Codex App, Gemini CLI, opencode,
+> machine — Claude Code, Takumi, Codex CLI, Codex App, Codewith, Gemini CLI, opencode,
 > Cursor Agent, Pi Coding Agent, Hermes, Kimi Code, Grok Build, and custom tools.
 
 `accounts` is a local-first CLI. Each **profile** is an isolated config directory.
 Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** with
 `accounts apply` (syncs auth to live `~/.claude` paths).
 
-- **Isolated profiles** — separate config dirs (skills, settings, sessions). Nothing leaks.
+- **Isolated account state** — separate config dirs and credentials, with explicitly shared
+  Claude capabilities such as skills, agents, and merged session history.
 - **Apply mode** — sync OAuth / credentials to live paths for IDEs (Claude-only today).
 - **Remembers the email** — auto-detected from `.claude.json` when possible.
 - **Multi-tool** — first-class built-ins for Claude, Takumi, Codex CLI, Codex
-  App, Gemini, opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build;
+  App, Codewith, Gemini, opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build;
   custom tools via `accounts tools add`.
 - **Tool lock-in** — first login/use chooses the tool for a profile name, so
   later bare commands like `accounts launch work` keep using that tool.
-- **Local-first** — registry at `~/.hasna/accounts/`. No network, no telemetry.
+- **Local-first** — the registry defaults to `~/.hasna/accounts/`; network access is opt-in
+  for API storage and usage refreshes. No telemetry is sent by default.
 - **Open source** — source, docs, and contribution guidelines live in this repository.
 
 ## Install
@@ -106,7 +108,7 @@ selected profile's isolated `CODEX_HOME` and Electron user data directory.
 
 | Pointer / mode | Set by | Meaning |
 |----------------|--------|---------|
-| **Active** | `accounts use`, `launch`, `pick` | Registry `current` — which profile you intend (terminal + hook) |
+| **Active** | `accounts use`, interactive `launch`/`shell`, `pick` | Registry `current` — which profile you intend (terminal + hook) |
 | **Applied** | `accounts apply`, `pick` (default) | Registry `applied` — auth on live `~/.claude` (what Cursor sees) |
 | **Isolated** | `env`, `launch`, `shell` | Per-process `CLAUDE_CONFIG_DIR`; does not change live disk |
 
@@ -135,8 +137,9 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 
 ## What is isolated, and what is shared
 
-Only **credentials** are per-profile. Capabilities belong to the person at the
-machine, so every profile reads the same corpus:
+Account identity, credentials, and live process state are per-profile.
+Capabilities belong to the person at the machine, so every Claude profile reads
+the same explicitly configured corpus:
 
 | Concern | Where it lives | Shared? |
 |---------|----------------|---------|
@@ -267,13 +270,17 @@ per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CL
 
 ## Commands
 
+The table below covers common workflows. The complete, option-for-option command
+tree is in [CLI reference](docs/cli-reference.md) and is also available from
+`accounts <command> --help`.
+
 | Command | Description |
 |---------|-------------|
 | `accounts add <name>` | Create a profile. `--tool`, `--email`, `--display-name`, `--identity`, `--card-last4`, `--metadata key=value`, `--dir`, `--description`. |
 | `accounts import [name]` | Import existing config dir (default `~/.claude`). `--copy` for managed copy. |
 | `accounts login <name>` | Choose a tool when needed, lock the profile name to that tool, then launch that tool's login flow in an isolated profile dir. Use `--tool` to bypass or change the chooser. |
 | `accounts apply <name>` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
-| `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
+| `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`, or non-interactive usage-aware selection with `--healthiest`. |
 | `accounts switch <name>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. Use `--tool` only when ambiguous. |
 | `accounts switch <name> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. Supports `--permissions <preset>`. |
 | `accounts switch-account [name]` | Switch the CURRENT session's account in place — no restart, conversation intact (Claude-only; the running session re-reads `.credentials.json` on its next request). Picker when no name; `--dir`, `--yes`, `--json`. |
@@ -285,7 +292,7 @@ per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CL
 | `accounts applied [tool]` | Print applied profile name (scripting). |
 | `accounts env [name]` | Print one or more `export ...` lines for the profile. Use `--tool` only when ambiguous or when no name is passed. |
 | `accounts launch <name>` | Launch tool once with profile env. Supports `--permissions <preset>`. |
-| `accounts run <tool> [args...]` | Run a tool under the supervisor so MCP/CLI can switch and restart it. Supports `--permissions <preset>`. |
+| `accounts run <target> [args...]` | Run a tool or profile under the supervisor so MCP/CLI can switch and restart it. A tool target accepts `--profile`; a profile target accepts `--tool`. Supports `--resume` and `--permissions`. Claude `--headless`/`--background` runs bypass the supervisor. |
 | `accounts supervisor status [tool]` | Show running supervisors. |
 | `accounts supervisor switch <name>` | Switch a running supervisor to another profile. Use `--tool` only when ambiguous. |
 | `accounts supervisor stop <tool>` | Stop a running supervisor and its child process. |
@@ -295,13 +302,18 @@ per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CL
 | `accounts hook path` | Print hook script path. |
 | `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). `--background`, `--profile <name>`, `--json`. |
 | `accounts sessions` (`sessions list`) | Read-only catalog of root Claude sessions owned by registered local profiles. `--profile`, `--project`, `--uuid`, `--json`. |
+| `accounts sessions merge` | Union Claude transcripts/history into the shared home; `--link` opts registered profiles into shared history. Supports `--dry-run`, `--profile`, `--from`, and `--json`. |
+| `accounts usage` | Read cached Claude usage per account, or query the usage endpoint with `--refresh`. See [usage-aware switching](docs/usage-aware-switching.md). |
+| `accounts usage-hook` | Fail-open Claude `UserPromptSubmit` hook for cached usage-aware switching; not installed automatically. |
+| `accounts auth status|migrate|sweep` | Inspect and maintain the central UUID-keyed Claude auth store. See [central auth store](docs/auth-store.md). |
 | `accounts health` (`readiness`) | Print the sanitized account/provider readiness contract. Use `--json` for automation. |
 | `accounts detect <name>` | Re-detect email from config dir. |
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
 | `accounts-serve` | Start the Bun HTTP API for the cloud storage mode. Supports `--port`, `--host`, public probes, and authenticated `/v1` account routes. |
 | `accounts-migrate` | Check or apply the cloud Postgres schema migrations. Use `--dry-run` to print the pending migration plan without mutating the database. |
 
-See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
+See the [CLI reference](docs/cli-reference.md) for `set`, `rename`, `remove`,
+`tools`, `codex-app`, `storage`, `contracts`, `events`, and `webhooks`.
 
 ### Claude session catalog
 
@@ -390,6 +402,7 @@ Run migrations before serving, or as a deployment one-shot:
 ```bash
 HASNA_ACCOUNTS_STORAGE_MODE=cloud \
 HASNA_ACCOUNTS_DATABASE_URL=postgres://... \
+HASNA_ACCOUNTS_RUNTIME_ROLE=accounts_app \
 accounts-migrate --dry-run
 ```
 
@@ -436,6 +449,7 @@ Add it to Claude/Codex/opencode/Cursor MCP config as a command server named
 - `list_tools`
 - `list_profiles`
 - `current_profile`
+- `supervisor_status`
 - `switch_profile`
 
 For automatic agent restarts, start the agent through `accounts run`:
@@ -524,6 +538,12 @@ then invokes the real `claude` binary. Full behavior and footguns: [docs/hook.md
 
 Overrides: `ACCOUNTS_HOME`, `ACCOUNTS_STORE_PATH`.
 
+Profile directories are validated before API registry writes. They must
+be absolute, persistent, home-anchored paths under the managed profiles root or
+a built-in tool home; temp paths, worktrees, scratchpads, and caches are refused.
+Custom tool homes submitted to the API use the same persistence/home checks. See
+[Profile directory policy](docs/profile-directories.md).
+
 Registry access is selected through `AccountsStore`:
 
 - `local` uses the atomic on-machine JSON registry.
@@ -578,6 +598,7 @@ for the exact grants and rollout order.
 | Takumi | `takumi` | `TAKUMI_CONFIG_DIR` | `~/.takumi` |
 | Codex CLI | `codex` | `CODEX_HOME` | `~/.codex` |
 | Codex App | `codex-app` | `CODEX_HOME` + `--user-data-dir` | `~/.codex` |
+| Codewith | `codewith` | `CODEWITH_HOME`, `CODEX_HOME` | `~/.codewith` |
 | Gemini CLI | `gemini` | `GEMINI_CONFIG_DIR` | `~/.gemini` |
 | opencode | `opencode` | `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | `~/.config/opencode` |
 | Cursor Agent | `cursor` | `CURSOR_CONFIG_DIR` | `~/.cursor` |
@@ -605,8 +626,13 @@ to run.
 ## Library
 
 ```ts
-import { addProfile, applyProfile, importProfile } from "@hasna/accounts";
+import { addProfile, applyProfile, importProfile, resolveStore } from "@hasna/accounts";
 ```
+
+The package root exposes local profile, switching, auth, readiness, supervisor,
+session, and contract helpers. `@hasna/accounts/storage` retains deprecated
+storage compatibility exports, while `@hasna/accounts/sdk` is the generated HTTP
+client for `accounts-serve`. See [HTTP API and SDK](docs/http-api.md).
 
 ## License
 
