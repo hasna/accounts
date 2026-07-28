@@ -1,9 +1,14 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile } from "./lib/profiles.js";
-import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
+import {
+  ensureProfileAuthSnapshot,
+  restoreClaudeAuthIntoDir,
+  writeSwitchedAccountMarker,
+} from "./lib/claude-auth.js";
+import { profileEnv } from "./lib/env.js";
 import {
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
@@ -196,7 +201,8 @@ test("switchAccount swaps credentials and oauthAccount into the session dir", as
   expect(marker.email).toBe("beta@example.com");
   // The registry's active profile follows the switch.
   expect(loadStore().current.claude).toBe("beta");
-  expect(betaDir.length).toBeGreaterThan(0);
+  // Beta's own profile dir must be untouched by handing its auth to a session.
+  expect(dirAccessToken(betaDir)).toBe("beta@example.com-access");
   rmSync(sessionDir, { recursive: true, force: true });
 });
 
@@ -313,4 +319,120 @@ test("switchAccount refuses multiple live sessions without --yes", async () => {
     helper.kill();
     rmSync(sessionDir, { recursive: true, force: true });
   }
+});
+
+// --- review fixes (PR #39 adversarial pass) ---------------------------------
+
+test("owner detection prefers an agreeing marker over ambiguous email matches", async () => {
+  makeProfile("dup1", { email: "shared@example.com" });
+  const dup2Dir = makeProfile("dup2", { email: "shared@example.com" });
+  makeProfile("beta", { email: "beta@example.com" });
+  const sessionDir = mkdtempSync(join(tmpdir(), "swa-marker-owner-"));
+  writeIdentity(sessionDir, { email: "shared@example.com" });
+  // A previous in-place switch recorded that dup2's account lives here; the
+  // email alone is ambiguous (dup1/dup2), the marker is not.
+  writeSwitchedAccountMarker(sessionDir, { profile: "dup2", email: "shared@example.com" });
+
+  const result = await switchAccount("beta", { dir: sessionDir, env: {} });
+
+  expect(result.snapshotBackProfile).toBe("dup2");
+  const snap = readJson(profileCredentialsSnapshot(dup2Dir)) as { claudeAiOauth?: { accessToken?: string } };
+  expect(snap.claudeAiOauth?.accessToken).toBe("shared@example.com-access");
+  rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("a marker contradicted by the dir's live email is stale and is cleared", () => {
+  const alphaDir = makeProfile("alpha", { email: "alpha@example.com" });
+  // Simulate: dir switched to beta, then the user ran /login back to alpha
+  // in-session — dir files are alpha's again (and fresher than the snapshot),
+  // but the marker still claims beta.
+  writeFileSync(
+    join(alphaDir, ".credentials.json"),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "alpha@example.com-FRESH-LOGIN",
+        refreshToken: "alpha@example.com-refresh-FRESH",
+        expiresAt: Date.now() + 300_000,
+      },
+    }),
+  );
+  const future = new Date(Date.now() + 15_000);
+  utimesSync(join(alphaDir, ".credentials.json"), future, future);
+  writeSwitchedAccountMarker(alphaDir, { profile: "beta", email: "beta@example.com" });
+
+  ensureProfileAuthSnapshot(alphaDir, tool());
+
+  expect(existsSync(profileSwitchedAccountMarker(alphaDir))).toBe(false);
+  const snap = readJson(profileCredentialsSnapshot(alphaDir)) as { claudeAiOauth?: { accessToken?: string } };
+  expect(snap.claudeAiOauth?.accessToken).toBe("alpha@example.com-FRESH-LOGIN");
+});
+
+test("profileEnv self-heals a switched-away profile dir with no live sessions", async () => {
+  const alphaDir = makeProfile("alpha", { email: "alpha@example.com" });
+  makeProfile("beta", { email: "beta@example.com" });
+  await switchAccount("beta", { dir: alphaDir, env: {} });
+  expect(dirEmail(alphaDir)).toBe("beta@example.com");
+
+  const { getProfile } = await import("./lib/profiles.js");
+  profileEnv(getProfile("alpha", "claude"), tool());
+
+  // Launching alpha must run ALPHA's account again, not beta's leftovers.
+  expect(dirEmail(alphaDir)).toBe("alpha@example.com");
+  expect(dirAccessToken(alphaDir)).toBe("alpha@example.com-access");
+  expect(existsSync(profileSwitchedAccountMarker(alphaDir))).toBe(false);
+});
+
+test("profileEnv refuses to heal while a live session still runs on the dir", async () => {
+  const alphaDir = makeProfile("alpha", { email: "alpha@example.com" });
+  makeProfile("beta", { email: "beta@example.com" });
+  await switchAccount("beta", { dir: alphaDir, env: {} });
+  mkdirSync(join(alphaDir, "sessions"), { recursive: true });
+  writeFileSync(join(alphaDir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+
+  const { getProfile } = await import("./lib/profiles.js");
+  expect(() => profileEnv(getProfile("alpha", "claude"), tool())).toThrow(/live session/);
+  // The running session's identity must not be yanked out from under it.
+  expect(dirEmail(alphaDir)).toBe("beta@example.com");
+});
+
+test("restoreClaudeAuthIntoDir validates every write path before mutating anything", () => {
+  const betaDir = makeProfile("beta", { email: "beta@example.com" });
+  const sessionDir = mkdtempSync(join(tmpdir(), "swa-symlink-"));
+  writeIdentity(sessionDir, { email: "alpha@example.com" });
+  const outside = mkdtempSync(join(tmpdir(), "swa-outside-"));
+  writeFileSync(join(outside, "creds.json"), "{}");
+  rmSync(join(sessionDir, ".credentials.json"));
+  symlinkSync(join(outside, "creds.json"), join(sessionDir, ".credentials.json"));
+
+  expect(() => restoreClaudeAuthIntoDir(betaDir, tool(), sessionDir, "beta")).toThrow(AccountsError);
+  // The account file must be untouched when the credential write is refused.
+  expect(dirEmail(sessionDir)).toBe("alpha@example.com");
+  rmSync(sessionDir, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test("switchAccount refuses a home/base directory as the config dir", async () => {
+  makeProfile("beta", { email: "beta@example.com" });
+  await expect(switchAccount("beta", { dir: liveBase, env: {} })).rejects.toThrow(/config dir/);
+});
+
+test("a failed switch leaves no agreeing marker behind (fail-safe ordering)", async () => {
+  makeProfile("beta", { email: "beta@example.com" });
+  const sessionDir = mkdtempSync(join(tmpdir(), "swa-failsafe-"));
+  writeIdentity(sessionDir, { email: "alpha-solo@example.com" });
+  const outside = mkdtempSync(join(tmpdir(), "swa-out2-"));
+  writeFileSync(join(outside, "creds.json"), "{}");
+  rmSync(join(sessionDir, ".credentials.json"));
+  symlinkSync(join(outside, "creds.json"), join(sessionDir, ".credentials.json"));
+
+  await expect(switchAccount("beta", { dir: sessionDir, env: {} })).rejects.toThrow(AccountsError);
+  // The dir keeps its old identity, so any marker left behind must NOT agree
+  // with the dir email — otherwise later snapshot refreshes would freeze or
+  // mis-attribute the dir's real credentials.
+  const marker = existsSync(profileSwitchedAccountMarker(sessionDir))
+    ? (readJson(profileSwitchedAccountMarker(sessionDir)) as { email?: string })
+    : undefined;
+  expect(marker?.email === dirEmail(sessionDir)).toBe(false);
+  rmSync(sessionDir, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
 });

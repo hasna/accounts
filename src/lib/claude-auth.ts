@@ -1,9 +1,10 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import {
   CLAUDE_KEYCHAIN_SERVICE,
+  listDirLiveSessions,
   liveClaudeBase,
   liveClaudePaths,
   profileAccountJsonPaths,
@@ -21,7 +22,7 @@ import {
   type KeychainCredential,
   writeClaudeKeychain,
 } from "./keychain.js";
-import { assertSafeWritePath } from "./safe-path.js";
+import { assertSafeWritePath, writeFileAtomic } from "./safe-path.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -45,9 +46,13 @@ function readJsonFile(path: string): JsonRecord | undefined {
 }
 
 function writeJsonFile(path: string, data: JsonRecord, stayUnder?: string): void {
-  assertSafeWritePath(path, stayUnder ? { mustStayUnder: stayUnder } : undefined);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+  // Atomic write: these files (account json, credentials, markers) are read
+  // concurrently by running tools, and `writeFileSync`'s mode never tightens a
+  // pre-existing file — writeFileAtomic chmods explicitly after the rename.
+  writeFileAtomic(path, JSON.stringify(data, null, 2) + "\n", {
+    mode: 0o600,
+    ...(stayUnder ? { mustStayUnder: stayUnder } : {}),
+  });
 }
 
 function readOAuthFromPaths(paths: string[]): JsonRecord | undefined {
@@ -365,16 +370,50 @@ export function restoreClaudeAuthIntoDir(
   }
 
   mkdirSync(targetDir, { recursive: true });
-  sanitizeSettingsFile(targetDir, targetDir);
 
+  // Validate EVERY write path before mutating anything: a refused credential
+  // write (e.g. a symlinked target) must not leave the dir with a new
+  // oauthAccount over the old credentials.
   const accountFile = join(targetDir, tool.accountFile ?? ".claude.json");
-  assertSafeWritePath(accountFile, { mustStayUnder: targetDir });
-  mergeOAuthInto([accountFile], oauth, false, targetDir);
-
   const targetCredentials = join(targetDir, ".credentials.json");
+  assertSafeWritePath(accountFile, { mustStayUnder: targetDir });
   assertSafeWritePath(targetCredentials, { mustStayUnder: targetDir });
-  copyFileSync(credSnap, targetCredentials);
-  writeFileSync(targetCredentials, readFileSync(targetCredentials), { mode: 0o600 });
+  const credentialBytes = readFileSync(credSnap);
+
+  sanitizeSettingsFile(targetDir, targetDir);
+  mergeOAuthInto([accountFile], oauth, false, targetDir);
+  // Atomic: the running session reads this file on every request.
+  writeFileAtomic(targetCredentials, credentialBytes, { mode: 0o600, mustStayUnder: targetDir });
+}
+
+/**
+ * If a profile's own dir was switched to another account (agreeing marker) and
+ * no live session is using it, restore the profile's own auth so a fresh launch
+ * runs as the profile it claims to be. Throws when live sessions still run on
+ * the dir — yanking their identity out from under them is never right.
+ */
+export function healSwitchedProfileDir(profileDir: string, tool: ToolDef, profileName?: string): boolean {
+  if (tool.id !== "claude") return false;
+  const marker = readSwitchedAccountMarker(profileDir);
+  if (!marker) return false;
+
+  const liveEmailNow = readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool))?.emailAddress;
+  if (typeof liveEmailNow === "string" && liveEmailNow && marker.email && marker.email !== liveEmailNow) {
+    // Stale marker (a later login changed the dir); normal flows own it again.
+    clearSwitchedAccountMarker(profileDir);
+    return false;
+  }
+
+  const live = listDirLiveSessions(profileDir).filter((s) => s.alive).length;
+  if (live > 0) {
+    throw new AccountsError(
+      `profile "${profileName ?? "NAME"}" cannot launch: its config dir currently carries the account of "${marker.profile}" (in-place switch) with ${live} live session(s) attached. Switch the running session back first — accounts switch-account ${profileName ?? "NAME"} --dir ${profileDir}`,
+    );
+  }
+
+  restoreClaudeAuthIntoDir(profileDir, tool, profileDir, profileName);
+  clearSwitchedAccountMarker(profileDir);
+  return true;
 }
 
 /**
@@ -396,10 +435,22 @@ export function ensureProfileAuthSnapshot(
   // A fresh login (overwrite) makes the dir's files the profile's truth again;
   // otherwise a switched-away dir holds ANOTHER profile's live auth, and
   // refreshing snapshots from it would overwrite this profile's real tokens.
+  // A marker contradicted by the dir's live email is stale (e.g. an in-session
+  // /login landed after the switch) — the dir's files are the truth again, so
+  // the marker is dropped and the normal refresh resumes.
   if (opts.overwrite) clearSwitchedAccountMarker(profileDir);
-  else if (readSwitchedAccountMarker(profileDir)) {
-    sanitizeClaudeOAuthProfileSettings(profileDir, tool);
-    return;
+  else {
+    const marker = readSwitchedAccountMarker(profileDir);
+    if (marker) {
+      const liveEmailNow = readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool))?.emailAddress;
+      const stale =
+        typeof liveEmailNow === "string" && liveEmailNow && marker.email && marker.email !== liveEmailNow;
+      if (stale) clearSwitchedAccountMarker(profileDir);
+      else {
+        sanitizeClaudeOAuthProfileSettings(profileDir, tool);
+        return;
+      }
+    }
   }
 
   const oauthSource = findOAuthSource(profileAccountJsonPaths(profileDir, tool));
@@ -674,7 +725,9 @@ export function restoreClaudeAuthFromProfile(
   const oauth =
     oauthSnap?.oauthAccount && typeof oauthSnap.oauthAccount === "object"
       ? (oauthSnap.oauthAccount as JsonRecord)
-      : readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool));
+      : readSwitchedAccountMarker(profileDir)
+        ? undefined
+        : readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool));
 
   if (!oauth) {
     throw new AccountsError("profile has no OAuth account data to apply");

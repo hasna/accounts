@@ -1,5 +1,9 @@
 import type { Profile, ToolDef } from "../types.js";
-import { CLAUDE_API_AUTH_ENV_KEYS, sanitizeClaudeProfileApiSettings } from "./claude-auth.js";
+import {
+  CLAUDE_API_AUTH_ENV_KEYS,
+  healSwitchedProfileDir,
+  sanitizeClaudeProfileApiSettings,
+} from "./claude-auth.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
@@ -18,6 +22,10 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
   // capabilities existed are repaired the next time they are used.
   ensureSharedCapabilities(profile.dir, tool);
   if (tool.id === "claude") {
+    // A dir left switched to another account by `switch-account` must not
+    // launch as that other account: restore the profile's own auth (or refuse
+    // loudly while live sessions still use the dir).
+    healSwitchedProfileDir(profile.dir, tool, profile.name);
     sanitizeClaudeProfileApiSettings(profile.dir, tool);
     for (const key of CLAUDE_API_AUTH_ENV_KEYS) env[key] = "";
   }
