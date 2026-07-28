@@ -42,7 +42,13 @@ export { LocalAccountsRegistry } from "./local-registry.js";
 export type { LocalRegistrySeed } from "./local-registry.js";
 export { HttpAccountsRegistry } from "./http-registry.js";
 export type { HttpAccountsRegistryOptions } from "./http-registry.js";
-export { PostgresAccountsRegistry } from "./postgres-registry.js";
+// PostgresAccountsRegistry is deliberately not re-exported: it queries the
+// additive accounts_v2/runtimes_v2 tables, which no shipped migration creates,
+// so a published consumer would fail on its first query with a missing
+// relation. It rejoins this entry point in the migration slice that creates
+// those tables and proves the adapter against a real PostgreSQL. Until then it
+// stays reachable in-repo for contract tests only; the invariant is pinned by
+// src/v2/public-surface.test.ts.
 export {
   bindingAuthenticationSchema,
   machineBindingGenerationSchema,

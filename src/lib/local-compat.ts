@@ -4,12 +4,20 @@
  * They can never select the async hosted registry, so fail before touching the
  * local store whenever any hosted/self-hosted authority is configured. New
  * integrations must use resolveStore() (v1) or AccountsRegistry (v2).
+ *
+ * The single deliberate exemption is appliedProfileName(): it returns only the
+ * machine-local applied pointer (which profile's auth is restored to this
+ * machine's live default paths), never a registry record, so it stays readable
+ * under hosted authority and is exported straight from lib/apply.js.
+ * appliedProfile() resolves that same pointer against the local profile
+ * registry, so it is gated here like every other synchronous registry read.
  */
 import { AccountsError, type Profile, type Store, type ToolDef } from "../types.js";
 import {
   loadStore as localLoadStore,
   saveStore as localSaveStore,
 } from "../storage.js";
+import { appliedProfile as localAppliedProfile } from "./apply.js";
 import { resolveAccountsCloud } from "./cloud-accounts.js";
 import {
   addCustomTool as localAddCustomTool,
@@ -156,4 +164,9 @@ export function useProfile(name: string, toolId?: string): { profile: Profile; t
 export function currentProfile(toolId: string): Profile | undefined {
   assertRootCompatibilityIsLocal();
   return localCurrentProfile(toolId);
+}
+
+export function appliedProfile(toolId: string): Profile | undefined {
+  assertRootCompatibilityIsLocal();
+  return localAppliedProfile(toolId);
 }

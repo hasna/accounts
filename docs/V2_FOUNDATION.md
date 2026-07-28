@@ -38,6 +38,14 @@ with real HTTP or PostgreSQL backends. Name uniqueness and runtime-association
 enforcement are intentionally deferred until the tenant-backfill and collision
 gates are complete.
 
+The PostgreSQL adapter is therefore not exported from the published
+`@hasna/accounts/v2` entry point. Its `accounts_v2` and `runtimes_v2` tables
+have no shipped migration, so exporting it would hand consumers a registry whose
+first query fails on a missing relation, and its optimistic-lock and
+unique-violation paths are covered only by in-repo fixtures rather than by a
+real PostgreSQL. It joins the public entry point in the migration slice that
+creates those tables and exercises it against a live database.
+
 The process-local adapter and machine-binding overlay isolate their stored state
 from callers: constructor and write inputs are parsed into frozen snapshots, and
 every object or collection returned by read, write, or snapshot operations is a
@@ -79,7 +87,11 @@ may retain those legacy fields only inside its isolated compatibility contract.
 
 Synchronous profile functions exported from the package root are now explicit
 local-only compatibility. They preserve local behavior, but fail before local
-I/O whenever hosted/self-hosted authority is configured. The deprecated
+I/O whenever hosted/self-hosted authority is configured. That includes
+`appliedProfile`, which resolves the applied pointer into a registry record. The
+single exemption is `appliedProfileName`, which returns only the machine-local
+applied pointer — never a registry record — and so stays readable under hosted
+authority. The deprecated
 `ensureProfileForLogin` root export uses that same canonical authority resolver,
 including `HASNA_ACCOUNTS_MODE`, rather than maintaining a separate mode policy.
 Retired `remote`, `hybrid`, and `s3` words are skipped as absent authority and

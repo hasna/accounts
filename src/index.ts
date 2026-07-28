@@ -54,7 +54,8 @@ export {
 export type { AddOptions, RemoveOptions, UpdateOptions, ProfileMetadata, ProfileMetadataValue } from "./lib/profiles.js";
 export { resolveStore } from "./lib/store.js";
 export type { AccountsStore, CurrentEntry, RemoveResult } from "./lib/store.js";
-export { applyProfile, appliedProfile, appliedProfileName } from "./lib/apply.js";
+export { applyProfile, appliedProfileName } from "./lib/apply.js";
+export { appliedProfile } from "./lib/local-compat.js";
 export { importProfile } from "./lib/import-profile.js";
 export type { ImportOptions } from "./lib/import-profile.js";
 export {

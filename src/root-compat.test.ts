@@ -5,6 +5,8 @@ import { join } from "node:path";
 import {
   addCustomTool,
   addProfile,
+  appliedProfile,
+  appliedProfileName,
   ensureProfileForLogin,
   listProfiles,
   listTools,
@@ -176,6 +178,37 @@ describe("root synchronous compatibility exports", () => {
   });
 
   test.each([
+    [
+      "implicit hosted URL and key",
+      {
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+    ],
+    [
+      "cloud mode",
+      {
+        HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+    ],
+  ])(
+    "appliedProfile fails closed for %s while the machine-local pointer stays readable",
+    (_label, env) => {
+      seedAppliedProfile("ghost-local");
+      expect(appliedProfile("claude")).toMatchObject({ name: "ghost-local", tool: "claude" });
+
+      Object.assign(process.env, env);
+      // The registry record behind the pointer belongs to the hosted registry,
+      // so resolving it locally would hand out a ghost account.
+      expect(() => appliedProfile("claude")).toThrow(/local-only compatibility/);
+      // The pointer itself is machine-local state and stays readable.
+      expect(appliedProfileName("claude")).toBe("ghost-local");
+    },
+  );
+
+  test.each([
     ["default local", {}],
     [
       "explicit local",
@@ -268,6 +301,14 @@ describe("root synchronous compatibility exports", () => {
     expect(existsSync(join(home, "profiles"))).toBe(false);
   });
 });
+
+/** Seed a local profile plus the machine-local applied pointer for it. */
+function seedAppliedProfile(name: string, toolId = "claude"): void {
+  addProfile({ name, tool: toolId });
+  const store = loadStore();
+  store.applied[toolId] = name;
+  saveStore(store);
+}
 
 function emptyStore(): Store {
   return {
