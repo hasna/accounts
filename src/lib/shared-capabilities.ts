@@ -1,17 +1,19 @@
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   statSync,
   symlinkSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { platform } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ToolDef } from "../types.js";
-import { assertSafeWritePath } from "./safe-path.js";
+import { accountsHome } from "../storage.js";
+import { writeFileAtomic } from "./safe-path.js";
 
 /**
  * Capabilities (skills, subagents, MCP servers) belong to the person using the
@@ -63,12 +65,26 @@ export interface SharedCapabilityEntryHealth {
 
 export interface SharedCapabilityConfigHealth {
   key: string;
-  status: "shared" | "missing" | "unavailable";
+  /** `unreadable` means the profile's file exists but does not parse — never merge into it. */
+  status: "shared" | "missing" | "unavailable" | "unreadable";
   target: string;
   /** Member count available in the shared home. */
   shared: number;
   /** Member count present in the profile. */
   profile: number;
+  reason?: string;
+}
+
+/**
+ * A shared corpus is write-through, so a profile can destroy it for every other
+ * profile. Comparing realpaths only proves the pointer is right — it says
+ * nothing about whether the corpus still has anything in it. The floor is the
+ * high-water mark recorded when the link was made or last confirmed.
+ */
+export interface SharedCapabilityFloor {
+  entries: number;
+  digest: string;
+  recordedAt: string;
 }
 
 export interface SharedCapabilityHealth {
@@ -131,14 +147,33 @@ function isPlainObject(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function readJsonFile(path: string): JsonRecord | undefined {
-  if (!existsSync(path)) return undefined;
+/**
+ * "Absent" and "unreadable" must never collapse into the same answer. Treating
+ * an unparseable file as `{}` and writing a merge result over it destroys
+ * whatever the file still held — for `.claude.json` that is the account's
+ * identity.
+ */
+type JsonDocument =
+  | { state: "absent" }
+  | { state: "unreadable"; reason: string }
+  | { state: "object"; value: JsonRecord };
+
+function readJsonDocument(path: string): JsonDocument {
+  if (!existsSync(path)) return { state: "absent" };
+  let raw: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    return isPlainObject(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
+    raw = readFileSync(path, "utf8");
+  } catch (err) {
+    return { state: "unreadable", reason: message(err) };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (err) {
+    return { state: "unreadable", reason: `invalid JSON (${message(err)})` };
+  }
+  if (!isPlainObject(parsed)) return { state: "unreadable", reason: "top-level value is not a JSON object" };
+  return { state: "object", value: parsed };
 }
 
 function message(err: unknown): string {
@@ -222,21 +257,41 @@ function shareEntry(ctx: SharedContext, entry: string, result: SharedCapabilitie
   }
 }
 
-/** First source that supplies a non-empty object for a key wins. */
+/** An unsubstituted `{{TEMPLATE}}` marker anywhere in a member's definition. */
+function hasUnrenderedPlaceholder(value: unknown): boolean {
+  return /\{\{[^}]*\}\}/.test(JSON.stringify(value) ?? "");
+}
+
+/**
+ * Members are unioned across every source and the first definition of a member
+ * name wins, so the tool can list rendered files ahead of raw ones without
+ * losing anything only the raw file declares. A member whose definition still
+ * carries an unsubstituted placeholder is dropped: shipping it would put a
+ * server into every profile that cannot start.
+ */
 function readSharedConfig(sharedHome: string, tool: ToolDef): Record<string, JsonRecord> {
   const config = tool.sharedConfig;
   const found: Record<string, JsonRecord> = {};
   if (!config) return found;
+  const excluded = new Set(config.exclude ?? []);
   for (const rel of config.sources) {
     const path = resolveSharedSource(sharedHome, rel);
     if (!path) continue;
-    const data = readJsonFile(path);
-    if (!data) continue;
+    const doc = readJsonDocument(path);
+    if (doc.state !== "object") continue;
     for (const key of config.keys) {
-      if (found[key]) continue;
-      const value = data[key];
-      if (isPlainObject(value) && Object.keys(value).length > 0) found[key] = value;
+      const value = doc.value[key];
+      if (!isPlainObject(value)) continue;
+      const target = (found[key] ??= {});
+      for (const [member, definition] of Object.entries(value)) {
+        if (member in target || excluded.has(member)) continue;
+        if (hasUnrenderedPlaceholder(definition)) continue;
+        target[member] = definition;
+      }
     }
+  }
+  for (const key of Object.keys(found)) {
+    if (Object.keys(found[key]!).length === 0) delete found[key];
   }
   return found;
 }
@@ -248,7 +303,16 @@ function mergeSharedConfig(ctx: SharedContext, tool: ToolDef, result: SharedCapa
   if (Object.keys(shared).length === 0) return;
 
   const targetPath = join(ctx.profileDir, config.target);
-  const current = readJsonFile(targetPath) ?? {};
+  const doc = readJsonDocument(targetPath);
+  if (doc.state === "unreadable") {
+    // The file exists and holds bytes we cannot interpret. Merging would mean
+    // writing a document built from `{}` over the profile's identity.
+    result.errors.push(
+      `${config.target}: could not be read (${doc.reason}); refusing to merge shared config over it`,
+    );
+    return;
+  }
+  const current = doc.state === "object" ? doc.value : {};
   const next: JsonRecord = { ...current };
   const seeded: string[] = [];
 
@@ -266,12 +330,97 @@ function mergeSharedConfig(ctx: SharedContext, tool: ToolDef, result: SharedCapa
 
   if (seeded.length === 0) return;
   try {
-    assertSafeWritePath(targetPath, { mustStayUnder: ctx.profileDir });
-    writeFileSync(targetPath, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+    writeFileAtomic(targetPath, JSON.stringify(next, null, 2) + "\n", {
+      mode: 0o600,
+      mustStayUnder: ctx.profileDir,
+    });
     result.seededKeys.push(...seeded);
   } catch (err) {
     result.errors.push(`${config.target}: could not merge shared config (${message(err)})`);
   }
+}
+
+// --- corpus floor -----------------------------------------------------------
+
+const CORPUS_BASELINE_FILE = "capability-baseline.json";
+
+interface CorpusBaselineFile {
+  version: 1;
+  corpora: Record<string, SharedCapabilityFloor>;
+}
+
+function baselinePath(): string {
+  return join(accountsHome(), CORPUS_BASELINE_FILE);
+}
+
+function readBaselines(): CorpusBaselineFile {
+  const doc = readJsonDocument(baselinePath());
+  if (doc.state !== "object") return { version: 1, corpora: {} };
+  const corpora = isPlainObject(doc.value.corpora) ? (doc.value.corpora as Record<string, SharedCapabilityFloor>) : {};
+  return { version: 1, corpora };
+}
+
+function writeBaselines(file: CorpusBaselineFile): void {
+  writeFileAtomic(baselinePath(), JSON.stringify(file, null, 2) + "\n", {
+    mode: 0o600,
+    mustStayUnder: accountsHome(),
+  });
+}
+
+/** Directory-granularity census: entry count plus a digest of the sorted names. */
+function measureCorpus(path: string): SharedCapabilityFloor | undefined {
+  let names: string[];
+  try {
+    names = readdirSync(path).sort();
+  } catch {
+    return undefined;
+  }
+  return {
+    entries: names.length,
+    digest: createHash("sha256").update(names.join("\n")).digest("hex").slice(0, 16),
+    recordedAt: new Date().toISOString(),
+  };
+}
+
+function corpusKey(source: string): string {
+  return realpathIfExists(source) ?? resolve(source);
+}
+
+/**
+ * Raise the floor to the current census, never lower it. Growth is normal;
+ * shrinkage is the event this exists to catch, so it takes an explicit
+ * `resetCapabilityBaseline` to accept it.
+ */
+function recordCorpusFloor(source: string): void {
+  const current = measureCorpus(source);
+  if (!current) return;
+  const key = corpusKey(source);
+  try {
+    const file = readBaselines();
+    const previous = file.corpora[key];
+    if (previous && previous.entries >= current.entries) return;
+    file.corpora[key] = current;
+    writeBaselines(file);
+  } catch {
+    // The floor is a tripwire, not a prerequisite: never break a launch over it.
+  }
+}
+
+function corpusFloor(source: string): SharedCapabilityFloor | undefined {
+  return readBaselines().corpora[corpusKey(source)];
+}
+
+/** Forget the recorded floors for a tool's shared entries and re-record them. */
+export function resetCapabilityBaseline(tool: ToolDef): void {
+  const sharedHome = sharedHomeFor(tool);
+  const file = readBaselines();
+  for (const entry of tool.sharedEntries ?? []) {
+    const source = join(sharedHome, entry);
+    const current = measureCorpus(source);
+    if (current) file.corpora[corpusKey(source)] = current;
+    else delete file.corpora[corpusKey(source)];
+  }
+  writeBaselines(file);
 }
 
 /**
@@ -300,7 +449,12 @@ export function ensureSharedCapabilities(profileDir: string, tool: ToolDef): Sha
   }
 
   result.sharedHome = ctx.sharedHome;
-  for (const entry of tool.sharedEntries ?? []) shareEntry(ctx, entry, result);
+  for (const entry of tool.sharedEntries ?? []) {
+    shareEntry(ctx, entry, result);
+    if (result.linked.includes(entry) || result.repaired.includes(entry) || result.kept.includes(entry)) {
+      recordCorpusFloor(join(ctx.sharedHome, entry));
+    }
+  }
   mergeSharedConfig(ctx, tool, result);
   return result;
 }
@@ -328,10 +482,15 @@ function configHealth(sharedHome: string, profileDir: string, tool: ToolDef): Sh
   if (!config) return [];
   const shared = readSharedConfig(sharedHome, tool);
   const targetPath = join(profileDir, config.target);
-  const current = readJsonFile(targetPath) ?? {};
+  const doc = readJsonDocument(targetPath);
   return config.keys.map((key) => {
     const sharedCount = Object.keys(shared[key] ?? {}).length;
-    const value = current[key];
+    if (doc.state === "unreadable") {
+      // Reporting this as "empty" would be the wrong diagnosis and would invite
+      // the very repair that must not run against an unparseable file.
+      return { key, status: "unreadable" as const, target: targetPath, shared: sharedCount, profile: 0, reason: doc.reason };
+    }
+    const value = doc.state === "object" ? doc.value[key] : undefined;
     const profileCount = isPlainObject(value) ? Object.keys(value).length : 0;
     const status = sharedCount === 0 ? "unavailable" : profileCount === 0 ? "missing" : "shared";
     return { key, status, target: targetPath, shared: sharedCount, profile: profileCount };
@@ -372,9 +531,24 @@ export function sharedCapabilityHealth(profileDir: string, tool: ToolDef): Share
     if (entry.status === "missing") health.problems.push(`${entry.entry} is not shared (expected a link to ${entry.source})`);
     else if (entry.status === "diverged") health.problems.push(`${entry.entry} links to ${realpathIfExists(entry.target)}, not ${entry.source}`);
     else if (entry.status === "local") health.warnings.push(`${entry.entry} is a profile-local copy, not the shared corpus`);
+    if (entry.status !== "shared") continue;
+    // The link being correct says nothing about the corpus still having
+    // anything in it — a delete through the link leaves the pointer intact.
+    const floor = corpusFloor(entry.source);
+    const current = measureCorpus(entry.source);
+    if (floor && current && current.entries < floor.entries) {
+      health.problems.push(
+        `${entry.entry} corpus has shrunk: ${current.entries} entries in ${entry.source}, was ${floor.entries} ` +
+          `(if the removal was intended, re-baseline with \`accounts doctor --accept-capability-baseline\`)`,
+      );
+    }
   }
   for (const key of health.config) {
-    if (key.status === "missing") health.problems.push(`${key.key} is empty in ${key.target} (${key.shared} available in the shared home)`);
+    if (key.status === "unreadable") {
+      health.problems.push(`${key.target} could not be read (${key.reason}); shared config is not merged into it`);
+    } else if (key.status === "missing") {
+      health.problems.push(`${key.key} is empty in ${key.target} (${key.shared} available in the shared home)`);
+    }
   }
   return health;
 }

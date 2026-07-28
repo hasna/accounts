@@ -12,13 +12,56 @@ export const profileNameSchema = slugSchema;
 
 const reservedJsonKeys = new Set(["__proto__", "prototype", "constructor"]);
 
+/**
+ * Credential artifacts. A tool definition may arrive from the registry via
+ * `store.resolveTool()`, so "we would never write that" is not a control —
+ * sharing these is refused at the schema, before any filesystem work.
+ */
+const credentialArtifactNames = new Set([
+  ".credentials.json",
+  "credentials.json",
+  ".credentials",
+  ".accounts-auth",
+  "auth.json",
+  "keychain.json",
+  "oauth-account.json",
+  "token.json",
+  "tokens.json",
+]);
+
+/** JSON keys that carry account identity or secrets and must never be copied. */
+const credentialConfigKeys = new Set([
+  "oauthAccount",
+  "claudeAiOauth",
+  "customApiKeyResponses",
+  "apiKeyHelper",
+  "primaryApiKey",
+  "credentials",
+  "userID",
+  "machineID",
+]);
+
+/**
+ * NUL and friends are silently swallowed by path APIs (a NUL-bearing entry just
+ * fails `existsSync` and degrades to a no-op), so they are rejected outright.
+ * Written as a code-point check rather than a regex literal so this source file
+ * itself stays free of control characters.
+ */
+const noControlCharacters = (value: string): boolean =>
+  ![...value].some((ch) => {
+    const code = ch.codePointAt(0) ?? 0;
+    return code < 0x20 || code === 0x7f;
+  });
+
 /** A single path segment under a tool's home — never a nested or escaping path. */
 const pathSegmentSchema = z
   .string()
   .min(1)
   .max(64)
+  .refine(noControlCharacters, "must not contain control characters")
   .refine((v) => !/[\\/]/.test(v) && v !== "." && v !== "..", "must be a single path segment")
-  .refine((v) => !reservedJsonKeys.has(v), "must not be a reserved name");
+  .refine((v) => !reservedJsonKeys.has(v), "must not be a reserved name")
+  .refine((v) => !credentialArtifactNames.has(v.toLowerCase()), "must not be a credential artifact");
 
 /** A top-level JSON key shared between the tool's home and a profile. */
 const sharedConfigKeySchema = z
@@ -26,7 +69,16 @@ const sharedConfigKeySchema = z
   .min(1)
   .max(64)
   .regex(/^[A-Za-z_][A-Za-z0-9_-]*$/, "must look like a JSON config key")
-  .refine((v) => !reservedJsonKeys.has(v), "must not be a reserved key");
+  .refine((v) => !reservedJsonKeys.has(v), "must not be a reserved key")
+  .refine((v) => !credentialConfigKeys.has(v), "must not be a credential key");
+
+/** A member name inside a shared config key, e.g. one MCP server name. */
+const sharedConfigMemberSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine(noControlCharacters, "must not contain control characters")
+  .refine((v) => !reservedJsonKeys.has(v), "must not be a reserved name");
 
 /**
  * A shared-home-relative JSON file. At most one leading `..` is allowed, so a
@@ -37,6 +89,7 @@ const sharedConfigSourceSchema = z
   .string()
   .min(1)
   .max(255)
+  .refine(noControlCharacters, "must not contain control characters")
   .refine((v) => !/^([\\/]|[A-Za-z]:)/.test(v), "must be relative to the tool's shared home")
   .refine((v) => {
     const parts = v.split(/[\\/]/).filter(Boolean);
@@ -77,9 +130,15 @@ export const toolDefSchema = z.object({
     .object({
       /** Profile-relative JSON file the keys are merged into. */
       target: pathSegmentSchema,
-      /** Shared-home-relative JSON files read for those keys; first hit per key wins. */
+      /**
+       * Shared-home-relative JSON files read for those keys, in priority order.
+       * Members are unioned across all of them and the first definition of a
+       * given member name wins, so put rendered files ahead of raw ones.
+       */
       sources: z.array(sharedConfigSourceSchema).min(1).max(8),
       keys: z.array(sharedConfigKeySchema).min(1).max(16),
+      /** Member names never shared into a profile, whatever a source says. */
+      exclude: z.array(sharedConfigMemberSchema).max(64).optional(),
     })
     .optional(),
 });

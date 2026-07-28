@@ -137,14 +137,32 @@ machine, so every profile reads the same corpus:
 | MCP servers | `mcpServers` merged into `<profile>/.claude.json` | Yes — merged (the profile's own entries always win) |
 
 The links are plain symlinks, so this is **write-through**: creating or deleting a
-skill from inside any profile changes the one shared corpus for all of them. MCP
-servers cannot be linked (the file that holds them is rewritten in place), so they
-are merged member-by-member instead — a profile gains anything new in the shared
-set and never loses its own entries.
+skill from inside any profile changes the one shared corpus for all of them. That
+cuts both ways — one `rm -rf` through a link empties the corpus for every profile
+at once — so `accounts` records the size of each corpus when it links it and
+`accounts doctor` fails if the corpus later shrinks. Once you have confirmed a
+deletion was intended, accept it with:
 
-Instruction files (`CLAUDE.md`, `rules/`) are deliberately **not** copied into
-profiles: Claude Code discovers memory by walking the working directory's
-ancestors, not the config dir, so a copy inside a profile would never be read.
+```bash
+accounts doctor --accept-capability-baseline
+```
+
+MCP servers cannot be linked (the file that holds them is rewritten in place), so
+they are merged member-by-member instead — a profile gains anything new in the
+shared set and never loses its own entries. Servers are unioned across the tool's
+declared sources with the first definition of a name winning, so rendered config
+takes precedence over templated config; a server whose command still contains an
+unsubstituted `{{PLACEHOLDER}}` is dropped rather than shipped broken, and the
+`secrets` server is excluded outright — a vault-retrieval tool in another
+identity's tool list is the closest thing to sharing tokens without sharing them.
+If the profile's own config file exists but does not parse, the merge is refused
+and reported: it is never rebuilt from scratch over whatever the file still held.
+
+Instruction files (`CLAUDE.md`, `rules/`) are **not** handled here, and the status
+quo is not by design: Claude Code discovers memory by walking the working
+directory's ancestors, not the config dir, so a copy inside a profile would never
+be read. They load today only when the working directory happens to sit under the
+home directory that holds them — a session started outside it loses them silently.
 
 Sharing is materialized when a profile is created and re-checked on every launch,
 so profiles created by older versions are repaired the next time they are used;

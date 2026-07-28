@@ -17,6 +17,7 @@ export {
 export { profileEnv, formatEnvAssignments, formatExportLines } from "./lib/env.js";
 export {
   ensureSharedCapabilities,
+  resetCapabilityBaseline,
   sharedCapabilityHealth,
   sharedHomeFor,
   toolSharesCapabilities,
@@ -25,6 +26,7 @@ export type {
   SharedCapabilitiesResult,
   SharedCapabilityConfigHealth,
   SharedCapabilityEntryHealth,
+  SharedCapabilityFloor,
   SharedCapabilityHealth,
   SharedEntryStatus,
 } from "./lib/shared-capabilities.js";

@@ -16,7 +16,7 @@ import {
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./lib/tools.js";
-import { sharedCapabilityHealth } from "./lib/shared-capabilities.js";
+import { resetCapabilityBaseline, sharedCapabilityHealth } from "./lib/shared-capabilities.js";
 import {
   expandPath,
   type ProfileMetadata,
@@ -1330,10 +1330,18 @@ tools
 program
   .command("doctor")
   .description("check the store and profile dirs for problems (exits 1 if any)")
+  .option(
+    "--accept-capability-baseline",
+    "accept the current size of every shared capability corpus as the new floor (use after an intentional deletion)",
+  )
   .action(
-    action(async () => {
+    action(async (opts: { acceptCapabilityBaseline?: boolean }) => {
       console.log(chalk.bold(`store: ${storePath()}`));
       const store = resolveStore();
+      if (opts.acceptCapabilityBaseline) {
+        for (const tool of listTools()) resetCapabilityBaseline(tool);
+        console.log(chalk.dim("  capability corpus floors re-recorded at their current size"));
+      }
       const profiles = await store.listProfiles();
       // `current` is the shared, cloud-owned selection in api mode — read it
       // through the Store, never the local file. `applied` is machine-local.

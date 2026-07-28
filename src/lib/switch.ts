@@ -3,6 +3,7 @@ import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { prepareClaudeProfileKeychain } from "./claude-auth.js";
 import { claudeApiAuthClearingEnv, formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
+import { ensureSharedCapabilities } from "./shared-capabilities.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
 
@@ -64,6 +65,11 @@ export async function switchProfile(
     await store.useProfile(profile.name, tool.id);
   }
 
+  // In applied mode the session reads the live home rather than the profile
+  // dir, so `profileEnv` is skipped — but the profile dir must still be
+  // repaired, or `switch` (the headline way to change profiles) leaves it
+  // broken for every later isolated launch.
+  ensureSharedCapabilities(profile.dir, tool);
   const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : profileEnv(profile, tool);
   const command = commandFor(profile, tool, opts);
   prepareClaudeProfileKeychain(profile.dir, tool, profile.name);

@@ -5,20 +5,25 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, removeProfile } from "./lib/profiles.js";
-import { getTool } from "./lib/tools.js";
+import { addCustomTool, getTool } from "./lib/tools.js";
 import { profileEnv } from "./lib/env.js";
+import { switchProfile } from "./lib/switch.js";
 import { importProfile } from "./lib/import-profile.js";
 import { assertSafeWritePath } from "./lib/safe-path.js";
+import { AccountsError } from "./types.js";
 import {
   ensureSharedCapabilities,
+  resetCapabilityBaseline,
   sharedCapabilityHealth,
   sharedHomeFor,
 } from "./lib/shared-capabilities.js";
@@ -312,4 +317,207 @@ test("health is inert for tools that declare no shared capabilities", () => {
   const health = sharedCapabilityHealth(p.dir, getTool("codex"));
   expect(health.supported).toBe(false);
   expect(health.problems).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for the defects found in adversarial review of PR #34.
+// ---------------------------------------------------------------------------
+
+test("a corrupt profile account file is never replaced by the merge", () => {
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "corrupt" });
+  const accountFile = join(p.dir, ".claude.json");
+  // Exactly what an interrupted write leaves behind: a truncated prefix of a
+  // healthy file, still carrying the identity keys.
+  const truncated = JSON.stringify({
+    oauthAccount: { emailAddress: "corrupt@example.com" },
+    userID: "user-1",
+    machineID: "machine-1",
+    numStartups: 42,
+  }).slice(0, 60);
+  writeFileSync(accountFile, truncated);
+
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+  const result = ensureSharedCapabilities(p.dir, getTool("claude"));
+
+  expect(readFileSync(accountFile, "utf8")).toBe(truncated);
+  expect(result.seededKeys).toEqual([]);
+  expect(result.errors.join(" ")).toContain(".claude.json");
+  expect(result.errors.join(" ")).toMatch(/could not be read|invalid JSON/i);
+});
+
+test("an account file whose top level is not an object aborts the merge", () => {
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "notobject" });
+  const accountFile = join(p.dir, ".claude.json");
+  writeFileSync(accountFile, "[1,2,3]");
+
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+  const result = ensureSharedCapabilities(p.dir, getTool("claude"));
+  expect(readFileSync(accountFile, "utf8")).toBe("[1,2,3]");
+  expect(result.seededKeys).toEqual([]);
+  expect(result.errors.length).toBeGreaterThan(0);
+});
+
+test("health diagnoses a corrupt account file as unreadable, not as empty", () => {
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "corrupthealth" });
+  writeFileSync(join(p.dir, ".claude.json"), "{not json");
+
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+  const health = sharedCapabilityHealth(p.dir, getTool("claude"));
+  expect(health.config[0]!.status).toBe("unreadable");
+  expect(health.problems.join(" ")).toMatch(/could not be read/i);
+  expect(health.problems.join(" ")).not.toMatch(/is empty/i);
+});
+
+test("the account-file merge is atomic and tightens the file mode", () => {
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "atomic" });
+  const accountFile = join(p.dir, ".claude.json");
+  writeFileSync(accountFile, JSON.stringify({ oauthAccount: { emailAddress: "a@example.com" } }), { mode: 0o644 });
+  const before = statSync(accountFile);
+  expect(before.mode & 0o777).toBe(0o644);
+
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+  const result = ensureSharedCapabilities(p.dir, getTool("claude"));
+  expect(result.seededKeys).toEqual(["mcpServers"]);
+
+  const after = statSync(accountFile);
+  expect(after.mode & 0o777).toBe(0o600);
+  // A rename-based write replaces the inode; an in-place truncate+write keeps it.
+  if (process.platform !== "win32") expect(after.ino).not.toBe(before.ino);
+  expect(readdirSync(p.dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  const data = readJson(accountFile);
+  expect((data.oauthAccount as Record<string, string>).emailAddress).toBe("a@example.com");
+});
+
+test("rendered config sources win over the account file for the same server", () => {
+  // The account file is what Claude Code reads at runtime, but on a real machine
+  // it can be the *unrendered* copy — carrying {{PLACEHOLDER}} commands.
+  writeFileSync(
+    join(sharedHome, "settings.json"),
+    JSON.stringify({ mcpServers: { todos: { command: "/real/bin/todos" }, onlysettings: { command: "/real/bin/x" } } }),
+  );
+  const p = addProfile({ name: "rendered" });
+  const servers = readJson(join(p.dir, ".claude.json")).mcpServers as Record<string, { command: string }>;
+  expect(servers.todos!.command).toBe("/real/bin/todos");
+  // members are unioned across sources, so nothing the operator configured is dropped
+  expect(servers.onlysettings!.command).toBe("/real/bin/x");
+  expect(servers.notes!.command).toBe("notes-mcp");
+});
+
+test("servers with unrendered placeholders are never merged into a profile", () => {
+  writeFileSync(
+    join(home, ".claude.json"),
+    JSON.stringify({ mcpServers: { broken: { command: "{{BUN_BIN_DIR}}/thing" }, good: { command: "/bin/good" } } }),
+  );
+  const p = addProfile({ name: "placeholder" });
+  const servers = readJson(join(p.dir, ".claude.json")).mcpServers as Record<string, unknown>;
+  expect(Object.keys(servers)).toEqual(["good"]);
+});
+
+test("excluded members are never shared into a profile", () => {
+  writeFileSync(
+    join(home, ".claude.json"),
+    JSON.stringify({ mcpServers: { secrets: { command: "/bin/secrets" }, todos: { command: "/bin/todos" } } }),
+  );
+  const p = addProfile({ name: "excluded" });
+  const servers = readJson(join(p.dir, ".claude.json")).mcpServers as Record<string, unknown>;
+  expect(Object.keys(servers)).toEqual(["todos"]);
+  expect(getTool("claude").sharedConfig!.exclude).toContain("secrets");
+});
+
+test("switchProfile materializes shared capabilities even when it applies live auth", async () => {
+  const liveBase = join(home, "live");
+  mkdirSync(liveBase, { recursive: true });
+  process.env.ACCOUNTS_TEST_LIVE_DIR = liveBase;
+  try {
+    process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+    const dir = join(home, "switch-profile");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "switch@example.com" } }));
+    writeFileSync(
+      join(dir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "r", expiresAt: Date.now() + 60_000 } }),
+    );
+    addProfile({ name: "switcher", dir });
+    expect(existsSync(join(dir, "skills"))).toBe(false);
+
+    process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+    const result = await switchProfile("switcher", { tool: "claude" });
+    // Applied mode reads the live home, so that session is fine — the defect is
+    // that the profile dir stayed broken for every later isolated launch.
+    expect(result.applied).toBe(true);
+    expect(result.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(realpathSync(join(dir, "skills"))).toBe(realpathSync(join(sharedHome, "skills")));
+    expect(realpathSync(join(dir, "agents"))).toBe(realpathSync(join(sharedHome, "agents")));
+  } finally {
+    delete process.env.ACCOUNTS_TEST_LIVE_DIR;
+  }
+});
+
+test("health detects a corpus emptied through the link instead of reporting it shared", () => {
+  const p = addProfile({ name: "wiped" });
+  expect(sharedCapabilityHealth(p.dir, getTool("claude")).problems).toEqual([]);
+
+  // Destruction through the write-through link: the pointer is still correct.
+  rmSync(join(sharedHome, "skills", "alpha"), { recursive: true, force: true });
+  rmSync(join(sharedHome, "skills", "beta"), { recursive: true, force: true });
+
+  const health = sharedCapabilityHealth(p.dir, getTool("claude"));
+  expect(health.entries.find((e) => e.entry === "skills")!.status).toBe("shared");
+  expect(health.problems.join(" ")).toMatch(/shrunk/i);
+  expect(health.problems.join(" ")).toContain("skills");
+});
+
+test("a growing corpus raises the floor, and only an explicit reset lowers it", () => {
+  const p = addProfile({ name: "growing" });
+  mkdirSync(join(sharedHome, "skills", "gamma"), { recursive: true });
+  writeFileSync(join(sharedHome, "skills", "gamma", "SKILL.md"), "---\nname: gamma\n---\n");
+
+  ensureSharedCapabilities(p.dir, getTool("claude"));
+  expect(sharedCapabilityHealth(p.dir, getTool("claude")).problems).toEqual([]);
+
+  rmSync(join(sharedHome, "skills", "gamma"), { recursive: true, force: true });
+  expect(sharedCapabilityHealth(p.dir, getTool("claude")).problems.join(" ")).toMatch(/shrunk/i);
+  // A launch must not quietly ratify the loss.
+  ensureSharedCapabilities(p.dir, getTool("claude"));
+  expect(sharedCapabilityHealth(p.dir, getTool("claude")).problems.join(" ")).toMatch(/shrunk/i);
+
+  resetCapabilityBaseline(getTool("claude"));
+  expect(sharedCapabilityHealth(p.dir, getTool("claude")).problems).toEqual([]);
+});
+
+test("tool definitions may not share credential artifacts", () => {
+  const base = { label: "x", envVar: "X_HOME", defaultDir: "/tmp/x", bin: "x" };
+  for (const entry of [".credentials.json", "credentials.json", ".accounts-auth", "auth.json", "keychain.json"]) {
+    expect(() => addCustomTool({ ...base, id: "cred-entry", sharedEntries: [entry] })).toThrow(AccountsError);
+  }
+  expect(() =>
+    addCustomTool({
+      ...base,
+      id: "cred-target",
+      sharedConfig: { target: "auth.json", sources: ["settings.json"], keys: ["mcpServers"] },
+    }),
+  ).toThrow(AccountsError);
+  expect(() =>
+    addCustomTool({
+      ...base,
+      id: "cred-key",
+      sharedConfig: { target: "config.json", sources: ["settings.json"], keys: ["oauthAccount"] },
+    }),
+  ).toThrow(AccountsError);
+});
+
+test("tool definitions may not contain NUL bytes in shared paths", () => {
+  const base = { label: "x", envVar: "X_HOME", defaultDir: "/tmp/x", bin: "x" };
+  expect(() => addCustomTool({ ...base, id: "nul-entry", sharedEntries: ["skills\u0000evil"] })).toThrow(AccountsError);
+  expect(() =>
+    addCustomTool({
+      ...base,
+      id: "nul-source",
+      sharedConfig: { target: "config.json", sources: ["set\u0000tings.json"], keys: ["mcpServers"] },
+    }),
+  ).toThrow(AccountsError);
 });
