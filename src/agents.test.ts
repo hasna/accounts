@@ -1711,6 +1711,14 @@ test("agents library projections redact provider payloads and untracked process 
   let processGetterCount = 0;
   let processProxyTrapCount = 0;
   const providerProjectKey = ["sk", "proj", "provider-positional-token"].join("-");
+  const providerMetadataKey = "credential=provider-metadata-key-secret-a";
+  const providerMetadataCollisionKey = "credential=provider-metadata-key-secret-b";
+  const providerAuthorizationCredentialParts = [
+    "eyJhbGciOi" + "Provider12345",
+    "eyJzdWIiOi" + "Provider67890",
+    "sig" + "ProviderABCDE",
+  ];
+  const providerAuthorizationKey = `Authorization Bearer ${providerAuthorizationCredentialParts.join(".")}`;
   const runner: AgentsRunner = () => ({
     ok: true,
     raw: JSON.stringify([
@@ -1731,11 +1739,15 @@ test("agents library projections redact provider payloads and untracked process 
           "wrap/Authorization:Bearer",
           "provider-positional-bearer-secret",
           providerProjectKey,
+          "https://operator:provider-authority-secret@example.test/callback",
           "keep-provider-positional-control",
         ],
         metadata: {
           token: "provider-token-secret",
           message: "provider --api-key provider-message-secret --trace keep-provider-message",
+          [providerMetadataKey]: "provider-metadata-value-secret-a",
+          [providerMetadataCollisionKey]: "provider-metadata-value-secret-b",
+          [providerAuthorizationKey]: "provider-metadata-bearer-value-secret",
         },
       },
     ]),
@@ -1752,6 +1764,8 @@ test("agents library projections redact provider payloads and untracked process 
         "outer=(env=--master-key) \"\" process-command-wrapper-split-secret " +
         "keep-process-wrapper-split url=https://example.test/authorization:public " +
         "keep-process-url " +
+        "url=https://operator:process-authority-secret@example.test/callback " +
+        "keep-process-authority " +
         "keep-before-process-command-auth " +
         "env=Authorization:Bearer process-command-bearer-secret " +
         "keep-process-command",
@@ -1809,21 +1823,35 @@ test("agents library projections redact provider payloads and untracked process 
   expect(serialized).not.toContain("provider-positional-wrapper-split-secret");
   expect(serialized).not.toContain("provider-positional-bearer-secret");
   expect(serialized).not.toContain(providerProjectKey);
+  expect(serialized).not.toContain("provider-authority-secret");
   expect(serialized).not.toContain("process-command-secret");
   expect(serialized).not.toContain("process-command-wrapper-secret");
   expect(serialized).not.toContain("process-command-wrapper-split-secret");
+  expect(serialized).not.toContain("process-authority-secret");
   expect(serialized).not.toContain("process-command-bearer-secret");
   expect(serialized).not.toContain("process-getter-secret");
   expect(serialized).not.toContain("process-coercion-secret");
   expect(serialized).not.toContain("process-proxy-secret");
+  expect(serialized).not.toContain("provider-metadata-key-secret-a");
+  expect(serialized).not.toContain("provider-metadata-key-secret-b");
+  expect(serialized).not.toContain("provider-metadata-value-secret-a");
+  expect(serialized).not.toContain("provider-metadata-value-secret-b");
+  for (const credentialPart of providerAuthorizationCredentialParts) {
+    expect(serialized).not.toContain(credentialPart);
+  }
+  expect(serialized).not.toContain("provider-metadata-bearer-value-secret");
+  expect(serialized).toContain("credential=[REDACTED]");
+  expect(serialized).toContain("credential=[REDACTED]#2");
   expect(serialized).toContain("keep-provider-message");
   expect(serialized).toContain("keep-provider-positional-wrapper-split");
   expect(serialized).toContain("url=urn:authorization:public");
   expect(serialized).toContain("keep-provider-positional-urn");
+  expect(serialized).toContain("https://[REDACTED]@example.test/callback");
   expect(serialized).not.toContain("keep-provider-positional-control");
   expect(serialized).toContain("keep-process-wrapper-split");
   expect(serialized).toContain("url=https://example.test/authorization:public");
   expect(serialized).toContain("keep-process-url");
+  expect(serialized).toContain("keep-process-authority");
   expect(serialized).toContain("keep-before-process-command-auth");
   expect(serialized).not.toContain("keep-process-command");
   expect(results[0]?.agents[0]).toMatchObject({
@@ -1840,6 +1868,14 @@ test("agents library projections redact provider payloads and untracked process 
 
 test.skipIf(process.platform === "win32")("accounts agents JSON and human output use projected provider records", () => {
   const executable = join(home, "projected-agent-provider");
+  const agentMetadataKey = "credential=agent-json-metadata-key-secret-a";
+  const agentMetadataCollisionKey = "credential=agent-json-metadata-key-secret-b";
+  const agentAuthorizationCredentialParts = [
+    "eyJhbGciOi" + "AgentJson12345",
+    "eyJzdWIiOi" + "AgentJson67890",
+    "sig" + "AgentJsonABCDE",
+  ];
+  const agentAuthorizationKey = `Authorization Bearer ${agentAuthorizationCredentialParts.join(".")}`;
   const payload = JSON.stringify([
     {
       kind: "background",
@@ -1852,6 +1888,9 @@ test.skipIf(process.platform === "win32")("accounts agents JSON and human output
       metadata: {
         message:
           "provider --credentials agent-json-message-secret --debug keep-agent-json-message",
+        [agentMetadataKey]: "agent-json-metadata-value-secret-a",
+        [agentMetadataCollisionKey]: "agent-json-metadata-value-secret-b",
+        [agentAuthorizationKey]: "agent-json-metadata-bearer-value-secret",
       },
     },
   ]);
@@ -1898,8 +1937,18 @@ test.skipIf(process.platform === "win32")("accounts agents JSON and human output
     expect(result.stdout).not.toContain("agent-human-cwd-secret");
     expect(result.stdout).not.toContain("agent-json-token-secret");
     expect(result.stdout).not.toContain("agent-json-message-secret");
+    expect(result.stdout).not.toContain("agent-json-metadata-key-secret-a");
+    expect(result.stdout).not.toContain("agent-json-metadata-key-secret-b");
+    expect(result.stdout).not.toContain("agent-json-metadata-value-secret-a");
+    expect(result.stdout).not.toContain("agent-json-metadata-value-secret-b");
+    for (const credentialPart of agentAuthorizationCredentialParts) {
+      expect(result.stdout).not.toContain(credentialPart);
+    }
+    expect(result.stdout).not.toContain("agent-json-metadata-bearer-value-secret");
     expect(result.stdout).toContain("[REDACTED]");
   }
+  expect(jsonResult.stdout).toContain("credential=[REDACTED]");
+  expect(jsonResult.stdout).toContain("credential=[REDACTED]#2");
   expect(humanResult.stdout).toContain("keep-agent-human-name");
   expect(humanResult.stdout).toContain("keep-agent-human-cwd");
   expect(jsonResult.stdout).toContain("keep-agent-json-message");

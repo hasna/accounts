@@ -999,6 +999,99 @@ test("sensitive URL query values redact across public positional surfaces", () =
   }
 });
 
+test("URL authority userinfo redacts across public positional surfaces", () => {
+  const urls = [
+    "https://operator:authority-password-secret@example.test/callback",
+    "https://token%40user:encoded-authority-secret@example.test/callback?visible=keep",
+    "ftp://deploy:ftp-authority-secret@example.test/releases",
+    "url=https://assigned:assigned-authority-secret@example.test/callback",
+  ];
+  const safeNearMisses = [
+    "https://example.test/callback",
+    "urn:authorization:public",
+    "mailto:person@example.test?subject=keep",
+    "person@example.test",
+    "C:/safe/path:authorization:public",
+    String.raw`C:\safe\authorization:public`,
+  ];
+  const argv = ["provider", "--", ...urls, ...safeNearMisses, "keep-after-url-authority"];
+  const command = argv.join(" ");
+  const providerJson = JSON.stringify({
+    argv,
+    command,
+    commandLine: command,
+    processOutput: `untracked process ${urls[0]} keep-process-output`,
+  });
+
+  const textRedacted = redactText(command);
+  const argvRedacted = redactArgv(argv);
+  const publicRedacted = redactPublicValue({
+    argv,
+    command,
+    commandLine: command,
+    provider: providerJson,
+  });
+
+  for (const { redacted, jsonEscaped } of [
+    { redacted: textRedacted, jsonEscaped: false },
+    { redacted: JSON.stringify(argvRedacted), jsonEscaped: true },
+    { redacted: JSON.stringify(publicRedacted), jsonEscaped: true },
+  ]) {
+    for (const secret of [
+      "authority-password-secret",
+      "encoded-authority-secret",
+      "ftp-authority-secret",
+      "assigned-authority-secret",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain("https://[REDACTED]@example.test/callback");
+    expect(redacted).toContain("https://[REDACTED]@example.test/callback?visible=keep");
+    expect(redacted).toContain("ftp://[REDACTED]@example.test/releases");
+    expect(redacted).toContain("url=https://[REDACTED]@example.test/callback");
+    for (const nearMiss of safeNearMisses) {
+      expect(redacted).toContain(
+        jsonEscaped ? nearMiss.replaceAll("\\", "\\\\") : nearMiss,
+      );
+    }
+    expect(redacted).toContain("keep-after-url-authority");
+  }
+});
+
+test("encoded nested URL separators fail closed for sensitive query assignments", () => {
+  const urls = [
+    "https://example.test/callback?state=ok%26api_key%3Dnested-query-secret&visible=keep",
+    "https://example.test/callback?state=ok%2526api_key%253Ddouble-nested-query-secret&visible=keep",
+    "https://example.test/callback?state=ok%3Bclient_secret%3Dnested-semicolon-secret&visible=keep",
+    "https://example.test/callback#state=ok%26access_token%3Dnested-fragment-secret&visible=keep",
+    "https://example.test/callback#state=ok%2526access_token%253Ddouble-nested-fragment-secret&visible=keep",
+    "https://example.test/callback?state=ok%26scope%3Dread&visible=keep",
+    "https://example.test/callback?state=ok%26keyboard%3Dvisible&visible=keep",
+  ];
+  const argv = ["provider", "--", ...urls, "keep-after-nested-query"];
+  const command = argv.join(" ");
+  const redacted = redactText(command);
+  const argvRedacted = JSON.stringify(redactArgv(argv));
+  const publicRedacted = JSON.stringify(redactPublicValue({ argv, command }));
+
+  for (const output of [redacted, argvRedacted, publicRedacted]) {
+    for (const secret of [
+      "nested-query-secret",
+      "double-nested-query-secret",
+      "nested-semicolon-secret",
+      "nested-fragment-secret",
+      "double-nested-fragment-secret",
+    ]) {
+      expect(output).not.toContain(secret);
+    }
+    expect(output).toContain("state=[REDACTED]&visible=keep");
+    expect(output).toContain("#state=[REDACTED]&visible=keep");
+    expect(output).toContain("state=ok%26scope%3Dread&visible=keep");
+    expect(output).toContain("state=ok%26keyboard%3Dvisible&visible=keep");
+    expect(output).toContain("keep-after-nested-query");
+  }
+});
+
 test("quoted diagnostic command payloads retain wrapper split state across empty quotes", () => {
   const secret = "quoted-diagnostic-wrapper-split-secret";
   for (const suffix of ["", " (ENOENT)", ", code=ENOENT"]) {
@@ -2040,6 +2133,66 @@ test("recursive public redaction never evaluates accessors or proxy traps", () =
   expect(Object.getPrototypeOf(redacted["ordinary"])).toBeNull();
   expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
   expect(JSON.parse(serialized).ordinary.safe).toBe("keep-data-value");
+});
+
+test("recursive public redaction sanitizes provider-controlled credential keys with deterministic collisions", () => {
+  const nestedSpaceCredentialParts = [
+    "eyJhbGciOi" + "NestedSpace12345",
+    "eyJzdWIiOi" + "NestedSpace67890",
+    "sig" + "NestedSpaceABCDE",
+  ];
+  const metadata = {
+    "credential=metadata-key-secret-a": "metadata-value-secret-a",
+    "credential=metadata-key-secret-b": "metadata-value-secret-b",
+    safe: "keep-metadata-value",
+    nested: {
+      "Authorization: Bearer nested-key-secret": "nested-key-value-secret",
+      [`Authorization Bearer ${nestedSpaceCredentialParts.join(".")}`]:
+        "nested-space-key-value-secret",
+      visible: "keep-nested-value",
+    },
+  };
+
+  const redacted = redactPublicValue({ metadata }) as {
+    metadata: Record<string, unknown>;
+  };
+  const serialized = JSON.stringify(redacted);
+
+  for (const secret of [
+    "metadata-key-secret-a",
+    "metadata-key-secret-b",
+    "metadata-value-secret-a",
+    "metadata-value-secret-b",
+    "nested-key-secret",
+    "nested-key-value-secret",
+    "nested-space-key-value-secret",
+  ]) {
+    expect(serialized).not.toContain(secret);
+  }
+  for (const credentialPart of nestedSpaceCredentialParts) {
+    expect(serialized).not.toContain(credentialPart);
+  }
+  expect(Object.keys(redacted.metadata)).toEqual([
+    "credential=[REDACTED]",
+    "credential=[REDACTED]#2",
+    "safe",
+    "nested",
+  ]);
+  expect(redacted.metadata["credential=[REDACTED]"]).toBe("[REDACTED]");
+  expect(redacted.metadata["credential=[REDACTED]#2"]).toBe("[REDACTED]");
+  expect(redacted.metadata.safe).toBe("keep-metadata-value");
+  expect(
+    Object.keys(redacted.metadata.nested as Record<string, unknown>),
+  ).toEqual(["Authorization: [REDACTED]", "[REDACTED]", "visible"]);
+  expect(
+    (redacted.metadata.nested as Record<string, unknown>)["Authorization: [REDACTED]"],
+  ).toBe("[REDACTED]");
+  expect(
+    (redacted.metadata.nested as Record<string, unknown>)["[REDACTED]"],
+  ).toBe("[REDACTED]");
+  expect(
+    (redacted.metadata.nested as Record<string, unknown>).visible,
+  ).toBe("keep-nested-value");
 });
 
 test("dot, space, escaped, and single-quoted credential keys fail closed", () => {

@@ -461,7 +461,7 @@ function decodeSerializedKey(encoded: string): string | undefined {
 }
 
 function redactPlainText(value: string): string {
-  return redactUrlCredentialParameters(
+  return redactUrlCredentials(
     redactSensitiveFields(
       redactEscapedSerializedFields(
         redactCommandText(
@@ -487,22 +487,11 @@ function redactJsonDocument(value: string): { value: string; changed: boolean } 
     return { value, changed: false };
   }
 
-  let changed = false;
-  const redacted = JSON.stringify(parsed, (key, nested) => {
-    if (key && isSensitiveCredentialKey(key)) {
-      changed = true;
-      return "[REDACTED]";
-    }
-    if (typeof nested === "string") {
-      const safe = redactPlainText(nested);
-      if (safe !== nested) changed = true;
-      return safe;
-    }
-    return nested;
-  });
+  const compact = JSON.stringify(parsed);
+  const redacted = JSON.stringify(publicValue(parsed));
   return {
-    value: changed ? `${leading}${redacted}${trailing}` : value,
-    changed,
+    value: redacted !== compact ? `${leading}${redacted}${trailing}` : value,
+    changed: redacted !== compact,
   };
 }
 
@@ -761,7 +750,8 @@ function isStructuredCommandSegment(context: CommandSegmentContext): boolean {
 }
 
 const QUERY_PARAMETER_SEPARATORS = new Set(["&", ";"]);
-const URL_QUERY_HINT_PATTERN = /[?#]/;
+const URL_TOKEN_HINT_PATTERN = /[?#:]|www\./i;
+const MAX_NESTED_QUERY_DECODE_PASSES = 4;
 const URL_KNOWN_QUERY_SCHEMES = new Set([
   "file",
   "ftp",
@@ -778,6 +768,49 @@ function decodeQueryKey(value: string): string {
     .replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) =>
       String.fromCharCode(Number.parseInt(hex, 16)),
     );
+}
+
+function containsSensitiveQueryAssignment(
+  value: string,
+  start: number,
+  end: number,
+): boolean {
+  let cursor = start;
+  while (cursor < end) {
+    let parameterEnd = cursor;
+    let equals = -1;
+    while (
+      parameterEnd < end &&
+      !QUERY_PARAMETER_SEPARATORS.has(value[parameterEnd]!)
+    ) {
+      if (equals < 0 && value[parameterEnd] === "=") equals = parameterEnd;
+      parameterEnd++;
+    }
+
+    if (equals >= cursor && equals < parameterEnd) {
+      const key = decodeQueryKey(value.slice(cursor, equals));
+      if (isSensitiveCredentialKey(key)) return true;
+    }
+
+    cursor = parameterEnd < end ? parameterEnd + 1 : end;
+  }
+  return false;
+}
+
+function hasDecodedNestedSensitiveQueryAssignment(value: string): boolean {
+  let decoded = value;
+  for (let pass = 0; pass < MAX_NESTED_QUERY_DECODE_PASSES; pass++) {
+    const next = decodeQueryKey(decoded);
+    if (next === decoded) return false;
+    decoded = next;
+    if (
+      decoded.includes("=") &&
+      containsSensitiveQueryAssignment(decoded, 0, decoded.length)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function urlLikeCandidateStart(value: string, start: number): number {
@@ -817,6 +850,33 @@ function urlLikeCandidateStart(value: string, start: number): number {
     }
   }
   return -1;
+}
+
+function urlAuthorityUserinfoRange(
+  value: string,
+  candidate: number,
+): { start: number; end: number } | undefined {
+  const schemeEnd = value.indexOf(":", candidate);
+  if (schemeEnd < candidate || value.slice(schemeEnd + 1, schemeEnd + 3) !== "//") {
+    return undefined;
+  }
+
+  const authorityStart = schemeEnd + 3;
+  let authorityEnd = authorityStart;
+  while (
+    authorityEnd < value.length &&
+    value[authorityEnd] !== "/" &&
+    value[authorityEnd] !== "?" &&
+    value[authorityEnd] !== "#"
+  ) {
+    authorityEnd++;
+  }
+
+  const at = value.lastIndexOf("@", authorityEnd - 1);
+  if (at < authorityStart) return undefined;
+  return at === authorityStart
+    ? undefined
+    : { start: authorityStart, end: at };
 }
 
 function trimExternalQueryValueEnd(
@@ -867,13 +927,18 @@ function redactQueryParametersInRange(
 
     if (equals >= cursor && equals < parameterEnd) {
       const key = decodeQueryKey(value.slice(cursor, equals));
-      if (isSensitiveCredentialKey(key)) {
-        const valueStart = equals + 1;
-        const redactedEnd = trimExternalQueryValueEnd(
-          value,
-          valueStart,
-          parameterEnd,
-        );
+      const valueStart = equals + 1;
+      const redactedEnd = trimExternalQueryValueEnd(
+        value,
+        valueStart,
+        parameterEnd,
+      );
+      if (
+        isSensitiveCredentialKey(key) ||
+        hasDecodedNestedSensitiveQueryAssignment(
+          value.slice(valueStart, redactedEnd),
+        )
+      ) {
         output +=
           value.slice(outputCursor, valueStart) +
           "[REDACTED]" +
@@ -917,13 +982,23 @@ function redactUrlLikeToken(value: string): string {
     candidate = urlLikeCandidateStart(value, cursor)
   ) {
     if (candidate < cursor) break;
+    const authority = urlAuthorityUserinfoRange(value, candidate);
+    if (authority) {
+      output += value.slice(outputCursor, authority.start) + "[REDACTED]";
+      outputCursor = authority.end;
+      changed = true;
+    }
+
     const query = value.indexOf("?", candidate);
     const fragment = value.indexOf("#", candidate);
     const firstQuery =
       query >= 0 && (fragment < 0 || query < fragment) ? query : -1;
     const firstParameterStart =
       firstQuery >= 0 ? firstQuery + 1 : fragment >= 0 ? fragment + 1 : -1;
-    if (firstParameterStart < 0) break;
+    if (firstParameterStart < 0) {
+      cursor = authority?.end ?? candidate + 1;
+      continue;
+    }
 
     const parameterEnd = fragment >= 0 && firstQuery >= 0 && fragment > firstQuery
       ? fragment
@@ -955,14 +1030,14 @@ function redactUrlLikeToken(value: string): string {
       break;
     }
 
-    cursor = firstParameterStart;
+    cursor = authority?.end ?? firstParameterStart;
   }
 
   return changed ? output + value.slice(outputCursor) : value;
 }
 
-function redactUrlCredentialParameters(value: string): string {
-  if (!URL_QUERY_HINT_PATTERN.test(value)) return value;
+function redactUrlCredentials(value: string): string {
+  if (!URL_TOKEN_HINT_PATTERN.test(value)) return value;
 
   let output = "";
   let cursor = 0;
@@ -979,7 +1054,7 @@ function redactUrlCredentialParameters(value: string): string {
       cursor++;
     }
     const token = value.slice(tokenStart, cursor);
-    if (!URL_QUERY_HINT_PATTERN.test(token)) continue;
+    if (!URL_TOKEN_HINT_PATTERN.test(token)) continue;
 
     const redacted = redactUrlLikeToken(token);
     if (redacted !== token) {
@@ -2045,12 +2120,43 @@ const COMMAND_ARGUMENT_ARRAY_KEYS = new Set([
   "argv",
   "command",
 ]);
+const PUBLIC_OBJECT_KEY_AUTHORIZATION_CREDENTIAL_PATTERN =
+  /(?:^|[^A-Za-z0-9])(?:(?:proxy-)?authorization[ \t]+(?:[A-Za-z][A-Za-z0-9._-]*[ \t]+)?|bearer[ \t]+)[A-Za-z0-9._~+/=-]{8,}(?=$|[^A-Za-z0-9._~+/=-])/i;
 
 interface PublicValueFrame {
   value: unknown;
   depth: number;
   key?: string;
   assign: (projected: unknown) => void;
+}
+
+interface PublicObjectKeyProjection {
+  key: string;
+  redactedCredential: boolean;
+}
+
+function projectPublicObjectKey(key: string): PublicObjectKeyProjection {
+  let publicKey = TEXT_REDACTION_HINT_PATTERN.test(key) ? redactText(key) : key;
+  let redactedCredential =
+    publicKey !== key && publicKey.includes("[REDACTED]");
+
+  if (PUBLIC_OBJECT_KEY_AUTHORIZATION_CREDENTIAL_PATTERN.test(publicKey)) {
+    publicKey = "[REDACTED]";
+    redactedCredential = true;
+  }
+
+  return { key: publicKey, redactedCredential };
+}
+
+function uniquePublicObjectKey(
+  result: Record<string, unknown>,
+  preferred: string,
+): string {
+  if (!Object.hasOwn(result, preferred)) return preferred;
+
+  let suffix = 2;
+  while (Object.hasOwn(result, `${preferred}#${suffix}`)) suffix++;
+  return `${preferred}#${suffix}`;
 }
 
 function publicValue(value: unknown): unknown {
@@ -2210,11 +2316,16 @@ function publicValue(value: unknown): unknown {
         break;
       }
       entryCount++;
-      if (isSensitiveCredentialKey(key)) {
-        result[key] = "[REDACTED]";
+      const projectedKey = projectPublicObjectKey(key);
+      const publicKey = uniquePublicObjectKey(
+        result,
+        projectedKey.key,
+      );
+      if (isSensitiveCredentialKey(key) || projectedKey.redactedCredential) {
+        result[publicKey] = "[REDACTED]";
       } else {
-        result[key] = null;
-        children.push([key, descriptor.value]);
+        result[publicKey] = null;
+        children.push([publicKey, descriptor.value]);
       }
     }
     if (entriesTruncated) {
