@@ -39,6 +39,20 @@ describe("resolveStore transport selection", () => {
     expect(resolveStore(cloudEnv).transport).toBe("api");
   });
 
+  test("ACCOUNTS_HOME forces LocalStore despite inherited API URL+KEY", () => {
+    expect(resolveStore({ ...cloudEnv, ACCOUNTS_HOME: "/tmp/isolated-accounts" }).transport).toBe("local");
+  });
+
+  test("explicit cloud mode overrides ACCOUNTS_HOME isolation", () => {
+    expect(
+      resolveStore({
+        ...cloudEnv,
+        ACCOUNTS_HOME: "/tmp/isolated-accounts",
+        HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+      }).transport,
+    ).toBe("api");
+  });
+
   test("forced local mode uses LocalStore even with URL+KEY", () => {
     expect(
       resolveStore({ ...cloudEnv, HASNA_ACCOUNTS_STORAGE_MODE: "local" } as NodeJS.ProcessEnv).transport,

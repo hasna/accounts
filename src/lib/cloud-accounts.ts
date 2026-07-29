@@ -7,9 +7,10 @@
 // HTTP storage client, so it inherits retries, timeout, idempotency and JSON
 // error mapping.
 //
-// Without an explicit mode, both API env vars select cloud and an incomplete
-// pair stays local. Explicit `self_hosted`/`cloud` fails closed unless both
-// vars exist; explicit `local` forces local. Only the retired
+// Without an explicit mode, `ACCOUNTS_HOME` forces local isolation; otherwise
+// both API env vars select cloud and an incomplete pair stays local. Explicit
+// `self_hosted`/`cloud` fails closed unless both vars exist; explicit `local`
+// forces local. Only the retired
 // `remote`/`hybrid`/`s3` aliases are ignored.
 //
 // Registry vs local: the cloud is the source of truth for account metadata
@@ -128,7 +129,9 @@ const MODE_ENV_KEYS = ["HASNA_ACCOUNTS_STORAGE_MODE", "ACCOUNTS_STORAGE_MODE", "
  * Bridge the fleet flip's two-var convention to the contracts resolver. The
  * toggle is the presence of BOTH `HASNA_ACCOUNTS_API_URL` and
  * `HASNA_ACCOUNTS_API_KEY`: when both are set (and mode is not explicitly
- * `local`) the client uses the cloud HTTP transport; otherwise local.
+ * selected and `ACCOUNTS_HOME` is unset) the client uses the cloud HTTP
+ * transport; otherwise local. `ACCOUNTS_HOME` is an isolation boundary for
+ * probes and agents that may inherit production API credentials.
  *
  * Canonical modes are enforced here. Explicit `self_hosted`/`cloud` requires
  * both API variables and fails before the contracts resolver if either is
@@ -165,6 +168,9 @@ function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
       throw new AccountsError(`${explicitMode} storage mode requires ${missing}`);
     }
     next.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
+  } else if (env.ACCOUNTS_HOME?.trim()) {
+    // An isolated home must not inherit an ambient production API target.
+    next.HASNA_ACCOUNTS_STORAGE_MODE = "local";
   } else if (url && key) {
     // Both self_hosted and cloud use the identical cloud-http transport; the
     // canonical runtime word contracts expects is `cloud`.
