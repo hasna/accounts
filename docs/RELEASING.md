@@ -108,9 +108,9 @@ Configure the package trusted publisher with these exact values:
 The publication step accepts only GitHub-hosted OIDC and rejects `NPM_TOKEN` or
 `NODE_AUTH_TOKEN`. It publishes the already verified `.tgz` with
 `--ignore-scripts`, so npm cannot run a third `prepack`. The package's
-`prepublishOnly` script rejects direct publication; it is defense in depth, not
-a substitute for npm access policy because any caller can pass
-`--ignore-scripts`.
+`prepublishOnly` script rejects direct publication unless the audited
+break-glass override below is set; it is defense in depth, not a substitute for
+npm access policy because any caller can pass `--ignore-scripts`.
 
 ### npm dist-tag promotion credential
 
@@ -130,7 +130,85 @@ CLI have passed. npm does not currently offer a dist-tag-only token permission,
 so the protected environment and release-tag ruleset remain mandatory external
 authority boundaries.
 
+## Release environment provisioning
+
+Until the two environment secrets exist, **no tag can publish**. The workflow's
+first step fails before checkout and names whichever secret is missing, so this
+is diagnosed in seconds rather than several minutes into a release run.
+
+Both secrets live in the `npm-release` environment of `hasna/accounts`:
+
+| Secret | Purpose | Created by |
+| --- | --- | --- |
+| `NPM_DIST_TAG_TOKEN` | granular npm token scoped to `@hasna/accounts`, used only by the dist-tag promotion step | an npm owner of the package |
+| `RELEASE_GITHUB_ADMIN_TOKEN` | reads the live release-tag ruleset and environment configuration during preflight | a `hasna` organization administrator |
+
+Verify presence without reading either value:
+
+```bash
+gh api repos/hasna/accounts/environments/npm-release/secrets \
+  --jq '[.secrets[].name]'
+```
+
+The npm trusted publisher described above must exist as well. `publish-staged`
+authenticates purely by GitHub OIDC and sets no `NODE_AUTH_TOKEN`, so if the
+trusted publisher is absent or its workflow filename or environment name differs
+by even one character, publication fails with an npm authorization error.
+Confirm it on npmjs.com under the package's *Settings → Trusted publisher*
+before the first tag.
+
+## Break-glass direct publish
+
+`prepublishOnly` runs `release-provenance.ts reject-direct-publish`, which aborts
+every `npm publish` from a working copy. That is the intended steady state: the
+workflow is the release path.
+
+It must not, however, be the *only* path. `@hasna/accounts` is load-bearing for
+fleet limit-switching, and GitHub Actions or npm OIDC can be degraded exactly
+when a hotfix is needed. One narrow, audited override exists. Read this now, not
+during an incident.
+
+```bash
+export ACCOUNTS_RELEASE_BREAK_GLASS=i-am-publishing-without-release-verification
+export ACCOUNTS_RELEASE_BREAK_GLASS_REASON="npm OIDC returning 5xx; 0.2.2x hotfix restores limit switching"
+npm publish
+```
+
+The override refuses unless all of the following hold, and each refusal names
+the condition it failed:
+
+- `ACCOUNTS_RELEASE_BREAK_GLASS` equals that exact token — `1`, `true`, and
+  other truthy spellings are rejected so it cannot be enabled by reflex;
+- `ACCOUNTS_RELEASE_BREAK_GLASS_REASON` records why, in at least 24 characters;
+- the process is **not** running inside GitHub Actions, so no workflow can ever
+  route around verified publication;
+- the working tree is clean and its commit is readable, so the published bytes
+  remain traceable to a commit. Commit the hotfix first; an unreadable git state
+  is treated as dirty, not as clean.
+
+When it proceeds it prints a banner to stderr naming the package, commit, and
+reason, and listing what was skipped: deterministic pack verification, npm
+provenance attestation, Sigstore identity policy, protected tag and ruleset
+preflight, and the staged-then-promoted dist-tag quarantine.
+
+A break-glass release is unattested. Record it in the log below and return the
+next version to the workflow.
+
+### Break-glass log
+
+| Date (UTC) | Version | Operator | Reason | Follow-up |
+| --- | --- | --- | --- | --- |
+| _none yet_ | | | | |
+
 ## Pinned release substrate
+
+Node, npm, and Bun versions are declared once, in
+`scripts/release-toolchain.json`. `scripts/release-provenance.ts` reads that file
+for its preflight assertions, `scripts/assert-toolchain.mjs` checks the live
+runner against it before dependencies are installed, and a test binds the
+`setup-node` and `setup-bun` inputs in both workflows to the same values — a
+workflow input cannot read a file, so drift is caught by `bun test` with an
+explicit message instead of by an opaque shell comparison.
 
 The release and CI workflows pin:
 
@@ -170,7 +248,9 @@ root, so a release cannot silently accept a changed live trust document.
    ```
 
 3. The protected tag starts the release workflow. Do not run `npm publish`
-   locally and do not move any dist-tag manually while it is running.
+   locally and do not move any dist-tag manually while it is running. If the
+   workflow itself is unavailable, use "Break-glass direct publish" above
+   deliberately; do not improvise around the guard.
 
 All release tags share the single `hasna-accounts-npm-release` concurrency
 group. Later tags queue behind earlier tags rather than running concurrently.

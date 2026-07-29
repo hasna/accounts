@@ -31,9 +31,20 @@ export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const PUBLISH_PREDICATE =
   "https://github.com/npm/attestation/tree/main/specs/publish/v0.1";
 export const PROVENANCE_PREDICATE = "https://slsa.dev/provenance/v1";
-export const RELEASE_NODE_VERSION = "24.18.0";
-export const RELEASE_NPM_VERSION = "11.16.0";
-export const RELEASE_BUN_VERSION = "1.3.14";
+const pinnedToolchain = JSON.parse(
+  readFileSync(new URL("./release-toolchain.json", import.meta.url), "utf8"),
+) as Record<string, unknown>;
+export const RELEASE_NODE_VERSION = text(pinnedToolchain.node, "pinned Node version");
+export const RELEASE_NPM_VERSION = text(pinnedToolchain.npm, "pinned npm version");
+export const RELEASE_BUN_VERSION = text(pinnedToolchain.bun, "pinned Bun version");
+// Break-glass: the ONLY way to publish without the verified release workflow.
+// Deliberately unguessable and reason-bearing so it cannot be enabled by reflex,
+// and refused inside GitHub Actions so automation can never route around
+// provenance. See docs/RELEASING.md, "Break-glass direct publish".
+export const BREAK_GLASS_ENV = "ACCOUNTS_RELEASE_BREAK_GLASS";
+export const BREAK_GLASS_TOKEN = "i-am-publishing-without-release-verification";
+export const BREAK_GLASS_REASON_ENV = "ACCOUNTS_RELEASE_BREAK_GLASS_REASON";
+export const BREAK_GLASS_MIN_REASON_LENGTH = 24;
 export const MAX_JSON_BYTES = 8 * 1024 * 1024;
 export const MAX_TARBALL_BYTES = 32 * 1024 * 1024;
 export const MAX_ARCHIVE_ENTRIES = 512;
@@ -1953,6 +1964,81 @@ async function promoteDistTag(
   );
 }
 
+export interface DirectPublishContext {
+  name: string;
+  version: string;
+  commit: string;
+  dirty: boolean;
+}
+
+/**
+ * Decides whether a direct `npm publish` may proceed.
+ *
+ * Throws — aborting the publish — unless every break-glass condition is met.
+ * On success it returns the banner the caller must print, so an emergency
+ * publish is never silent.
+ */
+export function evaluateDirectPublish(
+  env: NodeJS.ProcessEnv,
+  context: DirectPublishContext,
+): string[] {
+  const requested = (env[BREAK_GLASS_ENV] ?? "").trim();
+  check(
+    requested.length > 0,
+    "direct npm publish is forbidden; the release workflow must publish the preserved verified tarball. " +
+      `In a genuine emergency see docs/RELEASING.md ("Break-glass direct publish") and set ${BREAK_GLASS_ENV}.`,
+  );
+  check(
+    requested === BREAK_GLASS_TOKEN,
+    `${BREAK_GLASS_ENV} must be set to exactly "${BREAK_GLASS_TOKEN}"; ` +
+      "refusing an ambiguous value so this cannot be enabled by reflex",
+  );
+  check(
+    !env.GITHUB_ACTIONS,
+    `${BREAK_GLASS_ENV} is refused inside GitHub Actions; automation must publish through the verified release workflow`,
+  );
+  const reason = (env[BREAK_GLASS_REASON_ENV] ?? "").trim();
+  check(
+    reason.length >= BREAK_GLASS_MIN_REASON_LENGTH,
+    `${BREAK_GLASS_REASON_ENV} must record why verification is being bypassed, ` +
+      `in at least ${BREAK_GLASS_MIN_REASON_LENGTH} characters`,
+  );
+  check(
+    !context.dirty,
+    "break-glass refuses a modified, untracked, or unreadable working tree because the build reads " +
+      "the filesystem, not the commit; run `git status --porcelain` and commit or remove what it " +
+      "lists so the published bytes stay traceable",
+  );
+  return [
+    "",
+    "!!!  BREAK-GLASS DIRECT PUBLISH  !!!",
+    `  package: ${context.name}@${context.version}`,
+    `  commit:  ${context.commit}`,
+    `  reason:  ${reason}`,
+    "  skipped: deterministic pack verification, npm provenance attestation, Sigstore identity",
+    "           policy, protected tag/ruleset preflight, and the staged-then-promoted dist-tag",
+    "           quarantine that the release workflow normally enforces.",
+    "  required afterwards: record this publish in the docs/RELEASING.md break-glass log and",
+    "           return the next version to the release workflow.",
+    "",
+  ];
+}
+
+function guardDirectPublish(root: string, manifest: Manifest, env: NodeJS.ProcessEnv): void {
+  // Fail closed: an unreadable git state counts as untraceable, not as clean.
+  const head = runResult("git", ["rev-parse", "HEAD"], root);
+  const status = runResult("git", ["status", "--porcelain"], root);
+  const traceable = head.status === 0 && status.status === 0;
+  for (const line of evaluateDirectPublish(env, {
+    name: manifest.name,
+    version: manifest.version,
+    commit: traceable ? (head.stdout ?? "").trim() : "unknown",
+    dirty: !traceable || (status.stdout ?? "").trim().length > 0,
+  })) {
+    console.error(line);
+  }
+}
+
 function option(args: string[], name: string, fallback?: string): string {
   const index = args.indexOf(name);
   const value = index === -1 ? fallback : args[index + 1];
@@ -1967,9 +2053,7 @@ async function main(): Promise<void> {
   if (subcommand === "pack") {
     verifyDeterministicPack(root);
   } else if (subcommand === "reject-direct-publish") {
-    throw new Error(
-      "direct npm publish is forbidden; the release workflow must publish the preserved verified tarball",
-    );
+    guardDirectPublish(root, manifest, process.env);
   } else if (subcommand === "preflight") {
     assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
     assertGitContext(root, manifest, process.env);

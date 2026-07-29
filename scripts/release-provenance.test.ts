@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import {
+  BREAK_GLASS_ENV,
+  BREAK_GLASS_MIN_REASON_LENGTH,
+  BREAK_GLASS_REASON_ENV,
+  BREAK_GLASS_TOKEN,
   MAX_ARCHIVE_ENTRIES,
   MAX_ARCHIVE_ENTRY_BYTES,
   MAX_ARCHIVE_UNPACKED_BYTES,
@@ -24,6 +28,7 @@ import {
   assertPromotionVersion,
   assertTrustedPublishEnvironment,
   createOriginPackumentReader,
+  evaluateDirectPublish,
   expectedSigstoreIdentity,
   extractVerifiedAttestations,
   originIntentPackumentUrl,
@@ -1976,8 +1981,7 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(workflow).toContain("bun run test:provenance-crypto");
   expect(workflow).toContain(`node-version: "${RELEASE_NODE_VERSION}"`);
   expect(workflow).toContain(`bun-version: "${RELEASE_BUN_VERSION}"`);
-  expect(workflow).toContain(`npm_version="$(npm --version)"`);
-  expect(workflow).toContain(`[[ "$npm_version" == "${RELEASE_NPM_VERSION}" ]]`);
+  expect(workflow).toContain("node scripts/assert-toolchain.mjs");
   expect(workflow).toContain("--artifact \"$RUNNER_TEMP/release-candidate.tgz\"");
   expect(workflow).toContain("release-provenance.ts publish-staged");
   expect(workflow).toContain("release-provenance.ts verify-registry");
@@ -2025,4 +2029,137 @@ test("package lifecycle rejects direct publication outside the preserved-artifac
   expect(packageJson.devDependencies["@sigstore/protobuf-specs"]).toBe("0.5.1");
   expect(packageJson.devDependencies["@sigstore/verify"]).toBe("3.1.1");
   expect(packageJson.devDependencies.sigstore).toBeUndefined();
+});
+
+const breakGlassContext = {
+  name: "@hasna/accounts",
+  version: "0.2.21",
+  commit: "27cffd716ccf99c036f089f3eb75ee13554a7792",
+  dirty: false,
+};
+const breakGlassReason = "npm OIDC degraded during a fleet limit-switching outage";
+
+test("direct publish stays forbidden when no break-glass override is requested", () => {
+  expect(() => evaluateDirectPublish({}, breakGlassContext))
+    .toThrow("direct npm publish is forbidden");
+  expect(() => evaluateDirectPublish({ [BREAK_GLASS_ENV]: "   " }, breakGlassContext))
+    .toThrow("direct npm publish is forbidden");
+  // The refusal must point at the documented escape hatch instead of dead-ending.
+  expect(() => evaluateDirectPublish({}, breakGlassContext)).toThrow(BREAK_GLASS_ENV);
+});
+
+test("break-glass refuses ambiguous truthy values so it cannot be enabled by accident", () => {
+  for (const value of ["1", "true", "yes", "on", BREAK_GLASS_TOKEN.toUpperCase()]) {
+    expect(() =>
+      evaluateDirectPublish(
+        { [BREAK_GLASS_ENV]: value, [BREAK_GLASS_REASON_ENV]: breakGlassReason },
+        breakGlassContext,
+      )
+    ).toThrow("must be set to exactly");
+  }
+});
+
+test("break-glass is refused inside GitHub Actions so CI cannot skip verified publication", () => {
+  expect(() =>
+    evaluateDirectPublish(
+      {
+        [BREAK_GLASS_ENV]: BREAK_GLASS_TOKEN,
+        [BREAK_GLASS_REASON_ENV]: breakGlassReason,
+        GITHUB_ACTIONS: "true",
+      },
+      breakGlassContext,
+    )
+  ).toThrow("refused inside GitHub Actions");
+});
+
+test("break-glass demands a recorded reason of substance", () => {
+  expect(() =>
+    evaluateDirectPublish({ [BREAK_GLASS_ENV]: BREAK_GLASS_TOKEN }, breakGlassContext)
+  ).toThrow(BREAK_GLASS_REASON_ENV);
+  expect(() =>
+    evaluateDirectPublish(
+      { [BREAK_GLASS_ENV]: BREAK_GLASS_TOKEN, [BREAK_GLASS_REASON_ENV]: "oops" },
+      breakGlassContext,
+    )
+  ).toThrow(`at least ${BREAK_GLASS_MIN_REASON_LENGTH} characters`);
+});
+
+test("break-glass refuses an untraceable working tree", () => {
+  expect(() =>
+    evaluateDirectPublish(
+      { [BREAK_GLASS_ENV]: BREAK_GLASS_TOKEN, [BREAK_GLASS_REASON_ENV]: breakGlassReason },
+      { ...breakGlassContext, dirty: true },
+    )
+  ).toThrow("working tree");
+});
+
+test("break-glass allows an audited emergency publish and announces exactly what was skipped", () => {
+  const banner = evaluateDirectPublish(
+    { [BREAK_GLASS_ENV]: BREAK_GLASS_TOKEN, [BREAK_GLASS_REASON_ENV]: breakGlassReason },
+    breakGlassContext,
+  );
+  const rendered = banner.join("\n");
+  expect(rendered).toContain("BREAK-GLASS DIRECT PUBLISH");
+  expect(rendered).toContain(`${breakGlassContext.name}@${breakGlassContext.version}`);
+  expect(rendered).toContain(breakGlassContext.commit);
+  expect(rendered).toContain(breakGlassReason);
+  expect(rendered).toContain("provenance");
+  expect(rendered).toContain("docs/RELEASING.md");
+});
+
+test("pinned toolchain has exactly one declaration that every consumer reads", () => {
+  const pinned = JSON.parse(
+    readFileSync(new URL("./release-toolchain.json", import.meta.url), "utf8"),
+  ) as Record<string, string>;
+  expect(pinned.node).toBe(RELEASE_NODE_VERSION);
+  expect(pinned.npm).toBe(RELEASE_NPM_VERSION);
+  expect(pinned.bun).toBe(RELEASE_BUN_VERSION);
+
+  const implementation = readFileSync(
+    new URL("./release-provenance.ts", import.meta.url),
+    "utf8",
+  );
+  // The literals must not be restated in TypeScript either.
+  expect(implementation).toContain("release-toolchain.json");
+  expect(implementation).not.toContain(`RELEASE_NODE_VERSION = "${RELEASE_NODE_VERSION}"`);
+
+  for (const relative of ["../.github/workflows/ci.yml", "../.github/workflows/release.yml"]) {
+    const workflow = readFileSync(new URL(relative, import.meta.url), "utf8");
+    // setup-node / setup-bun inputs cannot read a file, so a test binds them instead.
+    expect(workflow).toContain(`node-version: "${RELEASE_NODE_VERSION}"`);
+    expect(workflow).toContain(`bun-version: "${RELEASE_BUN_VERSION}"`);
+    expect(workflow).not.toMatch(/\[\[ "\$\(?node --version\)?" ==/);
+    expect(workflow).not.toMatch(/== "1\.3\.14" \]\]/);
+    expect(workflow).toContain("node scripts/assert-toolchain.mjs");
+  }
+});
+
+test("release workflow names its missing environment secrets before doing any work", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  const preflightStep = workflow.indexOf("release-provenance.ts preflight");
+  const secretsStep = workflow.indexOf("NPM_DIST_TAG_TOKEN is not configured");
+  expect(secretsStep).toBeGreaterThan(-1);
+  expect(secretsStep).toBeLessThan(preflightStep);
+  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN is not configured");
+  expect(workflow.indexOf("uses: actions/checkout")).toBeGreaterThan(secretsStep);
+});
+
+test("deterministic pack verification runs beside the test job, not inside it", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  expect(workflow).toContain("\n  pack:\n");
+  const packJob = workflow.slice(workflow.indexOf("\n  pack:\n"));
+  expect(packJob).toContain("bun run verify:pack");
+  const testJob = workflow.slice(
+    workflow.indexOf("\n  test:\n"),
+    workflow.indexOf("\n  pack:\n") > workflow.indexOf("\n  test:\n")
+      ? workflow.indexOf("\n  pack:\n")
+      : workflow.length,
+  );
+  expect(testJob).not.toContain("verify:pack");
 });
