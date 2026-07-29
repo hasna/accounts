@@ -19,6 +19,7 @@ import {
   resolveSessionConfigDir,
   switchAccount,
 } from "./lib/switch-account.js";
+import { publicSwitchResult } from "./lib/switch.js";
 import { loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -288,6 +289,44 @@ test("switchAccount swaps credentials and oauthAccount into the session dir", as
   expect(loadStore().current.claude).toBe("beta");
   // Beta's own profile dir must be untouched by handing its auth to a session.
   expect(dirAccessToken(betaDir)).toBe("beta@example.com-access");
+  rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("public switch projection excludes internal account and session details", async () => {
+  makeProfile("alpha", { email: "alpha@example.com" });
+  makeProfile("beta", { email: "beta@example.com" });
+  const sessionDir = mkdtempSync(join(tmpdir(), "swa-public-session-"));
+  writeIdentity(sessionDir, { email: "alpha@example.com" });
+
+  const internal = await switchAccount("beta", {
+    dir: sessionDir,
+    env: {},
+    allowUnregisteredDir: true,
+  });
+  internal.profile.cardLast4 = "4242";
+  internal.profile.metadata = { privateNote: "private-profile-metadata" };
+  internal.warnings.push("private warning with session details");
+
+  const output = publicSwitchResult(internal);
+  const serialized = JSON.stringify(output);
+
+  expect(output).toEqual({
+    schema: "hasna.accounts.switch-output/v1",
+    profile: { name: "beta", tool: "claude" },
+    tool: { id: "claude", label: "Claude Code" },
+    applied: false,
+    active: true,
+    command: [],
+    commandLine: "",
+    restartRequired: false,
+    message: "beta is now the active Claude Code profile",
+  });
+  expect(serialized).not.toContain(sessionDir);
+  expect(serialized).not.toContain("alpha@example.com");
+  expect(serialized).not.toContain("beta@example.com");
+  expect(serialized).not.toContain("4242");
+  expect(serialized).not.toContain("private-profile-metadata");
+  expect(serialized).not.toContain("private warning with session details");
   rmSync(sessionDir, { recursive: true, force: true });
 });
 

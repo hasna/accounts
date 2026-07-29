@@ -11,6 +11,7 @@ import {
 } from "./env.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 import { resolveStore, type AccountsStore } from "./store.js";
+import type { SwitchAccountResult } from "./switch-account.js";
 import {
   BUILTIN_TOOLS,
   getTool,
@@ -81,9 +82,11 @@ export function publicSwitchMessage(
     : `${profileName} is now the active ${toolLabel} profile`;
 }
 
-/** Project an internal launch result to the only shape allowed on public output. */
-export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
-  const command = redactArgv(result.command);
+/** Project an internal switch result to the only shape allowed on public output. */
+export function publicSwitchResult(result: SwitchResult | SwitchAccountResult): PublicSwitchResult {
+  const launchResult = "command" in result ? result : undefined;
+  const command = redactArgv(launchResult?.command ?? []);
+  const applied = "dirKind" in result ? result.dirKind === "live-default" : result.applied;
   const toolLabel = publicToolLabel(result.tool.id);
   return {
     schema: "hasna.accounts.switch-output/v1",
@@ -95,13 +98,13 @@ export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
       id: result.tool.id,
       label: toolLabel,
     },
-    applied: result.applied,
-    active: result.active,
+    applied,
+    active: launchResult?.active ?? true,
     command,
-    commandLine: commandLine(redactEnvironment(result.env), command),
-    ...(result.permissions ? { permissions: redactText(result.permissions) } : {}),
+    commandLine: launchResult ? commandLine(redactEnvironment(launchResult.env), command) : "",
+    ...(launchResult?.permissions ? { permissions: redactText(launchResult.permissions) } : {}),
     restartRequired: result.restartRequired,
-    message: publicSwitchMessage(result.profile.name, toolLabel, result.applied),
+    message: publicSwitchMessage(result.profile.name, toolLabel, applied),
   };
 }
 
