@@ -1,8 +1,9 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addProfile } from "./lib/profiles.js";
+import { addProfile, updateProfile } from "./lib/profiles.js";
 import {
   ensureProfileAuthSnapshot,
   restoreClaudeAuthIntoDir,
@@ -87,6 +88,14 @@ function dirAccessToken(dir: string): string {
   return data.claudeAiOauth?.accessToken ?? "";
 }
 
+function runCli(...args: string[]) {
+  return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: { ...process.env },
+  });
+}
+
 // --- resolveSessionConfigDir -------------------------------------------------
 
 test("resolveSessionConfigDir prefers explicit dir over env and live default", () => {
@@ -143,6 +152,76 @@ test("listDirLiveSessions returns empty for a dir without session files", () => 
 
 test("switchAccount rejects an unknown profile", async () => {
   await expect(switchAccount("ghost", { env: {} })).rejects.toThrow(AccountsError);
+});
+
+test("switch-account CLI projects JSON and human output through the public switch DTO", () => {
+  const targetDir = makeProfile("safe-target", { email: "target-secret@example.com" });
+  updateProfile("safe-target", {
+    cardLast4: "4242",
+    metadata: { private: "profile-metadata-secret" },
+  });
+
+  const jsonDir = mkdtempSync(join(tmpdir(), "swa-json-secret-"));
+  writeIdentity(jsonDir, { email: "previous-json-secret@example.com" });
+  const json = runCli(
+    "switch-account",
+    "safe-target",
+    "--dir",
+    jsonDir,
+    "--allow-unregistered-dir",
+    "--json",
+  );
+
+  expect(json.status).toBe(0);
+  expect(JSON.parse(json.stdout)).toEqual({
+    schema: "hasna.accounts.switch-output/v1",
+    profile: { name: "safe-target", tool: "claude" },
+    tool: { id: "claude", label: "Claude Code" },
+    applied: false,
+    active: true,
+    command: [],
+    commandLine: "",
+    restartRequired: false,
+    message: "safe-target is now the active Claude Code profile",
+  });
+  for (const secret of [
+    "target-secret@example.com",
+    "previous-json-secret@example.com",
+    "4242",
+    "profile-metadata-secret",
+    targetDir,
+    jsonDir,
+  ]) {
+    expect(json.stdout).not.toContain(secret);
+  }
+
+  const humanDir = mkdtempSync(join(tmpdir(), "swa-human-secret-"));
+  writeIdentity(humanDir, { email: "previous-human-secret@example.com" });
+  const human = runCli(
+    "switch-account",
+    "safe-target",
+    "--dir",
+    humanDir,
+    "--allow-unregistered-dir",
+  );
+
+  expect(human.status).toBe(0);
+  expect(human.stdout).toContain("safe-target is now the active Claude Code profile");
+  expect(human.stdout).toContain("verify: the session's next reply runs as the new account");
+  for (const secret of [
+    "target-secret@example.com",
+    "previous-human-secret@example.com",
+    "4242",
+    "profile-metadata-secret",
+    targetDir,
+    humanDir,
+  ]) {
+    expect(human.stdout).not.toContain(secret);
+  }
+
+  rmSync(jsonDir, { recursive: true, force: true });
+  rmSync(humanDir, { recursive: true, force: true });
+  rmSync(targetDir, { recursive: true, force: true });
 });
 
 // --- 63e642c1: aged-out access token vs genuinely dead credential ------------

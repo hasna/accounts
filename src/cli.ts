@@ -908,23 +908,23 @@ program
           // Deliberate, human-typed override only. `usage-hook` never sets it.
           allowUnregisteredDir: opts.allowUnregisteredDir,
         });
+        const output = publicSwitchResult({
+          profile: result.profile,
+          tool: result.tool,
+          applied: result.dirKind === "live-default",
+          active: true,
+          restartRequired: result.restartRequired,
+        });
         if (opts.json) {
-          console.log(JSON.stringify(result, null, 2));
+          console.log(JSON.stringify(output, null, 2));
           return;
         }
         if (result.alreadyActive) {
-          console.log(chalk.yellow(`• ${result.message}`));
+          console.log(chalk.yellow(`• ${output.message}`));
           return;
         }
-        console.log(chalk.green(`✓ ${result.message}`));
-        console.log(chalk.dim(`  config dir: ${result.configDir} (${result.dirKind})`));
-        if (result.previousEmail) {
-          console.log(chalk.dim(`  identity: ${result.previousEmail} → ${result.profile.email ?? result.profile.name}`));
-        }
-        if (result.snapshotBackProfile) {
-          console.log(chalk.dim(`  outgoing credentials snapshotted to ${result.snapshotBackProfile}`));
-        }
-        for (const warning of result.warnings) console.log(chalk.yellow(`  ! ${warning}`));
+        console.log(chalk.green(`✓ ${output.message}`));
+        if (output.applied) console.log(chalk.dim("  live/default auth updated"));
         console.log(chalk.dim("  verify: the session's next reply runs as the new account; /status shows the email"));
       },
     ),

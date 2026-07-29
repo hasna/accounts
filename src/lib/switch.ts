@@ -62,6 +62,11 @@ export interface PublicSwitchResult {
   message: string;
 }
 
+type PublicSwitchInput = Pick<
+  SwitchResult,
+  "profile" | "tool" | "applied" | "active" | "restartRequired"
+> & Partial<Pick<SwitchResult, "env" | "command" | "permissions">>;
+
 function commandLine(env: Record<string, string>, command: string[]): string {
   return `${formatEnvAssignments(env)} ${command.map(quotePosixShellWord).join(" ")}`.trim();
 }
@@ -81,9 +86,9 @@ export function publicSwitchMessage(
     : `${profileName} is now the active ${toolLabel} profile`;
 }
 
-/** Project an internal launch result to the only shape allowed on public output. */
-export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
-  const command = redactArgv(result.command);
+/** Project an internal switch result to the only shape allowed on public output. */
+export function publicSwitchResult(result: PublicSwitchInput): PublicSwitchResult {
+  const command = redactArgv(result.command ?? []);
   const toolLabel = publicToolLabel(result.tool.id);
   return {
     schema: "hasna.accounts.switch-output/v1",
@@ -98,7 +103,7 @@ export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
     applied: result.applied,
     active: result.active,
     command,
-    commandLine: commandLine(redactEnvironment(result.env), command),
+    commandLine: command.length > 0 ? commandLine(redactEnvironment(result.env ?? {}), command) : "",
     ...(result.permissions ? { permissions: redactText(result.permissions) } : {}),
     restartRequired: result.restartRequired,
     message: publicSwitchMessage(result.profile.name, toolLabel, result.applied),
