@@ -165,6 +165,21 @@ test("a rotated-away live file must NOT overwrite the parked snapshot", () => {
   expect(classifyCredentialFile(profileCredentialsSnapshot(dir)).state).toBe("usable");
 });
 
+test("a sharply truncated non-empty refresh token must NOT overwrite the parked snapshot", () => {
+  const dir = makeProfile("alpha", UUID_A, "alpha");
+  const parked = readFileSync(profileCredentialsSnapshot(dir));
+
+  // Presence alone is not plausibility: before the local length-regression
+  // guard this tied with the full token and won because its mtime was newer.
+  writeFileSync(join(dir, ".credentials.json"), credentialJson({ label: "truncated", refreshToken: "x" }));
+  const snapMtime = statSync(profileCredentialsSnapshot(dir)).mtimeMs;
+  utimesSync(join(dir, ".credentials.json"), new Date(), new Date(snapMtime + 60_000));
+
+  ensureProfileAuthSnapshot(dir, tool());
+
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
+});
+
 test("POSITIVE CONTROL: a genuinely rotated NEWER credential still replaces the snapshot", () => {
   // Without this, the test above is satisfied by never refreshing snapshots at
   // all — which would reintroduce the bug the mtime rule exists to prevent:
@@ -173,7 +188,10 @@ test("POSITIVE CONTROL: a genuinely rotated NEWER credential still replaces the 
   const dir = makeProfile("alpha", UUID_A, "alpha");
   const before = readFileSync(profileCredentialsSnapshot(dir), "utf8");
 
-  writeFileSync(join(dir, ".credentials.json"), credentialJson({ label: "rotated-fresh" }));
+  writeFileSync(
+    join(dir, ".credentials.json"),
+    credentialJson({ label: "rotated-fresh", refreshToken: "fresh-token" }),
+  );
   const snapMtime = statSync(profileCredentialsSnapshot(dir)).mtimeMs;
   utimesSync(join(dir, ".credentials.json"), new Date(), new Date(snapMtime + 60_000));
 
@@ -182,6 +200,7 @@ test("POSITIVE CONTROL: a genuinely rotated NEWER credential still replaces the 
   const after = readFileSync(profileCredentialsSnapshot(dir), "utf8");
   expect(after).not.toBe(before);
   expect(JSON.parse(after).claudeAiOauth.accessToken).toBe("rotated-fresh-access");
+  expect(JSON.parse(after).claudeAiOauth.refreshToken).toBe("fresh-token");
 });
 
 test("POSITIVE CONTROL: a fresh login (overwrite) still replaces the parked snapshot", () => {

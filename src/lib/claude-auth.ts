@@ -171,17 +171,21 @@ function findOAuthSource(paths: string[]): { path: string; oauth: JsonRecord } |
  * this way, surviving only because the central store refused the same downgrade.
  *
  * The central store never had this hole — `syncCredentialsFile` in auth-store.ts
- * replaces central only with a strict `betterCredential` winner. This restores
- * the symmetry the comment above already claims: the two layers rank credentials
- * identically. `betterCredential` orders on refresh-token presence, then
- * usability, then mtime, so it subsumes the staleness rule rather than
- * contradicting it — a genuinely rotated token still wins, and a blank never
- * does.
+ * replaces central only with a strict `betterCredential` winner. That shared
+ * ordering subsumes the staleness rule rather than contradicting it: a genuinely
+ * rotated token still wins, and a blank never does. This snapshot-only guard is
+ * deliberately stricter about one additional degradation shape: a non-empty
+ * refresh token sharply truncated relative to the parked copy. Global merge
+ * callers retain `betterCredential`'s presence-based semantics.
  */
 function wouldDowngradeSnapshot(sourcePath: string, snapshotPath: string): boolean {
   const source = credentialHealth(sourcePath);
   const snapshot = credentialHealth(snapshotPath);
   if (!snapshot.exists || !source.exists) return false;
+  // Token rotations can change encoded length slightly. Falling below half the
+  // parked length is instead evidence of truncation, even when one character
+  // remains and `betterCredential` therefore sees refresh-token presence.
+  if (source.refreshTokenLength * 2 < snapshot.refreshTokenLength) return true;
   return betterCredential(source, snapshot) !== source;
 }
 
