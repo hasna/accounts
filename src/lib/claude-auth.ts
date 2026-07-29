@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDef } from "../types.js";
@@ -474,6 +475,19 @@ export interface ParkedRecoveryResult {
   layers?: ProfileCredentialLayers;
 }
 
+const UNREADABLE_CREDENTIAL_ARCHIVE_PREFIX = "credentials.unreadable.";
+
+/** Preserve unknown live bytes before recovery replaces them with a known credential. */
+function preserveUnreadableLiveCredential(profileDir: string, livePath: string): string {
+  const timestamp = new Date().toISOString().replaceAll(":", "-");
+  const archivePath = join(
+    profileAuthDir(profileDir),
+    `${UNREADABLE_CREDENTIAL_ARCHIVE_PREFIX}${timestamp}.${randomUUID()}.json`,
+  );
+  writeFileAtomic(archivePath, readFileSync(livePath), { mode: 0o600, mustStayUnder: profileDir });
+  return archivePath;
+}
+
 /**
  * Put a profile's own PARKED credential back into its dir when the dir's live
  * copy has been rotated away.
@@ -503,8 +517,9 @@ export interface ParkedRecoveryResult {
  * silently.
  *
  * Nothing is deleted: the parked snapshot and the central store are read-only
- * here, and the only file overwritten is a live slot already proven to hold no
- * credential material.
+ * here. A live slot with the known `rotated-away` fingerprint is worthless and
+ * can be replaced directly. An `unreadable` live slot is unknown rather than
+ * worthless, so its exact bytes are archived before it is replaced.
  */
 export function recoverParkedCredential(
   profileDir: string,
@@ -583,12 +598,18 @@ export function recoverParkedCredential(
   // with it — recovery is an improvement on the way past, not a precondition.
   // `restoreClaudeAuthIntoDir` throws for a profile with no OAuth account data,
   // and that profile still deserves to launch and reach its own error.
+  let preservedLiveCredential: string | undefined;
   try {
+    if (layers.live.state === "unreadable") {
+      preservedLiveCredential = preserveUnreadableLiveCredential(profileDir, layers.live.path);
+    }
     restoreClaudeAuthIntoDir(profileDir, tool, profileDir, profileName);
   } catch (error) {
     return {
       outcome: "failed",
-      detail: `could not restore the parked credential: ${error instanceof Error ? error.message : String(error)}`,
+      detail:
+        `could not restore the parked credential: ${error instanceof Error ? error.message : String(error)}` +
+        `${preservedLiveCredential ? `; preserved the unreadable live file at ${preservedLiveCredential}` : ""}`,
       layers,
     };
   }
@@ -598,7 +619,8 @@ export function recoverParkedCredential(
     outcome: "recovered",
     detail:
       `restored this profile's own parked credential from the ${verdict.restorableLayers[0]} ` +
-      `(the dir's copy was ${describeCredentialState(layers.live.state)})`,
+      `(the dir's copy was ${describeCredentialState(layers.live.state)})` +
+      `${preservedLiveCredential ? `; preserved the unreadable live file at ${preservedLiveCredential}` : ""}`,
     layers,
   };
 }

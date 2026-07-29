@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile } from "./lib/profiles.js";
@@ -96,6 +96,12 @@ function dirCredential(dir: string): { accessToken?: string; refreshToken?: stri
     claudeAiOauth?: { accessToken?: string; refreshToken?: string };
   };
   return raw.claudeAiOauth ?? {};
+}
+
+function unreadableCredentialArchives(dir: string): string[] {
+  return readdirSync(join(dir, ".accounts-auth"))
+    .filter((entry) => entry.startsWith("credentials.unreadable."))
+    .map((entry) => join(dir, ".accounts-auth", entry));
 }
 
 // --- classification ---------------------------------------------------------
@@ -246,6 +252,24 @@ test("recoverParkedCredential restores the parked credential into a rotated-away
   // ARCHIVE-NEVER-DELETE: the parked copy is the only source of this material
   // and must survive the restore byte-for-byte.
   expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(snapshotBefore);
+  // `rotated-away` is a known-spent payload, not unknown evidence worth keeping.
+  expect(unreadableCredentialArchives(dir)).toEqual([]);
+});
+
+test("recovery preserves an unreadable live credential before replacing it", () => {
+  const dir = makeProfile("alpha", UUID_A, "alpha");
+  const unknownPayload = Buffer.from('{"schemaVersion":2,"foreignCredential":{"opaque":"keep-me"}}\n');
+  writeFileSync(join(dir, ".credentials.json"), unknownPayload);
+  expect(classifyCredentialFile(join(dir, ".credentials.json")).state).toBe("unreadable");
+
+  const result = recoverParkedCredential(dir, tool(), "alpha");
+
+  expect(result.outcome).toBe("recovered");
+  expect(classifyCredentialFile(join(dir, ".credentials.json")).state).toBe("usable");
+  const archives = unreadableCredentialArchives(dir);
+  expect(archives).toHaveLength(1);
+  expect(readFileSync(archives[0]!)).toEqual(unknownPayload);
+  expect(statSync(archives[0]!).mode & 0o777).toBe(0o600);
 });
 
 test("recovery works even with live sessions attached — there is no identity to yank", () => {
