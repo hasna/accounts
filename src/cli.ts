@@ -39,7 +39,7 @@ import {
   sweepCentralAuth,
   type SyncResult,
 } from "./lib/auth-store.js";
-import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
+import { ensureProfileAuthSnapshot, recoverParkedCredential } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -49,7 +49,7 @@ import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
-import { resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
 import { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
 import {
   DEFAULT_COOLDOWN_MS,
@@ -57,8 +57,10 @@ import {
   DEFAULT_MIN_SESSION_HEADROOM,
   DEFAULT_SWITCH_THRESHOLD,
   readAutoSwitchState,
+  readHookNoticeState,
   readUsageCache,
   writeAutoSwitchState,
+  writeHookNoticeState,
 } from "./lib/auto-switch.js";
 import {
   activeCooldowns,
@@ -73,7 +75,17 @@ import {
   pickHealthiestAccount,
   type AccountUsageEntry,
 } from "./lib/usage-report.js";
-import { hookOutputJson, runUsageHook } from "./lib/usage-hook.js";
+import {
+  DEFAULT_HOOK_NOTICE_INTERVAL_MS,
+  DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS,
+  hookOutputJson,
+  runUsageHook,
+} from "./lib/usage-hook.js";
+import {
+  describeCredentialState,
+  parkedCredentialVerdict,
+  profileCredentialLayers,
+} from "./lib/credential-state.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -853,12 +865,16 @@ program
   .option("-t, --tool <tool>", "tool id (in-place switching supports claude only)", DEFAULT_TOOL)
   .option("--dir <path>", "session config dir (default: $CLAUDE_CONFIG_DIR, else the live default)")
   .option("--yes", "proceed even when several live sessions share the config dir")
+  .option(
+    "--allow-unregistered-dir",
+    "write credentials into a dir that is neither the live config dir nor a registered profile dir",
+  )
   .option("--json", "output JSON")
   .action(
     action(
       async (
         name: string | undefined,
-        opts: { tool?: string; dir?: string; yes?: boolean; json?: boolean },
+        opts: { tool?: string; dir?: string; yes?: boolean; allowUnregisteredDir?: boolean; json?: boolean },
       ) => {
         let target = name;
         if (!target) {
@@ -870,6 +886,8 @@ program
           tool: opts.tool,
           dir: opts.dir,
           yes: opts.yes,
+          // Deliberate, human-typed override only. `usage-hook` never sets it.
+          allowUnregisteredDir: opts.allowUnregisteredDir,
         });
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
@@ -999,8 +1017,13 @@ existing "UserPromptSubmit" hooks, do not replace them:
 
 Tuning (env or flags): ACCOUNTS_USAGE_SWITCH_THRESHOLD (default ${DEFAULT_SWITCH_THRESHOLD}),
 ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM (${DEFAULT_MIN_HEADROOM}), ACCOUNTS_USAGE_SWITCH_COOLDOWN_S (${DEFAULT_COOLDOWN_MS / 1000}),
-ACCOUNTS_USAGE_CACHE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000}).
-Decisions use cached usage only; warm it with a cron/loop running: accounts usage --refresh --quiet`;
+ACCOUNTS_USAGE_CACHE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000}),
+ACCOUNTS_USAGE_CACHE_STALE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS / 1000}),
+ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S (${DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000}).
+Decisions use cached usage only; warm it with a cron/loop running: accounts usage --refresh --quiet
+A reading past the freshness age still decides — usage inside a window only rises, so a stale
+number can miss a switch but never invent one. Past the stale age the hook says so out loud.
+The cooldown is per config dir, so one session's switch never blocks another's.`;
 
 function usageHookLog(line: string): void {
   try {
@@ -1023,8 +1046,10 @@ program
   .option("--threshold <percent>", "switch when any unscoped usage window is at/over this percent used")
   .option("--min-headroom <percent>", "a switch target must have at least this much WEEKLY headroom")
   .option("--min-session-headroom <percent>", "a switch target must have at least this much 5-hour headroom")
-  .option("--cooldown <seconds>", "minimum time between auto-switch attempts")
-  .option("--max-age <seconds>", "usage cache tolerance for decisions")
+  .option("--cooldown <seconds>", "minimum time between auto-switch attempts FOR THIS CONFIG DIR")
+  .option("--max-age <seconds>", "usage cache age still considered fresh")
+  .option("--stale-max-age <seconds>", "oldest usage cache still worth deciding from")
+  .option("--notice-interval <seconds>", "minimum gap between repeats of the same degraded notice")
   .option("--print-install", "print the settings.json snippet that enables the hook, then exit")
   .action(
     async (opts: {
@@ -1035,6 +1060,8 @@ program
       minSessionHeadroom?: string;
       cooldown?: string;
       maxAge?: string;
+      staleMaxAge?: string;
+      noticeInterval?: string;
       printInstall?: boolean;
     }) => {
       if (opts.printInstall) {
@@ -1060,6 +1087,18 @@ program
             cooldownMs: hookNumber(opts.cooldown, "ACCOUNTS_USAGE_SWITCH_COOLDOWN_S", DEFAULT_COOLDOWN_MS / 1000) * 1000,
             cacheMaxAgeMs:
               hookNumber(opts.maxAge, "ACCOUNTS_USAGE_CACHE_MAX_AGE_S", DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000) * 1000,
+            staleCacheMaxAgeMs:
+              hookNumber(
+                opts.staleMaxAge,
+                "ACCOUNTS_USAGE_CACHE_STALE_MAX_AGE_S",
+                DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS / 1000,
+              ) * 1000,
+            noticeIntervalMs:
+              hookNumber(
+                opts.noticeInterval,
+                "ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S",
+                DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000,
+              ) * 1000,
           },
           {
             currentAccountUuid: (dir) => dirAccountUuid(dir, tool),
@@ -1083,8 +1122,16 @@ program
               const result = await switchAccount(profileName, { tool: opts.tool, dir, yes: true }, store);
               return { liveSessions: result.liveSessions };
             },
-            readState: () => readAutoSwitchState(),
-            writeState: (state) => writeAutoSwitchState(state),
+            // Anti-flap state is keyed by THIS session's config dir. It used to
+            // be one file per machine, so an unrelated session's switch blocked
+            // every other session for ten minutes, silently.
+            readState: () => readAutoSwitchState(configDir),
+            writeState: (state) => writeAutoSwitchState(state, configDir),
+            // Contention detection: an account another dir is actively running
+            // must not be taken as a switch target.
+            liveSessionsIn: (dir) => listDirLiveSessions(dir).filter((session) => session.alive).length,
+            readNotices: () => readHookNoticeState(),
+            writeNotices: (state) => writeHookNoticeState(state),
             activeCooldowns: (at) => activeCooldowns(readExhaustionLedger(), at),
             recordExhaustion: (input) => {
               recordExhaustion(input);
@@ -1092,14 +1139,107 @@ program
             clearExhaustion: (accountUuid) => clearExhaustion(accountUuid),
           },
         );
-        usageHookLog(`${outcome.action}${outcome.reason ? ` reason=${JSON.stringify(outcome.reason)}` : ""}`);
+        // The destination is logged on every invocation: it is the directory a
+        // switch would write credentials into, and an unexpected value here is
+        // the first sign of a caller steering the hook somewhere it should not.
+        usageHookLog(
+          `${outcome.action}${outcome.reason ? ` reason=${JSON.stringify(outcome.reason)}` : ""}` +
+            ` dir=${JSON.stringify(configDir)}`,
+        );
         const output = hookOutputJson(outcome);
         if (output) console.log(output);
       } catch (error) {
-        usageHookLog(`fail-open error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+        // Anything thrown BEFORE runUsageHook could install its own handler:
+        // resolving the tool, the store, or the session dir. runUsageHook's
+        // internal catch speaks; without this one, those earlier failures stay
+        // exactly as silent as the outcomes this change exists to expose — a
+        // misconfigured registry would kill auto-switching with no symptom but
+        // a log line nobody reads.
+        const reason = error instanceof Error ? error.message : String(error);
+        usageHookLog(`fail-open error=${JSON.stringify(reason)}`);
+        try {
+          const notices = readHookNoticeState() ?? {};
+          const last = Date.parse(notices["fail-open"] ?? "");
+          const now = Date.now();
+          if (!Number.isFinite(last) || now - last >= DEFAULT_HOOK_NOTICE_INTERVAL_MS) {
+            writeHookNoticeState({ ...notices, "fail-open": new Date(now).toISOString() });
+            console.log(
+              JSON.stringify({
+                systemMessage:
+                  `accounts: usage-based auto-switching is NOT running for this session — ${reason}. ` +
+                  `The session keeps working, but nothing will move it off an account that runs out.`,
+              }),
+            );
+          }
+        } catch {
+          // The notice is best-effort. An unwritable ACCOUNTS_HOME must not
+          // turn fail-open into a non-zero exit.
+        }
       }
       process.exitCode = 0;
     },
+  );
+
+program
+  .command("repair-auth")
+  .argument("[name]", "profile to repair (all Claude profiles when omitted)")
+  .description("put a profile's parked credential back when its live copy was rotated away by another copy of the same account")
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("--dry-run", "report what would be repaired without writing anything")
+  .option("--json", "output JSON")
+  .action(
+    action(async (name: string | undefined, opts: { tool: string; dryRun?: boolean; json?: boolean }) => {
+      const tool = getTool(opts.tool);
+      const store = resolveStore();
+      const profiles = (await store.listProfiles(opts.tool)).filter((p) => (name ? p.name === name : true));
+      if (name && profiles.length === 0) throw new AccountsError(`no profile named "${name}" for tool "${opts.tool}"`);
+
+      const rows = profiles.map((profile) => {
+        const layers = profileCredentialLayers(profile.dir, tool);
+        const verdict = parkedCredentialVerdict(layers);
+        // --dry-run must not write, so it reports the verdict instead of acting.
+        const result = opts.dryRun
+          ? {
+              outcome: verdict.recoverable ? ("would-recover" as const) : ("nothing-to-do" as const),
+              detail: verdict.recoverable
+                ? `parked copy in the ${verdict.restorableLayers.join(" and ")} would be restored`
+                : `live credential is ${describeCredentialState(layers.live.state)}`,
+            }
+          : recoverParkedCredential(profile.dir, tool, profile.name);
+        return {
+          profile: profile.name,
+          dir: profile.dir,
+          live: layers.live.state,
+          snapshot: layers.snapshot.state,
+          ...(layers.central ? { central: layers.central.state } : {}),
+          outcome: result.outcome,
+          detail: result.detail,
+        };
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify({ dryRun: Boolean(opts.dryRun), profiles: rows }, null, 2));
+        return;
+      }
+      const acted = rows.filter((r) => r.outcome === "recovered" || r.outcome === "would-recover");
+      const blocked = rows.filter((r) => r.outcome === "identity-would-change" || r.outcome === "no-parked-credential");
+      console.log("");
+      for (const row of [...acted, ...blocked]) {
+        const colour =
+          row.outcome === "recovered" || row.outcome === "would-recover"
+            ? chalk.green
+            : row.outcome === "no-parked-credential"
+              ? chalk.red
+              : chalk.yellow;
+        console.log(`  ${chalk.bold(row.profile)} — ${colour(row.outcome)}`);
+        console.log(chalk.dim(`    live=${row.live} snapshot=${row.snapshot}${row.central ? ` central=${row.central}` : ""}`));
+        console.log(chalk.dim(`    ${row.detail}`));
+      }
+      if (acted.length === 0 && blocked.length === 0) {
+        console.log(chalk.dim(`  nothing to repair across ${rows.length} profile(s)`));
+      }
+      console.log("");
+    }),
   );
 
 const hook = program.command("hook").description("install a shell wrapper for claude");
