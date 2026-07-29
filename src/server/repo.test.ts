@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
-import { AccountsRepo } from "./repo.js";
+import { accountNameLockKey, AccountsRepo, toolLockKey } from "./repo.js";
 
 const OLD_ROW = {
   tool: "claude",
@@ -94,5 +94,80 @@ describe("AccountsRepo account/current atomicity", () => {
     expect(fixture.evidence().transactions).toBe(1);
     expect(fixture.evidence().statements.some((sql) => /FOR UPDATE/.test(sql))).toBe(true);
     expect(fixture.evidence().statements.some((sql) => /DELETE FROM current_selections/.test(sql))).toBe(false);
+  });
+});
+
+/**
+ * A client that records the advisory-lock KEYS a call takes, in order.
+ *
+ * `existingName` is the only name the fake registry knows about, matched
+ * against any bound parameter so the fixture does not have to mirror the exact
+ * shape of the repository's lookup query.
+ */
+function lockRecordingClient(existingName: string | null) {
+  const lockKeys: string[] = [];
+  const row = {
+    ...OLD_ROW,
+    name: existingName ?? OLD_ROW.name,
+  };
+  const tx: TypedQueryClient = {
+    async query() {
+      return { rows: [], rowCount: 0 };
+    },
+    async many() {
+      return [];
+    },
+    async get(_sql, params) {
+      const wanted = existingName !== null && (params ?? []).includes(existingName);
+      return wanted ? row : null;
+    },
+    async one() {
+      return row;
+    },
+    async execute(sql, params) {
+      if (/pg_advisory_xact_lock/.test(sql)) lockKeys.push(String(params?.[0]));
+    },
+  };
+  const client = {
+    pool: {} as never,
+    close: async () => {},
+    async transaction<T>(fn: (client: TypedQueryClient) => Promise<T>): Promise<T> {
+      return fn(tx);
+    },
+  } as unknown as PoolQueryClient;
+  return { client, lockKeys };
+}
+
+describe("AccountsRepo advisory lock keys", () => {
+  test("create takes the tool lock before the name lock", async () => {
+    const fixture = lockRecordingClient(null);
+    await new AccountsRepo(fixture.client).create({ tool: "claude", name: "alpha" });
+    expect(fixture.lockKeys).toEqual([toolLockKey("claude"), accountNameLockKey("alpha")]);
+  });
+
+  test("rename takes both name locks in sorted order whichever way round it is called", async () => {
+    // Two opposing renames over the same pair. If each followed its own
+    // argument order these two sequences would be reverses of each other,
+    // which is the deadlock. Sorting collapses them onto one order.
+    const forward = lockRecordingClient("alpha");
+    await new AccountsRepo(forward.client).rename("claude", "alpha", "beta");
+    const backward = lockRecordingClient("beta");
+    await new AccountsRepo(backward.client).rename("codex", "beta", "alpha");
+
+    const sorted = [accountNameLockKey("alpha"), accountNameLockKey("beta")];
+    expect(forward.lockKeys).toEqual(sorted);
+    expect(backward.lockKeys).toEqual(sorted);
+  });
+
+  test("rename to the same name takes that name lock once", async () => {
+    const fixture = lockRecordingClient("alpha");
+    await new AccountsRepo(fixture.client).rename("claude", "alpha", "alpha");
+    expect(fixture.lockKeys).toEqual([accountNameLockKey("alpha")]);
+  });
+
+  test("rename takes no tool lock, so tool and name locks cannot cycle", async () => {
+    const fixture = lockRecordingClient("alpha");
+    await new AccountsRepo(fixture.client).rename("claude", "alpha", "beta");
+    expect(fixture.lockKeys.filter((key) => key.startsWith("accounts:tool:"))).toEqual([]);
   });
 });

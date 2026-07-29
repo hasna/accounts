@@ -60,6 +60,48 @@ interface AccountRow {
   last_used_at: string | Date | null;
 }
 
+/**
+ * The single statement every advisory lock in this repository goes through.
+ *
+ * Exported so tests can park a blocker on the exact same lock the repository
+ * takes, instead of re-typing the SQL and silently drifting from it.
+ */
+export const ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+
+/**
+ * Lock namespaces, and the order in which a caller that needs both must take
+ * them: TOOL first, then NAME. No path acquires them the other way round, so
+ * the two namespaces cannot form a wait cycle.
+ *
+ * The tool lock is genuinely tool-scoped — it guards the custom-tool
+ * registration/tombstone races, where the contended resource is the tool id.
+ * It cannot also guard account-name uniqueness: two creates of the same name
+ * under different tools take DIFFERENT tool locks, so they never see each
+ * other. The name lock is what serializes name allocation across tools.
+ */
+export function toolLockKey(tool: string): string {
+  return `accounts:tool:${tool}`;
+}
+
+export function accountNameLockKey(name: string): string {
+  return `accounts:name:${name}`;
+}
+
+/**
+ * Deterministic, argument-order-independent acquisition order for a set of
+ * account-name locks.
+ *
+ * `rename()` holds two name locks at once. Two opposing renames over the same
+ * pair (`a -> b` and `b -> a`) would take them in opposite orders and deadlock
+ * if each simply followed its own argument order. Sorting collapses both onto
+ * one order, so one waits instead of both dying. Duplicates are dropped: an
+ * advisory lock taken twice in a transaction is harmless but the extra round
+ * trip is not free, and the deduped list is what the ordering test asserts on.
+ */
+export function sortedNameLockKeys(names: readonly string[]): string[] {
+  return [...new Set(names)].sort().map(accountNameLockKey);
+}
+
 function iso(value: string | Date | null | undefined): string | undefined {
   if (value === null || value === undefined) return undefined;
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -129,10 +171,7 @@ export class AccountsRepo implements AccountsStore {
   }
 
   private async lockToolRegistry(client: TypedQueryClient, tool: string): Promise<void> {
-    await client.execute(
-      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-      [`accounts:tool:${tool}`],
-    );
+    await client.execute(ADVISORY_LOCK_SQL, [toolLockKey(tool)]);
   }
 
   async create(input: CreateAccountInput): Promise<Account> {
