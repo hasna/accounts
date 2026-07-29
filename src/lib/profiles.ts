@@ -135,6 +135,24 @@ export interface AddOptions {
   description?: string;
 }
 
+/**
+ * One-account-one-tool: an account name identifies exactly one tool, because
+ * resolution is name-first — `resolveProfileFromStore` throws `exists for
+ * multiple tools` the moment two rows share a name, breaking every bare
+ * `accounts <cmd> <name>`. Same rule and error wording as the api transport
+ * (AccountsRepo.nameConflict, src/server/repo.ts) so both transports refuse a
+ * duplicate identically. Grandfathered collisions already in the store stay
+ * resolvable (via --tool or a tool lock); only NEW collisions are refused.
+ */
+function nameConflict(name: string, holderTool: string, tool: string): AccountsError {
+  return holderTool === tool
+    ? new AccountsError(`a ${tool} profile named "${name}" already exists`)
+    : new AccountsError(
+        `a profile named "${name}" already exists for tool "${holderTool}"; ` +
+          "account names must be unique across tools",
+      );
+}
+
 export function addProfile(opts: AddOptions): Profile {
   const name = opts.name;
   const nameCheck = profileNameSchema.safeParse(name);
@@ -144,8 +162,9 @@ export function addProfile(opts: AddOptions): Profile {
   const tool = getTool(toolId);
 
   const store = loadStore();
-  if (store.profiles.some((p) => p.name === name && p.tool === toolId)) {
-    throw new AccountsError(`a ${toolId} profile named "${name}" already exists`);
+  const holder = store.profiles.find((p) => p.name === name);
+  if (holder) {
+    throw nameConflict(name, holder.tool, toolId);
   }
 
   const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, name);
@@ -243,8 +262,11 @@ export function renameProfile(oldName: string, newName: string, toolId?: string)
     );
   }
   const profile = matches[0]!;
-  if (store.profiles.some((p) => p.name === newName && p.tool === profile.tool)) {
-    throw new AccountsError(`a ${profile.tool} profile named "${newName}" already exists`);
+  // Name-scoped, and skipped for a rename onto itself — the same semantics as
+  // AccountsRepo.rename (src/server/repo.ts), so both transports behave alike.
+  if (oldName !== newName) {
+    const holder = store.profiles.find((p) => p.name === newName);
+    if (holder) throw nameConflict(newName, holder.tool, profile.tool);
   }
 
   if (store.current[profile.tool] === oldName) store.current[profile.tool] = newName;
