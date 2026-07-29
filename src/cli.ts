@@ -39,7 +39,7 @@ import {
   sweepCentralAuth,
   type SyncResult,
 } from "./lib/auth-store.js";
-import { ensureProfileAuthSnapshot, recoverParkedCredential } from "./lib/claude-auth.js";
+import { ensureProfileAuthSnapshot, planParkedRecovery, recoverParkedCredential } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -87,11 +87,7 @@ import {
   hookOutputJson,
   runUsageHook,
 } from "./lib/usage-hook.js";
-import {
-  describeCredentialState,
-  parkedCredentialVerdict,
-  profileCredentialLayers,
-} from "./lib/credential-state.js";
+import { profileCredentialLayers } from "./lib/credential-state.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -1202,7 +1198,9 @@ program
 program
   .command("repair-auth")
   .argument("[name]", "profile to repair (all Claude profiles when omitted)")
-  .description("put a profile's parked credential back when its live copy was rotated away by another copy of the same account")
+  .description(
+    "put a profile's own parked credential back — when its live copy was rotated away by another copy of the SAME account, or when its dir is held by a DIFFERENT one",
+  )
   .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
   .option("--dry-run", "report what would be repaired without writing anything")
   .option("--json", "output JSON")
@@ -1214,16 +1212,16 @@ program
       if (name && profiles.length === 0) throw new AccountsError(`no profile named "${name}" for tool "${opts.tool}"`);
 
       const rows = profiles.map((profile) => {
-        const layers = profileCredentialLayers(profile.dir, tool);
-        const verdict = parkedCredentialVerdict(layers);
-        // --dry-run must not write, so it reports the verdict instead of acting.
+        // ONE DECISION, TWO CONSUMERS. `--dry-run` used to re-derive its own
+        // verdict from `parkedCredentialVerdict.recoverable`, so it could — and
+        // did — disagree with the acting path: an occupied dir reported
+        // `nothing-to-do / live credential is usable` because occupancy was
+        // invisible to a content-only verdict. Both paths now ask
+        // `planParkedRecovery`; dry-run just declines to execute the plan.
+        const plan = planParkedRecovery(profile.dir, tool, profile.name);
+        const layers = plan.layers ?? profileCredentialLayers(profile.dir, tool);
         const result = opts.dryRun
-          ? {
-              outcome: verdict.recoverable ? ("would-recover" as const) : ("nothing-to-do" as const),
-              detail: verdict.recoverable
-                ? `parked copy in the ${verdict.restorableLayers.join(" and ")} would be restored`
-                : `live credential is ${describeCredentialState(layers.live.state)}`,
-            }
+          ? { outcome: plan.action === "none" ? plan.outcome : `would-${plan.action}`, detail: plan.detail }
           : recoverParkedCredential(profile.dir, tool, profile.name);
         return {
           profile: profile.name,
@@ -1231,6 +1229,7 @@ program
           live: layers.live.state,
           snapshot: layers.snapshot.state,
           ...(layers.central ? { central: layers.central.state } : {}),
+          ...(layers.occupancy?.occupied ? { occupiedByAnotherAccount: true } : {}),
           outcome: result.outcome,
           detail: result.detail,
         };
@@ -1240,16 +1239,20 @@ program
         console.log(JSON.stringify({ dryRun: Boolean(opts.dryRun), profiles: rows }, null, 2));
         return;
       }
-      const acted = rows.filter((r) => r.outcome === "recovered" || r.outcome === "would-recover");
-      const blocked = rows.filter((r) => r.outcome === "identity-would-change" || r.outcome === "no-parked-credential");
+      const ACTED = new Set(["recovered", "would-recover", "reconciled", "would-reconcile"]);
+      // Everything an operator has to do something about. `occupied-by-another-account`
+      // is the whole point of this verb existing: silently omitting it is how
+      // seven dirs stayed occupied indefinitely.
+      const BLOCKED = new Set(["identity-would-change", "no-parked-credential", "occupied-by-another-account"]);
+      const acted = rows.filter((r) => ACTED.has(r.outcome));
+      const blocked = rows.filter((r) => BLOCKED.has(r.outcome));
       console.log("");
       for (const row of [...acted, ...blocked]) {
-        const colour =
-          row.outcome === "recovered" || row.outcome === "would-recover"
-            ? chalk.green
-            : row.outcome === "no-parked-credential"
-              ? chalk.red
-              : chalk.yellow;
+        const colour = ACTED.has(row.outcome)
+          ? chalk.green
+          : row.outcome === "no-parked-credential"
+            ? chalk.red
+            : chalk.yellow;
         console.log(`  ${chalk.bold(row.profile)} — ${colour(row.outcome)}`);
         console.log(chalk.dim(`    live=${row.live} snapshot=${row.snapshot}${row.central ? ` central=${row.central}` : ""}`));
         console.log(chalk.dim(`    ${row.detail}`));

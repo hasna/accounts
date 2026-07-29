@@ -105,11 +105,17 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
   // capabilities existed are repaired the next time they are used.
   ensureSharedCapabilities(profile.dir, tool);
   if (tool.id === "claude") {
-    // A dir whose own credential was rotated away by another copy of the same
-    // account has parked material nothing else reaches — put it back before the
-    // launch, so the session starts with a working credential instead of a
-    // blank one. Runs BEFORE the switched-away heal because it refuses the
-    // identity-changing case outright, leaving that to the function below.
+    // Two shapes of dir with parked material nothing else reaches, both put
+    // back before the launch so the session starts as the profile it claims to
+    // be with a working credential:
+    //   - its own credential was rotated away by another copy of the SAME
+    //     account (recover), and
+    //   - it is idle and holds a DIFFERENT account after an in-place login that
+    //     wrote no switch marker (reconcile). Launching would otherwise run as
+    //     the wrong account entirely.
+    // Runs BEFORE the switched-away heal, and deliberately leaves MARKED
+    // occupations to it — that path owns the occupations `switch-account`
+    // created, and has its own liveness refusal. Never throws.
     recoverParkedCredential(profile.dir, tool, profile.name);
     // A dir left switched to another account by `switch-account` must not
     // launch as that other account: restore the profile's own auth (or refuse

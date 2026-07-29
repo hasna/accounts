@@ -36,7 +36,9 @@ import {
   centralCredentialsPathForProfile,
   centralOAuthRecordForProfile,
   credentialHealth,
+  dirLiveAccountUuid,
   dirLiveIdentityIsForeign,
+  parkForeignLiveCredential,
   type CredentialHealthPresent,
   type SyncResult,
   syncProfileSnapshotToCentral,
@@ -460,6 +462,10 @@ export function healSwitchedProfileDir(profileDir: string, tool: ToolDef, profil
 
 export type ParkedRecoveryOutcome =
   | "recovered"
+  /** An occupied dir was returned to its own account (defect 6a58cdb8). */
+  | "reconciled"
+  /** Occupied by another account, but its sessions are live — refused. */
+  | "occupied-by-another-account"
   | "live-credential-usable"
   | "no-parked-credential"
   | "identity-would-change"
@@ -474,71 +480,153 @@ export interface ParkedRecoveryResult {
   layers?: ProfileCredentialLayers;
 }
 
+export interface ParkedRecoveryPlan {
+  /**
+   * `recover`   put the profile's own parked credential back into a dir whose
+   *             own copy is dead — the dir already presents the right account.
+   * `reconcile` return an occupied dir to its own account, parking the
+   *             occupant's credential first.
+   * `none`      nothing to do, or a deliberate refusal.
+   */
+  action: "recover" | "reconcile" | "none";
+  /** For an action, the outcome it would produce; otherwise the standing one. */
+  outcome: ParkedRecoveryOutcome;
+  detail: string;
+  layers?: ProfileCredentialLayers;
+}
+
 /**
- * Put a profile's own PARKED credential back into its dir when the dir's live
- * copy has been rotated away.
+ * Decide what an occupied or degraded dir needs, WITHOUT writing anything.
  *
- * THE GAP THIS FILLS: `healSwitchedProfileDir` above answers a narrower
- * question — "was this dir switched away, and can it be switched back" — and
- * returns false on its second line when there is no switch marker. A dir whose
- * own credential was rotated out from under it in place never had a marker, so
- * no CLI path reached it at all. Measured 2026-07-29: four of the six affected
- * profiles on this machine had no marker, and each was sitting on a parked
- * refresh token valid for another three to four weeks that nothing would use.
- * The operator's only remaining route was an interactive browser re-login.
+ * Split out of `recoverParkedCredential` because `repair-auth --dry-run`
+ * re-derived its own verdict from `parkedCredentialVerdict.recoverable` instead
+ * of asking this question, so the two could — and did — disagree: dry-run
+ * reported `nothing-to-do / live credential is usable` for dirs the acting path
+ * also silently skipped, and there was no single place to fix either. One
+ * decision, two consumers.
  *
- * WHY LIVE SESSIONS DO NOT BLOCK THIS, WHERE THEY DO BLOCK `healSwitchedProfileDir`:
- * that function evicts a WORKING identity, so live sessions are a reason to
- * refuse. Here the live slot holds no working credential by definition — that is
- * the precondition. Restoring takes nothing away from the attached sessions; it
- * gives back the credential they lost. Five of the six affected dirs had live
- * sessions, so refusing on liveness would have made the recovery reach almost
- * nothing.
- *
- * WHAT IT WILL NOT DO: change which ACCOUNT the dir presents. When the dir
- * currently carries another account (an in-place switch) the parked credential
- * belongs to a different identity, and restoring it would swap the identity
- * under attached sessions. That is the eviction case, and it stays a deliberate
- * operator action (`accounts switch-account`), not something a launch does
- * silently.
- *
- * Nothing is deleted: the parked snapshot and the central store are read-only
- * here, and the only file overwritten is a live slot already proven to hold no
- * credential material.
+ * ORDER IS THE FIX. Identity is evaluated BEFORE credential health. The old
+ * order returned `live-credential-usable` from the first branch, which made the
+ * identity gate below it unreachable for any dir held by a healthy occupant —
+ * i.e. for every occupied dir on the fleet.
  */
-export function recoverParkedCredential(
+export function planParkedRecovery(
   profileDir: string,
   tool: ToolDef,
   profileName?: string,
-): ParkedRecoveryResult {
+): ParkedRecoveryPlan {
   if (tool.id !== "claude") {
-    return { outcome: "not-applicable", detail: `parked-credential recovery is Claude-only, not ${tool.id}` };
+    return {
+      action: "none",
+      outcome: "not-applicable",
+      detail: `parked-credential recovery is Claude-only, not ${tool.id}`,
+    };
   }
 
   const layers = profileCredentialLayers(profileDir, tool);
+  const verdict = parkedCredentialVerdict(layers);
+  const occupancy = layers.occupancy;
+  const name = profileName ?? "NAME";
+
+  // --- identity first ---------------------------------------------------------
+  // A MARKED occupation belongs to `healSwitchedProfileDir`, which runs right
+  // after this on the launch path and has its own liveness refusal. Deciding it
+  // in two places is how two guards start disagreeing, so marked dirs fall
+  // through to the health-based branches below exactly as before.
+  if (occupancy?.occupied && !occupancy.marked) {
+    if (!verdict.parkedRestorable) {
+      // Refusing is not conservatism, it is the only non-destructive answer:
+      // handing the dir back to an owner with no restorable credential would
+      // replace the occupant's WORKING credential with a dead one.
+      return {
+        action: "none",
+        outcome: "no-parked-credential",
+        detail:
+          `this dir presents another account (in-place login, no switch marker) and "${name}" has no parked ` +
+          `copy that could serve it (snapshot: ${describeCredentialState(layers.snapshot.state)}` +
+          `${layers.central ? `, central store: ${describeCredentialState(layers.central.state)}` : ""}). ` +
+          `Handing the dir back would replace a working credential with a dead one. ` +
+          `Re-authenticate first: \`accounts login ${name}\`.`,
+        layers,
+      };
+    }
+    if (occupancy.liveSessions > 0) {
+      // THE DESIGN CALL. Reconciliation never evicts a live session. The
+      // attached session is actively refreshing the credential in this slot,
+      // and swapping the file under it races that refresh — refresh-token
+      // rotation between two copies destroys the loser, and that is the one
+      // confirmed destructive path in this package. `healSwitchedProfileDir`
+      // already refuses eviction on liveness for the marked case; this keeps
+      // the two consistent. Reported, never silently skipped, so an operator
+      // can act.
+      return {
+        action: "none",
+        outcome: "occupied-by-another-account",
+        detail:
+          `this dir presents another account (in-place login, no switch marker) with ` +
+          `${occupancy.liveSessions} live session(s) attached, so "${name}"'s own parked credential is not being ` +
+          `used and nothing here will evict a running session. Move the running session first: ` +
+          `\`accounts switch-account ${name} --dir ${profileDir}\`.`,
+        layers,
+      };
+    }
+    // CREDENTIALS ARE PARKED, NEVER DESTROYED — so if the occupant's WORKING
+    // credential cannot be parked, it must not be overwritten. Detection
+    // tolerates a malformed live uuid (a garbled identity still contradicts the
+    // parked one), but the central store keys on a well-formed uuid because it
+    // becomes a path segment. Without this branch, reconciling a dir whose
+    // occupant has a malformed uuid would destroy the only copy of a healthy
+    // credential — trading one defect for a worse one on exactly the inputs
+    // least likely to be well-formed.
+    if (isRestorableState(layers.live.state) && !dirLiveAccountUuid(profileDir, tool)) {
+      return {
+        action: "none",
+        outcome: "occupied-by-another-account",
+        detail:
+          `this dir presents another account (in-place login, no switch marker) whose credential is ` +
+          `${describeCredentialState(layers.live.state)} but whose account uuid is not well-formed, so it cannot ` +
+          `be parked under its own identity. Refusing to overwrite a working credential that could not be put ` +
+          `back. Repair the dir's account file, or move the account out with \`accounts switch-account\`.`,
+        layers,
+      };
+    }
+    return {
+      action: "reconcile",
+      outcome: "reconciled",
+      detail:
+        `this dir presents another account (in-place login, no switch marker) and is idle; "${name}"'s own ` +
+        `parked credential in the ${verdict.restorableLayers[0]} will be restored and the occupant's credential ` +
+        `parked under its own account first`,
+      layers,
+    };
+  }
+
+  // --- then credential health -------------------------------------------------
   if (isRestorableState(layers.live.state)) {
     return {
+      action: "none",
       outcome: "live-credential-usable",
       detail: `the dir's credential is ${describeCredentialState(layers.live.state)}; nothing to recover`,
       layers,
     };
   }
 
-  const verdict = parkedCredentialVerdict(layers);
   if (!verdict.parkedRestorable) {
     return {
+      action: "none",
       outcome: "no-parked-credential",
       detail:
         `the dir's credential is ${describeCredentialState(layers.live.state)} and no parked copy can serve it ` +
         `(snapshot: ${describeCredentialState(layers.snapshot.state)}` +
         `${layers.central ? `, central store: ${describeCredentialState(layers.central.state)}` : ""}). ` +
-        `Re-authentication is required: \`accounts login ${profileName ?? "NAME"}\`.`,
+        `Re-authentication is required: \`accounts login ${name}\`.`,
       layers,
     };
   }
 
-  // Identity gate. The parked copy is the profile's OWN account; if the dir is
-  // presenting someone else's, restoring changes who the dir is.
+  // Identity gate for the RECOVER path. The parked copy is the profile's OWN
+  // account; if the dir is presenting someone else's, restoring changes who the
+  // dir is.
   //
   // The profile's own identity must be KNOWN, not merely not-contradicted.
   // `profileHasOAuthAccount` is satisfied by the LIVE `.claude.json`, which
@@ -555,27 +643,79 @@ export function recoverParkedCredential(
   const liveUuid = typeof liveUuidRaw === "string" ? liveUuidRaw.toLowerCase() : undefined;
   if (!ownUuid) {
     return {
+      action: "none",
       outcome: "identity-unknown",
       detail:
         `the dir's credential is ${describeCredentialState(layers.live.state)} and a parked copy exists, but this ` +
         `profile has no OAuth account snapshot of its own, so the parked credential cannot be attributed to an ` +
         `account. Restoring it would pair whatever identity the dir currently shows with this credential. ` +
-        `Run \`accounts detect ${profileName ?? "NAME"}\` or re-authenticate.`,
+        `Run \`accounts detect ${name}\` or re-authenticate.`,
       layers,
     };
   }
   if (liveUuid && ownUuid !== liveUuid) {
-    const attached = listDirLiveSessions(profileDir).filter((s) => s.alive).length;
     return {
+      action: "none",
       outcome: "identity-would-change",
       detail:
         `the dir currently carries a different account after an in-place switch, and its credential is ` +
         `${describeCredentialState(layers.live.state)}. Restoring "${profileName ?? "this profile"}"'s own parked ` +
         `credential would change which account the dir presents` +
-        `${attached > 0 ? `, with ${attached} live session(s) attached` : ""}, so it is left to an explicit ` +
-        `\`accounts switch-account\`.`,
+        `${occupancy && occupancy.liveSessions > 0 ? `, with ${occupancy.liveSessions} live session(s) attached` : ""}` +
+        `, so it is left to an explicit \`accounts switch-account\`.`,
       layers,
     };
+  }
+
+  return {
+    action: "recover",
+    outcome: "recovered",
+    detail:
+      `restored this profile's own parked credential from the ${verdict.restorableLayers[0]} ` +
+      `(the dir's copy was ${describeCredentialState(layers.live.state)})`,
+    layers,
+  };
+}
+
+/**
+ * Execute `planParkedRecovery`: put a profile's own parked auth back into its
+ * dir, either because the dir's own copy was rotated away (`recovered`) or
+ * because the dir is idle and occupied by another account (`reconciled`).
+ *
+ * THE GAP THIS FILLS: `healSwitchedProfileDir` above answers a narrower
+ * question — "was this dir switched away, and can it be switched back" — and
+ * returns false on its third line when there is no switch marker. A dir whose
+ * own credential was rotated out from under it in place, or that was logged in
+ * to another account IN SESSION, never had a marker, so no CLI path reached it
+ * at all. Measured 2026-07-29: four of six rotated-away profiles had no marker,
+ * and seven further dirs were held by a DIFFERENT account with no marker and no
+ * route back.
+ *
+ * WHY LIVE SESSIONS BLOCK ONE PATH AND NOT THE OTHER. On the `recover` path the
+ * live slot holds no working credential by definition — that is the
+ * precondition — so restoring takes nothing from the attached sessions and
+ * gives back the credential they lost. Five of the six rotated-away dirs had
+ * live sessions, and refusing on liveness would have reached almost none of
+ * them. On the `reconcile` path the live slot holds a WORKING credential
+ * belonging to someone else, and an attached session is actively refreshing it;
+ * swapping the file under it races that refresh, and refresh-token rotation
+ * between two copies destroys the loser. So reconciliation refuses on liveness
+ * exactly as `healSwitchedProfileDir` does, and reports rather than skips.
+ *
+ * NOTHING IS DESTROYED. The profile's parked snapshot and the central store are
+ * read-only here. On the reconcile path the occupant's live credential is
+ * parked centrally under the OCCUPANT's own uuid before the slot is handed
+ * back, so the material survives; the central copy is a park, not a second live
+ * copy, so it cannot create the two-rotating-copies condition.
+ */
+export function recoverParkedCredential(
+  profileDir: string,
+  tool: ToolDef,
+  profileName?: string,
+): ParkedRecoveryResult {
+  const plan = planParkedRecovery(profileDir, tool, profileName);
+  if (plan.action === "none") {
+    return { outcome: plan.outcome, detail: plan.detail, ...(plan.layers ? { layers: plan.layers } : {}) };
   }
 
   // NEVER THROWS. This runs inside `profileEnv`, which every launch surface goes
@@ -584,23 +724,25 @@ export function recoverParkedCredential(
   // `restoreClaudeAuthIntoDir` throws for a profile with no OAuth account data,
   // and that profile still deserves to launch and reach its own error.
   try {
+    if (plan.action === "reconcile") {
+      // ORDER IS LOAD-BEARING: park the occupant BEFORE overwriting the slot.
+      // Reversed, a throw from the restore would leave the occupant's only copy
+      // already gone. `parkForeignLiveCredential` keys on the dir's LIVE
+      // identity, so the guest's token lands under the guest's uuid and never
+      // in this profile's central entry.
+      parkForeignLiveCredential(profileDir, tool);
+    }
     restoreClaudeAuthIntoDir(profileDir, tool, profileDir, profileName);
   } catch (error) {
     return {
       outcome: "failed",
       detail: `could not restore the parked credential: ${error instanceof Error ? error.message : String(error)}`,
-      layers,
+      ...(plan.layers ? { layers: plan.layers } : {}),
     };
   }
   // The dir now presents its own account again, so any marker is stale.
   if (readSwitchedAccountMarker(profileDir)) clearSwitchedAccountMarker(profileDir);
-  return {
-    outcome: "recovered",
-    detail:
-      `restored this profile's own parked credential from the ${verdict.restorableLayers[0]} ` +
-      `(the dir's copy was ${describeCredentialState(layers.live.state)})`,
-    layers,
-  };
+  return { outcome: plan.outcome, detail: plan.detail, ...(plan.layers ? { layers: plan.layers } : {}) };
 }
 
 /**

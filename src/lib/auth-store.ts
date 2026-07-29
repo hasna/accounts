@@ -31,6 +31,7 @@ import { getTool } from "./tools.js";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import {
+  dirCredentialsFile,
   profileAccountJsonPaths,
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
@@ -254,6 +255,87 @@ export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): bo
 }
 
 /**
+ * The profile's OWN account identity token — the parked snapshot ONLY, never
+ * the dir's live files.
+ *
+ * Distinct from `profileAccountUuid`, which falls back to the live account file
+ * when no snapshot exists. That fallback is right for BINDING (a fresh profile
+ * has to bind to something) and wrong for OCCUPANCY: on an occupied dir it
+ * returns the occupant's uuid, so `own` would equal `live` and the occupation
+ * would be invisible to the very check that exists to find it.
+ */
+export function profileParkedIdentityToken(profileDir: string): string | undefined {
+  return identityToken(oauthRecordFromSnapshot(profileDir));
+}
+
+/** The identity the dir's live files present right now, marker-blind. */
+export function dirLiveIdentityToken(profileDir: string, tool?: ToolDef): string | undefined {
+  return identityToken(liveOAuthRecordUnfiltered(profileDir, tool));
+}
+
+/**
+ * The dir's live account uuid, UUID_RE-filtered — i.e. the identity the central
+ * store can actually key on.
+ *
+ * Deliberately narrower than `dirLiveIdentityToken`. Detection tolerates a
+ * malformed uuid (a garbled identity still contradicts the parked one), but
+ * FILING one requires a well-formed value because it becomes a path segment.
+ * The two must stay separable: a caller that is about to overwrite a foreign
+ * credential has to know whether it can park it first.
+ */
+export function dirLiveAccountUuid(profileDir: string, tool?: ToolDef): string | undefined {
+  return uuidFromOAuthRecord(liveOAuthRecordUnfiltered(profileDir, tool));
+}
+
+export interface ForeignParkResult {
+  parked: boolean;
+  /** The OCCUPANT's account uuid the material was filed under, when it was. */
+  uuid?: string;
+  credentials?: SyncFileAction;
+  oauth?: SyncFileAction;
+  reason?: string;
+}
+
+/**
+ * Park the credential a dir's LIVE slot currently holds under the account that
+ * slot actually presents — the OCCUPANT's account, not the profile's own.
+ *
+ * WHY THIS IS NOT `syncProfileSnapshotToCentral`: that function resolves the
+ * uuid through `profileAccountUuid`, which prefers the profile's own parked
+ * snapshot. Called on an occupied dir it would file the OCCUPANT's credential
+ * under the HOST's uuid — mirroring one account's token into another account's
+ * central entry, which is the exact confusion the identity-keyed store exists
+ * to prevent. The candidate set here is the live file and nothing else, for the
+ * mirror image of the same reason: admitting the profile's own snapshot would
+ * file the HOST's credential under the GUEST's uuid.
+ *
+ * CREDENTIALS ARE PARKED, NEVER DESTROYED. This is the step that makes
+ * reconciling an occupied dir non-destructive: the occupant's material is
+ * preserved under its own identity before the live slot is handed back. The
+ * central copy is a PARK, not a second live copy — nothing refreshes it — so
+ * this cannot create the two-rotating-copies condition that destroys the loser.
+ * The `betterCredential` guard still applies, so an existing central copy is
+ * only ever replaced by a strict winner.
+ */
+export function parkForeignLiveCredential(profileDir: string, tool?: ToolDef): ForeignParkResult {
+  const liveRecord = liveOAuthRecordUnfiltered(profileDir, tool);
+  const uuid = uuidFromOAuthRecord(liveRecord);
+  if (!liveRecord || !uuid) {
+    return { parked: false, reason: "the dir's live files carry no well-formed account uuid to file them under" };
+  }
+  const own = profileParkedIdentityToken(profileDir);
+  if (own && own === uuid) {
+    // Refusing here keeps this function honest about what it is for. The
+    // profile's own material has its own write path.
+    return { parked: false, reason: "the dir's live identity is this profile's own; nothing foreign to park" };
+  }
+
+  const oauth = syncOAuthFile(uuid, liveRecord);
+  const credentials = syncCredentialsFromPaths(uuid, [dirCredentialsFile(profileDir)]);
+  return { parked: true, uuid, credentials, oauth };
+}
+
+/**
  * The account uuid a profile dir is bound to: per-profile snapshot first
  * (owner-true even when the dir's live files were switched to another
  * account), then the dir's account file. Without `tool` the claude default
@@ -314,19 +396,14 @@ function syncOAuthFile(uuid: string, source: JsonRecord): SyncFileAction {
   return action;
 }
 
-function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): SyncFileAction {
-  // Candidates: the per-profile snapshot, plus the dir's live credential file
-  // when no switch-marker FILE claims it for another account (fail closed —
-  // see switchMarkerFilePresent) AND the dir's live identity does not itself
-  // contradict the profile's parked one (see dirLiveIdentityIsForeign — the
-  // in-session `/login` case, which writes no marker). `uuid` here is the
-  // profile's OWN bound account, so admitting a foreign live credential would
-  // mirror the guest's token straight into the host's central entry and destroy
-  // the last copy of the host's material.
-  const liveFilesAreForeign = switchMarkerFilePresent(profileDir) || dirLiveIdentityIsForeign(profileDir, tool);
-  const candidatePaths = liveFilesAreForeign
-    ? [profileCredentialsSnapshot(profileDir)]
-    : [profileCredentialsSnapshot(profileDir), join(profileDir, ".credentials.json")];
+/**
+ * The ONE central-credential write rule: pick the best of `candidatePaths` by
+ * `betterCredential`, then replace the central copy only if it is a strict
+ * winner. Every caller supplies its own candidate set — choosing which files
+ * may compete for a given uuid is an IDENTITY decision and belongs to the
+ * caller; ranking and the no-downgrade guarantee belong here, once.
+ */
+function syncCredentialsFromPaths(uuid: string, candidatePaths: string[]): SyncFileAction {
   const candidates = candidatePaths
     .filter((path) => existsSync(path) && !lstatSync(path).isSymbolicLink())
     .map((path) => ({ path, health: credentialHealth(path) }))
@@ -345,6 +422,22 @@ function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): 
   if (readFileSync(centralPath).equals(bytes)) return "kept";
   writeCentralFile(centralPath, bytes);
   return "updated";
+}
+
+function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): SyncFileAction {
+  // Candidates: the per-profile snapshot, plus the dir's live credential file
+  // when no switch-marker FILE claims it for another account (fail closed —
+  // see switchMarkerFilePresent) AND the dir's live identity does not itself
+  // contradict the profile's parked one (see dirLiveIdentityIsForeign — the
+  // in-session `/login` case, which writes no marker). `uuid` here is the
+  // profile's OWN bound account, so admitting a foreign live credential would
+  // mirror the guest's token straight into the host's central entry and destroy
+  // the last copy of the host's material.
+  const liveFilesAreForeign = switchMarkerFilePresent(profileDir) || dirLiveIdentityIsForeign(profileDir, tool);
+  const candidatePaths = liveFilesAreForeign
+    ? [profileCredentialsSnapshot(profileDir)]
+    : [profileCredentialsSnapshot(profileDir), join(profileDir, ".credentials.json")];
+  return syncCredentialsFromPaths(uuid, candidatePaths);
 }
 
 /**
