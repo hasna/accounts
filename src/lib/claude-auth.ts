@@ -383,6 +383,30 @@ export function snapshotDirAuthToProfile(sourceDir: string, tool: ToolDef, profi
 }
 
 /**
+ * Put a dir's OWN parked identity back into its live account file, touching no
+ * credential at all. Returns false when the dir has no parked identity to
+ * restore.
+ *
+ * WHY THIS IS SEPARATE FROM `restoreClaudeAuthIntoDir`: that function restores
+ * identity AND credential together, and begins by calling
+ * `ensureProfileAuthSnapshot`, which re-reads the LIVE account file. On a dir
+ * whose live files carry a foreign account, calling it first is the wrong
+ * order — the live guest identity is newer than the park, so the refresh
+ * overwrites the dir's own parked identity with the guest's, and every
+ * downstream identity gate then compares the guest against itself and passes.
+ *
+ * Callers reconciling an occupied dir must restore the identity FIRST with
+ * this, so the dir's live and own identities agree again, and only then hand
+ * the credential question to the guarded `recoverParkedCredential`.
+ */
+export function restoreOwnIdentityIntoLiveFiles(profileDir: string, tool: ToolDef): boolean {
+  const own = readOAuthSnapshot(profileDir);
+  if (!own) return false;
+  mergeOAuthInto(profileAccountJsonPaths(profileDir, tool), own, false, profileDir);
+  return true;
+}
+
+/**
  * Restore a profile's auth into an arbitrary session config dir: the write half
  * of an in-place account switch. Merges `oauthAccount` into the dir's account
  * file (preserving unrelated session state) and installs the profile's
