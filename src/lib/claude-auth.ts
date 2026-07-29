@@ -14,7 +14,15 @@ import {
   profileOAuthSnapshot,
   profileSwitchedAccountMarker,
   OAUTH_SNAPSHOT,
+  dirCredentialsFile,
 } from "./claude-layout.js";
+import {
+  describeCredentialState,
+  isRestorableState,
+  parkedCredentialVerdict,
+  profileCredentialLayers,
+  type ProfileCredentialLayers,
+} from "./credential-state.js";
 import {
   assertAllowedKeychainCredential,
   keychainSupported,
@@ -76,7 +84,7 @@ function readOAuthSnapshot(profileDir: string): JsonRecord | undefined {
 }
 
 function profileCredentialFile(profileDir: string): string {
-  return join(profileDir, ".credentials.json");
+  return dirCredentialsFile(profileDir);
 }
 
 export interface SwitchedAccountMarker {
@@ -148,6 +156,34 @@ function findOAuthSource(paths: string[]): { path: string; oauth: JsonRecord } |
 }
 
 /** True when the snapshot is missing or strictly older than its source file. */
+/**
+ * Would copying `sourcePath` over `snapshotPath` destroy credential material?
+ *
+ * THE HOLE THIS CLOSES: the snapshot refresh above was ordered by MTIME alone,
+ * and the newest write is not always a credential. When two config dirs hold one
+ * account, the second one to refresh gets its token rotated out from under it
+ * and Claude Code blanks its `.credentials.json` in place — a newer file
+ * containing nothing. The mtime rule then copied that blank over the profile's
+ * parked credential, which for a profile whose dir had already lost its live
+ * copy was the ONLY remaining copy under that directory. Measured on this fleet:
+ * one profile (account031) had already lost both its live file and its snapshot
+ * this way, surviving only because the central store refused the same downgrade.
+ *
+ * The central store never had this hole — `syncCredentialsFile` in auth-store.ts
+ * replaces central only with a strict `betterCredential` winner. This restores
+ * the symmetry the comment above already claims: the two layers rank credentials
+ * identically. `betterCredential` orders on refresh-token presence, then
+ * usability, then mtime, so it subsumes the staleness rule rather than
+ * contradicting it — a genuinely rotated token still wins, and a blank never
+ * does.
+ */
+function wouldDowngradeSnapshot(sourcePath: string, snapshotPath: string): boolean {
+  const source = credentialHealth(sourcePath);
+  const snapshot = credentialHealth(snapshotPath);
+  if (!snapshot.exists || !source.exists) return false;
+  return betterCredential(source, snapshot) !== source;
+}
+
 function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
   if (!existsSync(snapshotPath)) return true;
   try {
@@ -421,6 +457,151 @@ export function healSwitchedProfileDir(profileDir: string, tool: ToolDef, profil
   return true;
 }
 
+export type ParkedRecoveryOutcome =
+  | "recovered"
+  | "live-credential-usable"
+  | "no-parked-credential"
+  | "identity-would-change"
+  | "identity-unknown"
+  | "failed"
+  | "not-applicable";
+
+export interface ParkedRecoveryResult {
+  outcome: ParkedRecoveryOutcome;
+  /** Operator-facing explanation, safe to print. */
+  detail: string;
+  layers?: ProfileCredentialLayers;
+}
+
+/**
+ * Put a profile's own PARKED credential back into its dir when the dir's live
+ * copy has been rotated away.
+ *
+ * THE GAP THIS FILLS: `healSwitchedProfileDir` above answers a narrower
+ * question — "was this dir switched away, and can it be switched back" — and
+ * returns false on its second line when there is no switch marker. A dir whose
+ * own credential was rotated out from under it in place never had a marker, so
+ * no CLI path reached it at all. Measured 2026-07-29: four of the six affected
+ * profiles on this machine had no marker, and each was sitting on a parked
+ * refresh token valid for another three to four weeks that nothing would use.
+ * The operator's only remaining route was an interactive browser re-login.
+ *
+ * WHY LIVE SESSIONS DO NOT BLOCK THIS, WHERE THEY DO BLOCK `healSwitchedProfileDir`:
+ * that function evicts a WORKING identity, so live sessions are a reason to
+ * refuse. Here the live slot holds no working credential by definition — that is
+ * the precondition. Restoring takes nothing away from the attached sessions; it
+ * gives back the credential they lost. Five of the six affected dirs had live
+ * sessions, so refusing on liveness would have made the recovery reach almost
+ * nothing.
+ *
+ * WHAT IT WILL NOT DO: change which ACCOUNT the dir presents. When the dir
+ * currently carries another account (an in-place switch) the parked credential
+ * belongs to a different identity, and restoring it would swap the identity
+ * under attached sessions. That is the eviction case, and it stays a deliberate
+ * operator action (`accounts switch-account`), not something a launch does
+ * silently.
+ *
+ * Nothing is deleted: the parked snapshot and the central store are read-only
+ * here, and the only file overwritten is a live slot already proven to hold no
+ * credential material.
+ */
+export function recoverParkedCredential(
+  profileDir: string,
+  tool: ToolDef,
+  profileName?: string,
+): ParkedRecoveryResult {
+  if (tool.id !== "claude") {
+    return { outcome: "not-applicable", detail: `parked-credential recovery is Claude-only, not ${tool.id}` };
+  }
+
+  const layers = profileCredentialLayers(profileDir, tool);
+  if (isRestorableState(layers.live.state)) {
+    return {
+      outcome: "live-credential-usable",
+      detail: `the dir's credential is ${describeCredentialState(layers.live.state)}; nothing to recover`,
+      layers,
+    };
+  }
+
+  const verdict = parkedCredentialVerdict(layers);
+  if (!verdict.parkedRestorable) {
+    return {
+      outcome: "no-parked-credential",
+      detail:
+        `the dir's credential is ${describeCredentialState(layers.live.state)} and no parked copy can serve it ` +
+        `(snapshot: ${describeCredentialState(layers.snapshot.state)}` +
+        `${layers.central ? `, central store: ${describeCredentialState(layers.central.state)}` : ""}). ` +
+        `Re-authentication is required: \`accounts login ${profileName ?? "NAME"}\`.`,
+      layers,
+    };
+  }
+
+  // Identity gate. The parked copy is the profile's OWN account; if the dir is
+  // presenting someone else's, restoring changes who the dir is.
+  //
+  // The profile's own identity must be KNOWN, not merely not-contradicted.
+  // `profileHasOAuthAccount` is satisfied by the LIVE `.claude.json`, which
+  // after an in-place switch is the guest's, and `restoreClaudeAuthIntoDir`
+  // falls back to that same live record when no snapshot exists. A profile
+  // holding a parked credential but no parked IDENTITY would therefore have had
+  // the guest's `oauthAccount` written next to this profile's credential —
+  // pairing one account's identity with another account's token, which is the
+  // precise failure the identity-index layering exists to prevent. Unknown
+  // identity is a refusal, not a free pass.
+  const own = readOAuthSnapshot(profileDir) ?? centralOAuthRecordForProfile(profileDir, tool);
+  const ownUuid = typeof own?.accountUuid === "string" ? own.accountUuid.toLowerCase() : undefined;
+  const liveUuidRaw = readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool))?.accountUuid;
+  const liveUuid = typeof liveUuidRaw === "string" ? liveUuidRaw.toLowerCase() : undefined;
+  if (!ownUuid) {
+    return {
+      outcome: "identity-unknown",
+      detail:
+        `the dir's credential is ${describeCredentialState(layers.live.state)} and a parked copy exists, but this ` +
+        `profile has no OAuth account snapshot of its own, so the parked credential cannot be attributed to an ` +
+        `account. Restoring it would pair whatever identity the dir currently shows with this credential. ` +
+        `Run \`accounts detect ${profileName ?? "NAME"}\` or re-authenticate.`,
+      layers,
+    };
+  }
+  if (liveUuid && ownUuid !== liveUuid) {
+    const attached = listDirLiveSessions(profileDir).filter((s) => s.alive).length;
+    return {
+      outcome: "identity-would-change",
+      detail:
+        `the dir currently carries a different account after an in-place switch, and its credential is ` +
+        `${describeCredentialState(layers.live.state)}. Restoring "${profileName ?? "this profile"}"'s own parked ` +
+        `credential would change which account the dir presents` +
+        `${attached > 0 ? `, with ${attached} live session(s) attached` : ""}, so it is left to an explicit ` +
+        `\`accounts switch-account\`.`,
+      layers,
+    };
+  }
+
+  // NEVER THROWS. This runs inside `profileEnv`, which every launch surface goes
+  // through, so a profile with incomplete auth must not take the launch down
+  // with it — recovery is an improvement on the way past, not a precondition.
+  // `restoreClaudeAuthIntoDir` throws for a profile with no OAuth account data,
+  // and that profile still deserves to launch and reach its own error.
+  try {
+    restoreClaudeAuthIntoDir(profileDir, tool, profileDir, profileName);
+  } catch (error) {
+    return {
+      outcome: "failed",
+      detail: `could not restore the parked credential: ${error instanceof Error ? error.message : String(error)}`,
+      layers,
+    };
+  }
+  // The dir now presents its own account again, so any marker is stale.
+  if (readSwitchedAccountMarker(profileDir)) clearSwitchedAccountMarker(profileDir);
+  return {
+    outcome: "recovered",
+    detail:
+      `restored this profile's own parked credential from the ${verdict.restorableLayers[0]} ` +
+      `(the dir's copy was ${describeCredentialState(layers.live.state)})`,
+    layers,
+  };
+}
+
 /**
  * Build auth snapshots from files already present in the profile config dir.
  * Snapshots are refreshed per-file whenever the source in the profile dir is
@@ -468,7 +649,11 @@ export function ensureProfileAuthSnapshot(
 
   const credFile = profileCredentialFile(profileDir);
   const credSnap = profileCredentialsSnapshot(profileDir);
-  if (existsSync(credFile) && (opts.overwrite || snapshotIsStale(credFile, credSnap))) {
+  if (
+    existsSync(credFile) &&
+    (opts.overwrite || snapshotIsStale(credFile, credSnap)) &&
+    !wouldDowngradeSnapshot(credFile, credSnap)
+  ) {
     assertSafeWritePath(credSnap, { mustStayUnder: profileDir });
     copyFileSync(credFile, credSnap);
   }
@@ -621,11 +806,35 @@ export function claudeProfileAuthHealth(
   const keychainSnapshotPresent = existsSync(profileKeychainSnapshot(profileDir));
   const snapshotPresent = hasAuthSnapshot(profileDir);
 
+  // Reasons name the STATE and the LAYER, because "credential payload is
+  // expired" was reported for every one of these and sent three separate
+  // investigations to study token lifetimes when the answer was custody. An
+  // operator needs to know whether to wait (the tool renews it), restore
+  // (a parked copy survives) or re-authenticate (nothing survives) — and those
+  // are three different actions behind one old message.
+  const layers = profileCredentialLayers(profileDir, tool);
+  const verdict = parkedCredentialVerdict(layers);
   const reasons: string[] = [];
   if (!oauthAccountPresent) reasons.push("OAuth account snapshot is missing");
   if (!credentialPayloadPresent) reasons.push("credential payload is missing");
-  if (!validCredential && expiredCredential) reasons.push("credential payload is expired");
-  if (!validCredential && parseableInvalidCredential) reasons.push("credential payload has no refresh token");
+  if (!validCredential) {
+    if (layers.live.state === "rotated-away") {
+      reasons.push(
+        verdict.parkedRestorable
+          ? `this dir's credential was ${describeCredentialState("rotated-away")}, and a restorable copy is ` +
+            `parked in the ${verdict.restorableLayers.join(" and ")} — recoverable without re-authenticating`
+          : `this dir's credential was ${describeCredentialState("rotated-away")} and no parked copy survives`,
+      );
+    }
+    if (expiredCredential && renewableCredential) {
+      reasons.push("access token aged out; the refresh token is intact and the tool renews it on use");
+    } else if (expiredCredential) {
+      reasons.push("credential payload is expired");
+    }
+    if (parseableInvalidCredential && layers.live.state !== "rotated-away") {
+      reasons.push("credential payload has no refresh token");
+    }
+  }
   if (credentialPayloadPresent && !validCredential && !expiredCredential && !parseableInvalidCredential) {
     reasons.push("credential payload expiry is unknown");
   }

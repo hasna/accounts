@@ -92,6 +92,13 @@ export interface UsageHookDeps {
    */
   readNotices?(): HookNoticeState | undefined;
   writeNotices?(state: HookNoticeState): void;
+  /**
+   * Live sessions attached to a config dir. Used to refuse a switch onto an
+   * account another dir is already running — two live copies of one account
+   * end with refresh-token rotation destroying one of the credentials.
+   * Optional: without it the hook behaves as before and does not guard.
+   */
+  liveSessionsIn?(dir: string): number;
   now?: () => Date;
 }
 
@@ -127,6 +134,12 @@ type NoticeKey =
   | "no-candidate"
   | "no-door"
   | "fail-open";
+
+/** Path comparison for config dirs, tolerant of trailing separators. */
+function sameDir(a: string, b: string): boolean {
+  const norm = (v: string) => v.replace(/\/+$/, "");
+  return norm(a) === norm(b);
+}
 
 function pct(value: number): string {
   return `${Math.round(value)}%`;
@@ -304,12 +317,47 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     const entry = deps.readCache(identity.accountUuid, staleMaxAgeMs);
     return { identity, ...(entry?.usage ? { usage: entry.usage } : {}) };
   });
+
+  // An account another dir is actively running is not a safe target however
+  // much headroom it has: two Claude Code processes behind one refresh token
+  // end with the server rotating it and one copy being blanked. Our OWN dir is
+  // excluded from the check — it is the one being switched away from.
+  //
+  // KNOWN FALSE POSITIVE, accepted deliberately: liveness comes from pid files
+  // plus `kill(pid, 0)`, so a stale pid file whose number has been reused by an
+  // unrelated process reads as live and needlessly withholds that account. The
+  // failure directions are not symmetric — a false positive costs one switch
+  // option and is reported; a false negative destroys a credential — so this
+  // errs toward refusing. It is an exclusion rather than a ranking penalty for
+  // the same reason: a contended account ranked last would still be chosen
+  // whenever it is the only candidate, which is exactly the case that hurts.
+  const contendedAccounts = new Set<string>();
+  const liveSessionsIn = deps.liveSessionsIn;
+  if (liveSessionsIn) {
+    for (const identity of identities) {
+      for (const door of identity.doors) {
+        if (sameDir(door.dir, opts.configDir)) continue;
+        let live = 0;
+        try {
+          live = liveSessionsIn(door.dir);
+        } catch {
+          // A dir we cannot inspect is not evidence of contention.
+          continue;
+        }
+        if (live > 0) {
+          contendedAccounts.add(identity.accountUuid);
+          break;
+        }
+      }
+    }
+  }
   const selection = selectHealthiestAccount(entries, {
     currentUuid,
     minHeadroom: opts.minHeadroom,
     ...(opts.minSessionHeadroom !== undefined ? { minSessionHeadroom: opts.minSessionHeadroom } : {}),
     now: clock,
     ...(deps.activeCooldowns ? { cooldowns: deps.activeCooldowns(clock) } : {}),
+    ...(contendedAccounts.size > 0 ? { contendedAccounts } : {}),
   });
 
   const breachedWindow = breach.window!;
@@ -328,10 +376,14 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
           `(${selection.considered} checked) — no account has headroom to switch to. Staying put.`,
       });
     }
+    const contended = selection.excluded.filter((e) => e.reason === "contended").length;
     const detail =
-      selection.reason === "no-usage-data"
-        ? `no other account has been measured yet (${selection.excluded.length} known)`
-        : `no other usable account is registered on this machine`;
+      contended > 0
+        ? `${contended} account${contended === 1 ? " is" : "s are"} already being run by another session and ` +
+          `cannot be shared — a second copy would get its token rotated away`
+        : selection.reason === "no-usage-data"
+          ? `no other account has been measured yet (${selection.excluded.length} known)`
+          : `no other usable account is registered on this machine`;
     return degraded(opts, deps, clock, "no-candidate", {
       action: "none",
       reason: selection.reason ?? "no-candidate",
