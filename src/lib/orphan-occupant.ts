@@ -334,6 +334,22 @@ export async function adoptOrphanOccupant(
       `the dir ${host.profileName ?? host.dir} no longer carries a readable oauthAccount record`,
     );
   }
+  // INVARIANT, not a reachable branch today: this record is parked next to the
+  // credential we are about to move, so if it named a different account we
+  // would pair one account's identity with another's token — the precise
+  // failure the identity-index layering exists to prevent. It cannot currently
+  // diverge (we only got here because the index resolved this uuid from this
+  // dir's live file), so this is a tripwire for a future change to either
+  // reader rather than a live guard. It refuses instead of throwing so a
+  // corrupt dir yields a verdict, not a crash.
+  const recordUuid = typeof oauthRecord.accountUuid === "string" ? oauthRecord.accountUuid.toLowerCase() : undefined;
+  if (recordUuid !== identity.accountUuid.toLowerCase()) {
+    return refuse(
+      "unknown-account",
+      `the dir ${host.profileName ?? host.dir} now reads as ${recordUuid ?? "no account"} rather than ` +
+        `${identity.accountUuid}; it changed under us, so nothing was moved`,
+    );
+  }
 
   const plan: AdoptPlan = {
     accountUuid: identity.accountUuid,
