@@ -1,0 +1,237 @@
+# Accounts v2 migration sidecar
+
+The v2 migration sidecar is an additive, preflight-only contract for planning
+and recording a future migration from the v1 registry. This foundation does not
+run a live migration, rewrite `accounts.json`, move or copy profile roots,
+change credentials, activate v2 routes, or retire a v1 client or server.
+
+## Frozen census and immutable identities
+
+`buildMigrationPlan` accepts a strict, scope-bound census:
+
+- exact digests for the v1 registry, session catalog, hooks, and supervisor;
+- a verified or explicitly unsafe observation for every legacy profile root;
+- device, inode, entry count, byte count, and digest for verified roots;
+- authentication health only, never credential contents or references;
+- current, applied, and tool-lock pointer observations;
+- digested session references and catalog skips;
+- historical account and session aliases; and
+- one encrypted backup and restore-drill plan.
+
+The backup byte requirement must cover every verified root. A rerun may reuse an
+existing plan only when the complete canonical input digest is unchanged.
+Opaque runtime, account, and binding IDs are deterministically allocated from
+the canonical frozen input and then frozen in the plan. Rebuilding an identical
+input without an existing plan produces identical IDs and an identical
+idempotency key. A supplied existing plan is accepted only when its structured
+census, source keys, binding identities, input digest, and idempotency key are
+self-consistent and its complete plan digest is intact. Deterministic allocation
+is namespaced by tenant and scope so identical legacy coordinates in different
+scopes cannot collide. Legacy records are not grouped, renamed, or physically
+relocated.
+
+The redacted census view uses redaction scheme version 1: SHA-256 over a
+versioned, length-framed context, one schema-owned semantic domain, and the
+UTF-8 value. Machine IDs, authority IDs, runtime tool keys, runtime labels,
+profile names, paths, unsafe-root reasons, source keys, account aliases,
+session aliases, device IDs, and inode IDs each use distinct domains. Equal
+caller text in different fields therefore cannot produce a shared digest, and
+delimiter-like text cannot cross a frame boundary. The view retains only
+schema-owned enums, counts, content/input digests, allocated opaque IDs, and
+quarantine evidence; raw filesystem identity and arbitrary census text are
+never emitted. An unsafe-root digest supplied by an upstream scanner is still
+caller-origin evidence, so the exported redacted view wraps that digest again
+in the versioned `root.path` domain rather than passing the upstream digest
+through as a stable cross-surface identifier.
+
+Public migration conflict and drift errors expose a stable
+`migration_*` code, optional numeric counts, and only domain-hashed opaque
+references. Both error classes are `AccountsError` subclasses. They do not
+interpolate plan IDs, source keys, tool keys, aliases, runtime IDs, nested
+parser messages, or other caller-controlled text into the message.
+Account-alias and session-alias diagnostics use distinct
+`diagnostic.alias.account` and `diagnostic.alias.session` domains. Every public
+migration function parses strict inputs at its boundary, including the runtime
+gate-intent, state-target, alias-kind, and store-option schemas. Validation and
+callback failures are mapped to stable Accounts migration errors; Zod issue
+paths, unknown keys, values, messages, and raw causes are never part of the
+public error.
+
+## Conflict quarantine and aliases
+
+Unsafe roots, unresolved catalog skips, duplicate legacy identities, the same
+mutable name observed across runtimes, and distinct legacy identities resolving
+to either the same canonicalized verified real path or the same canonicalized
+device/inode identity are quarantined. Device and inode strings are normalized
+as decimal integers, so leading-zero aliases cannot evade the physical-root
+check. A shared canonical path with contradictory device, inode, or digest
+evidence also fails closed, as does one device/inode identity with conflicting
+path or digest evidence. Equal content digests alone do not conflate otherwise
+distinct roots. Lexical path aliases such as `directory/../root` cannot evade
+the path equivalence class, and hard-link aliases cannot evade the device/inode
+equivalence class. A partial backfill may include only records marked `ready`;
+final cutover remains blocked while any quarantine exists.
+
+Historical account aliases target the frozen account ID. Historical session
+aliases target the frozen machine-binding ID. The alias journal is append-only,
+sequence-numbered, and digest-chained. Replaying the exact same alias is
+idempotent; changing its source or target fails closed.
+
+Every alias is normalized to Unicode NFC before the frozen input digest and ID
+allocation. Duplicate aliases, including canonically equivalent Unicode forms,
+are rejected before allocation. Plan records store one strictly ordered unique
+representation, aliases are globally unique within each alias kind, and the
+canonical genesis journal must contain exactly the plan-declared aliases in
+that order. Reordering a stored plan and recomputing its unkeyed digest cannot
+change the accepted genesis.
+
+## Gates and cutover states
+
+The preflight gate requires:
+
+- no active migration writers;
+- an exact match for every frozen input digest;
+- enough free space for the backup contract;
+- no unknown migration-ledger entries or checksum mismatches;
+- no unresolved catalog skips;
+- an encrypted, mode `0600`, complete backup manifest;
+- database point-in-time recovery and a restore drill completed no later than
+  the shared cutover epoch and no earlier than plan creation; and
+- the exact plan ID, idempotency key, and cutover epoch.
+
+The explicit state sequence is:
+
+```text
+planned -> partial_ready -> partial_applied -> final_ready -> final_applied
+```
+
+`planned -> final_ready` is permitted only when no record is quarantined.
+Entering either readiness state requires current evidence evaluated against the
+frozen plan. The accepted evidence is written into a checksum-protected gate
+receipt bound to the exact predecessor sidecar through a bounded, digest-chained
+transition journal. Entering either applied state requires the committed,
+scope-bound receipt returned by `applyScopedBackfill`; that receipt covers the
+plan, idempotency key, scope, exact ready predecessor, ready-record digest,
+transaction counts, and epoch result. The unkeyed SHA-256 digests provide
+tamper evidence and deterministic drift detection only; they are not signatures,
+authentication, authorization, or proof that a writer is trusted. File
+permissions, writer locking, compare-and-swap, and deployment authority remain
+separate controls. Backward and skipped transitions fail. These states are
+contracts only; this foundation does not make a production cutover decision.
+
+## Transactional backfill hook
+
+`applyScopedBackfill` exposes one tenant/scope transaction callback. It ensures
+ready runtimes, accounts, legacy-to-v2 crosswalks, and the shared cutover epoch
+inside that transaction. The storage port owns commit and rollback. Only after
+every runtime, account, crosswalk, and epoch result is validated inside the
+transaction does the function return the receipt required for the matching
+`*_applied` transition. No PostgreSQL schema, migration file, or HTTP route is
+added by this sidecar.
+
+The port must invoke the callback exactly once, await it as part of the
+transaction, and return that exact callback result. Skipping or repeating the
+callback, swallowing a second-call failure, resolving the transaction before
+the callback completes, or substituting even a schema-valid result fails
+closed. The callback result is validated and deeply frozen before it leaves the
+callback; the receipt is derived only from that captured value, never from a
+port-supplied replacement.
+
+The canonical runtime definition is the exact `(legacy tool key, runtime
+label)` tuple: those are the plan-record fields that become the v2 runtime
+`key` and `label`. Runtime labels must already use Unicode NFC, no leading or
+trailing whitespace, and one ordinary space for each whitespace run; tool keys
+remain lowercase runtime slugs. The deterministic allocator, plan schema,
+existing-plan validation, redacted view, transactional runtime/crosswalk
+derivation, and ready-record receipt checks all use that same tuple.
+
+Every runtime ID maps to exactly one canonical definition across every plan
+record, including quarantined records, and one canonical definition maps back
+to one runtime ID. Multiple records may legitimately share both the same
+definition and runtime ID. Divergent definitions for one shared runtime ID
+fail before disposition filtering or backfill, including case differences.
+Noncanonical Unicode or whitespace encodings fail schema validation.
+
+The standalone plan, input, and sidecar hashes are unkeyed integrity evidence,
+not authentication of the plan's semantic origin. A globally self-consistent
+runtime remap can satisfy standalone schema and sidecar creation when every
+affected record and digest is recomputed. Detecting that rewrite requires an
+independently trusted original frozen census and comparison through
+`buildMigrationPlan(originalInput, { existingPlan: candidatePlan })`; the
+candidate plan's hashes alone are not a trust anchor. The crosswalk retains
+source authority, authority ID, legacy tool/name, and the frozen account,
+runtime, and binding IDs.
+
+## Durable file contract and repair
+
+`MigrationSidecarStore` derives one immutable path set: the sidecar, sidecar
+staging file, WAL, WAL staging file, writer lock, and their containing
+directory. Every path in that set must be distinct from the configured v1
+registry by normalized absolute path and, when the paths exist, resolved path
+plus device/inode identity. Exact, parent-normalized, hard-link, symlink, and
+post-construction aliases fail closed before store mutation. The checks are
+repeated at write, rename, cleanup, repair, and lock boundaries, and file opens
+use no-follow flags where the platform supports them. Existing sidecar and WAL
+files must be regular, non-symlink files with mode `0600`. The store does not
+use a separate mutable backup path; backup and restore artifacts remain
+evidence-only inputs to the preflight plan.
+
+All configured store paths and callbacks are ECMAScript-private runtime state,
+not enumerable properties. Stringification returns only the schema version and
+the schema-owned `migration_sidecar_store` kind. Filesystem and safe-path
+failures are mapped to stable codes plus a versioned `root.path` reference; raw
+paths and underlying error causes are not exposed through the message, JSON,
+string conversion, or object inspection.
+
+Each update uses:
+
+1. an exclusive migration-writer lock;
+2. a full-payload WAL containing the exact predecessor and successor digests;
+3. WAL file `fsync`, atomic rename, and parent-directory `fsync`;
+4. sidecar file `fsync`, atomic rename, and parent-directory `fsync`; and
+5. WAL removal followed by another parent-directory `fsync`.
+
+Updates after the initial `planned` install require the exact previously read
+integrity digest. This compare-and-swap boundary prevents a stale writer from
+overwriting a newer state or alias-journal entry.
+
+An existing WAL or WAL staging file always wins over a later install attempt.
+The later writer fails closed and must run `repair()`; it cannot replace the
+first crash-recovery intent.
+
+`repair()` is idempotent at every durable boundary. It adopts an already
+installed exact successor or completes a WAL transition only from its exact
+predecessor after rechecking immutable alias, receipt, and transition-journal
+history. A genesis WAL may install only the exact canonical `planned` sidecar
+derived from the frozen plan. Every parsed state must retain the complete
+canonical plan-required alias journal as an immutable prefix, and every
+reconstructed transition predecessor must include that same alias-bearing
+genesis. Rehashing a later state after deleting historical aliases therefore
+fails closed. A lock owned by a live process is preserved; a valid lock naming
+a dead process is removed before repair retries. Ambiguous drift preserves the
+WAL and fails closed.
+
+Reclaiming a dead writer lock is itself serialized. Observing the lock,
+confirming its owner is dead, and unlinking it are three separate operations, so
+two processes that observe the same dead lock could otherwise both unlink: the
+first would immediately create its own live lock, and the second would unlink
+that live lock and acquire the mutex as well, putting two writers past it. A
+reclaimer therefore first creates an exclusive `<sidecar>.lock.reclaim-<device>-
+<inode>` token, re-reads the lock inside that token, and unlinks only when the
+device, inode, and payload still match what it observed. The token is bound to
+the dead lock's identity, so a token abandoned by a process that died inside the
+reclaim window cannot block reclaim of any later lock — a replacement lock has a
+different inode. It blocks only that one abandoned identity, and does so by
+failing closed with `migration_writer_lock_reclaim_contended` rather than by
+admitting a second writer. Recovery is to delete the reported reclaim token once
+no migration writer is running.
+
+## Compatibility fixture
+
+[`test/fixtures/v2-migration-compatibility.json`](../test/fixtures/v2-migration-compatibility.json)
+freezes exactly one case for every old, transition, and new client/server pair.
+Transition clients may preflight against an old server without writes. New
+clients require final cutover before using a transition server. Old clients
+cannot use a new-only server, while transition clients use the v2 contract
+against a new server. The fixture does not activate any route or compatibility
+behavior.

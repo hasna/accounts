@@ -128,3 +128,9 @@ separate mode policy. Retired `remote`, `hybrid`, and `s3` words are skipped as
 absent authority and cannot mask a canonical value from a lower-precedence
 compatibility key. Async v1 callers use `resolveStore()`; new callers use
 `@hasna/accounts/v2`.
+
+The additive v2 export also includes a migration sidecar/preflight contract.
+It freezes a redacted census, stable identity allocation, quarantine and alias
+journals, cutover gates, transactional backfill hooks, durable WAL repair, and
+old/new compatibility fixtures without performing a live migration. See
+[V2_MIGRATION_SIDECAR.md](V2_MIGRATION_SIDECAR.md).
