@@ -174,9 +174,53 @@ export class AccountsRepo implements AccountsStore {
     await client.execute(ADVISORY_LOCK_SQL, [toolLockKey(tool)]);
   }
 
+  /**
+   * Serialize every writer that allocates or moves one of `names`.
+   *
+   * Taken in sorted order so a caller holding two of them can never be half of
+   * a cycle with a caller holding the same two the other way round.
+   */
+  private async lockAccountNames(
+    client: TypedQueryClient,
+    names: readonly string[],
+  ): Promise<void> {
+    for (const key of sortedNameLockKeys(names)) {
+      await client.execute(ADVISORY_LOCK_SQL, [key]);
+    }
+  }
+
+  /**
+   * Find the account holding `name` under ANY tool.
+   *
+   * An account name identifies exactly one tool: the name is also the profile
+   * DIRECTORY name, and two tools claiming one directory name is the ambiguity
+   * this whole change exists to close. So the conflict a writer has to look for
+   * is name-scoped, not (tool,name)-scoped — the callers below hold the name
+   * lock while they ask, which is what makes the answer still true by the time
+   * they act on it.
+   */
+  private async findByName(
+    client: TypedQueryClient,
+    name: string,
+  ): Promise<{ tool: string } | null> {
+    return client.get<{ tool: string }>("SELECT tool FROM accounts WHERE name = $1", [name]);
+  }
+
+  private nameConflict(name: string, holder: { tool: string }, tool: string): AccountsError {
+    return holder.tool === tool
+      ? new AccountsError(`a ${tool} profile named "${name}" already exists`)
+      : new AccountsError(
+          `a profile named "${name}" already exists for tool "${holder.tool}"; ` +
+            "account names must be unique across tools",
+        );
+  }
+
   async create(input: CreateAccountInput): Promise<Account> {
     return this.client.transaction(async (client) => {
+      // Tool lock first, then name lock. Every path that needs both takes them
+      // in this order and none takes them in the other, so they cannot cycle.
       await this.lockToolRegistry(client, input.tool);
+      await this.lockAccountNames(client, [input.name]);
       const removed = await client.get<{ id: string }>(
         "SELECT id FROM custom_tool_tombstones WHERE id = $1",
         [input.tool],
@@ -184,9 +228,9 @@ export class AccountsRepo implements AccountsStore {
       if (removed) {
         throw new AccountsError(`custom tool "${input.tool}" was explicitly removed`);
       }
-      const existing = await this.getWith(client, input.tool, input.name);
+      const existing = await this.findByName(client, input.name);
       if (existing) {
-        throw new AccountsError(`a ${input.tool} profile named "${input.name}" already exists`);
+        throw this.nameConflict(input.name, existing, input.tool);
       }
       const row = await client.one<AccountRow>(
         `INSERT INTO accounts (tool, name, email, display_name, identity, card_last4, metadata, dir, description)
@@ -245,11 +289,16 @@ export class AccountsRepo implements AccountsStore {
 
   async rename(tool: string, oldName: string, newName: string): Promise<Account> {
     return this.client.transaction(async (client) => {
+      // Both endpoints of the move, so a concurrent writer can neither take the
+      // name being vacated nor the name being claimed. Deliberately no tool
+      // lock: nothing else acquires a name lock before a tool lock, and adding
+      // one here would be the only path that does, which is the cycle.
+      await this.lockAccountNames(client, [oldName, newName]);
       const existing = await this.getWith(client, tool, oldName, { forUpdate: true });
       if (!existing) throw new AccountsError(`no profile named "${oldName}" for tool "${tool}"`);
       if (oldName !== newName) {
-        const dupe = await this.getWith(client, tool, newName);
-        if (dupe) throw new AccountsError(`a ${tool} profile named "${newName}" already exists`);
+        const dupe = await this.findByName(client, newName);
+        if (dupe) throw this.nameConflict(newName, dupe, tool);
       }
       const row = await client.one<AccountRow>(
         "UPDATE accounts SET name = $1 WHERE tool = $2 AND name = $3 RETURNING *",

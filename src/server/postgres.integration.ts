@@ -661,12 +661,12 @@ describePostgres("PostgreSQL migration and repository integration", () => {
   test("unseen legacy custom tool IDs remain valid for old-client account creation", async () => {
     const repo = new AccountsRepo(client);
     const response = await createLiveHandler(repo)(
-      oldClientCreateRequest("legacy-unseen", "profile"),
+      oldClientCreateRequest("legacy-unseen", "legacy-unseen-profile"),
     );
     expect(response.status).toBe(201);
     expect(await response.json()).toMatchObject({
       tool: "legacy-unseen",
-      name: "profile",
+      name: "legacy-unseen-profile",
     });
     expect(
       await client.get<{ id: string }>(
@@ -692,13 +692,13 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       ),
     ).toEqual({ id: "legacy-removed" });
     const response = await createLiveHandler(repo)(
-      oldClientCreateRequest("legacy-removed", "profile"),
+      oldClientCreateRequest("legacy-removed", "legacy-removed-profile"),
     );
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({
       error: 'custom tool "legacy-removed" was explicitly removed',
     });
-    expect(await repo.get("legacy-removed", "profile")).toBeNull();
+    expect(await repo.get("legacy-removed", "legacy-removed-profile")).toBeNull();
 
     await repo.addCustomTool({
       id: "legacy-removed",
@@ -730,16 +730,22 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       const [created, removeAfterCreate] = await runOrderedToolRace(
         "legacy-create-first",
         "race-create-first",
-        () => createFirstRepo.create({ tool: "legacy-create-first", name: "profile" }),
+        () =>
+          createFirstRepo.create({
+            tool: "legacy-create-first",
+            name: "legacy-create-first-profile",
+          }),
         "race-remove-second",
         () => removeSecondRepo.removeCustomTool("legacy-create-first"),
       );
       expect(created.status).toBe("fulfilled");
       expect(removeAfterCreate.status).toBe("rejected");
       expect(String(removeAfterCreate.status === "rejected" ? removeAfterCreate.reason : "")).toContain(
-        "still used by profile(s) profile",
+        "still used by profile(s) legacy-create-first-profile",
       );
-      expect((await createFirstRepo.get("legacy-create-first", "profile"))?.name).toBe("profile");
+      expect(
+        (await createFirstRepo.get("legacy-create-first", "legacy-create-first-profile"))?.name,
+      ).toBe("legacy-create-first-profile");
       expect(
         await client.get("SELECT id FROM custom_tool_tombstones WHERE id = $1", ["legacy-create-first"]),
       ).toBeNull();
@@ -759,14 +765,20 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         "race-remove-first",
         () => removeFirstRepo.removeCustomTool("legacy-remove-first"),
         "race-create-second",
-        () => createSecondRepo.create({ tool: "legacy-remove-first", name: "profile" }),
+        () =>
+          createSecondRepo.create({
+            tool: "legacy-remove-first",
+            name: "legacy-remove-first-profile",
+          }),
       );
       expect(removed).toEqual({ status: "fulfilled", value: true });
       expect(createAfterRemove.status).toBe("rejected");
       expect(String(createAfterRemove.status === "rejected" ? createAfterRemove.reason : "")).toContain(
         'custom tool "legacy-remove-first" was explicitly removed',
       );
-      expect(await createSecondRepo.get("legacy-remove-first", "profile")).toBeNull();
+      expect(
+        await createSecondRepo.get("legacy-remove-first", "legacy-remove-first-profile"),
+      ).toBeNull();
       expect(
         await client.get<{ id: string }>(
           "SELECT id FROM custom_tool_tombstones WHERE id = $1",
@@ -808,7 +820,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         () =>
           createFirstClient.execute(
             "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
-            ["raw-create-first-tool", "profile"],
+            ["raw-create-first-tool", "raw-create-first-profile"],
           ),
         "raw-delete-second",
         () =>
@@ -824,7 +836,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       expect(
         await appClient.get("SELECT tool FROM accounts WHERE tool = $1 AND name = $2", [
           "raw-create-first-tool",
-          "profile",
+          "raw-create-first-profile",
         ]),
       ).toEqual({ tool: "raw-create-first-tool" });
       expect(
@@ -862,7 +874,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         () =>
           createSecondClient.execute(
             "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
-            ["raw-delete-first-tool", "profile"],
+            ["raw-delete-first-tool", "raw-delete-first-profile"],
           ),
       );
       expect(deleted.status).toBe("fulfilled");
@@ -873,7 +885,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       expect(
         await appClient.get("SELECT tool FROM accounts WHERE tool = $1 AND name = $2", [
           "raw-delete-first-tool",
-          "profile",
+          "raw-delete-first-profile",
         ]),
       ).toBeNull();
       expect(
@@ -945,6 +957,35 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         await clientB.close();
       }
     }
+  });
+
+  test("a name taken by another tool is refused over HTTP as 409, not 500", async () => {
+    const handler = createLiveHandler(new AccountsRepo(client));
+    const name = "http-cross-tool-name";
+
+    // Both arms. A refusal probe that never saw the accepted arm cannot tell a
+    // working guard apart from a service that rejects everything.
+    const accepted = await handler(oldClientCreateRequest("http-cross-tool-a", name));
+    expect({ status: accepted.status, body: await accepted.json() }).toMatchObject({
+      status: 201,
+      body: { tool: "http-cross-tool-a", name },
+    });
+
+    const refused = await handler(oldClientCreateRequest("http-cross-tool-b", name));
+    expect({ status: refused.status, body: await refused.json() }).toEqual({
+      status: 409,
+      body: {
+        error:
+          `a profile named "${name}" already exists for tool "http-cross-tool-a"; ` +
+          "account names must be unique across tools",
+      },
+    });
+    expect(
+      await client.many<{ tool: string }>(
+        "SELECT tool FROM accounts WHERE name = $1 ORDER BY tool",
+        [name],
+      ),
+    ).toEqual([{ tool: "http-cross-tool-a" }]);
   });
 
   test("renames into one new name across tools resolve to exactly one holder", async () => {
