@@ -2128,9 +2128,13 @@ test("pinned toolchain has exactly one declaration that every consumer reads", (
     // setup-node / setup-bun inputs cannot read a file, so a test binds them instead.
     expect(workflow).toContain(`node-version: "${RELEASE_NODE_VERSION}"`);
     expect(workflow).toContain(`bun-version: "${RELEASE_BUN_VERSION}"`);
-    expect(workflow).not.toMatch(/\[\[ "\$\(?node --version\)?" ==/);
-    expect(workflow).not.toMatch(/== "1\.3\.14" \]\]/);
     expect(workflow).toContain("node scripts/assert-toolchain.mjs");
+    // No workflow may restate a version as a shell comparison; that is the
+    // duplication this file exists to remove, and it fails with no output.
+    for (const version of [RELEASE_NODE_VERSION, RELEASE_NPM_VERSION, RELEASE_BUN_VERSION]) {
+      expect(workflow).not.toContain(`== "${version}" ]]`);
+      expect(workflow).not.toContain(`== "v${version}" ]]`);
+    }
   }
 });
 
@@ -2147,19 +2151,30 @@ test("release workflow names its missing environment secrets before doing any wo
   expect(workflow.indexOf("uses: actions/checkout")).toBeGreaterThan(secretsStep);
 });
 
-test("deterministic pack verification runs beside the test job, not inside it", () => {
+// `test` is a required status check on main and a separate job would not be, so
+// the double build-and-pack must stay in this job — but it belongs last, behind
+// every cheaper signal, so a contributor never waits on it to learn something a
+// faster step already knew.
+test("deterministic pack verification stays in the required test job, and runs last", () => {
   const workflow = readFileSync(
     new URL("../.github/workflows/ci.yml", import.meta.url),
     "utf8",
   );
-  expect(workflow).toContain("\n  pack:\n");
-  const packJob = workflow.slice(workflow.indexOf("\n  pack:\n"));
-  expect(packJob).toContain("bun run verify:pack");
-  const testJob = workflow.slice(
-    workflow.indexOf("\n  test:\n"),
-    workflow.indexOf("\n  pack:\n") > workflow.indexOf("\n  test:\n")
-      ? workflow.indexOf("\n  pack:\n")
-      : workflow.length,
-  );
-  expect(testJob).not.toContain("verify:pack");
+  const jobStart = workflow.indexOf("\n  test:\n");
+  const jobEnd = workflow.indexOf("\n  portable-claude:\n");
+  expect(jobStart).toBeGreaterThan(-1);
+  expect(jobEnd).toBeGreaterThan(jobStart);
+  const testJob = workflow.slice(jobStart, jobEnd);
+  const packStep = testJob.indexOf("bun run verify:pack");
+  expect(packStep).toBeGreaterThan(-1);
+  for (const cheaper of [
+    "bun run typecheck",
+    "bun test\n",
+    "bun run build\n",
+    "bun run conformance",
+    "bun run test:postgres",
+  ]) {
+    expect(testJob.indexOf(cheaper)).toBeGreaterThan(-1);
+    expect(testJob.indexOf(cheaper)).toBeLessThan(packStep);
+  }
 });
