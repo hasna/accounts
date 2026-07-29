@@ -1,4 +1,17 @@
-import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { AccountsError } from "../types.js";
 
@@ -129,4 +142,42 @@ export function assertSafeWritePath(filePath: string, opts?: { mustStayUnder?: s
     }
   }
   return resolved;
+}
+
+/**
+ * Write a file so an interrupted or short write can never be observed: the
+ * content lands in a fresh temp file, is fsynced, and is moved into place with
+ * a single rename. Anything that reads the target sees either the old bytes or
+ * the new ones, never a truncated prefix.
+ *
+ * `mode` is applied explicitly after the rename because `writeFileSync`'s mode
+ * only takes effect when it creates the file — it will not tighten an existing
+ * one.
+ */
+export function writeFileAtomic(
+  path: string,
+  contents: string | Uint8Array,
+  opts: { mode: number; mustStayUnder?: string },
+): void {
+  const guard = opts.mustStayUnder ? { mustStayUnder: opts.mustStayUnder } : undefined;
+  assertSafeWritePath(path, guard);
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  assertSafeWritePath(temp, guard);
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, "wx", opts.mode);
+    // No encoding argument: a `Uint8Array` must land as its exact bytes, and a
+    // string still defaults to utf8. Session trees carry binary attachments
+    // alongside JSONL, so a utf8 round-trip here would corrupt them.
+    writeFileSync(fd, contents);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, path);
+    chmodSync(path, opts.mode);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
 }

@@ -115,6 +115,16 @@ selected profile's isolated `CODEX_HOME` and Electron user data directory.
 | **Isolated** | `accounts launch`, `accounts env`, `accounts shell` | Terminal, two accounts at once |
 | **Apply** | `accounts apply <name>` | Cursor, VS Code, single global auth |
 | **Picker** | `accounts pick` | Interactive choose; default applies to live paths |
+| **In-place** | `accounts switch-account <name>` | Change the RUNNING Claude session's account mid-conversation, no restart |
+
+**In-place switching** works because Claude Code re-reads `<configDir>/.credentials.json`
+from disk on every API request (measured on 2.1.220): `switch-account` snapshots the
+dir's outgoing credentials back to their owning profile, installs the target profile's
+credentials + `oauthAccount` into the session's config dir, and the session's next
+message runs as the new account with the conversation intact. Every live session
+sharing that config dir switches together, so the command refuses multi-session dirs
+without `--yes`. If a target profile's auth is expired it fails loudly before touching
+anything.
 
 `accounts use` alone does **not** change Cursor — run `accounts apply` for IDE auth.
 
@@ -122,6 +132,131 @@ A child process cannot change your parent shell — use `eval "$(accounts env �
 [shell hook](docs/hook.md) (terminal `claude` only, not IDE extensions).
 
 Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
+
+## What is isolated, and what is shared
+
+Only **credentials** are per-profile. Capabilities belong to the person at the
+machine, so every profile reads the same corpus:
+
+| Concern | Where it lives | Shared? |
+|---------|----------------|---------|
+| OAuth account, credentials, keychain snapshot | `<profile>/.claude.json`, `<profile>/.credentials.json`, `<profile>/.accounts-auth/` | No — per profile |
+| Live per-process session state | `<profile>/sessions` | No — per profile |
+| Transcripts (sessions, subagents, workflows) | `<profile>/projects` → `~/.claude/projects` | Yes — symlink, **after `accounts sessions merge`** |
+| Prompt history | `<profile>/history.jsonl` → `~/.claude/history.jsonl` | Yes — symlink, **after `accounts sessions merge`** |
+| Skills | `<profile>/skills` → `~/.claude/skills` | Yes — symlink |
+| Subagents | `<profile>/agents` → `~/.claude/agents` | Yes — symlink |
+| MCP servers | `mcpServers` merged into `<profile>/.claude.json` | Yes — merged (the profile's own entries always win) |
+
+The links are plain symlinks, so this is **write-through**: creating or deleting a
+skill from inside any profile changes the one shared corpus for all of them. That
+cuts both ways — one `rm -rf` through a link empties the corpus for every profile
+at once — so `accounts` records the size of each corpus when it links it and
+`accounts doctor` fails if the corpus later shrinks. Once you have confirmed a
+deletion was intended, accept it with:
+
+```bash
+accounts doctor --accept-capability-baseline
+```
+
+MCP servers cannot be linked (the file that holds them is rewritten in place), so
+they are merged member-by-member instead — a profile gains anything new in the
+shared set and never loses its own entries. Servers are unioned across the tool's
+declared sources with the first definition of a name winning, so rendered config
+takes precedence over templated config; a server whose command still contains an
+unsubstituted `{{PLACEHOLDER}}` is dropped rather than shipped broken, and the
+`secrets` server is excluded outright — a vault-retrieval tool in another
+identity's tool list is the closest thing to sharing tokens without sharing them.
+If the profile's own config file exists but does not parse, the merge is refused
+and reported: it is never rebuilt from scratch over whatever the file still held.
+
+### Sessions: merge first, then link
+
+Sessions are the one capability that cannot simply be linked. A profile created
+before session sharing already owns a real, populated `projects/` directory, and
+the linker deliberately refuses to replace a real directory a profile owns — that
+guard is what stops a link from swallowing real data. Listing sessions as a shared
+entry on its own would therefore do nothing at all while reporting success. The
+contents have to be unioned into the shared home first:
+
+```bash
+accounts sessions merge --dry-run      # report only, writes nothing
+accounts sessions merge                # union every profile's sessions into the shared home
+accounts sessions merge --link         # …and then point each registered profile at it
+```
+
+What the merge guarantees:
+
+- **Nothing is deleted, ever.** Source files are only read. When `--link` replaces
+  a profile's own directory, the original is *renamed* to
+  `<profile>/.accounts-session-migration/<timestamp>/`, never removed, and if the
+  swap fails at any point the rename is undone and that profile is left exactly as
+  it was.
+- **Files are merged with `link(2)`, not copied.** The shared home gets the same
+  inode, so a transcript that is still being appended to arrives whole instead of
+  as a torn prefix of itself, mtimes are preserved (the tool prunes sessions by
+  age — a copy that reset them would stop pruning entirely), the migration costs
+  no disk, and a re-run is a no-op by construction: the same inode means the file
+  is already merged. Copying is the fallback for a source on another filesystem,
+  and it refuses a JSONL body that does not end in a newline.
+- **Files are keyed by their full path under `projects/`, never by name.** The
+  tree is nested — subagent and workflow transcripts sit several directories down,
+  and `journal.jsonl` alone occurs at hundreds of distinct paths — so a
+  name-keyed merge would collapse unrelated files into one.
+- **A conflict never overwrites.** Same path, identical bytes: nothing to do. Same
+  path, and the shared copy is a *proven* byte prefix of the incoming one:
+  the longer one replaces it atomically, which cannot lose a byte. Anything else
+  is a genuine fork, and both copies are kept — the second under a deterministic
+  `<name>.from-<source>.<hash>.jsonl`, so a re-run finds its own copy instead of
+  making another.
+- **Sources are enumerated from the filesystem, not the registry.** Profile
+  directories that Accounts has forgotten still hold real transcripts, and they
+  are merged too. They are never *linked*, because only registered profiles are
+  visited by the launch-time repair that keeps a link pointing at the right place;
+  they are listed in the report so you can `accounts import` them and merge again.
+- **`--from <dir>` merges extra read-only trees**, such as a backup taken before
+  the migration, so a transcript deleted from the live tree since the backup is
+  restored rather than lost.
+- **It verifies before *and after* it links.** Transcript counts are taken
+  recursively on the shared side — adding the sources back in would double-count
+  every hardlink — and the shared tree must have grown by exactly the transcripts
+  the run placed. The count is re-taken after the link step, because that is the
+  only part of the run that can destroy anything. A profile is linked only when
+  everything under it is demonstrably in the shared home, and anything written to
+  it during the run is merged out of the retained tree before the swap is
+  accepted.
+- **Symlinks inside the tree are reproduced, not discarded.** Claude Code creates
+  them for forked and resumed subagent transcripts. They are rewritten relative
+  so the shared corpus stays portable; a link pointing out of the tree is refused
+  with guidance rather than followed.
+- **A dry run reports bounds, not exact counts.** It places nothing, so each
+  source is compared against a shared tree that never received the earlier ones:
+  merge counts are an upper bound and collision counts a lower bound.
+
+`<profile>/sessions` is deliberately *not* shared: it holds one file per running
+process, with a status heartbeat, and each instance reaps entries whose process it
+believes to be dead — two profiles sharing it would reap each other's live
+sessions. Nothing is lost by keeping it per-profile, because a session's durable
+record is its transcript under `projects/`.
+
+Because the shared corpus is write-through, `accounts doctor` records a floor for
+it and fails if it shrinks. For `projects/` that floor is counted **recursively**:
+its top level is one directory per project, so a top-level count would not move
+even if every transcript inside were deleted.
+
+Instruction files (`CLAUDE.md`, `rules/`) are **not** handled here, and the status
+quo is not by design: Claude Code discovers memory by walking the working
+directory's ancestors, not the config dir, so a copy inside a profile would never
+be read. They load today only when the working directory happens to sit under the
+home directory that holds them — a session started outside it loses them silently.
+
+Sharing is materialized when a profile is created and re-checked on every launch,
+so profiles created by older versions are repaired the next time they are used;
+`accounts doctor` reports any profile that is not actually sharing. Which entries
+and config keys are shared is per-tool data (`sharedEntries` / `sharedConfig` on a
+tool definition), so a custom tool registered with `accounts tools add` can opt in.
+The shared home defaults to the tool's default config dir and can be overridden
+per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CLAUDE`).
 
 ## Switching modes (summary)
 
@@ -141,6 +276,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
 | `accounts switch <name>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. Use `--tool` only when ambiguous. |
 | `accounts switch <name> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. Supports `--permissions <preset>`. |
+| `accounts switch-account [name]` | Switch the CURRENT session's account in place — no restart, conversation intact (Claude-only; the running session re-reads `.credentials.json` on its next request). Picker when no name; `--dir`, `--yes`, `--json`. |
 | `accounts use <name>` | Mark profile active; prints apply/env hints. |
 | `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
 | `accounts show <name> --tool <tool>` | Profile details including active/applied flags. |

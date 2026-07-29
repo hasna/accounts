@@ -10,21 +10,9 @@
 
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { type Store, storeSchema, AccountsError, profileNameSchema } from "./types.js";
-import { assertSafeWritePath } from "./lib/safe-path.js";
+import { writeFileAtomic } from "./lib/safe-path.js";
 
 function validateEnvPath(value: string, label: string): string {
   const trimmed = value.trim();
@@ -178,23 +166,10 @@ export function saveStore(store: Store): void {
   if (!parsed.success) {
     throw new AccountsError(`invalid store: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
   }
-  assertSafeWritePath(path, { mustStayUnder: accountsHome() });
-  mkdirSync(join(path, ".."), { recursive: true });
-  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  assertSafeWritePath(temp, { mustStayUnder: accountsHome() });
-  let fd: number | undefined;
-  try {
-    fd = openSync(temp, "wx", 0o600);
-    writeFileSync(fd, JSON.stringify(parsed.data, null, 2) + "\n", "utf8");
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = undefined;
-    renameSync(temp, path);
-    chmodSync(path, 0o600);
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-    rmSync(temp, { force: true });
-  }
+  writeFileAtomic(path, JSON.stringify(parsed.data, null, 2) + "\n", {
+    mode: 0o600,
+    mustStayUnder: accountsHome(),
+  });
 }
 
 /**
