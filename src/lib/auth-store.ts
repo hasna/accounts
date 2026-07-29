@@ -177,18 +177,23 @@ function switchMarkerFilePresent(profileDir: string): boolean {
   return existsSync(profileSwitchedAccountMarker(profileDir));
 }
 
-function oauthRecordFromAccountFiles(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
-  // A switched-away dir's live account file carries ANOTHER profile's account;
-  // binding from it would attach this profile to a foreign identity. The
-  // snapshot (checked first by callers) stays owner-true; without one, a
-  // marked dir simply has no resolvable binding.
-  if (switchMarkerFilePresent(profileDir)) return undefined;
+/** The dir's live account record, marker-blind — the raw read. */
+function liveOAuthRecordUnfiltered(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
   const paths = tool ? profileAccountJsonPaths(profileDir, tool) : [join(profileDir, ".claude.json")];
   for (const p of paths) {
     const oauth = readJsonFile(p)?.oauthAccount;
     if (oauth && typeof oauth === "object") return oauth as JsonRecord;
   }
   return undefined;
+}
+
+function oauthRecordFromAccountFiles(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
+  // A switched-away dir's live account file carries ANOTHER profile's account;
+  // binding from it would attach this profile to a foreign identity. The
+  // snapshot (checked first by callers) stays owner-true; without one, a
+  // marked dir simply has no resolvable binding.
+  if (switchMarkerFilePresent(profileDir)) return undefined;
+  return liveOAuthRecordUnfiltered(profileDir, tool);
 }
 
 function uuidFromOAuthRecord(oauth: JsonRecord | undefined): string | undefined {
@@ -213,16 +218,6 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
   if (typeof uuid !== "string") return undefined;
   const token = uuid.trim().toLowerCase();
   return token.length > 0 ? token : undefined;
-}
-
-/** The dir's live account record, marker-blind — the raw read for conflict detection. */
-function liveOAuthRecordUnfiltered(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
-  const paths = tool ? profileAccountJsonPaths(profileDir, tool) : [join(profileDir, ".claude.json")];
-  for (const p of paths) {
-    const oauth = readJsonFile(p)?.oauthAccount;
-    if (oauth && typeof oauth === "object") return oauth as JsonRecord;
-  }
-  return undefined;
 }
 
 /**
