@@ -60,6 +60,48 @@ interface AccountRow {
   last_used_at: string | Date | null;
 }
 
+/**
+ * The single statement every advisory lock in this repository goes through.
+ *
+ * Exported so tests can park a blocker on the exact same lock the repository
+ * takes, instead of re-typing the SQL and silently drifting from it.
+ */
+export const ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+
+/**
+ * Lock namespaces, and the order in which a caller that needs both must take
+ * them: TOOL first, then NAME. No path acquires them the other way round, so
+ * the two namespaces cannot form a wait cycle.
+ *
+ * The tool lock is genuinely tool-scoped — it guards the custom-tool
+ * registration/tombstone races, where the contended resource is the tool id.
+ * It cannot also guard account-name uniqueness: two creates of the same name
+ * under different tools take DIFFERENT tool locks, so they never see each
+ * other. The name lock is what serializes name allocation across tools.
+ */
+export function toolLockKey(tool: string): string {
+  return `accounts:tool:${tool}`;
+}
+
+export function accountNameLockKey(name: string): string {
+  return `accounts:name:${name}`;
+}
+
+/**
+ * Deterministic, argument-order-independent acquisition order for a set of
+ * account-name locks.
+ *
+ * `rename()` holds two name locks at once. Two opposing renames over the same
+ * pair (`a -> b` and `b -> a`) would take them in opposite orders and deadlock
+ * if each simply followed its own argument order. Sorting collapses both onto
+ * one order, so one waits instead of both dying. Duplicates are dropped: an
+ * advisory lock taken twice in a transaction is harmless but the extra round
+ * trip is not free, and the deduped list is what the ordering test asserts on.
+ */
+export function sortedNameLockKeys(names: readonly string[]): string[] {
+  return [...new Set(names)].sort().map(accountNameLockKey);
+}
+
 function iso(value: string | Date | null | undefined): string | undefined {
   if (value === null || value === undefined) return undefined;
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -129,15 +171,66 @@ export class AccountsRepo implements AccountsStore {
   }
 
   private async lockToolRegistry(client: TypedQueryClient, tool: string): Promise<void> {
-    await client.execute(
-      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-      [`accounts:tool:${tool}`],
-    );
+    await client.execute(ADVISORY_LOCK_SQL, [toolLockKey(tool)]);
+  }
+
+  /**
+   * Serialize every writer that allocates or moves one of `names`.
+   *
+   * Taken in sorted order so a caller holding two of them can never be half of
+   * a cycle with a caller holding the same two the other way round.
+   */
+  private async lockAccountNames(
+    client: TypedQueryClient,
+    names: readonly string[],
+  ): Promise<void> {
+    for (const key of sortedNameLockKeys(names)) {
+      await client.execute(ADVISORY_LOCK_SQL, [key]);
+    }
+  }
+
+  /**
+   * Find the account holding `name` under ANY tool.
+   *
+   * An account name has to identify exactly one tool because RESOLUTION is
+   * name-first: `resolveProfileFromStore` (src/lib/profiles.ts) looks a profile
+   * up by name and, when no `--tool` is given, throws `profile "<name>" exists
+   * for multiple tools` the moment two rows share it. A name claimed by two
+   * tools therefore breaks every bare `accounts <cmd> <name>` for that name —
+   * that is the ambiguity this change closes.
+   *
+   * NOT because the name is the profile directory name. It is not: managed dirs
+   * are tool-namespaced — `join(profilesDir(), toolId, name)` in
+   * src/lib/profiles.ts, src/lib/login.ts and src/lib/store.ts — so two tools
+   * sharing a name produce two DISTINCT directories, and directory collision
+   * has its own independent guard (`sameConfigDir`, src/lib/profiles.ts).
+   *
+   * So the conflict a writer has to look for is name-scoped, not
+   * (tool,name)-scoped — and the callers below hold the name lock while they
+   * ask, which is what makes the answer still true by the time they act on it.
+   */
+  private async findByName(
+    client: TypedQueryClient,
+    name: string,
+  ): Promise<{ tool: string } | null> {
+    return client.get<{ tool: string }>("SELECT tool FROM accounts WHERE name = $1", [name]);
+  }
+
+  private nameConflict(name: string, holder: { tool: string }, tool: string): AccountsError {
+    return holder.tool === tool
+      ? new AccountsError(`a ${tool} profile named "${name}" already exists`)
+      : new AccountsError(
+          `a profile named "${name}" already exists for tool "${holder.tool}"; ` +
+            "account names must be unique across tools",
+        );
   }
 
   async create(input: CreateAccountInput): Promise<Account> {
     return this.client.transaction(async (client) => {
+      // Tool lock first, then name lock. Every path that needs both takes them
+      // in this order and none takes them in the other, so they cannot cycle.
       await this.lockToolRegistry(client, input.tool);
+      await this.lockAccountNames(client, [input.name]);
       const removed = await client.get<{ id: string }>(
         "SELECT id FROM custom_tool_tombstones WHERE id = $1",
         [input.tool],
@@ -145,9 +238,9 @@ export class AccountsRepo implements AccountsStore {
       if (removed) {
         throw new AccountsError(`custom tool "${input.tool}" was explicitly removed`);
       }
-      const existing = await this.getWith(client, input.tool, input.name);
+      const existing = await this.findByName(client, input.name);
       if (existing) {
-        throw new AccountsError(`a ${input.tool} profile named "${input.name}" already exists`);
+        throw this.nameConflict(input.name, existing, input.tool);
       }
       const row = await client.one<AccountRow>(
         `INSERT INTO accounts (tool, name, email, display_name, identity, card_last4, metadata, dir, description)
@@ -206,11 +299,16 @@ export class AccountsRepo implements AccountsStore {
 
   async rename(tool: string, oldName: string, newName: string): Promise<Account> {
     return this.client.transaction(async (client) => {
+      // Both endpoints of the move, so a concurrent writer can neither take the
+      // name being vacated nor the name being claimed. Deliberately no tool
+      // lock: nothing else acquires a name lock before a tool lock, and adding
+      // one here would be the only path that does, which is the cycle.
+      await this.lockAccountNames(client, [oldName, newName]);
       const existing = await this.getWith(client, tool, oldName, { forUpdate: true });
       if (!existing) throw new AccountsError(`no profile named "${oldName}" for tool "${tool}"`);
       if (oldName !== newName) {
-        const dupe = await this.getWith(client, tool, newName);
-        if (dupe) throw new AccountsError(`a ${tool} profile named "${newName}" already exists`);
+        const dupe = await this.findByName(client, newName);
+        if (dupe) throw this.nameConflict(newName, dupe, tool);
       }
       const row = await client.one<AccountRow>(
         "UPDATE accounts SET name = $1 WHERE tool = $2 AND name = $3 RETURNING *",
