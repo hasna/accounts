@@ -184,6 +184,35 @@ test("POSITIVE CONTROL: a genuinely rotated NEWER credential still replaces the 
   expect(JSON.parse(after).claudeAiOauth.accessToken).toBe("rotated-fresh-access");
 });
 
+test("POSITIVE CONTROL: a fresh login (overwrite) still replaces the parked snapshot", () => {
+  // The downgrade guard applies to `overwrite: true` as well, so it could in
+  // principle block a re-login from parking its new credential — which would
+  // silently strand a re-authenticated profile on its old token. betterCredential
+  // ranks refresh-token presence, then usability, then mtime, so a real login
+  // always wins; this proves it rather than assuming it.
+  const dir = makeProfile("alpha", UUID_A, "alpha");
+  const before = readFileSync(profileCredentialsSnapshot(dir), "utf8");
+
+  writeFileSync(join(dir, ".credentials.json"), credentialJson({ label: "after-login" }));
+  ensureProfileAuthSnapshot(dir, tool(), { overwrite: true });
+
+  const after = readFileSync(profileCredentialsSnapshot(dir), "utf8");
+  expect(after).not.toBe(before);
+  expect(JSON.parse(after).claudeAiOauth.accessToken).toBe("after-login-access");
+});
+
+test("a login that somehow wrote a BLANK still cannot destroy the parked copy", () => {
+  // The other side of the same knob: `overwrite` must not be a bypass for the
+  // downgrade guard, or re-login becomes a way to lose the last good copy.
+  const dir = makeProfile("alpha", UUID_A, "alpha");
+  const parked = readFileSync(profileCredentialsSnapshot(dir));
+
+  writeFileSync(join(dir, ".credentials.json"), rotatedAwayJson());
+  ensureProfileAuthSnapshot(dir, tool(), { overwrite: true });
+
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
+});
+
 // --- the gap: nothing recovered a marker-less rotated-away dir ---------------
 
 test("healSwitchedProfileDir does NOT reach a rotated-away dir with no marker", () => {
@@ -267,25 +296,86 @@ test("recovery leaves a healthy dir alone", () => {
   expect(readFileSync(join(dir, ".credentials.json"), "utf8")).toBe(before);
 });
 
-test("recovery never throws on the launch path, even for a profile with no OAuth account", () => {
-  // profileEnv runs this on EVERY launch. restoreClaudeAuthIntoDir throws for a
-  // profile with no OAuth account data, and that profile still has to be able to
-  // launch and reach its own error rather than being taken down by a repair
-  // attempt it never asked for.
-  const dir = mkdtempSync(join(tmpdir(), "recov-nooauth-"));
+test("recovery REFUSES when the profile has a parked credential but no parked IDENTITY", () => {
+  // Found by adversarial self-review, not by the brief. `profileHasOAuthAccount`
+  // is satisfied by the LIVE .claude.json — the guest's after an in-place switch —
+  // and restoreClaudeAuthIntoDir falls back to that same record when no snapshot
+  // exists. Without this gate the dir would end up carrying the GUEST's
+  // oauthAccount next to THIS profile's credential: one account's identity
+  // paired with another account's token.
+  const dir = mkdtempSync(join(tmpdir(), "recov-noident-"));
   mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
-  // A restorable parked credential, but no oauth-account.json anywhere.
-  writeFileSync(join(dir, ".accounts-auth", "credentials.json"), credentialJson({ label: "orphan" }));
+  // A restorable parked credential, but no parked identity for it.
+  writeFileSync(join(dir, ".accounts-auth", "credentials.json"), credentialJson({ label: "parked" }));
+  // The dir currently shows a DIFFERENT account, and its credential is blanked.
+  writeFileSync(
+    join(dir, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: UUID_B, emailAddress: "guest@example.com" } }),
+  );
   writeFileSync(join(dir, ".credentials.json"), rotatedAwayJson());
-  addProfile({ name: "orphan", dir });
+  addProfile({ name: "noident", dir });
 
-  let result: ReturnType<typeof recoverParkedCredential> | undefined;
-  expect(() => {
-    result = recoverParkedCredential(dir, tool(), "orphan");
-  }).not.toThrow();
-  expect(result?.outcome).toBe("failed");
-  expect(result?.detail).toMatch(/could not restore/i);
+  const result = recoverParkedCredential(dir, tool(), "noident");
+
+  expect(result.outcome).toBe("identity-unknown");
+  // Nothing written: the guest identity was NOT paired with the parked credential.
+  expect(classifyCredentialFile(join(dir, ".credentials.json")).state).toBe("rotated-away");
+  const stillGuest = JSON.parse(readFileSync(join(dir, ".claude.json"), "utf8")) as {
+    oauthAccount?: { accountUuid?: string };
+  };
+  expect(stillGuest.oauthAccount?.accountUuid).toBe(UUID_B);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("recovery never throws on the launch path, whatever shape the dir is in", () => {
+  // profileEnv runs this on EVERY launch, so a malformed or half-built profile
+  // must not take the launch down with it — it still has to reach its own error.
+  // The guarantee is "returns an outcome, never throws", so it is asserted
+  // across the broken shapes rather than for one of them.
+  const known = new Set([
+    "recovered",
+    "live-credential-usable",
+    "no-parked-credential",
+    "identity-would-change",
+    "identity-unknown",
+    "failed",
+    "not-applicable",
+  ]);
+
+  const shapes: Array<[string, (dir: string) => void]> = [
+    ["parked credential, no parked identity", (dir) => {
+      mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+      writeFileSync(join(dir, ".accounts-auth", "credentials.json"), credentialJson({ label: "orphan" }));
+      writeFileSync(join(dir, ".credentials.json"), rotatedAwayJson());
+    }],
+    ["nothing at all", () => {}],
+    ["unreadable everything", (dir) => {
+      mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+      writeFileSync(join(dir, ".claude.json"), "{ not json");
+      writeFileSync(join(dir, ".credentials.json"), "{ not json");
+      writeFileSync(join(dir, ".accounts-auth", "credentials.json"), "{ not json");
+    }],
+    ["identity present, credential unreadable", (dir) => {
+      mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+      writeFileSync(
+        join(dir, ".accounts-auth", "oauth-account.json"),
+        JSON.stringify({ oauthAccount: { accountUuid: UUID_A, emailAddress: "a@example.com" } }),
+      );
+      writeFileSync(join(dir, ".accounts-auth", "credentials.json"), "{ not json");
+      writeFileSync(join(dir, ".credentials.json"), rotatedAwayJson());
+    }],
+  ];
+
+  for (const [label, build] of shapes) {
+    const dir = mkdtempSync(join(tmpdir(), "recov-shape-"));
+    build(dir);
+    let outcome: string | undefined;
+    expect(() => {
+      outcome = recoverParkedCredential(dir, tool(), "shaky").outcome;
+    }, label).not.toThrow();
+    expect(known.has(outcome ?? ""), `${label} -> ${outcome}`).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("recovery says re-authentication is required only when nothing is parked", () => {

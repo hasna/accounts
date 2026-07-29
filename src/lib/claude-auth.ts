@@ -462,6 +462,7 @@ export type ParkedRecoveryOutcome =
   | "live-credential-usable"
   | "no-parked-credential"
   | "identity-would-change"
+  | "identity-unknown"
   | "failed"
   | "not-applicable";
 
@@ -537,11 +538,32 @@ export function recoverParkedCredential(
 
   // Identity gate. The parked copy is the profile's OWN account; if the dir is
   // presenting someone else's, restoring changes who the dir is.
+  //
+  // The profile's own identity must be KNOWN, not merely not-contradicted.
+  // `profileHasOAuthAccount` is satisfied by the LIVE `.claude.json`, which
+  // after an in-place switch is the guest's, and `restoreClaudeAuthIntoDir`
+  // falls back to that same live record when no snapshot exists. A profile
+  // holding a parked credential but no parked IDENTITY would therefore have had
+  // the guest's `oauthAccount` written next to this profile's credential —
+  // pairing one account's identity with another account's token, which is the
+  // precise failure the identity-index layering exists to prevent. Unknown
+  // identity is a refusal, not a free pass.
   const own = readOAuthSnapshot(profileDir) ?? centralOAuthRecordForProfile(profileDir, tool);
   const ownUuid = typeof own?.accountUuid === "string" ? own.accountUuid.toLowerCase() : undefined;
   const liveUuidRaw = readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool))?.accountUuid;
   const liveUuid = typeof liveUuidRaw === "string" ? liveUuidRaw.toLowerCase() : undefined;
-  if (ownUuid && liveUuid && ownUuid !== liveUuid) {
+  if (!ownUuid) {
+    return {
+      outcome: "identity-unknown",
+      detail:
+        `the dir's credential is ${describeCredentialState(layers.live.state)} and a parked copy exists, but this ` +
+        `profile has no OAuth account snapshot of its own, so the parked credential cannot be attributed to an ` +
+        `account. Restoring it would pair whatever identity the dir currently shows with this credential. ` +
+        `Run \`accounts detect ${profileName ?? "NAME"}\` or re-authenticate.`,
+      layers,
+    };
+  }
+  if (liveUuid && ownUuid !== liveUuid) {
     const attached = listDirLiveSessions(profileDir).filter((s) => s.alive).length;
     return {
       outcome: "identity-would-change",

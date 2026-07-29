@@ -322,6 +322,15 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
   // much headroom it has: two Claude Code processes behind one refresh token
   // end with the server rotating it and one copy being blanked. Our OWN dir is
   // excluded from the check — it is the one being switched away from.
+  //
+  // KNOWN FALSE POSITIVE, accepted deliberately: liveness comes from pid files
+  // plus `kill(pid, 0)`, so a stale pid file whose number has been reused by an
+  // unrelated process reads as live and needlessly withholds that account. The
+  // failure directions are not symmetric — a false positive costs one switch
+  // option and is reported; a false negative destroys a credential — so this
+  // errs toward refusing. It is an exclusion rather than a ranking penalty for
+  // the same reason: a contended account ranked last would still be chosen
+  // whenever it is the only candidate, which is exactly the case that hurts.
   const contendedAccounts = new Set<string>();
   const liveSessionsIn = deps.liveSessionsIn;
   if (liveSessionsIn) {
