@@ -56,7 +56,12 @@ import {
   type SwitchMode,
 } from "./lib/switch.js";
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
-import { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+import {
+  buildIdentityIndex,
+  describeAccountStatus,
+  dirAccountUuid,
+  statusNeedsOperator,
+} from "./lib/identity-index.js";
 import {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_MIN_HEADROOM,
@@ -79,6 +84,7 @@ import {
   collectAccountsUsage,
   DEFAULT_USAGE_CACHE_MAX_AGE_MS,
   pickHealthiestAccount,
+  usageDoorSummary,
   type AccountUsageEntry,
 } from "./lib/usage-report.js";
 import {
@@ -935,7 +941,15 @@ function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): strin
   const marker = entry.accountUuid === currentUuid ? chalk.cyan(" (this session)") : "";
   const lines: string[] = [];
   if (entry.status !== "ok") {
-    lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.yellow(entry.status)}`);
+    // A bare status word sent an operator to re-authenticate a live account, so
+    // the status always carries its gloss. `needs-refresh` is the routine state
+    // of any parked copy older than the 8-hour access-token life and is painted
+    // as a non-problem; only the statuses that need a human are highlighted.
+    const paint = statusNeedsOperator(entry.status) ? chalk.yellow : chalk.dim;
+    lines.push(
+      `  ${chalk.bold(who)}${marker} — ${paint(entry.status)} ` +
+        chalk.dim(`(${describeAccountStatus(entry.status)})`),
+    );
   } else if (entry.error) {
     lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.red(`${entry.error.kind}: ${entry.error.message}`)}`);
   } else if (entry.usage) {
@@ -969,9 +983,7 @@ function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): strin
       lines.push(chalk.dim(`      ${w.id} [${cls}]: ${used}${reset}`) + active);
     }
   }
-  const doors: string[] = [];
-  if (entry.profiles.length) doors.push(`profiles: ${entry.profiles.join(", ")}`);
-  if (entry.occupies.length) doors.push(`running in: ${entry.occupies.join(", ")}`);
+  const doors = usageDoorSummary(entry);
   if (doors.length) lines.push(chalk.dim(`      ${doors.join(" · ")}`));
   return lines.join("\n");
 }

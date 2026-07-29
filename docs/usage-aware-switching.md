@@ -165,9 +165,43 @@ accounts usage-hook            # the UserPromptSubmit handler (fail-open, cached
 accounts usage-hook --print-install          # the settings.json snippet — NOT auto-installed
 ```
 
-Expired-OAuth profiles are reported as `expired` (never crash the report);
-profiles with no credentials as `no-credentials`; dirs that don't exist are
-skipped.
+### What the status words mean
+
+`status` is a credential-**liveness** verdict and nothing else. The report never
+crashes on a bad credential; it names the state:
+
+| status | meaning | operator action |
+| --- | --- | --- |
+| `ok` | unexpired access token | none |
+| `needs-refresh` | access token aged out, refresh token intact | **none** — the tool renews it on the next request |
+| `expired` | no usable access token **and** no refresh token | re-authenticate |
+| `no-credentials` | no credential file pairs with this uuid in any store | log in |
+
+`needs-refresh` exists because its absence was an incident. Access tokens live
+8 hours, so on a fleet that idles overnight most *parked* copies are past expiry
+at any given moment — that is the normal state of a healthy account, and it used
+to be spelled `expired`, the same word as "dead". On 2026-07-29 six of twelve
+accounts read as dead for this reason and were acted on. Dirs that don't exist
+are still skipped.
+
+### Occupancy is a separate axis
+
+A profile dir can currently be running as a *different* account (an in-place
+switch parks the owner's credential and moves someone else in). That is reported
+on its own fields, never folded into `status`, because the two facts are
+independent — a squatted dir's parked credential may be perfectly alive, and an
+unsquatted dir's may be dead:
+
+- `profiles` — profiles whose **own** identity is this account
+- `occupies` — profiles whose dir currently **runs as** this account
+- `displacedFrom` — profiles this account owns but is currently **displaced
+  from**; always a subset of `profiles`
+
+So a squatted owner reads `status: needs-refresh`, `profiles: [account004]`,
+`displacedFrom: [account004]`, and the squatter reads `occupies: [account004]`.
+Both halves of the swap are visible. `accounts repair-auth` is the fix for a
+displaced account whose parked copy is restorable; re-login is the fix only for
+`expired`.
 
 ## The hook
 

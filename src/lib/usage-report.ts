@@ -3,6 +3,7 @@ import { getTool } from "./tools.js";
 import {
   accessTokenForAccount,
   buildIdentityIndex,
+  statusWithoutValidAccessToken,
   type AccountIdentity,
   type AccountStatus,
 } from "./identity-index.js";
@@ -32,6 +33,19 @@ export interface AccountUsageEntry {
   profiles: string[];
   /** Profiles whose dir currently RUNS as this account (occupancy). */
   occupies: string[];
+  /**
+   * Profiles this account OWNS but is currently displaced from — another
+   * account's credential is in those dirs' live files right now. Always a
+   * subset of `profiles`.
+   *
+   * Reported separately from `status` on purpose. Displacement says nothing
+   * about whether the parked credential is alive, and liveness says nothing
+   * about who is in the dir; an operator needs both to know whether the fix is
+   * `accounts repair-auth` (parked copy is fine, put it back) or a re-login
+   * (the account is genuinely dead). Collapsing them is the defect this field
+   * exists to close.
+   */
+  displacedFrom: string[];
   usage?: AccountUsage;
   error?: UsageFetchError;
   source: UsageSource;
@@ -66,11 +80,16 @@ export async function collectAccountsUsage(
         status: identity.status,
         profiles: doorNames(identity, "own-identity"),
         occupies: doorNames(identity, "current-occupant"),
+        displacedFrom: displacedProfileNames(identity),
         source: "none",
       };
       if (identity.status !== "ok") {
-        // Expired / credential-less accounts are REPORTED, never queried and
-        // never crashed on — expiry is a state, not an error.
+        // Only `ok` carries an access token the endpoint will accept, so
+        // `needs-refresh` accounts are reported without being queried — the
+        // widened STATUS must not widen what gets called. This is not a demotion:
+        // `accounts` never mints tokens, so a renewable-but-aged-out credential
+        // has nothing to authenticate with until the tool itself renews it.
+        // Non-ok accounts are REPORTED, never queried and never crashed on.
         return base;
       }
 
@@ -80,7 +99,14 @@ export async function collectAccountsUsage(
       }
 
       const token = accessTokenForAccount(identity);
-      if (!token) return { ...base, status: "expired" };
+      // The index said `ok`, so the file was readable and unexpired when it was
+      // scanned; getting nothing back now means it changed underneath us (a
+      // concurrent refresh or park rewrites it in place). Downgrade to what the
+      // credential can still do rather than to the word for "dead" — the same
+      // conflation, one layer up.
+      if (!token) {
+        return { ...base, status: statusWithoutValidAccessToken(identity.credential) };
+      }
 
       const result = await fetchAccountUsage(token, {
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
@@ -105,6 +131,35 @@ export async function collectAccountsUsage(
 
 function doorNames(identity: AccountIdentity, role: "own-identity" | "current-occupant"): string[] {
   return [...new Set(identity.doors.filter((d) => d.role === role && d.profileName).map((d) => d.profileName!))].sort();
+}
+
+/**
+ * The door line an operator reads under an account: which profiles own it, which
+ * are currently running it, and which it has been displaced from.
+ *
+ * Exported and pure so the wording is testable without spawning the CLI. Before
+ * this, the rendering lived inline in `cli.ts` and the displacement half of the
+ * swap was simply missing from the output: a squatted account printed
+ * `profiles: account004` with nothing to say that account004's dir was serving
+ * somebody else.
+ */
+export function usageDoorSummary(entry: AccountUsageEntry): string[] {
+  const parts: string[] = [];
+  if (entry.profiles.length) parts.push(`profiles: ${entry.profiles.join(", ")}`);
+  if (entry.occupies.length) parts.push(`running in: ${entry.occupies.join(", ")}`);
+  if (entry.displacedFrom.length) parts.push(`displaced from: ${entry.displacedFrom.join(", ")}`);
+  return parts;
+}
+
+/** Own-identity doors another account is sitting in right now. */
+function displacedProfileNames(identity: AccountIdentity): string[] {
+  return [
+    ...new Set(
+      identity.doors
+        .filter((d) => d.role === "own-identity" && d.occupiedBy && d.profileName)
+        .map((d) => d.profileName!),
+    ),
+  ].sort();
 }
 
 export interface HealthiestPickResult {

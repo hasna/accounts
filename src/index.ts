@@ -194,7 +194,13 @@ export type {
 // THE uuid-keyed account enumerator (central store first, per-profile stores
 // as compat fallback). Consumers must reason over this instead of walking
 // profile dirs themselves.
-export { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+export {
+  buildIdentityIndex,
+  describeAccountStatus,
+  dirAccountUuid,
+  statusNeedsOperator,
+  statusWithoutValidAccessToken,
+} from "./lib/identity-index.js";
 export type {
   AccountDoor,
   AccountDoorRole,

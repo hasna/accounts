@@ -109,13 +109,43 @@ test("a switched dir maps its LIVE occupant and its OWN snapshot to different id
   expect(owner.doors.some((d) => d.role === "own-identity")).toBe(true);
 });
 
-test("an account whose only credential is expired reports status expired, not a crash", () => {
-  const dir = makeDir("expired");
+test("an aged-out access token with a refresh token reports needs-refresh, not a crash and not expired", () => {
+  // This assertion used to read `expired`, and the word was wrong: the fixture
+  // has always carried a refresh token, so the account is alive and the tool
+  // renews it on next use. Reporting it as `expired` is the defect — six live
+  // accounts read as dead from it on 2026-07-29 — so the expectation is
+  // corrected here rather than preserved. `expired` keeps a test of its own
+  // below, with a fixture that is actually dead.
+  const dir = makeDir("aged-out");
   writeLive(dir, { uuid: "uuid-exp", email: "tired@example.com", expiresInMs: -60_000 });
   writeSnapshot(dir, { uuid: "uuid-exp", email: "tired@example.com", expiresInMs: -60_000 });
 
-  const index = buildIdentityIndex([{ name: "expired", dir }], tool());
+  const index = buildIdentityIndex([{ name: "aged-out", dir }], tool());
   expect(index).toHaveLength(1);
+  expect(index[0]!.credential?.renewable).toBe(true);
+  expect(index[0]!.status).toBe("needs-refresh");
+  // Unchanged: no VALID access token, so nothing is handed out.
+  expect(accessTokenForAccount(index[0]!)).toBeUndefined();
+});
+
+test("an account with no refresh token reports expired — the word now means genuinely dead", () => {
+  const dir = makeDir("dead");
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(
+    join(dir, ".accounts-auth", "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: "uuid-dead", emailAddress: "dead@example.com" } }),
+  );
+  writeFileSync(
+    join(dir, ".accounts-auth", "credentials.json"),
+    // No refreshToken key at all: re-authentication is the only fix.
+    JSON.stringify({
+      claudeAiOauth: { accessToken: "SYNTHETIC-dead-access", expiresAt: Date.now() - 60_000 },
+    }),
+  );
+
+  const index = buildIdentityIndex([{ name: "dead", dir }], tool());
+  expect(index).toHaveLength(1);
+  expect(index[0]!.credential?.renewable).toBe(false);
   expect(index[0]!.status).toBe("expired");
   expect(accessTokenForAccount(index[0]!)).toBeUndefined();
 });
