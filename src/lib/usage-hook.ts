@@ -4,10 +4,14 @@ import {
   selectHealthiestAccount,
   thresholdBreached,
   type AutoSwitchState,
+  type HookNoticeState,
+  type SwitchCandidate,
   type UsageCacheEntry,
 } from "./auto-switch.js";
 import { deriveWindowHealth } from "./usage-windows.js";
 import type { RecordExhaustionInput } from "./exhaustion-ledger.js";
+
+export type { HookNoticeState } from "./auto-switch.js";
 
 /**
  * UserPromptSubmit hook brain. Proactive by design: a limit arrives as a
@@ -22,6 +26,13 @@ import type { RecordExhaustionInput } from "./exhaustion-ledger.js";
  *    a silent identity change is the half-switch nightmare in a new costume.
  *  - HONEST: after switching, the active accountUuid is re-read and must have
  *    CHANGED to the target; "switched" onto the same account is a failure.
+ *  - LOUD ABOUT NOT ACTING TOO: every outcome that means "this session is no
+ *    longer protected" emits a systemMessage as well, throttled per reason.
+ *    Measured on the shipped build: 50 of 161 production invocations (31%)
+ *    reached no decision and said nothing, the longest unbroken run spanning
+ *    70 minutes. Only `all-limited` — the rarest branch — ever spoke. An
+ *    unattended session is by definition one nobody is watching, so the first
+ *    symptom of a degraded hook was the session hitting the wall unexplained.
  */
 
 export interface UsageHookOptions {
@@ -35,8 +46,24 @@ export interface UsageHookOptions {
   minSessionHeadroom?: number;
   /** No second auto-switch (or retry of a failed one) within this window. */
   cooldownMs: number;
-  /** Cached usage older than this is treated as absent. */
+  /** Cached usage older than this is refreshed in the background. */
   cacheMaxAgeMs: number;
+  /**
+   * Cached usage older than `cacheMaxAgeMs` but younger than this still
+   * decides. Beyond it the reading is discarded.
+   *
+   * Freshness used to be a hard gate, which coupled the hook to prompt
+   * frequency: a sparse session always arrived to an expired cache and the hook
+   * degraded to a pure no-op (median gap for a decision-reaching invocation was
+   * 66.7s; for a no-decision one, 340.2s against a 300s TTL). A stale reading is
+   * still safe to act on because utilization inside a window only ever RISES —
+   * so an old number can under-report and cause a missed switch, but can never
+   * invent a breach — and a window whose reset boundary has passed is already
+   * discarded as "rolled" by thresholdBreached.
+   */
+  staleCacheMaxAgeMs?: number;
+  /** Minimum gap between repeats of the same degraded notice. */
+  noticeIntervalMs?: number;
 }
 
 export interface UsageHookDeps {
@@ -57,6 +84,14 @@ export interface UsageHookDeps {
   activeCooldowns?(now: Date): Map<string, string>;
   recordExhaustion?(input: RecordExhaustionInput): void;
   clearExhaustion?(accountUuid: string): void;
+  /**
+   * Per-reason "last announced at" store backing the notice throttle. Both
+   * halves are optional and only take effect together; without them every
+   * degraded outcome speaks, which is what a caller that wants no throttling
+   * (and every unit test) gets.
+   */
+  readNotices?(): HookNoticeState | undefined;
+  writeNotices?(state: HookNoticeState): void;
   now?: () => Date;
 }
 
@@ -69,8 +104,37 @@ export interface UsageHookOutcome {
   additionalContext?: string;
 }
 
+/**
+ * A stale reading is worth acting on for far longer than it is worth calling
+ * fresh. One hour covers the 70-minute no-decision run measured in production
+ * without letting a session act on a reading old enough for a 5-hour window to
+ * have rolled and been re-consumed.
+ */
+export const DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * Long enough that a persistently degraded hook does not put a line above every
+ * prompt; short enough that a session degraded overnight says so more than once.
+ */
+export const DEFAULT_HOOK_NOTICE_INTERVAL_MS = 15 * 60 * 1000;
+
+/** Stable keys for the notice throttle — never the free-text reason. */
+type NoticeKey =
+  | "no-account"
+  | "no-usage"
+  | "cooldown"
+  | "all-limited"
+  | "no-candidate"
+  | "no-door"
+  | "fail-open";
+
 function pct(value: number): string {
   return `${Math.round(value)}%`;
+}
+
+function minutes(ms: number): string {
+  const value = Math.round(ms / 60_000);
+  return value === 1 ? "1 minute" : `${value} minutes`;
 }
 
 function windowLabel(id: string): string {
@@ -86,34 +150,114 @@ function windowLabel(id: string): string {
   }
 }
 
+/**
+ * Has this reason been announced recently enough to stay quiet about?
+ *
+ * Deliberately fail-OPEN in the noisy direction: any problem reading or writing
+ * the throttle state means the message is emitted. Losing a warning is worse
+ * than repeating one, and this runs inside the hook, so it must never throw.
+ */
+function announce(opts: UsageHookOptions, deps: UsageHookDeps, key: NoticeKey, now: Date): boolean {
+  if (!deps.readNotices || !deps.writeNotices) return true;
+  try {
+    const state = deps.readNotices() ?? {};
+    const last = Date.parse(state[key] ?? "");
+    const interval = opts.noticeIntervalMs ?? DEFAULT_HOOK_NOTICE_INTERVAL_MS;
+    if (Number.isFinite(last) && now.getTime() - last < interval) return false;
+    deps.writeNotices({ ...state, [key]: now.toISOString() });
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+/** An outcome the user should hear about, subject to the notice throttle. */
+function degraded(
+  opts: UsageHookOptions,
+  deps: UsageHookDeps,
+  now: Date,
+  key: NoticeKey,
+  outcome: UsageHookOutcome & { systemMessage: string },
+): UsageHookOutcome {
+  if (announce(opts, deps, key, now)) return outcome;
+  const { systemMessage: _suppressed, ...quiet } = outcome;
+  return quiet;
+}
+
 export async function runUsageHook(opts: UsageHookOptions, deps: UsageHookDeps): Promise<UsageHookOutcome> {
   try {
     return await decide(opts, deps);
   } catch (error) {
     // Fail open: the user's prompt always goes through. The error reason is
     // surfaced in the outcome for logging, never as a blocking condition.
-    return {
-      action: "fail-open",
-      reason: error instanceof Error ? error.message : String(error),
-    };
+    const reason = error instanceof Error ? error.message : String(error);
+    const outcome: UsageHookOutcome = { action: "fail-open", reason };
+    try {
+      // Loud, but throttled — and wrapped so a throttle failure cannot turn
+      // fail-open into fail-closed. This is the branch that fired unseen in
+      // production against a registry 401 three invocations running.
+      const now = (deps.now ?? (() => new Date()))();
+      if (announce(opts, deps, "fail-open", now)) {
+        outcome.systemMessage =
+          `accounts: usage-based auto-switching is NOT running for this session — ${reason}. ` +
+          `The session keeps working, but nothing will move it off an account that runs out. ` +
+          `Check with \`accounts usage\`.`;
+      }
+    } catch {
+      // Never let the notice path break the fail-open guarantee.
+    }
+    return outcome;
   }
+}
+
+/** Age of a cache entry in ms, or undefined when it carries no usable stamp. */
+function cacheAgeMs(entry: UsageCacheEntry, now: Date): number | undefined {
+  const fetchedAt = Date.parse(entry.fetchedAt);
+  if (!Number.isFinite(fetchedAt)) return undefined;
+  return Math.max(0, now.getTime() - fetchedAt);
 }
 
 async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<UsageHookOutcome> {
   const now = deps.now ?? (() => new Date());
+  const clock = now();
+  const staleMaxAgeMs = Math.max(
+    opts.staleCacheMaxAgeMs ?? DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS,
+    opts.cacheMaxAgeMs,
+  );
 
   const currentUuid = deps.currentAccountUuid(opts.configDir);
-  if (!currentUuid) return { action: "fail-open", reason: "no readable account in config dir" };
-
-  const cached = deps.readCache(currentUuid, opts.cacheMaxAgeMs);
-  if (!cached?.usage) {
-    // No (fresh) measurement — let the prompt through and warm the cache for
-    // the next one. Never block a prompt on the network.
-    deps.triggerRefresh();
-    return { action: "refresh-triggered", reason: cached ? "cached entry has no usage" : "no fresh cache" };
+  if (!currentUuid) {
+    return degraded(opts, deps, clock, "no-account", {
+      action: "fail-open",
+      reason: "no readable account in config dir",
+      systemMessage:
+        `accounts: usage-based auto-switching is NOT running for this session — ` +
+        `${opts.configDir} holds no readable Claude account, so there is nothing to measure. ` +
+        `Nothing will move this session off an account that runs out.`,
+    });
   }
 
-  const clock = now();
+  const cached = deps.readCache(currentUuid, staleMaxAgeMs);
+  if (!cached?.usage) {
+    // No measurement at all within the stale bound — let the prompt through and
+    // warm the cache for the next one. Never block a prompt on the network.
+    deps.triggerRefresh();
+    return degraded(opts, deps, clock, "no-usage", {
+      action: "refresh-triggered",
+      reason: cached ? "cached entry has no usage" : "no usage cache within the stale bound",
+      systemMessage:
+        `accounts: no usage measurement for this session's account within the last ` +
+        `${minutes(staleMaxAgeMs)}, so auto-switching cannot decide anything. A refresh was started ` +
+        `in the background. If this repeats, the cache warmer is not running: ` +
+        `\`accounts usage --refresh --quiet\`.`,
+    });
+  }
+
+  const ageMs = cacheAgeMs(cached, clock);
+  const staleReading = ageMs !== undefined && ageMs > opts.cacheMaxAgeMs;
+  // Acting on a stale reading is still worth a background refresh so the NEXT
+  // prompt is fresh — the original code only refreshed when it gave up.
+  if (staleReading) deps.triggerRefresh();
 
   // Durable record of THIS account's exhaustion, written before any switch
   // decision. The usage cache expires and a refresh can fail; without a
@@ -137,16 +281,27 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
   }
 
   const breach = thresholdBreached(cached.usage, opts.thresholdPercent, clock);
-  if (!breach.breached) return { action: "none", reason: "headroom ok" };
+  if (!breach.breached) {
+    return { action: "none", reason: staleReading ? "headroom ok (stale reading)" : "headroom ok" };
+  }
 
   const state = deps.readState();
   if (cooldownActive(state, opts.cooldownMs, clock)) {
-    return { action: "none", reason: "cooldown" };
+    const since = Date.parse(state?.lastSwitchAt ?? "");
+    const waited = Number.isFinite(since) ? clock.getTime() - since : undefined;
+    return degraded(opts, deps, clock, "cooldown", {
+      action: "none",
+      reason: "cooldown",
+      systemMessage:
+        `accounts: this session is over its usage threshold but the anti-flap cooldown is still ` +
+        `active${waited === undefined ? "" : ` (last attempt ${minutes(waited)} ago)`} — not switching yet. ` +
+        `It will retry on a later prompt; \`accounts switch-account\` overrides it now.`,
+    });
   }
 
   const identities = await deps.listIdentities();
   const entries = identities.map((identity) => {
-    const entry = deps.readCache(identity.accountUuid, opts.cacheMaxAgeMs);
+    const entry = deps.readCache(identity.accountUuid, staleMaxAgeMs);
     return { identity, ...(entry?.usage ? { usage: entry.usage } : {}) };
   });
   const selection = selectHealthiestAccount(entries, {
@@ -162,26 +317,60 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     `${windowLabel(breachedWindow.id)} at ${pct(breachedWindow.utilization)}` +
     (breachedWindow.resetsAt ? ` (resets ${breachedWindow.resetsAt})` : "");
 
-  if (!selection.candidate) {
+  if (selection.ranked.length === 0) {
     deps.triggerRefresh();
     if (selection.reason === "all-limited") {
-      return {
+      return degraded(opts, deps, clock, "all-limited", {
         action: "none",
         reason: "all-limited",
         systemMessage:
           `accounts: ${breachText}, and all known accounts are limited too ` +
           `(${selection.considered} checked) — no account has headroom to switch to. Staying put.`,
-      };
+      });
     }
-    return { action: "none", reason: selection.reason ?? "no-candidate" };
+    const detail =
+      selection.reason === "no-usage-data"
+        ? `no other account has been measured yet (${selection.excluded.length} known)`
+        : `no other usable account is registered on this machine`;
+    return degraded(opts, deps, clock, "no-candidate", {
+      action: "none",
+      reason: selection.reason ?? "no-candidate",
+      systemMessage:
+        `accounts: ${breachText}, and there is nowhere to switch to — ${detail}. ` +
+        `This session will hit the wall unless an account is added or measured ` +
+        `(\`accounts usage --refresh\`).`,
+    });
   }
 
-  const candidate = selection.candidate;
-  const door = candidate.identity.doors
-    .filter((d) => d.role === "own-identity" && d.profileName)
-    .sort((a, b) => (a.profileName ?? "").localeCompare(b.profileName ?? ""))[0];
-  if (!door?.profileName) {
-    return { action: "none", reason: "candidate has no profile door to switch through" };
+  // A candidate is only reachable through an own-identity door: a profile dir on
+  // THIS machine whose own account is that candidate. The shipped code took the
+  // top-ranked candidate alone and gave up when it had none, which measured as
+  // `performSwitch` never being called at all while a door-having runner-up sat
+  // one rank down — and it gave up silently. Walk the ranking instead.
+  let candidate: SwitchCandidate | undefined;
+  let door: { profileName?: string } | undefined;
+  let doorless = 0;
+  for (const entry of selection.ranked) {
+    const found = entry.identity.doors
+      .filter((d) => d.role === "own-identity" && d.profileName)
+      .sort((a, b) => (a.profileName ?? "").localeCompare(b.profileName ?? ""))[0];
+    if (found?.profileName) {
+      candidate = entry;
+      door = found;
+      break;
+    }
+    doorless += 1;
+  }
+
+  if (!candidate || !door?.profileName) {
+    return degraded(opts, deps, clock, "no-door", {
+      action: "none",
+      reason: `no candidate has a profile door to switch through (${doorless} skipped)`,
+      systemMessage:
+        `accounts: ${breachText}, and ${doorless === 1 ? "the one account" : `all ${doorless} accounts`} ` +
+        `with headroom cannot be switched to — no profile on this machine owns them. ` +
+        `Import or log in to one with \`accounts add\` / \`accounts login\`, or switch manually.`,
+    });
   }
 
   const currentEmail = identities.find((i) => i.accountUuid === currentUuid)?.email ?? currentUuid;
@@ -207,6 +396,7 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
       fromUuid: currentUuid,
       toUuid: candidate.accountUuid,
       outcome: "failed",
+      configDir: opts.configDir,
     });
     const detail =
       switchErrorMessage ??
@@ -228,18 +418,34 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     fromUuid: currentUuid,
     toUuid: candidate.accountUuid,
     outcome: "switched",
+    configDir: opts.configDir,
   });
 
   const sessionsNote =
     liveSessions > 1
       ? ` ${liveSessions} live sessions share this config dir and ALL of them switched together.`
       : "";
+  const staleNote = staleReading
+    ? ` (decided from a ${minutes(ageMs ?? 0)}-old usage reading — a fresh one is being fetched)`
+    : "";
+  // An expired-but-renewable target is a deliberate last resort; say so, because
+  // "the switch worked but the next request 401s" is otherwise indistinguishable
+  // from the hook misbehaving.
+  const renewalNote =
+    candidate.identity.credential?.valid === false
+      ? ` The target's access token has aged out and needs a token refresh on the next request.`
+      : "";
+  const skippedNote =
+    doorless > 0
+      ? ` ${doorless} account${doorless === 1 ? "" : "s"} with more headroom had no profile on this machine to switch through.`
+      : "";
   // Report BOTH windows: "80% headroom" hides whether the new account has a
   // healthy week or is one 5-hour roll away from the same wall.
   const message =
     `accounts: auto-switched this session from ${currentEmail} (${breachText}) ` +
     `to ${targetEmail} (${pct(candidate.sessionHeadroom)} session / ` +
-    `${pct(candidate.weeklyHeadroom)} weekly headroom).${sessionsNote}`;
+    `${pct(candidate.weeklyHeadroom)} weekly headroom)${staleNote}.` +
+    `${renewalNote}${skippedNote}${sessionsNote}`;
   return {
     action: "switched",
     systemMessage: message,

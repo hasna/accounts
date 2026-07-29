@@ -157,7 +157,9 @@ test("switchAccount rejects a profile whose credential has NO refresh token, lou
   makeProfile("dead", { email: "dead@example.com", expiresInMs: -60_000, refreshToken: null });
   const sessionDir = mkdtempSync(join(tmpdir(), "swa-session-"));
   writeIdentity(sessionDir, { email: "live@example.com" });
-  await expect(switchAccount("dead", { dir: sessionDir, env: {} })).rejects.toThrow(/expired/);
+  await expect(
+    switchAccount("dead", { dir: sessionDir, env: {}, allowUnregisteredDir: true }),
+  ).rejects.toThrow(/expired/);
   // The session dir must be untouched by a failed switch.
   expect(dirEmail(sessionDir)).toBe("live@example.com");
   rmSync(sessionDir, { recursive: true, force: true });
@@ -172,7 +174,7 @@ test("switchAccount accepts an aged-out access token when the refresh token is i
   const sessionDir = mkdtempSync(join(tmpdir(), "swa-aged-session-"));
   writeIdentity(sessionDir, { email: "live@example.com" });
 
-  const result = await switchAccount("aged", { dir: sessionDir, env: {} });
+  const result = await switchAccount("aged", { dir: sessionDir, env: {}, allowUnregisteredDir: true });
 
   // The switch really happened — the dir now carries the target's account and
   // its credential bytes, not just an absence of an exception.
@@ -191,8 +193,62 @@ test("switchAccount rejects a profile with no credentials", async () => {
   addProfile({ name: "nocred", dir });
   const sessionDir = mkdtempSync(join(tmpdir(), "swa-session2-"));
   writeIdentity(sessionDir, { email: "live@example.com" });
-  await expect(switchAccount("nocred", { dir: sessionDir, env: {} })).rejects.toThrow(AccountsError);
+  await expect(
+    switchAccount("nocred", { dir: sessionDir, env: {}, allowUnregisteredDir: true }),
+  ).rejects.toThrow(AccountsError);
   rmSync(sessionDir, { recursive: true, force: true });
+});
+
+// --- 9a069a85: the destination is an allowlist, not the caller's argument ----
+
+test("switchAccount refuses to write credentials into an unregistered dir", async () => {
+  // The reviewer's exploit shape: a directory holding only a planted
+  // `.claude.json`, never registered with `accounts add`. Before the guard,
+  // `accounts usage-hook --dir <that path>` would rank the OTHER accounts, pick
+  // the healthiest, and write its real access and refresh tokens here.
+  makeProfile("healthy", { email: "healthy@example.com" });
+  const planted = mkdtempSync(join(tmpdir(), "swa-planted-"));
+  writeFileSync(
+    join(planted, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: "planted-uuid-0000", emailAddress: "stranger@example.com" } }),
+  );
+
+  await expect(switchAccount("healthy", { dir: planted, env: {} })).rejects.toThrow(
+    /not a registered profile dir/,
+  );
+  // The absence claim that matters: no credential material landed.
+  expect(existsSync(join(planted, ".credentials.json"))).toBe(false);
+  rmSync(planted, { recursive: true, force: true });
+});
+
+test("POSITIVE CONTROL: the same call with the override DOES write the credential", async () => {
+  // Without this, the test above proves nothing — an assertion that no file
+  // appeared is worthless unless the identical input can make one appear.
+  makeProfile("healthy", { email: "healthy@example.com" });
+  const planted = mkdtempSync(join(tmpdir(), "swa-planted-ctrl-"));
+  writeFileSync(
+    join(planted, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: "planted-uuid-0000", emailAddress: "stranger@example.com" } }),
+  );
+
+  const result = await switchAccount("healthy", { dir: planted, env: {}, allowUnregisteredDir: true });
+
+  expect(result.dirKind).toBe("external");
+  expect(existsSync(join(planted, ".credentials.json"))).toBe(true);
+  expect(dirAccessToken(planted)).toBe("healthy@example.com-access");
+  rmSync(planted, { recursive: true, force: true });
+});
+
+test("a registered profile dir needs no override — the allowlist refuses nothing in use", async () => {
+  // Every live CLAUDE_CONFIG_DIR on this fleet is a registered managed profile
+  // dir, so this is the shape production actually runs in.
+  makeProfile("alpha", { email: "alpha@example.com" });
+  const betaDir = makeProfile("beta", { email: "beta@example.com" });
+
+  const result = await switchAccount("alpha", { dir: betaDir, env: {} });
+
+  expect(result.dirKind).toBe("profile-dir");
+  expect(dirEmail(betaDir)).toBe("alpha@example.com");
 });
 
 test("switchAccount rejects non-claude tools", async () => {
@@ -214,7 +270,7 @@ test("switchAccount swaps credentials and oauthAccount into the session dir", as
   claudeJson.projects = { "/tmp/somewhere": { history: ["hello"] } };
   writeFileSync(join(sessionDir, ".claude.json"), JSON.stringify(claudeJson));
 
-  const result = await switchAccount("beta", { dir: sessionDir, env: {} });
+  const result = await switchAccount("beta", { dir: sessionDir, env: {}, allowUnregisteredDir: true });
 
   expect(result.restartRequired).toBe(false);
   expect(result.alreadyActive).toBe(false);
@@ -253,7 +309,7 @@ test("switchAccount snapshots rotated credentials back to the owning profile", a
     }),
   );
 
-  const result = await switchAccount("beta", { dir: sessionDir, env: {} });
+  const result = await switchAccount("beta", { dir: sessionDir, env: {}, allowUnregisteredDir: true });
 
   expect(result.snapshotBackProfile).toBe("alpha");
   const snap = readJson(profileCredentialsSnapshot(alphaDir)) as { claudeAiOauth?: { accessToken?: string } };
@@ -303,7 +359,7 @@ test("switchAccount warns instead of snapshotting when the dir owner is ambiguou
   const sessionDir = mkdtempSync(join(tmpdir(), "swa-dup-"));
   writeIdentity(sessionDir, { email: "shared@example.com" });
 
-  const result = await switchAccount("beta", { dir: sessionDir, env: {} });
+  const result = await switchAccount("beta", { dir: sessionDir, env: {}, allowUnregisteredDir: true });
 
   expect(result.snapshotBackProfile).toBeUndefined();
   expect(result.warnings.some((w) => w.includes("shared@example.com"))).toBe(true);
@@ -338,10 +394,17 @@ test("switchAccount refuses multiple live sessions without --yes", async () => {
   const helper = Bun.spawn(["sleep", "30"]);
   try {
     writeFileSync(join(sessionDir, "sessions", `${helper.pid}.json`), JSON.stringify({ pid: helper.pid }));
-    await expect(switchAccount("beta", { dir: sessionDir, env: {} })).rejects.toThrow(/live session/);
+    await expect(
+      switchAccount("beta", { dir: sessionDir, env: {}, allowUnregisteredDir: true }),
+    ).rejects.toThrow(/live session/);
     expect(dirEmail(sessionDir)).toBe("solo@example.com");
 
-    const result = await switchAccount("beta", { dir: sessionDir, env: {}, yes: true });
+    const result = await switchAccount("beta", {
+      dir: sessionDir,
+      env: {},
+      yes: true,
+      allowUnregisteredDir: true,
+    });
     expect(result.liveSessions).toBe(2);
     expect(dirEmail(sessionDir)).toBe("beta@example.com");
   } finally {
@@ -362,7 +425,7 @@ test("owner detection prefers an agreeing marker over ambiguous email matches", 
   // email alone is ambiguous (dup1/dup2), the marker is not.
   writeSwitchedAccountMarker(sessionDir, { profile: "dup2", email: "shared@example.com" });
 
-  const result = await switchAccount("beta", { dir: sessionDir, env: {} });
+  const result = await switchAccount("beta", { dir: sessionDir, env: {}, allowUnregisteredDir: true });
 
   expect(result.snapshotBackProfile).toBe("dup2");
   const snap = readJson(profileCredentialsSnapshot(dup2Dir)) as { claudeAiOauth?: { accessToken?: string } };
@@ -454,7 +517,9 @@ test("a failed switch leaves no agreeing marker behind (fail-safe ordering)", as
   rmSync(join(sessionDir, ".credentials.json"));
   symlinkSync(join(outside, "creds.json"), join(sessionDir, ".credentials.json"));
 
-  await expect(switchAccount("beta", { dir: sessionDir, env: {} })).rejects.toThrow(AccountsError);
+  await expect(
+    switchAccount("beta", { dir: sessionDir, env: {}, allowUnregisteredDir: true }),
+  ).rejects.toThrow(AccountsError);
   // The dir keeps its old identity, so any marker left behind must NOT agree
   // with the dir email — otherwise later snapshot refreshes would freeze or
   // mis-attribute the dir's real credentials.
