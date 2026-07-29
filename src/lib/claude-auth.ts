@@ -36,6 +36,7 @@ import {
   centralCredentialsPathForProfile,
   centralOAuthRecordForProfile,
   credentialHealth,
+  dirLiveIdentityIsForeign,
   type CredentialHealthPresent,
   type SyncResult,
   syncProfileSnapshotToCentral,
@@ -641,9 +642,30 @@ export function ensureProfileAuthSnapshot(
     }
   }
 
+  // IDENTITY GATE (defect 0e7069a9), the symmetric counterpart to the one
+  // `recoverParkedCredential` applies on the restore path. An in-session
+  // `/login` to another account writes NO switch marker, so the marker branch
+  // above never fires; both credentials are then healthy, `betterCredential` is
+  // identity-blind, and the guest's newer file wins on mtime and replaces this
+  // profile's parked copy. Ranking cannot separate two healthy credentials —
+  // only identity can.
+  //
+  // READ ORDER IS LOAD-BEARING: this must be evaluated BEFORE the oauth
+  // snapshot refresh below, because that refresh is precisely what overwrites
+  // the profile's own identity with the guest's. Reading it afterwards would
+  // compare the guest against itself and always pass.
+  //
+  // BOTH writes are gated, not just the credential one. Gating the credential
+  // alone would still let the parked identity become the guest's, making `own`
+  // equal `live` on the next call — a one-invocation delay, not a fix.
+  //
+  // `overwrite` is the deliberate rebinding path (`finalizeLogin`): it means
+  // the dir's files are this profile's truth again, so it crosses the gate.
+  const liveIdentityIsForeign = !opts.overwrite && dirLiveIdentityIsForeign(profileDir, tool);
+
   const oauthSource = findOAuthSource(profileAccountJsonPaths(profileDir, tool));
   const oauthSnap = profileOAuthSnapshot(profileDir);
-  if (oauthSource && (opts.overwrite || snapshotIsStale(oauthSource.path, oauthSnap))) {
+  if (oauthSource && !liveIdentityIsForeign && (opts.overwrite || snapshotIsStale(oauthSource.path, oauthSnap))) {
     writeJsonFile(oauthSnap, { oauthAccount: oauthSource.oauth }, profileDir);
   }
 
@@ -651,6 +673,7 @@ export function ensureProfileAuthSnapshot(
   const credSnap = profileCredentialsSnapshot(profileDir);
   if (
     existsSync(credFile) &&
+    !liveIdentityIsForeign &&
     (opts.overwrite || snapshotIsStale(credFile, credSnap)) &&
     !wouldDowngradeSnapshot(credFile, credSnap)
   ) {
