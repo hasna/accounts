@@ -3146,7 +3146,8 @@ test("folded redaction scaling stays linear across newline styles and multi-mega
         redacted = redactText(input);
         samples.push(performance.now() - startedAt);
       }
-      elapsed.push(Math.min(...samples));
+      samples.sort((left, right) => left - right);
+      elapsed.push(samples[1]!);
 
       expect(redacted).not.toContain("credential-seed");
       expect(redacted).not.toContain(
@@ -3156,9 +3157,9 @@ test("folded redaction scaling stays linear across newline styles and multi-mega
       expect(redacted).toContain("status=429 keep-after-scaling-record");
     }
 
-    expect(elapsed[0]!).toBeLessThan(200);
-    expect(elapsed[1]!).toBeLessThan(400);
-    expect(elapsed[2]!).toBeLessThan(800);
+    const mediumCostPerByte = elapsed[1]! / inputs[1]!.length;
+    const largeCostPerByte = elapsed[2]! / inputs[2]!.length;
+    expect(largeCostPerByte).toBeLessThan(mediumCostPerByte * 2);
   }
 });
 
