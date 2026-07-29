@@ -1982,8 +1982,21 @@ program
   )
   .action(
     action(async (opts: { acceptCapabilityBaseline?: boolean }) => {
-      console.log(chalk.bold(`store: ${storePath()}`));
+      const localStorePath = storePath();
       const store = resolveStore();
+      if (store.transport === "api") {
+        console.log(chalk.bold("store: API registry"));
+        console.log(chalk.dim(`machine state: ${localStorePath}`));
+        if (existsSync(localStorePath)) {
+          console.error(chalk.red.bold("WARNING: LOCAL PROFILE DATA IS NOT AUTHORITATIVE IN API MODE"));
+          console.error(chalk.red(`  ${localStorePath} exists, but profiles are read from the API registry.`));
+          console.error(
+            chalk.red("  Its profile records may be stale. Use `accounts list`; do not inspect this file as registry evidence."),
+          );
+        }
+      } else {
+        console.log(chalk.bold(`store: ${localStorePath}`));
+      }
       if (opts.acceptCapabilityBaseline) {
         for (const tool of listTools()) resetCapabilityBaseline(tool);
         console.log(chalk.dim("  capability corpus floors re-recorded at their current size"));
