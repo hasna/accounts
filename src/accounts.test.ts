@@ -58,6 +58,35 @@ test("add rejects duplicate names", () => {
   expect(() => addProfile({ name: "work" })).toThrow(AccountsError);
 });
 
+// One-account-one-tool: an account name identifies exactly one tool, because
+// resolution is name-first (resolveProfileFromStore) — a shared name breaks
+// every bare `accounts <cmd> <name>`. Same rule and error wording as the api
+// transport (AccountsRepo.nameConflict in src/server/repo.ts).
+test("add refuses a name already held by another tool", () => {
+  addProfile({ name: "work", tool: "claude" });
+  expect(() => addProfile({ name: "work", tool: "codex" })).toThrow(
+    'a profile named "work" already exists for tool "claude"; account names must be unique across tools',
+  );
+  // The refused create must not leave a row behind.
+  expect(listProfiles().map((p) => `${p.tool}/${p.name}`)).toEqual(["claude/work"]);
+});
+
+test("rename refuses a name already held by another tool", () => {
+  addProfile({ name: "a", tool: "claude" });
+  addProfile({ name: "b", tool: "codex" });
+  expect(() => renameProfile("a", "b", "claude")).toThrow(
+    'a profile named "b" already exists for tool "codex"; account names must be unique across tools',
+  );
+  expect(getProfile("a", "claude").name).toBe("a");
+});
+
+test("rename to the profile's own name is a no-op, matching the api transport", () => {
+  addProfile({ name: "solo", tool: "claude" });
+  const renamed = renameProfile("solo", "solo", "claude");
+  expect(renamed.name).toBe("solo");
+  expect(getProfile("solo", "claude").tool).toBe("claude");
+});
+
 test("add rejects invalid names", () => {
   expect(() => addProfile({ name: "Work Space!" })).toThrow(AccountsError);
 });
@@ -128,15 +157,42 @@ test("unsupported permission preset fails clearly", () => {
   expect(permissionArgsFor(getTool("opencode"), "none")).toEqual([]);
 });
 
-test("same profile name is allowed across tools and ambiguous without tool", () => {
-  addProfile({ name: "work", tool: "claude" });
-  addProfile({ name: "work", tool: "codex" });
+// Registries created before the one-account-one-tool rule can hold the same
+// name under several tools. Those rows are grandfathered: still resolvable
+// (with --tool, or a tool lock), still switchable — but the name cannot spread
+// to yet another tool.
+function seedGrandfatheredDuplicates(name: string, tools: string[]): void {
+  const store = loadStore();
+  for (const tool of tools) {
+    store.profiles.push({
+      name,
+      tool,
+      dir: join(home, "profiles", tool, name),
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+  }
+  saveStore(store);
+}
+
+test("grandfathered cross-tool duplicates stay resolvable and ambiguous without tool", () => {
+  seedGrandfatheredDuplicates("work", ["claude", "codex"]);
   expect(() => getProfile("work")).toThrow(AccountsError);
   expect(getProfile("work", "codex").tool).toBe("codex");
   useProfile("work", "codex");
   expect(currentProfile("codex")?.name).toBe("work");
   expect(currentProfile("codex")?.tool).toBe("codex");
   expect(currentProfile("claude")).toBeUndefined();
+});
+
+test("a grandfathered duplicate name cannot spread to a third tool", () => {
+  seedGrandfatheredDuplicates("work", ["claude", "codex"]);
+  expect(() => addProfile({ name: "work", tool: "opencode" })).toThrow(
+    /account names must be unique across tools/,
+  );
+  addProfile({ name: "other", tool: "opencode" });
+  expect(() => renameProfile("other", "work", "opencode")).toThrow(
+    /account names must be unique across tools/,
+  );
 });
 
 test("profileEnv renders extra per-tool environment templates", () => {
@@ -352,9 +408,8 @@ test("use sets the active profile per tool and bumps lastUsedAt", () => {
   expect(getProfileToolLock("play")).toBe("codex");
 });
 
-test("tool lock resolves shared profile names for bare commands", () => {
-  addProfile({ name: "work", tool: "claude" });
-  addProfile({ name: "work", tool: "codex" });
+test("tool lock resolves grandfathered shared profile names for bare commands", () => {
+  seedGrandfatheredDuplicates("work", ["claude", "codex"]);
   expect(() => getProfile("work")).toThrow(AccountsError);
 
   useProfile("work", "codex");

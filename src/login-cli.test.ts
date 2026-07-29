@@ -244,6 +244,26 @@ function readStore() {
   };
 }
 
+/**
+ * Write a profile row straight into the store file, bypassing `accounts add`.
+ * This is how tests model a GRANDFATHERED registry: one written before the
+ * one-account-one-tool rule, which `accounts add` can no longer produce.
+ */
+function seedProfileRow(name: string, tool: string): void {
+  const path = join(home, "accounts.json");
+  const store = JSON.parse(readFileSync(path, "utf8")) as {
+    profiles?: Array<Record<string, unknown>>;
+  };
+  store.profiles = store.profiles ?? [];
+  store.profiles.push({
+    name,
+    tool,
+    dir: join(home, "profiles", tool, name),
+    createdAt: "2026-06-21T00:00:00.000Z",
+  });
+  writeFileSync(path, JSON.stringify(store, null, 2));
+}
+
 test("launch syncs Claude profile credentials into keychain before spawning", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
   const fakeSecurity = writeFakeSecurity();
@@ -821,7 +841,10 @@ test("login requires an explicit choice for shared profile names when non-intera
   addFakeLoginTool("fake-login", "Fake Login", "FAKE_LOGIN_HOME", "fake-login-tool");
   addFakeLoginTool("fake-variant", "Fake Variant", "FAKE_VARIANT_HOME", "fake-variant-tool");
   expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
-  expect(runCli("add", "acct", "--tool", "fake-variant").status).toBe(0);
+  // A shared name can no longer be CREATED (one-account-one-tool), but
+  // registries written before the rule still hold them — seed the second row
+  // directly, as such a registry would, and assert login still disambiguates.
+  seedProfileRow("acct", "fake-variant");
 
   const result = runCli("login", "acct");
 
@@ -830,6 +853,26 @@ test("login requires an explicit choice for shared profile names when non-intera
   expect(result.stderr).toContain("accounts login acct --tool fake-login");
   expect(result.stderr).toContain("accounts login acct --tool fake-variant");
   expect(readLogEntries()).toHaveLength(0);
+});
+
+test("login refuses to create a profile whose name is already held by another tool", () => {
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  writeFakeTool("fake-variant-tool", "FAKE_VARIANT_HOME", "fake-variant");
+  addFakeLoginTool("fake-login", "Fake Login", "FAKE_LOGIN_HOME", "fake-login-tool");
+  addFakeLoginTool("fake-variant", "Fake Variant", "FAKE_VARIANT_HOME", "fake-variant-tool");
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+
+  // The name is held by fake-login; logging in under fake-variant would have
+  // to create a duplicate, and must be refused at the login path itself.
+  const result = runCli("login", "acct", "--tool", "fake-variant");
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain(
+    'a profile named "acct" already exists for tool "fake-login"; account names must be unique across tools',
+  );
+  expect(readLogEntries()).toHaveLength(0);
+  const rows = readStore().profiles?.filter((entry) => entry.name === "acct") ?? [];
+  expect(rows.map((entry) => entry.tool)).toEqual(["fake-login"]);
 });
 
 test("login chooser creates a new account with a custom registered tool variant and persists the lock", () => {
