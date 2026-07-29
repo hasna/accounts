@@ -9,6 +9,19 @@ export const OAUTH_SNAPSHOT = "oauth-account.json";
 export const CREDENTIALS_SNAPSHOT = "credentials.json";
 export const KEYCHAIN_SNAPSHOT = "keychain.json";
 export const SWITCHED_ACCOUNT_MARKER = "switched-account.json";
+export const DIR_CREDENTIALS_FILE = ".credentials.json";
+
+/**
+ * A config dir's LIVE credential file.
+ *
+ * Named for what it holds rather than for the profile that owns the directory:
+ * after an in-place switch this file carries the CURRENT OCCUPANT's credential,
+ * not the dir's own. Reading it as "the profile's credential" is the single
+ * most repeated mistake on this code, so the helper says `dir`, not `profile`.
+ */
+export function dirCredentialsFile(configDir: string): string {
+  return join(configDir, DIR_CREDENTIALS_FILE);
+}
 
 /** Root directory for live Claude auth files (home or ACCOUNTS_TEST_LIVE_DIR). */
 export function liveClaudeBase(): string {

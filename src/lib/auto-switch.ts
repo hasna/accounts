@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { accountsHome } from "../storage.js";
 import { AccountsError } from "../types.js";
-import type { AccountIdentity } from "./identity-index.js";
+import { isUsableIdentity, type AccountIdentity } from "./identity-index.js";
 import type { AccountUsage, UsageFetchError, UsageWindow } from "./usage.js";
 import { deriveWindowHealth, type AccountWindowHealth } from "./usage-windows.js";
 import { writeFileAtomic } from "./safe-path.js";
@@ -17,7 +18,8 @@ import { writeFileAtomic } from "./safe-path.js";
 
 const CACHE_DIR = "cache";
 const USAGE_CACHE_DIR = "usage";
-const STATE_FILE = "auto-switch-state.json";
+const STATE_DIR = "auto-switch";
+const NOTICE_FILE = "usage-hook-notices.json";
 
 /** Account uuids come from JSON on disk; refuse anything path-hostile. */
 const SAFE_UUID = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
@@ -94,13 +96,23 @@ export interface SwitchCandidate {
 export type NoCandidateReason = "no-accounts" | "no-usage-data" | "all-limited";
 
 /**
- * Why an account was not a candidate. The two exhaustion reasons are kept
- * distinct on purpose: `weekly-exhausted` means unusable for days,
- * `session-exhausted` means unusable for minutes-to-hours.
+ * Why an account was not a candidate.
+ *
+ * `contended` is the one that is not about the account's own health: another
+ * config dir on this machine is already running a live session as it. Switching
+ * a second dir onto the same account puts two Claude Code processes behind one
+ * OAuth refresh token, and refresh tokens ROTATE — the first to refresh
+ * invalidates the copy the other still holds, the loser's refresh fails, and its
+ * `.credentials.json` is blanked in place. Measured on this fleet 2026-07-29:
+ * six of twenty-three profile dirs had been blanked that way, each within
+ * seconds to minutes of a sibling dir holding the same account refreshing.
+ * Because the usage hook switches automatically, every unguarded switch could
+ * add another pair.
  */
 export type ExclusionReason =
   | "current-account"
   | "credential"
+  | "contended"
   | "no-usage-data"
   | "weekly-exhausted"
   | "session-exhausted"
@@ -118,7 +130,16 @@ export interface ExcludedAccount {
 }
 
 export interface SelectionResult {
+  /** The top-ranked candidate; identical to `ranked[0]`. */
   candidate?: SwitchCandidate;
+  /**
+   * EVERY eligible candidate, best first. The caller needs the whole list, not
+   * just the winner: a candidate can be eligible on headroom yet unreachable
+   * because no profile on this machine is a door onto it, and giving up at that
+   * point strands the session on an exhausted account while a usable runner-up
+   * sits one rank down.
+   */
+  ranked: SwitchCandidate[];
   reason?: NoCandidateReason;
   /** Accounts that had headroom data but fell below the bar (for reporting). */
   considered: number;
@@ -135,6 +156,12 @@ export interface SelectionOptions {
   minSessionHeadroom?: number;
   /** uuid -> ISO time before which the account must not be re-selected. */
   cooldowns?: ReadonlyMap<string, string>;
+  /**
+   * Accounts a live session in ANOTHER config dir is already running. Switching
+   * onto one of these creates the two-copies-one-account state that
+   * refresh-token rotation then resolves by destroying a credential.
+   */
+  contendedAccounts?: ReadonlySet<string>;
   now?: Date;
 }
 
@@ -194,8 +221,18 @@ export function selectHealthiestAccount(
       excluded.push({ accountUuid: uuid, reason: "current-account" });
       continue;
     }
-    if (entry.identity.status !== "ok") {
+    // "valid OR renewable", not "status === ok": an account whose access token
+    // aged out but whose refresh token is intact is a usable target, ranked
+    // below every currently-valid one. See isUsableIdentity.
+    if (!isUsableIdentity(entry.identity)) {
       excluded.push({ accountUuid: uuid, reason: "credential" });
+      continue;
+    }
+    // Before health, because this is not a question about the account: taking a
+    // second live copy of it is what destroys credentials, however healthy it
+    // looks.
+    if (opts.contendedAccounts?.has(uuid)) {
+      excluded.push({ accountUuid: uuid, reason: "contended" });
       continue;
     }
     if (!entry.usage) {
@@ -259,33 +296,37 @@ export function selectHealthiestAccount(
   }
 
   if (eligible.length === 0) {
-    if (considered > 0) return { reason: "all-limited", considered, excluded };
-    if (measurable > 0) return { reason: "no-usage-data", considered, excluded };
-    return { reason: "no-accounts", considered, excluded };
+    if (considered > 0) return { ranked: [], reason: "all-limited", considered, excluded };
+    if (measurable > 0) return { ranked: [], reason: "no-usage-data", considered, excluded };
+    return { ranked: [], reason: "no-accounts", considered, excluded };
   }
 
-  const ranked = [...eligible].sort(
-    (a, b) =>
-      bindingHeadroom(b.windows) - bindingHeadroom(a.windows) ||
-      b.windows.weeklyHeadroom - a.windows.weeklyHeadroom ||
-      b.windows.sessionHeadroom - a.windows.sessionHeadroom ||
-      a.entry.identity.accountUuid.localeCompare(b.entry.identity.accountUuid),
-  );
-  const best = ranked[0]!;
-  return {
-    candidate: {
-      accountUuid: best.entry.identity.accountUuid,
-      ...(best.entry.identity.email ? { email: best.entry.identity.email } : {}),
-      headroom: Math.min(best.windows.sessionHeadroom, best.windows.weeklyHeadroom),
-      sessionHeadroom: best.windows.sessionHeadroom,
-      weeklyHeadroom: best.windows.weeklyHeadroom,
-      windows: best.windows,
-      usage: best.entry.usage,
-      identity: best.entry.identity,
-    },
-    considered,
-    excluded,
-  };
+  const ranked = [...eligible]
+    .sort(
+      (a, b) =>
+        // A credential that works NOW beats one the tool must renew first. This
+        // is the only place the valid/renewable distinction shows up in
+        // ordering, and it is deliberately the FIRST key: widening the pool
+        // must never demote a healthy account behind one that needs a round
+        // trip to become usable.
+        Number(b.entry.identity.status === "ok") - Number(a.entry.identity.status === "ok") ||
+        bindingHeadroom(b.windows) - bindingHeadroom(a.windows) ||
+        b.windows.weeklyHeadroom - a.windows.weeklyHeadroom ||
+        b.windows.sessionHeadroom - a.windows.sessionHeadroom ||
+        a.entry.identity.accountUuid.localeCompare(b.entry.identity.accountUuid),
+    )
+    .map(({ entry, windows }) => ({
+      accountUuid: entry.identity.accountUuid,
+      ...(entry.identity.email ? { email: entry.identity.email } : {}),
+      headroom: Math.min(windows.sessionHeadroom, windows.weeklyHeadroom),
+      sessionHeadroom: windows.sessionHeadroom,
+      weeklyHeadroom: windows.weeklyHeadroom,
+      windows,
+      usage: entry.usage,
+      identity: entry.identity,
+    }));
+
+  return { candidate: ranked[0]!, ranked, considered, excluded };
 }
 
 export interface ThresholdResult {
@@ -339,22 +380,52 @@ export interface AutoSwitchState {
   fromUuid?: string;
   toUuid?: string;
   outcome?: "switched" | "failed";
+  /** The session config dir this cooldown belongs to (diagnostics). */
+  configDir?: string;
 }
 
-export function autoSwitchStatePath(): string {
-  return join(accountsHome(), CACHE_DIR, STATE_FILE);
+/**
+ * Anti-flap state is PER SESSION CONFIG DIR, never fleet-wide.
+ *
+ * It used to be one `cache/auto-switch-state.json` for the whole machine, with
+ * nothing in the record naming a session. Measured against the shipped bytes:
+ * a session at 96% utilization was refused with `reason="cooldown"` because an
+ * UNRELATED session had switched three minutes earlier; the control, identical
+ * but with a 20-minute-old state, reached `performSwitch`. With ~18 live
+ * sessions that capped the entire fleet at one switch per ten minutes — and the
+ * losers were told nothing.
+ *
+ * The cooldown exists to stop ONE session ping-ponging between two exhausted
+ * accounts. That is a per-session property, so the file is keyed by a digest of
+ * the resolved config dir. The digest (rather than the path) keeps the filename
+ * fixed-length, traversal-free and free of the dir's own characters; the path
+ * itself is stored inside the file for diagnosis.
+ *
+ * No fallback to the old shared file on read: inheriting it would re-import the
+ * bug it fixes. The cost is that the first invocation per dir after upgrading
+ * ignores an in-flight cooldown — bounded, one-off, and self-correcting once
+ * that dir has written its own state.
+ */
+export function autoSwitchStateDir(): string {
+  return join(accountsHome(), CACHE_DIR, STATE_DIR);
 }
 
-export function writeAutoSwitchState(state: AutoSwitchState): void {
-  mkdirSync(join(accountsHome(), CACHE_DIR), { recursive: true });
-  writeFileAtomic(autoSwitchStatePath(), JSON.stringify(state, null, 2) + "\n", {
+export function autoSwitchStatePath(configDir: string): string {
+  const key = createHash("sha256").update(resolve(configDir)).digest("hex").slice(0, 32);
+  return join(autoSwitchStateDir(), `${key}.json`);
+}
+
+export function writeAutoSwitchState(state: AutoSwitchState, configDir: string): void {
+  mkdirSync(autoSwitchStateDir(), { recursive: true });
+  const record: AutoSwitchState = { ...state, configDir: state.configDir ?? resolve(configDir) };
+  writeFileAtomic(autoSwitchStatePath(configDir), JSON.stringify(record, null, 2) + "\n", {
     mode: 0o600,
     mustStayUnder: accountsHome(),
   });
 }
 
-export function readAutoSwitchState(): AutoSwitchState | undefined {
-  const path = autoSwitchStatePath();
+export function readAutoSwitchState(configDir: string): AutoSwitchState | undefined {
+  const path = autoSwitchStatePath(configDir);
   if (!existsSync(path)) return undefined;
   try {
     const state = JSON.parse(readFileSync(path, "utf8")) as AutoSwitchState;
@@ -364,12 +435,50 @@ export function readAutoSwitchState(): AutoSwitchState | undefined {
   }
 }
 
+/**
+ * Last time each degraded hook outcome was announced, so a session that stays
+ * degraded for an hour reports it rather than either spamming every prompt or
+ * (the shipped behaviour) saying nothing at all. Machine-wide on purpose: the
+ * conditions it throttles — an unreachable registry, a cold cache, a fleet with
+ * no headroom anywhere — are machine-wide too.
+ */
+export type HookNoticeState = Record<string, string>;
+
+export function hookNoticeStatePath(): string {
+  return join(accountsHome(), CACHE_DIR, NOTICE_FILE);
+}
+
+export function readHookNoticeState(): HookNoticeState | undefined {
+  const path = hookNoticeStatePath();
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const state: HookNoticeState = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === "string") state[key] = value;
+    }
+    return state;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeHookNoticeState(state: HookNoticeState): void {
+  mkdirSync(join(accountsHome(), CACHE_DIR), { recursive: true });
+  writeFileAtomic(hookNoticeStatePath(), JSON.stringify(state, null, 2) + "\n", {
+    mode: 0o600,
+    mustStayUnder: accountsHome(),
+  });
+}
+
 export const DEFAULT_COOLDOWN_MS = 10 * 60 * 1000;
 
 /**
  * True while a recent switch (or failed attempt) is still cooling down —
- * the anti-flap guard: one switch per window, never a ping-pong between
- * two nearly-exhausted accounts, never a retry storm on a broken switch.
+ * the anti-flap guard: one switch per window FOR THIS SESSION, never a
+ * ping-pong between two nearly-exhausted accounts, never a retry storm on a
+ * broken switch.
  */
 export function cooldownActive(
   state: AutoSwitchState | undefined,

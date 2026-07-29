@@ -12,7 +12,12 @@ import {
   assertMigrationStatusCompatible,
   readMigrationStatus,
 } from "./migrations.js";
-import { AccountsRepo } from "./repo.js";
+import {
+  accountNameLockKey,
+  AccountsRepo,
+  ADVISORY_LOCK_SQL,
+  toolLockKey,
+} from "./repo.js";
 import { createHandler, type ServiceContext } from "./app.js";
 import { grantAccountsRuntimeRole } from "./runtime-role.js";
 
@@ -138,10 +143,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       releaseLock = resolve;
     });
     const held = blocker.transaction(async (tx) => {
-      await tx.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        [`accounts:tool:${tool}`],
-      );
+      await tx.execute(ADVISORY_LOCK_SQL, [toolLockKey(tool)]);
       signalLocked();
       await released;
     });
@@ -160,6 +162,59 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       await held.catch(() => {});
       await blocker.close();
     }
+  }
+
+  /**
+   * Hold `gateKeys`, start every contender, wait until each is provably parked
+   * on an advisory lock, then release them all at the same instant.
+   *
+   * `gateKeys` is explicit rather than derived from the contender, because the
+   * two call sites need different gates: a same-name/different-tool create
+   * pair has no shared lock to gate on before the fix (that absence IS the
+   * defect), so it is gated on each contender's own tool lock; renames take no
+   * tool lock at all, so they are gated on the name lock they contend for.
+   * Either way, when the gate opens every contender is inside an open
+   * transaction, past BEGIN and short of its uniqueness check.
+   */
+  async function runReleasedTogether<T>(
+    gateKeys: string[],
+    contenders: { applicationName: string; run: () => Promise<T> }[],
+  ): Promise<PromiseSettledResult<T>[]> {
+    const blocker = openClient(`gate-blocker-${randomBytes(4).toString("hex")}`);
+    let releaseLock!: () => void;
+    let signalLocked!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const held = blocker.transaction(async (tx) => {
+      for (const key of gateKeys) await tx.execute(ADVISORY_LOCK_SQL, [key]);
+      signalLocked();
+      await released;
+    });
+
+    try {
+      await locked;
+      const running = contenders.map((contender) => contender.run());
+      // Attach a no-op catch now: a contender that rejects while we are still
+      // waiting on the other one would otherwise surface as an unhandled
+      // rejection and kill the test worker before allSettled ever sees it.
+      for (const pending of running) pending.catch(() => {});
+      for (const contender of contenders) await waitForAdvisoryWait(contender.applicationName);
+      releaseLock();
+      await held;
+      return await Promise.allSettled(running);
+    } finally {
+      releaseLock();
+      await held.catch(() => {});
+      await blocker.close();
+    }
+  }
+
+  function rejectionText(result: PromiseSettledResult<unknown>): string {
+    return result.status === "rejected" ? String(result.reason) : "";
   }
 
   function createLiveHandler(repo: AccountsRepo): (request: Request) => Promise<Response> {
@@ -606,12 +661,12 @@ describePostgres("PostgreSQL migration and repository integration", () => {
   test("unseen legacy custom tool IDs remain valid for old-client account creation", async () => {
     const repo = new AccountsRepo(client);
     const response = await createLiveHandler(repo)(
-      oldClientCreateRequest("legacy-unseen", "profile"),
+      oldClientCreateRequest("legacy-unseen", "legacy-unseen-profile"),
     );
     expect(response.status).toBe(201);
     expect(await response.json()).toMatchObject({
       tool: "legacy-unseen",
-      name: "profile",
+      name: "legacy-unseen-profile",
     });
     expect(
       await client.get<{ id: string }>(
@@ -637,13 +692,13 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       ),
     ).toEqual({ id: "legacy-removed" });
     const response = await createLiveHandler(repo)(
-      oldClientCreateRequest("legacy-removed", "profile"),
+      oldClientCreateRequest("legacy-removed", "legacy-removed-profile"),
     );
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({
       error: 'custom tool "legacy-removed" was explicitly removed',
     });
-    expect(await repo.get("legacy-removed", "profile")).toBeNull();
+    expect(await repo.get("legacy-removed", "legacy-removed-profile")).toBeNull();
 
     await repo.addCustomTool({
       id: "legacy-removed",
@@ -675,16 +730,22 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       const [created, removeAfterCreate] = await runOrderedToolRace(
         "legacy-create-first",
         "race-create-first",
-        () => createFirstRepo.create({ tool: "legacy-create-first", name: "profile" }),
+        () =>
+          createFirstRepo.create({
+            tool: "legacy-create-first",
+            name: "legacy-create-first-profile",
+          }),
         "race-remove-second",
         () => removeSecondRepo.removeCustomTool("legacy-create-first"),
       );
       expect(created.status).toBe("fulfilled");
       expect(removeAfterCreate.status).toBe("rejected");
       expect(String(removeAfterCreate.status === "rejected" ? removeAfterCreate.reason : "")).toContain(
-        "still used by profile(s) profile",
+        "still used by profile(s) legacy-create-first-profile",
       );
-      expect((await createFirstRepo.get("legacy-create-first", "profile"))?.name).toBe("profile");
+      expect(
+        (await createFirstRepo.get("legacy-create-first", "legacy-create-first-profile"))?.name,
+      ).toBe("legacy-create-first-profile");
       expect(
         await client.get("SELECT id FROM custom_tool_tombstones WHERE id = $1", ["legacy-create-first"]),
       ).toBeNull();
@@ -704,14 +765,20 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         "race-remove-first",
         () => removeFirstRepo.removeCustomTool("legacy-remove-first"),
         "race-create-second",
-        () => createSecondRepo.create({ tool: "legacy-remove-first", name: "profile" }),
+        () =>
+          createSecondRepo.create({
+            tool: "legacy-remove-first",
+            name: "legacy-remove-first-profile",
+          }),
       );
       expect(removed).toEqual({ status: "fulfilled", value: true });
       expect(createAfterRemove.status).toBe("rejected");
       expect(String(createAfterRemove.status === "rejected" ? createAfterRemove.reason : "")).toContain(
         'custom tool "legacy-remove-first" was explicitly removed',
       );
-      expect(await createSecondRepo.get("legacy-remove-first", "profile")).toBeNull();
+      expect(
+        await createSecondRepo.get("legacy-remove-first", "legacy-remove-first-profile"),
+      ).toBeNull();
       expect(
         await client.get<{ id: string }>(
           "SELECT id FROM custom_tool_tombstones WHERE id = $1",
@@ -753,7 +820,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         () =>
           createFirstClient.execute(
             "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
-            ["raw-create-first-tool", "profile"],
+            ["raw-create-first-tool", "raw-create-first-profile"],
           ),
         "raw-delete-second",
         () =>
@@ -769,7 +836,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       expect(
         await appClient.get("SELECT tool FROM accounts WHERE tool = $1 AND name = $2", [
           "raw-create-first-tool",
-          "profile",
+          "raw-create-first-profile",
         ]),
       ).toEqual({ tool: "raw-create-first-tool" });
       expect(
@@ -807,7 +874,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         () =>
           createSecondClient.execute(
             "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
-            ["raw-delete-first-tool", "profile"],
+            ["raw-delete-first-tool", "raw-delete-first-profile"],
           ),
       );
       expect(deleted.status).toBe("fulfilled");
@@ -818,7 +885,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       expect(
         await appClient.get("SELECT tool FROM accounts WHERE tool = $1 AND name = $2", [
           "raw-delete-first-tool",
-          "profile",
+          "raw-delete-first-profile",
         ]),
       ).toBeNull();
       expect(
@@ -838,6 +905,212 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         deleteFirstClient.close(),
         createSecondClient.close(),
       ]);
+    }
+  });
+
+  test("same-name creates under different tools resolve to exactly one account", async () => {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const name = `cross-tool-race-${attempt}`;
+      const toolA = `race-name-a-${attempt}`;
+      const toolB = `race-name-b-${attempt}`;
+      const appNameA = `cross-tool-race-a-${attempt}`;
+      const appNameB = `cross-tool-race-b-${attempt}`;
+      const clientA = openClient(appNameA);
+      const clientB = openClient(appNameB);
+      try {
+        const results = await runReleasedTogether(
+          [toolLockKey(toolA), toolLockKey(toolB)],
+          [
+            {
+              applicationName: appNameA,
+              run: () => new AccountsRepo(clientA).create({ tool: toolA, name }),
+            },
+            {
+              applicationName: appNameB,
+              run: () => new AccountsRepo(clientB).create({ tool: toolB, name }),
+            },
+          ],
+        );
+
+        // Re-read the registry rather than trusting the two return values: the
+        // claim is about what is IN the table, and a create that reported
+        // success is not evidence the row it describes is the only one.
+        const stored = await client.many<{ tool: string }>(
+          "SELECT tool FROM accounts WHERE name = $1 ORDER BY tool",
+          [name],
+        );
+        expect({
+          attempt,
+          fulfilled: results.filter((r) => r.status === "fulfilled").length,
+          stored: stored.length,
+        }).toEqual({ attempt, fulfilled: 1, stored: 1 });
+
+        const refused = results.find((r) => r.status === "rejected")!;
+        expect(rejectionText(refused)).toContain("already exists");
+        // The loser must be turned away by the domain check, not by a raw
+        // Postgres constraint violation surfacing as a 500. This change adds
+        // no UNIQUE(name); if one is ever added here, this assertion is what
+        // notices that the refusal path changed shape.
+        expect(rejectionText(refused)).not.toMatch(/duplicate key value|unique constraint/i);
+      } finally {
+        await clientA.close();
+        await clientB.close();
+      }
+    }
+  });
+
+  test("a name taken by another tool is refused over HTTP as 409, not 500", async () => {
+    const handler = createLiveHandler(new AccountsRepo(client));
+    const name = "http-cross-tool-name";
+
+    // Both arms. A refusal probe that never saw the accepted arm cannot tell a
+    // working guard apart from a service that rejects everything.
+    const accepted = await handler(oldClientCreateRequest("http-cross-tool-a", name));
+    expect({ status: accepted.status, body: await accepted.json() }).toMatchObject({
+      status: 201,
+      body: { tool: "http-cross-tool-a", name },
+    });
+
+    const refused = await handler(oldClientCreateRequest("http-cross-tool-b", name));
+    expect({ status: refused.status, body: await refused.json() }).toEqual({
+      status: 409,
+      body: {
+        error:
+          `a profile named "${name}" already exists for tool "http-cross-tool-a"; ` +
+          "account names must be unique across tools",
+      },
+    });
+    expect(
+      await client.many<{ tool: string }>(
+        "SELECT tool FROM accounts WHERE name = $1 ORDER BY tool",
+        [name],
+      ),
+    ).toEqual([{ tool: "http-cross-tool-a" }]);
+  });
+
+  test("renames into one new name across tools resolve to exactly one holder", async () => {
+    // `gated` runs last so its failure never masks the unsynchronized arm: the
+    // gate can only park a contender on a lock the repository actually takes,
+    // so a repository that takes no name lock times out here, whereas the
+    // unsynchronized arm reports the substantive result (how many won).
+    for (const gated of [false, true]) {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const label = `${gated ? "gated" : "free"}-${attempt}`;
+        const target = `rename-target-race-${label}`;
+        const toolA = `rename-race-a-${label}`;
+        const toolB = `rename-race-b-${label}`;
+        const appNameA = `rename-target-a-${label}`;
+        const appNameB = `rename-target-b-${label}`;
+        const clientA = openClient(appNameA);
+        const clientB = openClient(appNameB);
+        const seed = new AccountsRepo(client);
+        await seed.create({ tool: toolA, name: `${target}-from-a` });
+        await seed.create({ tool: toolB, name: `${target}-from-b` });
+        const contenders = [
+          {
+            applicationName: appNameA,
+            run: () => new AccountsRepo(clientA).rename(toolA, `${target}-from-a`, target),
+          },
+          {
+            applicationName: appNameB,
+            run: () => new AccountsRepo(clientB).rename(toolB, `${target}-from-b`, target),
+          },
+        ];
+        try {
+          const results = gated
+            ? await runReleasedTogether([accountNameLockKey(target)], contenders)
+            : await Promise.allSettled(contenders.map((contender) => contender.run()));
+
+          const stored = await client.many<{ tool: string }>(
+            "SELECT tool FROM accounts WHERE name = $1 ORDER BY tool",
+            [target],
+          );
+          expect({
+            label,
+            fulfilled: results.filter((r) => r.status === "fulfilled").length,
+            stored: stored.length,
+          }).toEqual({ label, fulfilled: 1, stored: 1 });
+          expect(rejectionText(results.find((r) => r.status === "rejected")!)).toContain(
+            "already exists",
+          );
+        } finally {
+          await clientA.close();
+          await clientB.close();
+        }
+      }
+    }
+  });
+
+  test("opposing renames over a shared name pair never deadlock", async () => {
+    const controlOne = openClient("deadlock-control-one");
+    const controlTwo = openClient("deadlock-control-two");
+    try {
+      // POSITIVE CONTROL. Two transactions take the same two name locks in
+      // OPPOSITE order — precisely what rename() would do if it acquired
+      // [old, new] as given. If this does NOT report a deadlock, the fixture
+      // cannot detect the failure it is here to rule out, and the assertion
+      // below would be worth nothing.
+      let signalOne!: () => void;
+      let signalTwo!: () => void;
+      const oneHeld = new Promise<void>((resolve) => {
+        signalOne = resolve;
+      });
+      const twoHeld = new Promise<void>((resolve) => {
+        signalTwo = resolve;
+      });
+      const control = await Promise.allSettled([
+        controlOne.transaction(async (tx) => {
+          await tx.execute(ADVISORY_LOCK_SQL, [accountNameLockKey("deadlock-alpha")]);
+          signalOne();
+          await twoHeld;
+          await tx.execute(ADVISORY_LOCK_SQL, [accountNameLockKey("deadlock-beta")]);
+        }),
+        controlTwo.transaction(async (tx) => {
+          await tx.execute(ADVISORY_LOCK_SQL, [accountNameLockKey("deadlock-beta")]);
+          signalTwo();
+          await oneHeld;
+          await tx.execute(ADVISORY_LOCK_SQL, [accountNameLockKey("deadlock-alpha")]);
+        }),
+      ]);
+      expect(control.filter((r) => /deadlock detected/i.test(rejectionText(r)))).toHaveLength(1);
+    } finally {
+      await Promise.all([controlOne.close(), controlTwo.close()]);
+    }
+
+    // The shipped rename() under the same opposing schedule. Both renames want
+    // the same two names, so both are correctly refused on uniqueness grounds —
+    // the claim under test is that neither dies at the LOCK stage.
+    const swapOne = openClient("deadlock-rename-one");
+    const swapTwo = openClient("deadlock-rename-two");
+    try {
+      const seed = new AccountsRepo(client);
+      const repoOne = new AccountsRepo(swapOne);
+      const repoTwo = new AccountsRepo(swapTwo);
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const alpha = `swap-alpha-${attempt}`;
+        const beta = `swap-beta-${attempt}`;
+        await seed.create({ tool: `swap-a-${attempt}`, name: alpha });
+        await seed.create({ tool: `swap-b-${attempt}`, name: beta });
+        const results = await Promise.allSettled([
+          repoOne.rename(`swap-a-${attempt}`, alpha, beta),
+          repoTwo.rename(`swap-b-${attempt}`, beta, alpha),
+        ]);
+        for (const result of results) {
+          expect({ attempt, deadlock: /deadlock detected|40P01/i.test(rejectionText(result)) })
+            .toEqual({ attempt, deadlock: false });
+        }
+        // Both reached the uniqueness check, which is the proof they got past
+        // the locks rather than being aborted inside them.
+        expect(results.every((r) => /already exists/.test(rejectionText(r)))).toBe(true);
+        expect(
+          await client.many<{ name: string }>(
+            "SELECT name FROM accounts WHERE name = ANY($1::text[]) ORDER BY name",
+            [[alpha, beta]],
+          ),
+        ).toEqual([{ name: alpha }, { name: beta }]);
+      }
+    } finally {
+      await Promise.all([swapOne.close(), swapTwo.close()]);
     }
   });
 });
