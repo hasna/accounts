@@ -39,7 +39,12 @@ import {
   sweepCentralAuth,
   type SyncResult,
 } from "./lib/auth-store.js";
-import { ensureProfileAuthSnapshot, recoverParkedCredential } from "./lib/claude-auth.js";
+import {
+  ensureProfileAuthSnapshot,
+  parkedRecoveryDisposition,
+  planParkedRecovery,
+  recoverParkedCredential,
+} from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -81,11 +86,7 @@ import {
   hookOutputJson,
   runUsageHook,
 } from "./lib/usage-hook.js";
-import {
-  describeCredentialState,
-  parkedCredentialVerdict,
-  profileCredentialLayers,
-} from "./lib/credential-state.js";
+import { profileCredentialLayers } from "./lib/credential-state.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -1194,18 +1195,26 @@ program
       const profiles = (await store.listProfiles(opts.tool)).filter((p) => (name ? p.name === name : true));
       if (name && profiles.length === 0) throw new AccountsError(`no profile named "${name}" for tool "${opts.tool}"`);
 
+      // The WHOLE profile list — every profile, every tool, not the filtered
+      // one. The cross-directory gate asks "is this account live in another
+      // dir", and narrowing the search to the single profile being repaired
+      // would answer "no" every time: a gate that cannot fail. Unfiltered by
+      // tool as well, because a Claude account can be sitting live in a dir
+      // registered under some other tool, and that copy rotates tokens just the
+      // same. `--dry-run` and the real run share this list for the same reason
+      // they share the planner: any input they do not share is a way for the
+      // preview to disagree with the operation.
+      const allProfiles = await store.listProfiles();
+
       const rows = profiles.map((profile) => {
         const layers = profileCredentialLayers(profile.dir, tool);
-        const verdict = parkedCredentialVerdict(layers);
-        // --dry-run must not write, so it reports the verdict instead of acting.
+        // --dry-run runs the SAME decision function as the real path and differs
+        // only in not executing it. It used to compute `parkedCredentialVerdict`
+        // instead — pure content ranking with no identity gate — and so promised
+        // recoveries the real run refused.
         const result = opts.dryRun
-          ? {
-              outcome: verdict.recoverable ? ("would-recover" as const) : ("nothing-to-do" as const),
-              detail: verdict.recoverable
-                ? `parked copy in the ${verdict.restorableLayers.join(" and ")} would be restored`
-                : `live credential is ${describeCredentialState(layers.live.state)}`,
-            }
-          : recoverParkedCredential(profile.dir, tool, profile.name);
+          ? planParkedRecovery(profile.dir, tool, profile.name, { profiles: allProfiles })
+          : recoverParkedCredential(profile.dir, tool, profile.name, { profiles: allProfiles });
         return {
           profile: profile.name,
           dir: profile.dir,
@@ -1221,12 +1230,15 @@ program
         console.log(JSON.stringify({ dryRun: Boolean(opts.dryRun), profiles: rows }, null, 2));
         return;
       }
-      const acted = rows.filter((r) => r.outcome === "recovered" || r.outcome === "would-recover");
-      const blocked = rows.filter((r) => r.outcome === "identity-would-change" || r.outcome === "no-parked-credential");
+      // Rendered from the outcome's DISPOSITION, not from a hand-kept list of
+      // outcome strings. The old list named two refusals and silently dropped
+      // the rest, so a profile the command had refused printed nothing at all.
+      const acted = rows.filter((r) => parkedRecoveryDisposition(r.outcome) === "acted");
+      const blocked = rows.filter((r) => parkedRecoveryDisposition(r.outcome) === "blocked");
       console.log("");
       for (const row of [...acted, ...blocked]) {
         const colour =
-          row.outcome === "recovered" || row.outcome === "would-recover"
+          parkedRecoveryDisposition(row.outcome) === "acted"
             ? chalk.green
             : row.outcome === "no-parked-credential"
               ? chalk.red
