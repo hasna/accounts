@@ -4,11 +4,14 @@ import type { ToolDef } from "../types.js";
 import {
   CREDENTIALS_SNAPSHOT,
   OAUTH_SNAPSHOT,
+  dirCredentialsFile,
   profileAccountJsonPaths,
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
 } from "./claude-layout.js";
 import { centralAuthRoot, isAccountUuid } from "./auth-store.js";
+import { classifyCredentialFile, isRestorableState, type CredentialState } from "./credential-state.js";
+import { canonicalConfigDir, sameConfigDir } from "./safe-path.js";
 
 /**
  * UUID-keyed account enumeration. Directories are DOORS; accounts are the
@@ -31,6 +34,17 @@ export interface AccountDoor {
   role: AccountDoorRole;
   profileName?: string;
   email?: string;
+  /**
+   * `own-identity` doors only: the uuid of the account whose credential is
+   * CURRENTLY in the dir's live files, when that is somebody else. Absent when
+   * the dir runs as its owner, and absent when the dir has no live occupant at
+   * all — "parked and idle" is not the same fact as "squatted".
+   *
+   * Occupancy is recorded per DOOR, never as a scalar on the account, because
+   * an account with two doors can be displaced from one and serving from the
+   * other; a single flag would have to be wrong about one of them.
+   */
+  occupiedBy?: string;
 }
 
 export type CredentialSource = "central" | "profile-snapshot" | "dir-live";
@@ -61,7 +75,86 @@ export interface AccountCredentialRef {
   renewable: boolean;
 }
 
-export type AccountStatus = "ok" | "expired" | "no-credentials";
+/**
+ * A credential-LIVENESS verdict, and nothing else.
+ *
+ *   ok             an unexpired access token; usable right now
+ *   needs-refresh  access token aged out, refresh token intact — the tool
+ *                  renews it on the next request; nothing for an operator to do
+ *   expired        no usable access token AND no refresh token: genuinely dead,
+ *                  re-authentication is the fix
+ *   no-credentials no credential file pairs with this uuid in any store
+ *
+ * `needs-refresh` exists because its absence was a measured incident. On
+ * 2026-07-29 six of twelve accounts on this fleet reported `expired` from
+ * `accounts usage`; every one of them held a refresh token and was alive, and
+ * the owner acted on the report. Access tokens live 8 hours and a fleet that
+ * idles overnight has most of its parked copies past expiry at any moment, so
+ * "the access token aged out" is the NORMAL state of a healthy parked account —
+ * spelling it with the same word as "dead" makes the common case indistinguishable
+ * from the emergency. `credential-state.ts` already drew this exact line for the
+ * per-file view (`needs-refresh` vs `unusable`); this is the account-level view
+ * of it, and the two now agree.
+ *
+ * `expired` only ever NARROWS as a result: an account that reads `expired` after
+ * this change would have read `expired` before it, so the word became more true
+ * and never appears anywhere new.
+ *
+ * Occupancy is deliberately NOT a member of this union. Whether another account
+ * currently squats a dir is orthogonal to whether this account's credential is
+ * alive — all four combinations occur — so it is reported on `AccountDoor`
+ * instead. Folding it in here would re-create the same defect from the other
+ * side, hiding liveness behind occupancy.
+ */
+export type AccountStatus = "ok" | "needs-refresh" | "expired" | "no-credentials";
+
+/**
+ * Operator-facing gloss for a status, safe to print (never a token value).
+ *
+ * Lives here rather than in the CLI for the same reason
+ * `describeCredentialState` lives in `credential-state.ts`: the words are the
+ * part that was wrong, so they belong somewhere a test can read them without
+ * spawning a process. A status word with no gloss is what sent an operator to
+ * re-authenticate a live account.
+ *
+ * The switch is exhaustive over `AccountStatus` with no `default`, so adding a
+ * member to the union fails the typecheck here instead of silently printing a
+ * bare identifier.
+ */
+export function describeAccountStatus(status: AccountStatus): string {
+  switch (status) {
+    case "ok":
+      return "usable now";
+    case "needs-refresh":
+      return "access token aged out, refresh token intact — the tool renews it on use";
+    case "expired":
+      return "no refresh token — re-authentication required";
+    case "no-credentials":
+      return "no credential file in any store";
+  }
+}
+
+/**
+ * The liveness verdict for a credential that cannot serve a session AS IS.
+ *
+ * Shared by `buildIdentityIndex` and by the usage collector's mid-flight
+ * downgrade so there is exactly ONE place that decides whether "no usable access
+ * token" means `needs-refresh` or `expired`. It was two places, and the second
+ * one said `expired` unconditionally — the same conflation, one layer up, in a
+ * branch no public-API test can reach (it needs the credential file to be
+ * rewritten between the index scan and the token read, which is what a
+ * concurrent refresh or park actually does). Making it a call to a tested
+ * function is how that branch gets correctness it cannot get from a test.
+ */
+export function statusWithoutValidAccessToken(credential?: AccountCredentialRef): AccountStatus {
+  if (!credential) return "no-credentials";
+  return credential.renewable ? "needs-refresh" : "expired";
+}
+
+/** True when the status is one an operator has to act on. */
+export function statusNeedsOperator(status: AccountStatus): boolean {
+  return status === "expired" || status === "no-credentials";
+}
 
 export interface AccountIdentity {
   accountUuid: string;
@@ -137,14 +230,14 @@ function credentialRef(path: string, source: CredentialSource): AccountCredentia
 /**
  * Can this account take a session over — now, or after the tool renews it?
  *
- * `status === "expired"` is not a verdict of unusable: it means the ACCESS
- * token aged out, which on a fleet that idles overnight is the majority state
- * (access tokens live 8 hours). Excluding those shrinks the switch pool exactly
- * when unattended sessions need it, so the pool is "valid OR renewable" and
- * ranking — not filtering — keeps valid credentials first.
+ * An aged-out access token is not a verdict of unusable: on a fleet that idles
+ * overnight it is the majority state (access tokens live 8 hours). Excluding
+ * those shrinks the switch pool exactly when unattended sessions need it, so the
+ * pool is "valid OR renewable" and ranking — not filtering — keeps valid
+ * credentials first.
  *
  * A credential with no refresh token is still unusable. That distinction is the
- * whole point: `needs-refresh` and `unusable` are different verdicts.
+ * whole point: `needs-refresh` and `expired` are different verdicts.
  */
 export function isUsableIdentity(identity: AccountIdentity): boolean {
   // Status-led on purpose, so this is a strict SUPERSET of the rule it
@@ -152,6 +245,13 @@ export function isUsableIdentity(identity: AccountIdentity): boolean {
   // the aged-out-but-refreshable case is added. A widening fix must not be able
   // to narrow anything by accident.
   if (identity.status === "ok") return true;
+  if (identity.status === "needs-refresh") return true;
+  // Retained deliberately. `buildIdentityIndex` can no longer produce
+  // `expired` together with a renewable credential — that pair is now spelled
+  // `needs-refresh` — but identities are also constructed by callers and tests
+  // that have not been re-spelled, and dropping this leg would NARROW the usable
+  // set for them. Keeping it makes the change a superset of both the old rule
+  // and the new one, which is the invariant stated above.
   return identity.status === "expired" && identity.credential?.renewable === true;
 }
 
@@ -243,9 +343,21 @@ export function buildIdentityIndex(
     const { dir } = profile;
     if (!existsSync(dir)) continue;
 
+    // Layer A — whoever's account currently occupies the dir's live files.
+    // Read BEFORE layer B so the owner's door can record that it is displaced;
+    // both layers are read from the same dir in the same pass, so this is a
+    // reordering, not an extra read.
+    const livePaths = profileAccountJsonPaths(dir, tool);
+    const occupant = oauthIdentityFrom(livePaths.length > 0 ? readJson(livePaths[0]!) : undefined);
+
     // Layer B — the dir's OWN identity (survives in-place switches away).
     const own = oauthIdentityFrom(readJson(profileOAuthSnapshot(dir)));
     if (own) {
+      // Squatted only when someone else is actually in the dir. No occupant is
+      // "parked and idle", and the owner occupying its own dir is the normal
+      // case — neither is displacement.
+      const displacedBy =
+        occupant && occupant.accountUuid !== own.accountUuid ? occupant.accountUuid : undefined;
       record(
         byUuid,
         own,
@@ -254,14 +366,12 @@ export function buildIdentityIndex(
           role: "own-identity",
           ...(profile.name ? { profileName: profile.name } : {}),
           ...(own.email ? { email: own.email } : {}),
+          ...(displacedBy ? { occupiedBy: displacedBy } : {}),
         },
         credentialRef(profileCredentialsSnapshot(dir), "profile-snapshot"),
       );
     }
 
-    // Layer A — whoever's account currently occupies the dir's live files.
-    const livePaths = profileAccountJsonPaths(dir, tool);
-    const occupant = oauthIdentityFrom(livePaths.length > 0 ? readJson(livePaths[0]!) : undefined);
     if (occupant) {
       record(
         byUuid,
@@ -283,13 +393,84 @@ export function buildIdentityIndex(
       ...(entry.email ? { email: entry.email } : {}),
       doors: entry.doors,
       ...(entry.credential ? { credential: entry.credential } : {}),
-      status: (entry.credential
+      // Three bits, three words. `valid` (usable now) and `renewable` (usable
+      // after the tool refreshes it) are both already computed per credential;
+      // before this, only the first reached the status and every renewable
+      // parked copy was labelled dead. See AccountStatus.
+      status: entry.credential
         ? entry.credential.valid
           ? "ok"
-          : "expired"
-        : "no-credentials") as AccountStatus,
+          : statusWithoutValidAccessToken(entry.credential)
+        : "no-credentials",
     }))
     .sort((a, b) => a.accountUuid.localeCompare(b.accountUuid));
+}
+
+export interface LiveAccountDoor {
+  dir: string;
+  profileName?: string;
+  /** State of that dir's live `.credentials.json` — never a token value. */
+  state: CredentialState;
+}
+
+/**
+ * Other directories whose LIVE slot is currently serving `accountUuid`.
+ *
+ * WHY THIS EXISTS: restoring a parked credential into a dir while another dir
+ * already runs the same account puts TWO live copies of one credential on disk,
+ * and the next refresh rotates the token — revoking whichever copy loses the
+ * race, server-side and irreversibly. That is the confirmed destructive hazard
+ * in this area, and no gate asked about it: `recoverParkedCredential`'s identity
+ * check only compared the dir's own live identity against the profile's own, so
+ * a profile holding a SUPERSEDED PREDECESSOR of an account that is alive
+ * elsewhere passed straight through. Measured 2026-07-29: three profiles on this
+ * fleet were in exactly that shape, and `repair-auth` with no profile argument
+ * attempts every profile, so a single blanket run would have taken out all
+ * three working copies.
+ *
+ * LIVENESS, NOT DOOR EXISTENCE. A door whose live credential is itself a husk
+ * holds nothing that a rotation could revoke, and refusing on those would strand
+ * an account with no working copy anywhere — the exact recovery this feature was
+ * built for. So the filter is `isRestorableState`, not "a door exists".
+ *
+ * Directory identity is `sameConfigDir`, the same canonicalisation profile
+ * creation uses. Comparing raw strings would let a symlinked alias of one
+ * directory read as two, and read a dir as being in conflict with itself.
+ */
+export function accountLiveDoorsElsewhere(
+  index: ReadonlyArray<AccountIdentity>,
+  accountUuid: string,
+  excludeDir: string,
+): LiveAccountDoor[] {
+  const wanted = accountUuid.toLowerCase();
+  // Match case-insensitively: `buildIdentityIndex` lowercases well-formed uuids
+  // but passes malformed ones through verbatim, and a malformed uuid must not
+  // silently fall out of the gate.
+  const identity = index.find((entry) => entry.accountUuid.toLowerCase() === wanted);
+  if (!identity) return [];
+
+  const seen = new Set<string>();
+  const live: LiveAccountDoor[] = [];
+  for (const door of identity.doors) {
+    // Only the CURRENT OCCUPANT of a dir can be rotated by that dir's tool. A
+    // dir that merely has the account parked in `.accounts-auth/` is not
+    // running it and takes part in no rotation race.
+    if (door.role !== "current-occupant") continue;
+    if (sameConfigDir(door.dir, excludeDir)) continue;
+    // Dedupe on the CANONICAL path, matching the exclusion above: two registry
+    // entries spelling one directory differently are one door, not two.
+    const canonical = canonicalConfigDir(door.dir);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    const state = classifyCredentialFile(dirCredentialsFile(door.dir)).state;
+    if (!isRestorableState(state)) continue;
+    live.push({
+      dir: door.dir,
+      ...(door.profileName ? { profileName: door.profileName } : {}),
+      state,
+    });
+  }
+  return live;
 }
 
 /** The accountUuid currently occupying a config dir's live account file. */

@@ -5,12 +5,15 @@ import { join } from "node:path";
 import type { AccountCredentialRef, AccountIdentity } from "./lib/identity-index.js";
 import type { AccountUsage } from "./lib/usage.js";
 import {
+  autoSwitchStatePath,
   cooldownActive,
   readAutoSwitchState,
+  readHookNoticeState,
   readUsageCache,
   selectHealthiestAccount,
   thresholdBreached,
   writeAutoSwitchState,
+  writeHookNoticeState,
   writeUsageCache,
   type UsageCacheEntry,
 } from "./lib/auto-switch.js";
@@ -131,6 +134,20 @@ test("a valid credential outranks a renewable one even with far less headroom", 
     { currentUuid: "uuid-other" },
   );
   expect(picked.candidate?.accountUuid).toBe("uuid-valid");
+  expect(picked.ranked.map((c) => c.accountUuid)).toEqual(["uuid-valid", "uuid-renewable"]);
+});
+
+test("the selector returns the whole ranking, not only the winner", () => {
+  const picked = selectHealthiestAccount(
+    [
+      { identity: identity("uuid-a", "a@x.com"), usage: usage(90) },
+      { identity: identity("uuid-b", "b@x.com"), usage: usage(70) },
+      { identity: identity("uuid-c", "c@x.com"), usage: usage(50) },
+    ],
+    { currentUuid: "uuid-other" },
+  );
+  expect(picked.ranked.map((c) => c.accountUuid)).toEqual(["uuid-a", "uuid-b", "uuid-c"]);
+  expect(picked.candidate).toBe(picked.ranked[0]!);
 });
 
 test("selector reports all-limited honestly instead of flapping to an exhausted account", () => {
@@ -226,10 +243,44 @@ test("usage cache refuses path-hostile account uuids", () => {
 
 test("auto-switch cooldown blocks re-switching until the window passes", () => {
   const now = new Date();
-  writeAutoSwitchState({ lastSwitchAt: now.toISOString(), fromUuid: "a", toUuid: "b" });
-  const state = readAutoSwitchState();
+  const dir = "/home/someone/.claude";
+  writeAutoSwitchState({ lastSwitchAt: now.toISOString(), fromUuid: "a", toUuid: "b" }, dir);
+  const state = readAutoSwitchState(dir);
   expect(state?.toUuid).toBe("b");
   expect(cooldownActive(state, 600_000, now)).toBe(true);
   expect(cooldownActive(state, 600_000, new Date(now.getTime() + 601_000))).toBe(false);
   expect(cooldownActive(undefined, 600_000, now)).toBe(false);
+});
+
+test("one session's cooldown does not block a different session's config dir", () => {
+  // ccc23767: a single machine-wide state file meant a session at 96%
+  // utilization was refused because an UNRELATED session had switched three
+  // minutes earlier. With ~18 live sessions that capped the fleet at one switch
+  // per ten minutes.
+  const now = new Date();
+  const mine = "/home/someone/.hasna/accounts/profiles/claude/account003";
+  const theirs = "/home/someone/.hasna/accounts/profiles/claude/account004";
+
+  writeAutoSwitchState({ lastSwitchAt: now.toISOString(), fromUuid: "a", toUuid: "b" }, theirs);
+
+  expect(cooldownActive(readAutoSwitchState(theirs), 600_000, now)).toBe(true);
+  expect(readAutoSwitchState(mine)).toBeUndefined();
+  expect(cooldownActive(readAutoSwitchState(mine), 600_000, now)).toBe(false);
+  // Distinct dirs must land in distinct files, and the record must name its dir.
+  expect(autoSwitchStatePath(mine)).not.toBe(autoSwitchStatePath(theirs));
+  expect(readAutoSwitchState(theirs)?.configDir).toBe(theirs);
+});
+
+test("the state path is stable per dir and insensitive to trailing separators", () => {
+  const dir = "/home/someone/.claude";
+  expect(autoSwitchStatePath(dir)).toBe(autoSwitchStatePath(`${dir}/`));
+  expect(autoSwitchStatePath(dir)).toBe(autoSwitchStatePath(`${dir}/../.claude`));
+  // The filename must never carry the dir's own characters.
+  expect(autoSwitchStatePath(dir)).toMatch(/\/[0-9a-f]{32}\.json$/);
+});
+
+test("hook notice state round-trips and survives a corrupt file", () => {
+  expect(readHookNoticeState()).toBeUndefined();
+  writeHookNoticeState({ "no-usage": "2026-07-28T12:00:00.000Z", bogus: "x" });
+  expect(readHookNoticeState()?.["no-usage"]).toBe("2026-07-28T12:00:00.000Z");
 });

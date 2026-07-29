@@ -6,10 +6,14 @@ import { mergeClaudeSessions, type SessionMergeReport } from "./session-merge.js
 import {
   isClaudeSessionUuid,
   listClaudeSessions,
+  planClaudeSameBindingResume,
   type ClaudeSessionCatalogEntry,
   type ClaudeSessionCatalogOptions,
   type ClaudeSessionScanSkip,
 } from "./claude-sessions.js";
+import { formatEnvAssignments, profileEnv, providerLaunchEnv } from "./env.js";
+import { runClaudeLaunch, redactArgv } from "./claude-launch.js";
+import { getTool } from "./tools.js";
 
 interface SessionsCliOptions {
   profile?: string;
@@ -242,6 +246,14 @@ interface SessionsMergeCliOptions {
   json?: boolean;
 }
 
+interface SessionsResumeCliOptions {
+  account?: string;
+  sessionId?: string;
+  cwd?: string;
+  dryRun?: boolean;
+  json?: boolean;
+}
+
 function formatMergeReport(report: SessionMergeReport): string {
   const lines: string[] = [];
   lines.push(report.dryRun ? chalk.yellow("dry run — nothing was written") : chalk.bold("session merge"));
@@ -346,6 +358,75 @@ async function runMerge(options: SessionsMergeCliOptions): Promise<void> {
   }
 }
 
+function formatResumePlan(plan: ReturnType<typeof planClaudeSameBindingResume>): string {
+  return [
+    plan.mode === "same-binding"
+      ? chalk.bold("same-binding Claude resume")
+      : chalk.bold(plan.mode),
+    `profile: ${plan.profile.name}`,
+    `session: ${plan.session.sessionId}`,
+    `cwd: ${plan.cwd}`,
+    `command: ${redactArgv(plan.command).join(" ")}`,
+    "cross-binding transfer: unsupported",
+  ].join("\n");
+}
+
+async function resumeSession(
+  catalogRef: string,
+  options: SessionsResumeCliOptions,
+): Promise<void> {
+  if (!options.account) {
+    throw new AccountsError("sessions resume requires --account <name>");
+  }
+  if (!options.sessionId) {
+    throw new AccountsError("sessions resume requires --session-id <uuid>");
+  }
+  if (options.json && !options.dryRun) {
+    throw new AccountsError("sessions resume --json requires --dry-run because provider stdio is attached");
+  }
+
+  const store = resolveStore();
+  if (store.transport !== "local") {
+    throw new AccountsError(
+      "sessions resume is restricted to the local Accounts registry and same local profile binding",
+    );
+  }
+  const profiles = await store.listProfiles("claude");
+  const targetProfile = await store.getProfile(options.account, "claude");
+  const skipped: ClaudeSessionScanSkip[] = [];
+  const sessions = listClaudeSessions(profiles, {
+    onSkip: (skip) => skipped.push(skip),
+  });
+  warnSkipped(skipped);
+  const plan = planClaudeSameBindingResume({
+    entries: sessions,
+    targetProfile,
+    catalogRef,
+    sessionId: options.sessionId,
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+  });
+  if (options.dryRun) {
+    await writeStdout(options.json ? JSON.stringify(plan, null, 2) : formatResumePlan(plan));
+    return;
+  }
+
+  const tool = getTool("claude");
+  const env = profileEnv(targetProfile, tool);
+  console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv(plan.command).join(" ")}`));
+  const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
+  // Resume attaches Claude to a credential-bearing provider session, so the
+  // inherited request-debug diagnostics that dump HTTP request headers must be
+  // scrubbed here rather than passed through with the rest of the routing env.
+  const exitCode = await runClaudeLaunch(
+    targetProfile,
+    tool,
+    plan.command.slice(1),
+    providerLaunchEnv(parentEnv, env),
+    plan.cwd,
+  );
+  process.exit(exitCode);
+}
+
 /** Register `accounts sessions` (list by default), `… list` and `… merge`. */
 export function registerClaudeSessionCommands(program: Command, wrapAction: ActionWrapper): void {
   const sessions = program
@@ -357,6 +438,17 @@ export function registerClaudeSessionCommands(program: Command, wrapAction: Acti
       .command("list", { isDefault: true })
       .description("list Accounts-owned local Claude sessions without transcript content"),
   ).action(wrapAction((options: SessionsCliOptions) => printSessions(options)));
+
+  sessions
+    .command("resume")
+    .description("resume a Claude session only through its current same profile binding")
+    .argument("<catalog-ref>", "opaque catalogRef from accounts sessions --json")
+    .requiredOption("--account <name>", "target local Accounts Claude profile")
+    .requiredOption("--session-id <uuid>", "explicit Claude session UUID; must match the catalog reference")
+    .option("--cwd <path>", "absolute launch cwd; required when the catalog did not observe one")
+    .option("--dry-run", "validate the same-binding resume plan without launching Claude")
+    .option("--json", "output the dry-run plan as structured JSON")
+    .action(wrapAction((catalogRef: string, options: SessionsResumeCliOptions) => resumeSession(catalogRef, options)));
 
   sessions
     .command("merge")

@@ -34,6 +34,13 @@ export interface SwitchAccountOptions {
   env?: NodeJS.ProcessEnv;
   /** Proceed even when several live sessions share the config dir. */
   yes?: boolean;
+  /**
+   * Write credentials into a dir that is NEITHER this machine's live config dir
+   * NOR a registered profile dir. Off by default — see the guard in
+   * {@link switchAccount} for why. An explicit, human-driven override only:
+   * `accounts usage-hook` must never set it.
+   */
+  allowUnregisteredDir?: boolean;
 }
 
 export interface SwitchAccountResult {
@@ -132,48 +139,6 @@ export async function switchAccount(
     );
   }
 
-  const warnings: string[] = [];
-
-  // Fail loudly on UNUSABLE auth before touching anything: a switch onto a dead
-  // profile would strand the running session mid-conversation.
-  //
-  // "Expired" alone is not unusable, and treating it as such deadlocked the CLI
-  // against itself. Observed 2026-07-29: `accounts login account004` refused
-  // because that profile's dir carried another account after an in-place switch
-  // and pointed the operator at `accounts switch-account`; `accounts
-  // switch-account account004 --dir ...` refused because the profile's own
-  // credential snapshot had an aged-out access token and pointed back at
-  // `accounts login`. Neither command has a `--force`, so five profiles had no
-  // CLI route out at all — each command deferring to the other.
-  //
-  // The refusal was also wrong on the facts. The snapshot it read
-  // (`.accounts-auth/credentials.json`, plus its central copy under
-  // ~/.hasna/accounts/auth/<uuid>/) carried a REAL refresh token valid for
-  // another three to four weeks; only the 8-hour access token had aged out, and
-  // Claude Code renews those in place. Measured across all 23 registered Claude
-  // profiles: every profile whose live dir file had been emptied still had its
-  // own refresh token intact in the snapshot or central store — six of six.
-  //
-  // A credential with no refresh token is still refused: that one really is
-  // dead, and re-authenticating is the only answer. The two verdicts are
-  // different and must stay different.
-  ensureProfileAuthSnapshot(profile.dir, tool);
-  const health = claudeProfileAuthHealth(profile.dir, tool, { restoreView: true });
-  if (!health.valid && !health.renewable) {
-    const detail = health.reasons.length ? health.reasons.join("; ") : `status ${health.status}`;
-    throw new AccountsError(
-      `profile "${profile.name}" cannot take over this session — ${detail}` +
-        (health.credentialExpiresAt ? ` (expired ${health.credentialExpiresAt})` : "") +
-        `. Re-authenticate with \`accounts login ${profile.name}\` first.`,
-    );
-  }
-  if (!health.valid) {
-    warnings.push(
-      `"${profile.name}" has an aged-out access token${health.credentialExpiresAt ? ` (expired ${health.credentialExpiresAt})` : ""}` +
-        `; its refresh token is intact, so the tool renews it on the next request`,
-    );
-  }
-
   const configDir = resolveSessionConfigDir(tool, opts);
   const resolvedConfigDir = resolve(configDir);
   if (resolvedConfigDir === resolve(liveClaudeBase())) {
@@ -191,6 +156,65 @@ export async function switchAccount(
         ? "profile-dir"
         : "external";
 
+  // THE DESTINATION IS CHECKED BEFORE THE SOURCE IS TOUCHED.
+  //
+  // This function's whole job is to copy a live OAuth credential into a
+  // directory, and until this guard existed that directory was whatever the
+  // caller named. `accounts usage-hook --dir <path>` therefore doubled as a
+  // credential-exfiltration primitive: plant a `.claude.json` carrying any
+  // `oauthAccount.accountUuid` plus a usage-cache entry for that uuid at 95%,
+  // and the hook would rank the OTHER accounts, pick the healthiest, and write
+  // its real access and refresh tokens into the caller's directory at mode
+  // 0600. No confirmation, no allowlist, and the flag reads like a diagnostic.
+  //
+  // The write path did carry a guard —
+  // `assertSafeWritePath(targetCredentials, { mustStayUnder: targetDir })` in
+  // restoreClaudeAuthIntoDir — but `targetDir` IS the caller's argument, so it
+  // only proved the file landed inside the directory the caller chose. A
+  // boundary check against an attacker-supplied boundary is vacuous by
+  // construction; the allowlist has to come from somewhere the caller does not
+  // control, which here means the profile registry plus this machine's live
+  // config dir.
+  //
+  // Measured before shipping this: every one of the 26 live `CLAUDE_CONFIG_DIR`
+  // values on this fleet is a registered managed profile dir, and the live
+  // default is registered too — so the allowlist refuses nothing that is
+  // actually in use.
+  if (dirKind === "external" && !opts.allowUnregisteredDir) {
+    throw new AccountsError(
+      `refusing to write ${tool.label} credentials into ${configDir}: it is not a registered profile dir ` +
+        `and it is not this machine's live config dir. Register it first ` +
+        `(\`accounts add <name> --dir ${configDir}\`), or pass --allow-unregistered-dir to override deliberately.`,
+    );
+  }
+
+  const warnings: string[] = [];
+
+  // Fail loudly on UNUSABLE auth before touching anything: a switch onto a dead
+  // profile would strand the running session mid-conversation.
+  //
+  // "Expired" alone is not unusable, and treating it as such deadlocked the CLI
+  // against itself — see the commit that introduced `renewable`. Claude Code
+  // mints 8-hour access tokens and renews them in place, so on a fleet that
+  // idles overnight most profiles read `expired` while holding a refresh token
+  // good for weeks. A credential with no refresh token is still refused: that
+  // one really is dead, and re-authenticating is the only answer.
+  ensureProfileAuthSnapshot(profile.dir, tool);
+  const health = claudeProfileAuthHealth(profile.dir, tool, { restoreView: true });
+  if (!health.valid && !health.renewable) {
+    const detail = health.reasons.length ? health.reasons.join("; ") : `status ${health.status}`;
+    throw new AccountsError(
+      `profile "${profile.name}" cannot take over this session — ${detail}` +
+        (health.credentialExpiresAt ? ` (expired ${health.credentialExpiresAt})` : "") +
+        `. Re-authenticate with \`accounts login ${profile.name}\` first.`,
+    );
+  }
+  if (!health.valid) {
+    warnings.push(
+      `"${profile.name}" has an aged-out access token${health.credentialExpiresAt ? ` (expired ${health.credentialExpiresAt})` : ""}; ` +
+        `its refresh token is intact, so the tool renews it on the next request`,
+    );
+  }
   const sessions = listDirLiveSessions(configDir);
   const liveSessions = sessions.filter((s: DirSessionInfo) => s.alive).length;
   if (liveSessions > 1 && !opts.yes) {

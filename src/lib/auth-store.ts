@@ -177,12 +177,8 @@ function switchMarkerFilePresent(profileDir: string): boolean {
   return existsSync(profileSwitchedAccountMarker(profileDir));
 }
 
-function oauthRecordFromAccountFiles(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
-  // A switched-away dir's live account file carries ANOTHER profile's account;
-  // binding from it would attach this profile to a foreign identity. The
-  // snapshot (checked first by callers) stays owner-true; without one, a
-  // marked dir simply has no resolvable binding.
-  if (switchMarkerFilePresent(profileDir)) return undefined;
+/** The dir's live account record, marker-blind — the raw read. */
+function liveOAuthRecordUnfiltered(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
   const paths = tool ? profileAccountJsonPaths(profileDir, tool) : [join(profileDir, ".claude.json")];
   for (const p of paths) {
     const oauth = readJsonFile(p)?.oauthAccount;
@@ -191,9 +187,70 @@ function oauthRecordFromAccountFiles(profileDir: string, tool?: ToolDef): JsonRe
   return undefined;
 }
 
+function oauthRecordFromAccountFiles(profileDir: string, tool?: ToolDef): JsonRecord | undefined {
+  // A switched-away dir's live account file carries ANOTHER profile's account;
+  // binding from it would attach this profile to a foreign identity. The
+  // snapshot (checked first by callers) stays owner-true; without one, a
+  // marked dir simply has no resolvable binding.
+  if (switchMarkerFilePresent(profileDir)) return undefined;
+  return liveOAuthRecordUnfiltered(profileDir, tool);
+}
+
 function uuidFromOAuthRecord(oauth: JsonRecord | undefined): string | undefined {
   const uuid = oauth?.accountUuid;
   return typeof uuid === "string" && UUID_RE.test(uuid) ? uuid.toLowerCase() : undefined;
+}
+
+/**
+ * An identity token for CONFLICT DETECTION only — deliberately NOT filtered
+ * through `UUID_RE` the way `uuidFromOAuthRecord` is.
+ *
+ * The two jobs differ. Binding resolution turns a uuid into a filesystem path
+ * under the central store, so it must reject anything malformed. Conflict
+ * detection only has to notice that two identities DIFFER, and treating a
+ * malformed-but-present uuid as "no identity" would wave a destroying write
+ * straight through on exactly the inputs least likely to be well-formed.
+ * Empty and whitespace-only are still unknown: they carry no identity to
+ * compare.
+ */
+function identityToken(oauth: JsonRecord | undefined): string | undefined {
+  const uuid = oauth?.accountUuid;
+  if (typeof uuid !== "string") return undefined;
+  const token = uuid.trim().toLowerCase();
+  return token.length > 0 ? token : undefined;
+}
+
+/**
+ * Does the dir's LIVE account contradict the profile's OWN parked identity?
+ *
+ * THE HOLE THIS CLOSES (defect 0e7069a9): an in-session `/login` to a different
+ * account writes NO switch marker, so every marker-keyed guard here and in
+ * claude-auth.ts stays silent. Both credentials are then healthy, and
+ * `betterCredential` — refresh-token presence, then usability, then mtime — is
+ * identity-blind, so the guest's freshly written file wins on mtime and
+ * replaces the host profile's parked copy. Ranking separates healthy from
+ * degraded; it cannot separate two healthy credentials belonging to different
+ * accounts. Only an identity check can.
+ *
+ * THE RULE, matching `recoverParkedCredential`'s gate: own must be KNOWN, live
+ * may be unknown, compared case-insensitively. The asymmetry is deliberate —
+ * `own` is what gets written, so it must be established before it can be
+ * defended; `live` only ever detects a conflict, so an unreadable live identity
+ * cannot prove one and must not block a legitimate refresh.
+ *
+ * An unknown `own` is the FIRST-CAPTURE case, not a conflict: a profile that
+ * has never been snapshotted has no claim to defend, and refusing here would
+ * stop it ever acquiring one. That is the one leg where this differs from
+ * `recoverParkedCredential`, where unknown own identity IS a refusal — there,
+ * restoring would pair the guest's identity with this profile's credential,
+ * which is active harm rather than a missing precondition.
+ */
+export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): boolean {
+  const own = identityToken(oauthRecordFromSnapshot(profileDir));
+  if (!own) return false;
+  const live = identityToken(liveOAuthRecordUnfiltered(profileDir, tool));
+  if (!live) return false;
+  return own !== live;
 }
 
 /**
@@ -257,12 +314,17 @@ function syncOAuthFile(uuid: string, source: JsonRecord): SyncFileAction {
   return action;
 }
 
-function syncCredentialsFile(uuid: string, profileDir: string): SyncFileAction {
+function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): SyncFileAction {
   // Candidates: the per-profile snapshot, plus the dir's live credential file
   // when no switch-marker FILE claims it for another account (fail closed —
-  // see switchMarkerFilePresent). The best one competes against central;
-  // central is only ever replaced by a strict winner.
-  const candidatePaths = switchMarkerFilePresent(profileDir)
+  // see switchMarkerFilePresent) AND the dir's live identity does not itself
+  // contradict the profile's parked one (see dirLiveIdentityIsForeign — the
+  // in-session `/login` case, which writes no marker). `uuid` here is the
+  // profile's OWN bound account, so admitting a foreign live credential would
+  // mirror the guest's token straight into the host's central entry and destroy
+  // the last copy of the host's material.
+  const liveFilesAreForeign = switchMarkerFilePresent(profileDir) || dirLiveIdentityIsForeign(profileDir, tool);
+  const candidatePaths = liveFilesAreForeign
     ? [profileCredentialsSnapshot(profileDir)]
     : [profileCredentialsSnapshot(profileDir), join(profileDir, ".credentials.json")];
   const candidates = candidatePaths
@@ -300,7 +362,7 @@ export function syncProfileSnapshotToCentral(profileDir: string, tool?: ToolDef)
   }
 
   const oauth = syncOAuthFile(uuid, oauthSource);
-  const credentials = syncCredentialsFile(uuid, profileDir);
+  const credentials = syncCredentialsFile(uuid, profileDir, tool);
   const email = typeof oauthSource.emailAddress === "string" ? oauthSource.emailAddress : undefined;
   return {
     synced: true,
