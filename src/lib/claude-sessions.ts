@@ -118,6 +118,33 @@ export interface ClaudeSessionCatalogOptions {
   onSkip?: (skip: ClaudeSessionScanSkip) => void;
 }
 
+export interface ClaudeSameBindingResumePlan {
+  schema: "hasna.accounts.claude-session-resume/v1";
+  mode: "same-binding";
+  profile: {
+    name: string;
+    tool: "claude";
+  };
+  session: {
+    catalogRef: string;
+    sessionId: string;
+    ownerProfiles: string[];
+    encodedProject: string;
+    projectIdentity: string;
+    sessionIdCheck: ClaudeSessionCatalogEntry["sessionIdCheck"];
+  };
+  cwd: string;
+  command: string[];
+}
+
+export interface ClaudeSameBindingResumeOptions {
+  entries: readonly ClaudeSessionCatalogEntry[];
+  targetProfile: Profile;
+  catalogRef: string;
+  sessionId: string;
+  cwd?: string;
+}
+
 interface VerifiedProfileRoot {
   ownerProfile: string;
   profileIdentity: string;
@@ -195,6 +222,121 @@ export function resolveClaudeSessionReference(
     );
   }
   return matches[0]!;
+}
+
+function canonicalExistingDirectory(path: string, label: string): string {
+  const resolved = safeResolve(path);
+  if (!resolved) throw new AccountsError(`${label} must be an absolute local directory`);
+  const stat = lstatNoThrow(resolved);
+  if (!stat?.isDirectory() || stat.isSymbolicLink()) {
+    throw new AccountsError(`${label} must be an existing real directory`);
+  }
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    throw new AccountsError(`${label} could not be canonicalized`);
+  }
+}
+
+/**
+ * Reproduce Claude's own project-directory encoding. It is lossy — `/a.b`,
+ * `/a-b` and `/a_b` all encode to `-a-b` — so the fallback check in
+ * `canonicalResumeCwd` is only as strong as the encoded name, and admits
+ * sibling directories that differ solely in punctuation. That is the whole of
+ * the available data when the transcript recorded no cwd; the observed-cwd
+ * path above is an exact comparison and is preferred whenever it applies.
+ */
+function claudeProjectKey(cwd: string): string {
+  return cwd.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+function canonicalResumeCwd(
+  requestedCwd: string | undefined,
+  entry: ClaudeSessionCatalogEntry,
+): string {
+  const chosen = requestedCwd ?? entry.cwd;
+  if (!chosen) {
+    throw new AccountsError(
+      "session cwd is unavailable; pass an explicit absolute --cwd that matches the catalog project",
+    );
+  }
+  if (!isAbsolute(chosen) || chosen.includes("\0") || /[\r\n]/.test(chosen)) {
+    throw new AccountsError("--cwd must be an absolute local directory");
+  }
+  const canonical = canonicalExistingDirectory(chosen, "launch cwd");
+  if (entry.cwd && !samePath(canonical, entry.cwd)) {
+    throw new AccountsError("launch cwd does not match the catalog session project binding");
+  }
+  if (!entry.cwd && claudeProjectKey(canonical) !== entry.encodedProject) {
+    throw new AccountsError("launch cwd does not match the catalog encoded project binding");
+  }
+  return canonical;
+}
+
+export function planClaudeSameBindingResume(
+  options: ClaudeSameBindingResumeOptions,
+): ClaudeSameBindingResumePlan {
+  if (isClaudeSessionUuid(options.catalogRef)) {
+    throw new AccountsError(
+      "sessions resume requires an opaque catalogRef from accounts sessions --json; pass the UUID separately with --session-id",
+    );
+  }
+  if (!isClaudeSessionUuid(options.sessionId)) {
+    throw new AccountsError("--session-id must be a valid Claude session UUID");
+  }
+  if (options.targetProfile.tool !== "claude") {
+    throw new AccountsError(`target account "${options.targetProfile.name}" is not a Claude profile`);
+  }
+
+  const entry = resolveClaudeSessionReference(options.entries, options.catalogRef);
+  const sessionId = options.sessionId.toLowerCase();
+  if (sessionId !== entry.uuid) {
+    throw new AccountsError("explicit --session-id does not match the resolved catalog session");
+  }
+  if (entry.sessionIdCheck !== "bounded-match") {
+    throw new AccountsError(
+      "resolved catalog session did not confirm the explicit session ID in bounded metadata; refresh or inspect before resuming",
+    );
+  }
+
+  const targetProfilePath = canonicalExistingDirectory(
+    options.targetProfile.dir,
+    `profile "${options.targetProfile.name}" config directory`,
+  );
+  const targetProfileIdentity = options.targetProfile.identity ?? targetProfilePath;
+  const targetRepresentation = entry.representations.find(
+    (representation) =>
+      representation.ownerProfile === options.targetProfile.name &&
+      representation.profileIdentity === targetProfileIdentity &&
+      samePath(representation.profilePath, targetProfilePath),
+  );
+  if (!targetRepresentation || !samePath(entry.storageIdentity.profilePath, targetProfilePath)) {
+    throw new AccountsError(
+      "cross-binding session transfer is unsupported; target account must be a current representation of the catalog source profile",
+    );
+  }
+
+  const cwd = canonicalResumeCwd(options.cwd, entry);
+  return {
+    schema: "hasna.accounts.claude-session-resume/v1",
+    mode: "same-binding",
+    profile: {
+      name: options.targetProfile.name,
+      tool: "claude",
+    },
+    session: {
+      catalogRef: entry.catalogRef,
+      sessionId,
+      ownerProfiles: [
+        ...new Set(entry.representations.map((representation) => representation.ownerProfile)),
+      ].sort(compareText),
+      encodedProject: entry.encodedProject,
+      projectIdentity: entry.projectIdentity,
+      sessionIdCheck: entry.sessionIdCheck,
+    },
+    cwd,
+    command: [getTool("claude").bin, "--resume", sessionId],
+  };
 }
 
 function safeResolve(path: string): string | undefined {

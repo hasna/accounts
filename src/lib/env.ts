@@ -8,6 +8,45 @@ import {
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
+/**
+ * Runtime request diagnostics that can print provider request headers or
+ * credential-bearing payloads. These are intentionally narrow: provider
+ * launches keep the caller's PATH, proxy, TLS, Bedrock, Vertex, and cloud SDK
+ * environment because they remain inside the caller's existing trust binding.
+ */
+export const UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEYS = [
+  "BUN_CONFIG_VERBOSE_FETCH",
+  "NODE_DEBUG",
+  "NODE_DEBUG_NATIVE",
+] as const;
+
+const UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEY_SET = new Set(
+  UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEYS.map((name) => name.toLowerCase()),
+);
+
+function isUnsafeProviderRequestDebugEnvKey(name: string): boolean {
+  return UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEY_SET.has(name.toLowerCase());
+}
+
+function removeUnsafeProviderRequestDebugEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  for (const name of Object.keys(env)) {
+    if (isUnsafeProviderRequestDebugEnvKey(name)) delete env[name];
+  }
+  return env;
+}
+
+/**
+ * Assemble the final environment at the credential-bearing provider boundary.
+ * Scrubbing after every overlay prevents a custom tool setting from re-enabling
+ * a dangerous inherited diagnostic, including on case-insensitive platforms.
+ */
+export function providerLaunchEnv(
+  parentEnv: NodeJS.ProcessEnv,
+  ...overlays: Array<NodeJS.ProcessEnv | Record<string, string>>
+): NodeJS.ProcessEnv {
+  return removeUnsafeProviderRequestDebugEnv(Object.assign({}, parentEnv, ...overlays));
+}
+
 function renderTemplate(value: string, profile: Profile): string {
   return value.replaceAll("{profileDir}", profile.dir).replaceAll("{profileName}", profile.name).replaceAll("{toolId}", profile.tool);
 }
