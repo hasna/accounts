@@ -129,9 +129,14 @@ export function claudeApiAuthClearingEnv(): Record<string, string> {
 export function formatEnvAssignments(
   env: Record<string, string>,
   parentEnv: NodeJS.ProcessEnv = process.env,
+  additionalUnsetKeys: readonly string[] = [],
 ): string {
   const sanitized = removeUnsafeProviderRequestDebugEnv({ ...env }) as Record<string, string>;
-  const unset = requestDebugUnsetKeys(parentEnv).flatMap((name) => {
+  const unsetKeys = requestDebugUnsetKeys(parentEnv);
+  for (const name of additionalUnsetKeys) {
+    if (!unsetKeys.includes(name)) unsetKeys.push(name);
+  }
+  const unset = unsetKeys.flatMap((name) => {
     assertPortableEnvName(name);
     return ["-u", name];
   });

@@ -335,7 +335,7 @@ test("public switch projection keeps a cleared auth variable cleared in the rest
   expect(output.commandLine).not.toContain("[REDACTED]");
 });
 
-test("public switch projection still redacts a non-empty credential-named launch variable", async () => {
+test("public switch projection unsets a non-empty credential-named launch variable", async () => {
   addCustomTool({
     id: "env-secret-tool",
     label: "Env Secret Tool",
@@ -350,7 +350,9 @@ test("public switch projection still redacts a non-empty credential-named launch
   const output = publicSwitchResult(internal);
 
   expect(internal.env.TOOL_API_KEY).toBe("switch-env-secret-value");
-  expect(output.commandLine).toContain("TOOL_API_KEY='[REDACTED]'");
+  expect(output.commandLine).toContain("-u TOOL_API_KEY");
+  expect(output.commandLine).not.toContain("TOOL_API_KEY=");
+  expect(output.commandLine).not.toContain("[REDACTED]");
   expect(output.commandLine).not.toContain("switch-env-secret-value");
   expect(JSON.stringify(output)).not.toContain("switch-env-secret-value");
 });
