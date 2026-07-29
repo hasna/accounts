@@ -7,12 +7,11 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
 import chalk from "chalk";
-import { AccountsError, type Profile } from "./types.js";
+import { AccountsError, portableEnvNameSchema, type Profile } from "./types.js";
 import {
   DEFAULT_TOOL,
   getTool,
   isBuiltinTool,
-  listTools,
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./lib/tools.js";
@@ -2116,8 +2115,9 @@ program
     action(async (opts: { acceptCapabilityBaseline?: boolean }) => {
       console.log(chalk.bold(`store: ${storePath()}`));
       const store = resolveStore();
+      const registeredTools = await store.listTools();
       if (opts.acceptCapabilityBaseline) {
-        for (const tool of listTools()) resetCapabilityBaseline(tool);
+        for (const tool of registeredTools) resetCapabilityBaseline(tool);
         console.log(chalk.dim("  capability corpus floors re-recorded at their current size"));
       }
       const profiles = await store.listProfiles();
@@ -2128,6 +2128,18 @@ program
       );
       const applied = loadAppliedMap();
       let problems = 0;
+      for (const tool of registeredTools) {
+        if (isBuiltinTool(tool.id)) continue;
+        for (const key of Object.keys(tool.extraEnv ?? {})) {
+          if (portableEnvNameSchema.safeParse(key).success) continue;
+          console.log(
+            chalk.red(
+              `  ✗ stored custom tool ${JSON.stringify(tool.id)} has non-portable extraEnv key ${JSON.stringify(key)}; rename it to match ^[A-Za-z_][A-Za-z0-9_]*$`,
+            ),
+          );
+          problems++;
+        }
+      }
       let capabilityHintNeeded = false;
       for (const p of profiles) {
         const missing = !existsSync(p.dir);
@@ -2145,7 +2157,7 @@ program
         if (missing) continue;
         // Capability check: a profile that carries none of the machine's skills,
         // subagents, or MCP servers is broken even when its auth is perfect.
-        const tool = listTools().find((t) => t.id === p.tool);
+        const tool = registeredTools.find((t) => t.id === p.tool);
         if (!tool) continue;
         const capabilities = sharedCapabilityHealth(p.dir, tool);
         for (const problem of capabilities.problems) {

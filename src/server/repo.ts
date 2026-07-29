@@ -6,7 +6,7 @@
 // (tool,name) rejected, delete clears the current selection, set-current
 // requires the account to exist and stamps last_used_at.
 
-import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
+import { AccountsError, type ToolDef, storedToolDefSchema, toolDefSchema } from "../types.js";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
 import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
 
@@ -372,7 +372,7 @@ export class AccountsRepo implements AccountsStore {
     const tools: ToolDef[] = [];
     for (const row of rows) {
       const raw = typeof row.definition === "string" ? safeJsonParse(row.definition) : row.definition;
-      const parsed = toolDefSchema.safeParse(raw);
+      const parsed = storedToolDefSchema.safeParse(raw);
       if (parsed.success) tools.push(parsed.data);
     }
     return tools;

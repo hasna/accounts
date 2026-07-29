@@ -42,7 +42,7 @@ import {
   clearCustomToolsCache,
   BUILTIN_TOOLS,
 } from "./tools.js";
-import { profileNameSchema, toolDefSchema } from "../types.js";
+import { profileNameSchema, storedToolDefSchema } from "../types.js";
 import { detectEmail } from "./detect.js";
 import {
   addProfile as localAdd,
@@ -309,7 +309,7 @@ class ApiStore implements AccountsStore {
     for (const item of cloud) {
       if (item.builtin !== false) continue;
       const { builtin: _builtin, ...definition } = item;
-      const parsed = toolDefSchema.safeParse(definition);
+      const parsed = storedToolDefSchema.safeParse(definition);
       if (!parsed.success) {
         throw new AccountsError(
           `invalid custom tool "${item.id}" returned by accounts-serve: ${parsed.error.issues.map((issue) => issue.message).join("; ")}`,

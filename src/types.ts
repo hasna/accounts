@@ -170,6 +170,15 @@ export const toolDefSchema = z.object({
 });
 
 /**
+ * Read compatibility for tool definitions persisted by releases that allowed
+ * arbitrary extraEnv keys. New registrations still go through toolDefSchema,
+ * and every POSIX handoff validates names before rendering them.
+ */
+export const storedToolDefSchema = toolDefSchema.extend({
+  extraEnv: z.record(z.string()).optional(),
+});
+
+/**
  * A supported app/tool. Each tool isolates its configuration in a directory
  * pointed at by an environment variable (e.g. Claude Code reads
  * `CLAUDE_CONFIG_DIR`). A "profile" is one such directory plus metadata.
@@ -263,7 +272,7 @@ export const storeSchema = z.object({
   toolLocks: z.record(slugSchema, slugSchema).default({}),
   profiles: z.array(profileSchema).default([]),
   /** User-registered tools (apps) added at runtime, on top of built-ins. */
-  tools: z.array(toolDefSchema).default([]),
+  tools: z.array(storedToolDefSchema).default([]),
 });
 
 export type Store = z.infer<typeof storeSchema>;

@@ -82,8 +82,31 @@ test("doctor names non-portable extraEnv keys in already-stored custom tools", (
     }),
   );
 
+  const list = runCli(sharedHome, "tools", "list");
+  expect(list.status).toBe(0);
+  expect(list.stdout).toContain("legacy-tool");
+
   const result = runCli(sharedHome, "doctor");
   expect(result.status).toBe(1);
-  expect(result.stderr).toContain('stored custom tool "legacy-tool" has non-portable extraEnv key "BAD-NAME"');
-  expect(result.stderr).toContain("^[A-Za-z_][A-Za-z0-9_]*$");
+  expect(result.stdout).toContain('stored custom tool "legacy-tool" has non-portable extraEnv key "BAD-NAME"');
+  expect(result.stdout).toContain("^[A-Za-z_][A-Za-z0-9_]*$");
+
+  const repair = runCli(
+    sharedHome,
+    "tools",
+    "add",
+    "legacy-tool",
+    "--label",
+    "Legacy Tool",
+    "--env-var",
+    "LEGACY_HOME",
+    "--bin",
+    "legacy-tool",
+    "--default-dir",
+    join(home, "legacy-tool"),
+    "--extra-env",
+    "GOOD_NAME=value",
+  );
+  expect(repair.status).toBe(0);
+  expect(runCli(sharedHome, "doctor").status).toBe(0);
 });

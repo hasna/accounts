@@ -2,6 +2,28 @@ import { describe, expect, test } from "bun:test";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
 import { accountNameLockKey, AccountsRepo, toolLockKey } from "./repo.js";
 
+test("listCustomTools preserves legacy extraEnv keys", async () => {
+  const definition = {
+    id: "legacy-tool",
+    label: "Legacy Tool",
+    envVar: "LEGACY_HOME",
+    extraEnv: { "BAD-NAME": "value" },
+    defaultDir: "/home/test/.legacy-tool",
+    bin: "legacy-tool",
+  };
+  const client = {
+    pool: {} as never,
+    close: async () => {},
+    async many() {
+      return [{ definition }];
+    },
+  } as unknown as PoolQueryClient;
+
+  const tools = await new AccountsRepo(client).listCustomTools();
+
+  expect(tools).toEqual([definition]);
+});
+
 const OLD_ROW = {
   tool: "claude",
   name: "old",

@@ -128,6 +128,19 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(tools.some((t) => t.id === "claude")).toBe(true);
     });
 
+    test("listTools preserves a cloud tool stored before extraEnv keys were tightened", async () => {
+      const legacy = { ...acme, extraEnv: { "BAD-NAME": "value" } };
+      const { fetchImpl } = mockFetch(() => ({
+        status: 200,
+        body: { tools: [{ ...legacy, builtin: false }] },
+      }));
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      expect((await store.listTools()).find((tool) => tool.id === "acme")?.extraEnv).toEqual({
+        "BAD-NAME": "value",
+      });
+    });
+
     test("new client accepts an old server's minimal builtin Tool response", async () => {
       const { fetchImpl } = mockFetch(() => ({
         status: 200,
