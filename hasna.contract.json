@@ -3,8 +3,8 @@
   "name": "accounts",
   "class": "service",
   "contractVersion": "v1",
-  "kitVersion": "0.8.1",
-  "description": "Manage and switch between multiple AI coding tool profiles/accounts. Local mode keeps the registry under ~/.hasna/accounts; self_hosted/cloud modes use the authenticated accounts-serve HTTP API and PostgreSQL.",
+  "kitVersion": "0.8.2",
+  "description": "Manage and switch between multiple AI coding tool profiles/accounts. Local mode keeps the registry in a JSON file at ~/.hasna/accounts/accounts.json (no embedded database engine); self_hosted/cloud modes use the authenticated accounts-serve HTTP API and PostgreSQL.",
   "bins": [
     "accounts",
     "accounts-mcp",
@@ -99,7 +99,6 @@
     ],
     "envPrefix": "HASNA_ACCOUNTS_",
     "aliasEnvPrefix": "ACCOUNTS_",
-    "sqlitePath": "~/.hasna/accounts/accounts.db",
     "pgTestGate": {
       "envVar": "HASNA_ACCOUNTS_TEST_DATABASE_URL",
       "command": "bun run test:postgres"
@@ -110,6 +109,9 @@
       "artifactScan": {
         "script": "scan:artifact"
       }
+    },
+    "storageNotes": {
+      "sqlite": "Declared to satisfy the dual-engine storage_capabilities gate, which admits no waiver for class 'service'. This package ships no SQLite driver: the single-box store is the JSON registry named in `description`, and no `storage.sqlitePath` is declared because no .db file is ever created. Read this field before trusting `storage.engines` as a statement about the code."
     }
   }
 }

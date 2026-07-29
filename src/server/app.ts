@@ -15,7 +15,7 @@ import {
 import { AccountsError } from "../types.js";
 import { BUILTIN_TOOLS, isBuiltinTool } from "../lib/tools.js";
 import { AccountsRepo, type AccountsStore } from "./repo.js";
-import { accountsMigrations, readMigrationStatus } from "./migrations.js";
+import { accountsMigrations, evaluateMigrationReadiness, readMigrationStatus } from "./migrations.js";
 import { createAccountSchema, createToolSchema, updateAccountSchema, renameAccountSchema, setCurrentSchema, toolIdSchema } from "./schema.js";
 import { APP_SLUG, API_KEYS_TABLE, SCOPES, resolveSigningSecret } from "./config.js";
 import { packageVersion } from "./version.js";
@@ -95,14 +95,7 @@ export function buildServiceContext(options: BuildContextOptions = {}): ServiceC
       if (!h.ok) return { ready: false, reason: h.error ?? "database unreachable" };
       // Privilege-safe readiness: probe the ledger without any DDL, so the
       // DML-only app role can report readiness.
-      const status = await readMigrationStatus(client, migrations);
-      if (!status.ledgerPresent) return { ready: false, reason: "schema not migrated (ledger table missing)" };
-      if (status.unknown.length > 0) return { ready: false, reason: `unknown applied migrations: ${status.unknown.join(", ")}` };
-      if (status.checksumMismatches.length > 0) {
-        return { ready: false, reason: `migration checksum mismatch: ${status.checksumMismatches.join(", ")}` };
-      }
-      if (status.pending.length > 0) return { ready: false, reason: `pending migrations: ${status.pending.join(", ")}` };
-      return { ready: true };
+      return evaluateMigrationReadiness(await readMigrationStatus(client, migrations));
     },
     mode: "cloud",
     version: packageVersion(),

@@ -137,3 +137,33 @@ export async function readMigrationStatus(
     .sort();
   return { ledgerPresent: true, pending, unknown, checksumMismatches };
 }
+
+/** Readiness verdict derived from the migration ledger. */
+export interface MigrationReadiness {
+  ready: boolean;
+  reason?: string;
+}
+
+/**
+ * Decide readiness from a migration status, failing closed.
+ *
+ * This is the gate that separates "the database answers" from "the database
+ * matches this binary". `/health` only proves the former, so deployment probes
+ * must read THIS, not health: a schema behind the binary's ledger leaves reads
+ * working (they are `SELECT *`) while writes that name a newly added column
+ * fail, which is a service that looks healthy and is not.
+ *
+ * `unknown` is the downgrade direction and is deliberately also not-ready: once
+ * a newer migration is recorded, an older binary cannot vouch for the schema it
+ * is being pointed at, so rolling the image back without rolling the ledger back
+ * keeps the old image out of the load balancer rather than silently serving it.
+ */
+export function evaluateMigrationReadiness(status: MigrationStatus): MigrationReadiness {
+  if (!status.ledgerPresent) return { ready: false, reason: "schema not migrated (ledger table missing)" };
+  if (status.unknown.length > 0) return { ready: false, reason: `unknown applied migrations: ${status.unknown.join(", ")}` };
+  if (status.checksumMismatches.length > 0) {
+    return { ready: false, reason: `migration checksum mismatch: ${status.checksumMismatches.join(", ")}` };
+  }
+  if (status.pending.length > 0) return { ready: false, reason: `pending migrations: ${status.pending.join(", ")}` };
+  return { ready: true };
+}

@@ -90,7 +90,7 @@
   "author": "Andrei Hasna <andrei@hasna.com>",
   "license": "Apache-2.0",
   "dependencies": {
-    "@hasna/contracts": "0.8.1",
+    "@hasna/contracts": "0.8.2",
     "@hasna/events": "^0.1.7",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",

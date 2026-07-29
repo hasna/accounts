@@ -67,8 +67,30 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    migration scratch state.
 4. Deploy `accounts-serve` with the DML-only role DSN and verify `/health`,
    `/ready`, `/version`,
-   `GET /v1/tools`, and the OpenAPI document.
+   `GET /v1/tools`, and the OpenAPI document. **`/ready` is the deployment
+   gate, not `/health`** — see "Readiness Is The Deploy Gate" below.
 5. Roll out new clients only after the server is ready.
+
+## Readiness Is The Deploy Gate
+
+`/health` proves only that the database answers and reports a version. `/ready`
+additionally reads the migration ledger. A binary deployed against a schema
+behind its ledger therefore answers `/health` with `200 ok` while writes that
+name a newly added column fail, so **any probe that decides whether to send
+traffic must read `/ready`**. The shipped `docker-compose.yml` healthcheck does.
+
+Ordering is `accounts-migrate`, then deploy, then confirm `GET /ready` returns
+`200`. To prove the gate is live rather than assumed, probe `/ready` *before*
+migrating and confirm it returns `503` with a `pending migrations: ...` reason.
+A `/ready` that returns `200` before migration is not reading the ledger, and
+the deploy gate is worthless.
+
+The ledger spans two sources: the app schema in `migrations/*.sql`, and the
+shared api-keys table owned by `@hasna/contracts`. Upgrading that dependency can
+add migrations without any change to this repository's SQL — `@hasna/contracts`
+0.8.x adds `hasna_auth_0003_api_keys_tenant` (additive `ADD COLUMN ... tid`) on
+top of the two api-key migrations in 0.5.x. `accounts-serve` never migrates on
+boot; migrations run only through the separate `accounts-migrate` binary.
 
 Server-before-client is required for `accounts rename`, `accounts tools add`,
 and `accounts tools remove`. A new client connected to an older server returns
@@ -129,6 +151,7 @@ schema migration so grants for the current manifest are revalidated.
 | New | Old | Existing operations work. Minimal legacy built-in Tool responses are accepted. Rename and custom-tool mutations require a server upgrade and fail with an actionable error. |
 | New | New before migrations 0003/0004/0005 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
 | New | New after migrations 0003/0004/0005 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, rename/remove/current updates, and pointer reconciliation are available. |
+| — | Server older than an applied migration | `/ready` is unavailable with an `unknown applied migrations: ...` reason. The older binary cannot vouch for the schema and stays out of the load balancer by design. Forward-fix; do not roll the image back across a migration boundary. |
 
 ## Rollback And Forward Fix
 
@@ -145,6 +168,17 @@ schema migration so grants for the current manifest are revalidated.
   migrations are recorded. The checksum ledger rejects migrations unknown to
   the supplied manifest as a deterministic downgrade guard. An application
   rollback must retain the new migrator binary/job; otherwise forward-fix.
+- **Rolling the server image back across a migration boundary is not a
+  rollback, it is an outage.** The same downgrade guard applies to `/ready`,
+  not only to the migrator: an applied migration that the running binary does
+  not define is reported as `unknown applied migrations: ...` and readiness
+  stays `503` until the binary is rolled forward again. This is deliberate — an
+  older build cannot vouch for a newer schema — but it means the rollback plan
+  for a migration-bearing release is forward-fix, not image-revert. Note that a
+  release can cross a migration boundary through a **dependency bump alone**:
+  `@hasna/contracts` 0.8.x contributes `hasna_auth_0003_api_keys_tenant` to the
+  ledger with no change to any file under `migrations/`. Check the effective
+  ledger, not just the SQL directory, before planning a rollback.
 - If migration `0004` requires data recovery, stop writes and restore the
   mandatory pre-migration backup. The orphan archive is evidence for
   reconciliation, not a substitute for the backup.

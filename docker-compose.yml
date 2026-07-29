@@ -18,8 +18,15 @@ services:
       HASNA_ACCOUNTS_DATABASE_URL: ${HASNA_ACCOUNTS_DATABASE_URL:?set the cloud Postgres DSN}
       HASNA_ACCOUNTS_API_SIGNING_KEY: ${HASNA_ACCOUNTS_API_SIGNING_KEY:?set the API-key signing secret}
       PORT: "8080"
+    # Probe /ready, not /health. /health reports only DB reachability, so a
+    # container whose schema is behind the binary's migration ledger reports
+    # healthy while writes that need the new columns fail. /ready additionally
+    # asserts the ledger, so "healthy" means "migrated". Run `accounts-migrate`
+    # before starting this service; until then the container stays unhealthy by
+    # design (an unhealthy container is not restarted by `restart:`, so this
+    # fails closed rather than crash-looping).
     healthcheck:
-      test: ["CMD", "bun", "-e", "await fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      test: ["CMD", "bun", "-e", "await fetch('http://127.0.0.1:8080/ready').then(r=>{if(!r.ok)process.exit(1)})"]
       interval: 30s
       timeout: 5s
       retries: 3
