@@ -300,9 +300,9 @@ async function promptForUnavailableTool(
 async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<Profile> {
   const existing = await store.findProfile(name, tool.id);
   const profile = existing ?? (await store.addProfile({ name, tool: tool.id, description: "created for login" }));
-  // The tool lock is a machine-local disambiguation for bare commands; only the
-  // LocalStore keeps it. In api mode the shared registry (+ explicit --tool)
-  // resolves the profile, so there is no local lock to write.
+  // The tool lock is a machine-local disambiguation for bare login commands;
+  // only the LocalStore keeps it. In api mode the shared registry (+ explicit
+  // --tool) resolves the profile, so there is no local lock to write.
   if (store.transport === "local") lockProfileTool(profile.name, profile.tool);
   return profile;
 }

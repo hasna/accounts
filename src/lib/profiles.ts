@@ -77,13 +77,6 @@ function resolveProfileFromStore(store: Store, name: string, toolId?: string): P
     const suffix = toolId ? ` for tool "${toolId}"` : "";
     throw new AccountsError(`no profile named "${name}"${suffix}. Run \`accounts list\` to see profiles.`);
   }
-  if (!toolId) {
-    const lockedTool = store.toolLocks[name];
-    if (lockedTool) {
-      const locked = matches.find((p) => p.tool === lockedTool);
-      if (locked) return locked;
-    }
-  }
   if (matches.length > 1) {
     throw new AccountsError(
       `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
@@ -164,7 +157,7 @@ export interface AddOptions {
  * `accounts <cmd> <name>`. Same rule and error wording as the api transport
  * (AccountsRepo.nameConflict, src/server/repo.ts) so both transports refuse a
  * duplicate identically. Grandfathered collisions already in the store stay
- * resolvable (via --tool or a tool lock); only NEW collisions are refused.
+ * resolvable via --tool; only NEW collisions are refused.
  */
 function nameConflict(name: string, holderTool: string, tool: string): AccountsError {
   return holderTool === tool

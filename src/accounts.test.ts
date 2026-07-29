@@ -159,7 +159,7 @@ test("unsupported permission preset fails clearly", () => {
 
 // Registries created before the one-account-one-tool rule can hold the same
 // name under several tools. Those rows are grandfathered: still resolvable
-// (with --tool, or a tool lock), still switchable — but the name cannot spread
+// with --tool, still switchable — but the name cannot spread
 // to yet another tool.
 function seedGrandfatheredDuplicates(name: string, tools: string[]): void {
   const store = loadStore();
@@ -408,14 +408,15 @@ test("use sets the active profile per tool and bumps lastUsedAt", () => {
   expect(getProfileToolLock("play")).toBe("codex");
 });
 
-test("tool lock resolves grandfathered shared profile names for bare commands", () => {
+test("tool lock does not resolve grandfathered shared profile names for bare commands", () => {
   seedGrandfatheredDuplicates("work", ["claude", "codex"]);
   expect(() => getProfile("work")).toThrow(AccountsError);
 
   useProfile("work", "codex");
 
   expect(getProfileToolLock("work")).toBe("codex");
-  expect(getProfile("work").tool).toBe("codex");
+  expect(() => getProfile("work")).toThrow('profile "work" exists for multiple tools (claude, codex); pass --tool');
+  expect(getProfile("work", "codex").tool).toBe("codex");
 });
 
 test("rename updates the current pointer too", () => {
