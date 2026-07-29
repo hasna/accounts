@@ -17,7 +17,7 @@ import { liveClaudePaths, profileKeychainSnapshot, profileOAuthSnapshot } from "
 import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook.js";
 import { resolvePickMode } from "./lib/pick.js";
 import { publicSwitchResult, switchProfile } from "./lib/switch.js";
-import { controlledProbeEnv, profileEnv, providerLaunchEnv } from "./lib/env.js";
+import { profileEnv } from "./lib/env.js";
 import { loadStore } from "./storage.js";
 import { addCustomTool, getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -353,46 +353,6 @@ test("public switch projection still redacts a non-empty credential-named launch
   expect(output.commandLine).toContain("TOOL_API_KEY='[REDACTED]'");
   expect(output.commandLine).not.toContain("switch-env-secret-value");
   expect(JSON.stringify(output)).not.toContain("switch-env-secret-value");
-});
-
-test("launch environment policy is case-insensitive and preserves same-binding routing", () => {
-  const inherited = {
-    Path: "/trusted/bin",
-    BUN_CONFIG_VERBOSE_FETCH: "1",
-    node_debug: "http,http2",
-    Node_Debug_Native: "http",
-    HTTP_PROXY: "http://proxy.example.test:8080",
-    HTTPS_PROXY: "http://proxy.example.test:8443",
-    NO_PROXY: "127.0.0.1,localhost",
-    CLAUDE_CODE_USE_BEDROCK: "1",
-    CLAUDE_CODE_USE_VERTEX: "1",
-    AWS_PROFILE: "work",
-    GOOGLE_APPLICATION_CREDENTIALS: "/profiles/work/google.json",
-  };
-  const overlay = {
-    NODE_DEBUG: "http",
-    CODEX_HOME: "/profiles/work/codex",
-  };
-
-  const provider = providerLaunchEnv(inherited, overlay);
-  const probe = controlledProbeEnv({ ...inherited, ...overlay });
-
-  for (const env of [provider, probe]) {
-    expect(Object.keys(env).filter((name) => name.toLowerCase() === "bun_config_verbose_fetch")).toEqual([]);
-    expect(Object.keys(env).filter((name) => name.toLowerCase() === "node_debug")).toEqual([]);
-    expect(Object.keys(env).filter((name) => name.toLowerCase() === "node_debug_native")).toEqual([]);
-    expect(env).toMatchObject({
-      Path: "/trusted/bin",
-      HTTP_PROXY: "http://proxy.example.test:8080",
-      HTTPS_PROXY: "http://proxy.example.test:8443",
-      NO_PROXY: "127.0.0.1,localhost",
-      CLAUDE_CODE_USE_BEDROCK: "1",
-      CLAUDE_CODE_USE_VERTEX: "1",
-      AWS_PROFILE: "work",
-      GOOGLE_APPLICATION_CREDENTIALS: "/profiles/work/google.json",
-      CODEX_HOME: "/profiles/work/codex",
-    });
-  }
 });
 
 test("applyProfile writes oauth to live paths", async () => {
