@@ -5,7 +5,8 @@
 // constraints as the local CLI/MCP — this is the "wrap the core lib" contract.
 
 import { z } from "zod";
-import { profileNameSchema } from "../types.js";
+import { profileNameSchema, toolDefSchema } from "../types.js";
+import { classifyProfileDir, classifyToolHomeDir } from "../lib/profile-dir-policy.js";
 
 /** Tool id: same slug grammar as the core (lowercase alnum/hyphen). */
 export const toolIdSchema = z
@@ -39,10 +40,21 @@ export const metadataSchema = z
 
 const optionalNonBlank = (label: string) =>
   z.string().refine((v) => v.trim().length > 0, `${label} must not be empty`);
-const profileDirSchema = z
-  .string()
-  .min(1)
-  .refine((value) => !value.includes("\0") && !/[\r\n]/.test(value), "dir contains invalid characters");
+/**
+ * A profile dir the cloud registry will store.
+ *
+ * The registry is shared across the whole fleet, so an unconstrained `dir`
+ * lets any caller holding an API key write a throwaway path into production —
+ * which is exactly how 16 `/tmp` rows accumulated. `classifyProfileDir` is
+ * filesystem-free by design: these paths belong to other machines, so they can
+ * only be judged lexically, never by stat-ing them here.
+ */
+const profileDirSchema = z.string().min(1).superRefine((value, ctx) => {
+  const verdict = classifyProfileDir(value);
+  if (!verdict.ok) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: verdict.reason.message });
+  }
+});
 
 export const createAccountSchema = z.object({
   name: profileNameSchema,
@@ -70,6 +82,32 @@ export const updateAccountSchema = z
   })
   .refine((v) => Object.keys(v).length > 0, "update requires at least one field");
 export type UpdateAccountInput = z.infer<typeof updateAccountSchema>;
+
+/**
+ * A custom tool as the cloud registry will store it.
+ *
+ * `toolDefSchema` types `defaultDir` as a bare non-empty string, which made
+ * `POST /v1/tools` a fourth write path into the same registry: `/tmp/evil`,
+ * `/dev/shm/x` and even `"relative"` were accepted under the same write scope
+ * that refuses `accounts.dir=/tmp/evil`. The value is consumed AS a profile dir
+ * (src/lib/agents.ts, src/lib/switch-account.ts), so it gets the same
+ * primitives. It does NOT get the profile-root allowlist — a custom tool exists
+ * to introduce a config dir the built-in table does not know.
+ *
+ * Wrapped here rather than in types.ts because types.ts is a leaf that
+ * builtin-tools.ts depends on; putting the check there would make the policy
+ * import cyclic.
+ */
+export const createToolSchema = toolDefSchema.superRefine((def, ctx) => {
+  const verdict = classifyToolHomeDir(def.defaultDir);
+  if (!verdict.ok) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["defaultDir"],
+      message: verdict.reason.message,
+    });
+  }
+});
 
 export const setCurrentSchema = z.object({ name: profileNameSchema });
 

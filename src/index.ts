@@ -78,6 +78,13 @@ export type {
 } from "./lib/login.js";
 export { switchProfile } from "./lib/switch.js";
 export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
+export { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+export type {
+  DirSessionInfo,
+  SessionDirKind,
+  SwitchAccountOptions,
+  SwitchAccountResult,
+} from "./lib/switch-account.js";
 export {
   codexAppBinaryExists,
   codexAppMenuState,
@@ -169,6 +176,39 @@ export {
   CLAUDE_API_AUTH_ENV_KEYS,
 } from "./lib/claude-auth.js";
 export type { ClaudeProfileAuthHealth, ClaudeProfileAuthStatus } from "./lib/claude-auth.js";
+export {
+  centralAuthRoot,
+  centralAuthDir,
+  centralOAuthSnapshot,
+  centralCredentialsSnapshot,
+  centralCredentialsPathForProfile,
+  centralOAuthRecordForProfile,
+  isAccountUuid,
+  profileAccountUuid,
+  syncProfileSnapshotToCentral,
+  listCentralAccounts,
+  sweepCentralAuth,
+} from "./lib/auth-store.js";
+export type {
+  CentralAccount,
+  SweepResult,
+  SweptOrphan,
+  SyncFileAction,
+  SyncResult,
+  UnresolvedProfileBinding,
+} from "./lib/auth-store.js";
+// THE uuid-keyed account enumerator (central store first, per-profile stores
+// as compat fallback). Consumers must reason over this instead of walking
+// profile dirs themselves.
+export { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+export type {
+  AccountDoor,
+  AccountDoorRole,
+  AccountIdentity,
+  AccountCredentialRef,
+  AccountStatus,
+  CredentialSource,
+} from "./lib/identity-index.js";
 export { withApplyLock } from "./lib/apply-lock.js";
 export { isSafeProfileName } from "./lib/hook.js";
 export { readClaudeKeychain, keychainSupported } from "./lib/keychain.js";

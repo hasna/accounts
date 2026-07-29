@@ -1,3 +1,4 @@
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ToolDef } from "../types.js";
@@ -7,6 +8,7 @@ export const ACCOUNTS_AUTH_DIR = ".accounts-auth";
 export const OAUTH_SNAPSHOT = "oauth-account.json";
 export const CREDENTIALS_SNAPSHOT = "credentials.json";
 export const KEYCHAIN_SNAPSHOT = "keychain.json";
+export const SWITCHED_ACCOUNT_MARKER = "switched-account.json";
 
 /** Root directory for live Claude auth files (home or ACCOUNTS_TEST_LIVE_DIR). */
 export function liveClaudeBase(): string {
@@ -47,4 +49,52 @@ export function profileCredentialsSnapshot(profileDir: string): string {
 
 export function profileKeychainSnapshot(profileDir: string): string {
   return join(profileAuthDir(profileDir), KEYCHAIN_SNAPSHOT);
+}
+
+/**
+ * Marker recording that a config dir's LIVE auth files currently carry another
+ * profile's account (written by in-place `switch-account`, cleared when the
+ * dir's own account is restored or a fresh login lands).
+ */
+export function profileSwitchedAccountMarker(profileDir: string): string {
+  return join(profileAuthDir(profileDir), SWITCHED_ACCOUNT_MARKER);
+}
+
+export interface DirSessionInfo {
+  pid: number;
+  alive: boolean;
+}
+
+/**
+ * Live sessions bound to a config dir, from the tool's `sessions/<pid>.json`
+ * heartbeat files. Every one of them flips identity together on an in-place
+ * switch — the dir is shared state, not per-session state.
+ */
+export function listDirLiveSessions(configDir: string): DirSessionInfo[] {
+  const sessionsDir = join(configDir, "sessions");
+  if (!existsSync(sessionsDir)) return [];
+  const sessions: DirSessionInfo[] = [];
+  for (const entry of readdirSync(sessionsDir)) {
+    if (!entry.endsWith(".json")) continue;
+    let pid = Number.parseInt(entry.slice(0, -".json".length), 10);
+    try {
+      const parsed = JSON.parse(readFileSync(join(sessionsDir, entry), "utf8")) as { pid?: unknown };
+      if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid)) pid = parsed.pid;
+    } catch {
+      // Fall back to the pid encoded in the filename.
+    }
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    sessions.push({ pid, alive: processAlive(pid) });
+  }
+  return sessions.sort((a, b) => a.pid - b.pid);
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to someone else.
+    return error instanceof Error && "code" in error && (error as { code?: string }).code === "EPERM";
+  }
 }

@@ -6,6 +6,122 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- Profile-dir policy for the cloud registry (`src/lib/profile-dir-policy.ts`).
+  `POST /v1/accounts` and `PATCH /v1/accounts/:tool/:name` now refuse a `dir`
+  that sits under an ephemeral root (`/tmp`, `/var/tmp`, `/var/folders`,
+  `/dev/shm`, `/run`, and the macOS `/private` aliases), is not anchored under a
+  home root, or does not sit in a tool home directory. Previously any string was
+  accepted, which let test harnesses and agents write throwaway paths into the
+  shared registry. The check is deliberately filesystem-free — the service
+  validates dirs belonging to other machines and must judge them lexically — and
+  the ephemeral check runs before the home check, so widening
+  `HASNA_ACCOUNTS_PROFILE_DIR_ROOTS` for an unusual machine layout cannot
+  re-admit a temp path. Enforcement is server-side only: the cloud client also
+  talks to test doubles and non-production instances and cannot know which, so
+  it does not judge dirs locally.
+
+- Central identity-keyed auth snapshot store (`docs/auth-store.md`):
+  `~/.hasna/accounts/auth/<accountUuid>/{credentials.json,oauth-account.json}`
+  replaces the per-profile `.accounts-auth/` dirs as the canonical credential
+  home, with a read-both/write-new compatibility window for <= 0.2.15
+  binaries (writes mirrored to both stores, reads pick the `betterCredential`
+  winner, nothing deleted). New CLI: `accounts auth status | migrate | sweep`
+  (sweep is dry-run by default, refuses in api storage mode, and only ever
+  MOVES orphaned entries to `auth-trash/`). `buildIdentityIndex()` and the
+  central-store surface are exported from the package root.
+
+- Usage-aware automatic account switching (`docs/usage-aware-switching.md`):
+  - `accounts usage` — per-ACCOUNT usage from Claude's `/api/oauth/usage`
+    (`Authorization: Bearer <accessToken>` + `anthropic-beta: oauth-2025-04-20`),
+    keyed on `oauthAccount.accountUuid` and deduplicated across profile dirs —
+    one query per distinct account however many dirs hold it. Reports session
+    and weekly windows (structured `limits[]` preferred), headroom
+    (100 − worst unscoped window), expired/credential-less accounts as states
+    (never crashes), and caches per uuid under `cache/usage/`.
+  - `accounts pick --healthiest` — non-interactive selector: the account with
+    the most headroom, never the one the session currently runs as (the
+    silent-no-op case), resolved to a profile door; reports "all limited"
+    honestly instead of flapping. No identity exclusions (user-ratified
+    2026-07-28: switching across all client identities is fine).
+  - `accounts usage-hook` — a Claude Code `UserPromptSubmit` handler that
+    auto-switches the session in place (via `switch-account`) when any
+    unscoped window crosses the threshold (default 90% used). Cached-only
+    decisions with a detached background refresh (never blocks a prompt),
+    fail-open on every error, cooldown against flapping, loud `systemMessage`
+    announcements for switches AND failed switches, and a mandatory
+    post-switch assertion that the active `accountUuid` actually changed.
+    NOT installed automatically — `--print-install` prints the settings.json
+    snippet for operator opt-in.
+  - Identity enumeration lives behind one accessor
+    (`buildIdentityIndex()`), reading the future central auth home
+    `~/.hasna/accounts/auth/<accountUuid>/` first with per-profile
+    `.accounts-auth/` fallback, ready for the auth-store migration.
+
+- Two-window (5-hour session vs 7-day weekly) rate-limit selection. Anthropic
+  enforces two independent limits that fail differently, and the selector
+  previously ranked accounts on a single blended headroom
+  (100 − worst unscoped window) — which scores an account whose 5-hour window
+  is spent but recovers in minutes identically to one that is dead until next
+  week. Both windows are now carried separately end to end:
+  - `src/lib/usage-windows.ts` classifies each window from the payload's
+    `group` discriminator (measured live 2026-07-28 across 8 accounts:
+    `kind=session group=session`, `kind=weekly_all group=weekly`,
+    `kind=weekly_scoped group=weekly scoped`), falling back to `kind` and then
+    to a deliberately ASYMMETRIC reset-horizon rule — a horizon over the
+    session window's 5-hour maximum implies weekly, but a short horizon does
+    NOT imply session (a live `weekly_all` window was measured 0.86h from its
+    reset). Horizon-derived classes are flagged `inferred`.
+  - `selectHealthiestAccount` excludes weekly-exhausted accounts until their
+    weekly reset and session-exhausted accounts only until their 5-hour roll,
+    reporting a per-account reason and `eligibleAt`; survivors rank by weekly
+    headroom, then session headroom, then uuid. A window whose `resets_at` has
+    passed since the reading is re-read as recovered (INFERRED), which is what
+    lets an account return without a fresh fetch; a `resets_at` already past at
+    read time is treated as a malformed payload, not a roll. New
+    `--min-session-headroom` / `ACCOUNTS_USAGE_SWITCH_MIN_SESSION_HEADROOM`
+    floor (default 10) keeps switches off targets with no immediate runway.
+  - `state/exhaustion-ledger.json` — restart-durable per-account cooldowns
+    with exponential backoff (15 min base, doubling), released at the later of
+    the reported reset and the backoff step, capped at 5h (session/unknown) and
+    24h (weekly) so a misclassified window can never retire an account
+    permanently. Corrupt or path-hostile entries degrade to "no cooldown".
+  - The switch announcement and `accounts usage` now report both windows rather
+    than one blended percentage. `accounts usage` labels each window with its
+    class and marks a window whose reset has passed as reset rather than
+    printing a stale "100% used" the selector disagrees with.
+  - `accounts pick --healthiest` reads the same exhaustion ledger the hook
+    writes, so the CLI and the hook no longer disagree about the pool.
+  - Exhaustion is decided by utilization alone; `severity` is not consulted.
+    Measured in the Claude Code 2.1.220 bundle (binary-safe): `severity:"normal"`
+    0, `severity:"critical"` 0, `severity:"exhausted"` 0, against positive
+    controls on the same file of `severity:"error"` 27, `"warning"` 22,
+    `"fatal"` 6 and bare `severity` 295. The reference client reads `kind`,
+    `scope`, `percent`, `resets_at` and `extra_usage.*` off a limit entry and
+    never reads `severity` from the usage payload.
+  - The ledger lives under `state/`, not `cache/` — a store whose purpose is
+    surviving restarts must not sit in a directory whose name licenses
+    deletion. (Motivated by a live observation that
+    `cache/auto-switch-state.json` is absent despite two switches 60s apart
+    under a 10-minute cooldown; the cause of that loss is NOT established and
+    is tracked separately.) No migration: nothing was ever released writing
+    the old path.
+
+- `accounts switch-account [name]` — switch the CURRENT Claude Code session's
+  account in place, with no restart and the conversation intact. Measured on
+  Claude Code 2.1.220: a running session `stat()`s `<configDir>/.credentials.json`
+  on every API request and re-reads it when the mtime changes (the stat sits
+  above the token-still-valid early return, inside the per-request client
+  factory) — so installing another profile's credentials +
+  `oauthAccount` into the session's config dir flips its identity on the next
+  message. The verb snapshots the dir's outgoing credentials back to their owning
+  profile first, records a `switched-account` marker so snapshot machinery never
+  cross-contaminates profiles, refuses dead-auth targets loudly before touching
+  anything, and refuses config dirs shared by multiple live sessions without
+  `--yes` (they all flip together). The live default dir routes through the
+  existing `apply` semantics.
+
 ### Fixed
 
 - Share capabilities across profiles instead of isolating them. A profile is an
