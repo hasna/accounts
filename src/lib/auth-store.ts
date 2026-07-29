@@ -319,11 +319,6 @@ export function parkedCredentialIsUnattributable(profileDir: string): boolean {
   return parkedPrint !== livePrint;
 }
 
-/** True when the profile has a parked identity it can attribute a credential to. */
-export function profileHasParkedIdentity(profileDir: string): boolean {
-  return identityToken(oauthRecordFromSnapshot(profileDir)) !== undefined;
-}
-
 /**
  * The account uuid a profile dir is bound to: per-profile snapshot first
  * (owner-true even when the dir's live files were switched to another

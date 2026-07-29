@@ -114,24 +114,21 @@ test("REACHABILITY: that state is produced by the shipped API, not planted by ha
 
   ensureProfileAuthSnapshot(dir, tool());
 
-  // BEFORE the fix this parked the credential and not the identity — an unattributable
-  // parked credential, which the identity gate then read as "nothing to defend". The fix
-  // removes the state at its source: a credential is not parked until it can be attributed.
-  expect(existsSync(profileOAuthSnapshot(dir))).toBe(false);        // identity NOT parked
-  expect(existsSync(profileCredentialsSnapshot(dir))).toBe(false);  // ...so neither is the credential
-
-  // Nothing is lost by waiting: the credential is still in the dir, and once the account
-  // file appears both get parked together, attributably.
-  writeFileSync(join(dir, ".claude.json"), identityJson(UUID_HOST, "host"));
-  ensureProfileAuthSnapshot(dir, tool());
-  expect(existsSync(profileOAuthSnapshot(dir))).toBe(true);
+  // The credential IS parked here and the identity is NOT — that asymmetry stays, because
+  // switchAccount's snapshot-back, `apply`, and profileEnv's self-heal all legitimately park
+  // credentials in dirs carrying no identity snapshot. An earlier revision of this fix
+  // refused to park until an identity existed, and CI measured the cost: ~14 existing tests
+  // broke with ENOENT on the parked file. So the state is allowed to exist and is DEFENDED
+  // instead.
+  expect(existsSync(profileCredentialsSnapshot(dir))).toBe(true);
+  expect(existsSync(profileOAuthSnapshot(dir))).toBe(false);
   expect(JSON.parse(readFileSync(profileCredentialsSnapshot(dir), "utf8")).claudeAiOauth.accessToken).toBe(
     "host-access",
   );
 
-  // ...and the sequence that used to destroy it is now refused.
+  // ...and from here the write that used to destroy it is refused, on the strength of the
+  // credential fingerprint alone, with no identity to compare.
   backdate(profileCredentialsSnapshot(dir), 3600);
-  backdate(profileOAuthSnapshot(dir), 3600);
   writeFileSync(join(dir, ".claude.json"), identityJson(UUID_GUEST, "guest"));
   writeFileSync(join(dir, ".credentials.json"), credentialJson("guest"));
 
@@ -175,6 +172,20 @@ test("POSITIVE CONTROL: a first capture WITH an identity present still parks bot
   expect(existsSync(profileCredentialsSnapshot(dir))).toBe(true);
 });
 
+test("POSITIVE CONTROL: a first capture with NO identity still parks the credential", () => {
+  // The regression this guards: refusing to park an unattributed credential breaks
+  // switchAccount's snapshot-back, `apply`, and profileEnv's self-heal, which park
+  // credentials in dirs with no identity snapshot. Measured on CI as ~14 ENOENT failures.
+  const dir = mkdtempSync(join(tmpdir(), "unattr-first-noident-"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("host"));
+  addProfile({ name: "firstnoident", dir });
+
+  ensureProfileAuthSnapshot(dir, tool());
+
+  expect(existsSync(profileCredentialsSnapshot(dir))).toBe(true);
+  expect(existsSync(profileOAuthSnapshot(dir))).toBe(false);
+});
+
 test("POSITIVE CONTROL: a legacy unattributed park still accepts the SAME credential's identity", () => {
   // The dir holds exactly what we parked, so a newly appeared account file plausibly
   // describes it. Refusing here would strand such a dir permanently — it could never
@@ -202,6 +213,11 @@ test("POSITIVE CONTROL: `accounts login` (overwrite) still rebinds a legacy unat
   writeFileSync(join(dir, ".claude.json"), identityJson(UUID_GUEST, "guest"));
   writeFileSync(join(dir, ".credentials.json"), credentialJson("guest"));
   addProfile({ name: "legacyoverwrite", dir });
+  // Backdate the parked copy so it is unambiguously the older, no-fresher credential.
+  // Without this the two fixtures can land in the same millisecond, `wouldDowngradeSnapshot`
+  // ties on both mtime and expiry, and `betterCredential` keeps the snapshot — the test then
+  // fails on fixture timing rather than on the behaviour it is asking about.
+  backdate(profileCredentialsSnapshot(dir), 3600);
 
   // finalizeLogin's path: "the dir's files are this profile's truth again".
   ensureProfileAuthSnapshot(dir, tool(), { overwrite: true });
@@ -229,4 +245,5 @@ test("a tool with no identity concept is unaffected: no live identity cannot pro
     "host-access",
   );
 });
+
 
