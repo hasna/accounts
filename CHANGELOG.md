@@ -8,6 +8,11 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ### Changed
 
+- `ACCOUNTS_HOME` now selects the local registry ahead of an inherited
+  `HASNA_ACCOUNTS_API_URL` + `HASNA_ACCOUNTS_API_KEY` pair, preventing scoped
+  agent and probe runs from silently reaching the production API. An explicit
+  `self_hosted` or `cloud` storage mode remains authoritative.
+
 - **Behaviour change to the published package root — read this before releasing.**
   The synchronous registry exports from `@hasna/accounts` (as opposed to
   `resolveStore()`, `@hasna/accounts/storage`, the CLI, the MCP server or the
