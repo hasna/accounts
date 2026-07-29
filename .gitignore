@@ -1,4 +1,5 @@
 node_modules/
+.npm-drain-cache/
 dist/
 .npm-cache/
 *.db
