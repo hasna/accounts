@@ -23,6 +23,7 @@ const AUTHORITY_KEYS = [
   "ACCOUNTS_API_URL",
   "HASNA_ACCOUNTS_API_KEY",
   "ACCOUNTS_API_KEY",
+  "HASNA_ACCOUNTS_STRICT_ROOT_COMPAT",
 ] as const;
 
 describe("root synchronous compatibility exports", () => {
@@ -89,13 +90,10 @@ describe("root synchronous compatibility exports", () => {
         HASNA_ACCOUNTS_API_KEY: "fixture-authority",
       },
     ],
-  ])("fails closed for %s before local reads or writes", (_label, env) => {
+  ])("writes fail closed for %s while reads stay answerable", (_label, env) => {
     Object.assign(process.env, env);
-    expect(() => listProfiles()).toThrow(/local-only compatibility/);
     expect(() => addProfile({ name: "must-not-write" })).toThrow(/local-only compatibility/);
-    expect(() => loadStore()).toThrow(/local-only compatibility/);
     expect(() => saveStore(emptyStore())).toThrow(/local-only compatibility/);
-    expect(() => listTools()).toThrow(/local-only compatibility/);
     expect(() =>
       addCustomTool({
         id: "fixture-tool",
@@ -105,6 +103,14 @@ describe("root synchronous compatibility exports", () => {
         bin: "fixture",
       }),
     ).toThrow(/local-only compatibility/);
+    // Reads answer from the machine-local registry and announce themselves via
+    // process.emitWarning instead of throwing, because the measured consumers
+    // swallow throws and would silently lose their answer. See
+    // root-compat-consumer.test.ts for the full contract.
+    expect(listProfiles()).toEqual([]);
+    expect(loadStore().version).toBe(1);
+    expect(listTools().some((tool) => tool.id === "claude")).toBe(true);
+    // No read created the local store on its way to answering.
     expect(existsSync(join(home, "accounts.json"))).toBe(false);
     expect(existsSync(join(home, "profiles"))).toBe(false);
   });
@@ -194,17 +200,28 @@ describe("root synchronous compatibility exports", () => {
       },
     ],
   ])(
-    "appliedProfile fails closed for %s while the machine-local pointer stays readable",
+    "appliedProfile stays readable for %s and so does the machine-local pointer",
     (_label, env) => {
       seedAppliedProfile("ghost-local");
       expect(appliedProfile("claude")).toMatchObject({ name: "ghost-local", tool: "claude" });
 
       Object.assign(process.env, env);
       // The registry record behind the pointer belongs to the hosted registry,
-      // so resolving it locally would hand out a ghost account.
-      expect(() => appliedProfile("claude")).toThrow(/local-only compatibility/);
+      // so this answer is machine-local and is announced as such (see
+      // root-compat-consumer.test.ts). It is not withheld: the consumers that
+      // read it wrap every call in try/catch, so withholding it produced a
+      // silent null rather than the intended loud failure.
+      expect(appliedProfile("claude")).toMatchObject({ name: "ghost-local", tool: "claude" });
       // The pointer itself is machine-local state and stays readable.
       expect(appliedProfileName("claude")).toBe("ghost-local");
+      // Opting into the end-state behaviour makes the record read fail closed.
+      process.env.HASNA_ACCOUNTS_STRICT_ROOT_COMPAT = "1";
+      try {
+        expect(() => appliedProfile("claude")).toThrow(/local-only compatibility/);
+        expect(appliedProfileName("claude")).toBe("ghost-local");
+      } finally {
+        delete process.env.HASNA_ACCOUNTS_STRICT_ROOT_COMPAT;
+      }
     },
   );
 

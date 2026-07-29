@@ -86,14 +86,45 @@ including those fields nested inside a metadata envelope. The existing v1 API
 may retain those legacy fields only inside its isolated compatibility contract.
 
 Synchronous profile functions exported from the package root are now explicit
-local-only compatibility. They preserve local behavior, but fail before local
-I/O whenever hosted/self-hosted authority is configured. That includes
-`appliedProfile`, which resolves the applied pointer into a registry record. The
-single exemption is `appliedProfileName`, which returns only the machine-local
-applied pointer — never a registry record — and so stays readable under hosted
-authority. The deprecated
-`ensureProfileForLogin` root export uses that same canonical authority resolver,
-including `HASNA_ACCOUNTS_MODE`, rather than maintaining a separate mode policy.
-Retired `remote`, `hybrid`, and `s3` words are skipped as absent authority and
-cannot mask a canonical value from a lower-precedence compatibility key.
-Async v1 callers use `resolveStore()`; new callers use `@hasna/accounts/v2`.
+local-only compatibility. They can never select the async hosted registry, so
+under hosted/self-hosted authority they are not answering for the store of
+record — but writes and reads get different treatment, because the two hazards
+are different.
+
+**Writes fail closed.** `saveStore`, `addProfile`, `removeProfile`,
+`renameProfile`, `updateProfile`, `redetectEmail`, `useProfile`,
+`lockProfileTool`, `addCustomTool`, `removeCustomTool` and the deprecated
+`ensureProfileForLogin` throw before any local I/O whenever hosted authority is
+configured. A synchronous root write there would land in this machine's local
+JSON file while the registry of record is elsewhere, silently diverging the two.
+There is no correct local answer to give.
+
+**Reads answer and announce.** `loadStore`, `listTools`, `getTool`,
+`listProfiles`, `findProfile`, `getProfile`, `getProfileToolLock`,
+`currentProfile` and `appliedProfile` return the same machine-local answer they
+returned before this layer existed, and emit a `DeprecationWarning` with code
+`HASNA_ACCOUNTS_LOCAL_COMPAT_READ` once per operation per process.
+
+Making reads throw was tried and measured on the fleet, and it was worse than
+the problem it addressed. `@hasna/economy`'s `resolveAccountForAgent` wraps
+every accounts call in `try {} catch {}`, so the intended loud failure arrived
+as a silent `null`: per-account cost attribution went to zero on every
+cloud-mode machine with no error, no log and no alert — the exact
+silent-wrong-answer class the gate exists to prevent. `process.emitWarning` is
+used precisely because a `catch` block cannot swallow it.
+
+Set `HASNA_ACCOUNTS_STRICT_ROOT_COMPAT=1` to opt a process into the end state,
+where hosted authority makes reads throw as well. That becomes the default once
+the remaining root-import consumers move to `resolveStore()` or
+`@hasna/accounts/v2`; until then it is how a caller that wants fail-closed reads
+gets them, and how the fleet will be flipped once `@hasna/economy` migrates.
+
+`appliedProfileName` is exempt in every mode, including strict: it returns only
+the machine-local applied pointer — never a registry record.
+
+The deprecated `ensureProfileForLogin` root export uses that same canonical
+authority resolver, including `HASNA_ACCOUNTS_MODE`, rather than maintaining a
+separate mode policy. Retired `remote`, `hybrid`, and `s3` words are skipped as
+absent authority and cannot mask a canonical value from a lower-precedence
+compatibility key. Async v1 callers use `resolveStore()`; new callers use
+`@hasna/accounts/v2`.
