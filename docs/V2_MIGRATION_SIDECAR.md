@@ -211,6 +211,21 @@ fails closed. A lock owned by a live process is preserved; a valid lock naming
 a dead process is removed before repair retries. Ambiguous drift preserves the
 WAL and fails closed.
 
+Reclaiming a dead writer lock is itself serialized. Observing the lock,
+confirming its owner is dead, and unlinking it are three separate operations, so
+two processes that observe the same dead lock could otherwise both unlink: the
+first would immediately create its own live lock, and the second would unlink
+that live lock and acquire the mutex as well, putting two writers past it. A
+reclaimer therefore first creates an exclusive `<sidecar>.lock.reclaim-<device>-
+<inode>` token, re-reads the lock inside that token, and unlinks only when the
+device, inode, and payload still match what it observed. The token is bound to
+the dead lock's identity, so a token abandoned by a process that died inside the
+reclaim window cannot block reclaim of any later lock — a replacement lock has a
+different inode. It blocks only that one abandoned identity, and does so by
+failing closed with `migration_writer_lock_reclaim_contended` rather than by
+admitting a second writer. Recovery is to delete the reported reclaim token once
+no migration writer is running.
+
 ## Compatibility fixture
 
 [`test/fixtures/v2-migration-compatibility.json`](../test/fixtures/v2-migration-compatibility.json)

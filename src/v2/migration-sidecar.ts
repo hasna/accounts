@@ -2897,6 +2897,11 @@ const migrationSidecarInstallOptionsSchema = z
   })
   .strict();
 
+interface WriterLockReclaimToken {
+  readonly path: string;
+  readonly descriptor: number;
+}
+
 interface MigrationSidecarStorePaths {
   readonly directory: string;
   readonly sidecar: string;
@@ -3357,21 +3362,109 @@ export class MigrationSidecarStore {
       this.#paths.lock,
       "migration writer lock",
     );
-    const rawPid = observed.contents.trim();
-    if (!/^[1-9][0-9]*$/.test(rawPid)) return false;
-    const pid = Number(rawPid);
-    if (!Number.isSafeInteger(pid) || processIsAlive(pid)) return false;
-    this.#assertGuardedPathsDistinctFromLegacy();
-    const currentStat = lstatSync(this.#paths.lock);
-    if (
-      observed.stat.dev !== currentStat.dev ||
-      observed.stat.ino !== currentStat.ino
-    ) {
-      return false;
+    if (!writerLockPidIsDead(observed.contents)) return false;
+
+    // Reclaiming a dead writer lock is an observe -> verify -> unlink sequence
+    // that is not atomic on its own. Two processes that observe the same dead
+    // lock can both pass the device/inode identity check; the first unlinks and
+    // immediately re-creates its own live lock through the O_EXCL retry, and the
+    // second then unlinks that live lock and acquires the mutex as well, putting
+    // two writers past a mutex whose whole purpose is to prevent that. Gate the
+    // sequence behind an exclusive reclaim token named after the observed lock
+    // identity, so exactly one process may reclaim a given dead lock, and re-read
+    // the lock inside the token rather than trusting the earlier observation.
+    //
+    // The token is bound to the dead lock's device/inode, so a token abandoned by
+    // a process that died inside the reclaim window cannot block reclaim of any
+    // later lock (a new lock file gets a new inode). It can only block reclaim of
+    // that one abandoned identity, which fails closed with
+    // `migration_writer_lock_reclaim_contended` and is cleared by removing the
+    // reported reclaim token. Failing closed is the intended trade against
+    // admitting a second concurrent writer.
+    const token = this.#openWriterLockReclaimToken(observed.stat);
+    try {
+      this.#assertGuardedPathsDistinctFromLegacy();
+      const current = readPrivateRegularFileNoFollow(
+        this.#paths.lock,
+        "migration writer lock",
+      );
+      if (
+        current.stat.dev !== observed.stat.dev ||
+        current.stat.ino !== observed.stat.ino ||
+        current.contents !== observed.contents ||
+        !writerLockPidIsDead(current.contents)
+      ) {
+        return false;
+      }
+      unlinkSync(this.#paths.lock);
+      fsyncDirectory(this.#paths.directory);
+      return true;
+    } finally {
+      this.#closeWriterLockReclaimToken(token);
     }
-    unlinkSync(this.#paths.lock);
-    fsyncDirectory(this.#paths.directory);
-    return true;
+  }
+
+  #writerLockReclaimTokenPath(stat: Stats): string {
+    if (
+      !Number.isSafeInteger(stat.dev) ||
+      !Number.isSafeInteger(stat.ino) ||
+      stat.dev < 0 ||
+      stat.ino < 0
+    ) {
+      throw new MigrationConflictError(
+        "migration writer lock identity is not addressable",
+        {
+          code: "migration_writer_lock_identity_unaddressable",
+          references: [diagnosticReference("root.path", this.#paths.lock)],
+        },
+      );
+    }
+    return `${this.#paths.lock}.reclaim-${stat.dev}-${stat.ino}`;
+  }
+
+  #openWriterLockReclaimToken(stat: Stats): WriterLockReclaimToken {
+    const path = this.#writerLockReclaimTokenPath(stat);
+    this.#assertGuardedPathsDistinctFromLegacy();
+    if (pathsReferToSameFile(path, this.#legacyStorePath)) {
+      throw new MigrationConflictError(
+        "migration sidecar storage must not alias the configured v1 registry path",
+        {
+          code: "migration_store_path_rejected",
+          references: [diagnosticReference("root.path", path)],
+        },
+      );
+    }
+    assertSafeWritePath(path, { mustStayUnder: this.#paths.directory });
+    let descriptor: number;
+    try {
+      descriptor = openSync(path, EXCLUSIVE_NOFOLLOW_WRITE_FLAGS, SIDECAR_MODE);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      throw new MigrationConflictError(
+        "another v2 migration writer is reclaiming the sidecar lock",
+        {
+          code: "migration_writer_lock_reclaim_contended",
+          references: [diagnosticReference("root.path", path)],
+        },
+      );
+    }
+    try {
+      writeFileSync(descriptor, `${process.pid}\n`, { encoding: "utf8" });
+      fsyncSync(descriptor);
+    } catch (error) {
+      this.#closeWriterLockReclaimToken({ path, descriptor });
+      throw error;
+    }
+    return { path, descriptor };
+  }
+
+  #closeWriterLockReclaimToken(token: WriterLockReclaimToken): void {
+    try {
+      closeSync(token.descriptor);
+    } finally {
+      rmSync(token.path, { force: true });
+      fsyncDirectory(this.#paths.directory);
+    }
   }
 
   #storeBoundary<T>(code: string, operation: () => T): T {
@@ -3582,6 +3675,14 @@ function processIsAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
+}
+
+function writerLockPidIsDead(contents: string): boolean {
+  const rawPid = contents.trim();
+  if (!/^[1-9][0-9]*$/.test(rawPid)) return false;
+  const pid = Number(rawPid);
+  if (!Number.isSafeInteger(pid)) return false;
+  return !processIsAlive(pid);
 }
 
 function assertPrivateRegularFile(path: string, label: string): void {

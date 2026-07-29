@@ -7,6 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -3158,6 +3159,71 @@ describe("durable sidecar WAL and repair", () => {
     writeFileSync(lockPath, "999999999\n", { mode: 0o600 });
     expect(store.repair()).toBeNull();
     expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("refuses to reclaim a dead writer lock another reclaimer already holds", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    const lockPath = `${sidecarPath}.lock`;
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    writeFileSync(lockPath, "999999999\n", { mode: 0o600 });
+    const lockStat = lstatSync(lockPath);
+    const tokenPath = `${lockPath}.reclaim-${lockStat.dev}-${lockStat.ino}`;
+    writeFileSync(tokenPath, "999999998\n", { mode: 0o600 });
+
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
+
+    const error = captureError(() => store.repair());
+    expect(error).toBeInstanceOf(MigrationConflictError);
+    expect(error.code).toBe("migration_writer_lock_reclaim_contended");
+    expect(JSON.stringify(error)).not.toContain(root);
+
+    // The contended reclaimer must not have stolen the lock: same inode, same
+    // payload, still present. Two writers past this mutex is the defect.
+    expect(existsSync(lockPath)).toBe(true);
+    const afterStat = lstatSync(lockPath);
+    expect(afterStat.dev).toBe(lockStat.dev);
+    expect(afterStat.ino).toBe(lockStat.ino);
+    expect(readFileSync(lockPath, "utf8")).toBe("999999999\n");
+    expect(readFileSync(tokenPath, "utf8")).toBe("999999998\n");
+
+    // Refusal is stable, and clearing the abandoned token restores reclaim.
+    expect(captureError(() => store.repair()).code).toBe(
+      "migration_writer_lock_reclaim_contended",
+    );
+    rmSync(tokenPath, { force: true });
+    expect(store.repair()).toBeNull();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("scopes writer lock reclaim tokens to the observed lock identity", () => {
+    const root = tempRoot();
+    const legacy = join(root, "accounts.json");
+    const sidecarPath = join(root, "migration-v2.json");
+    const lockPath = `${sidecarPath}.lock`;
+    writeFileSync(legacy, '{"version":1}\n', { mode: 0o600 });
+    writeFileSync(lockPath, "999999999\n", { mode: 0o600 });
+    const lockStat = lstatSync(lockPath);
+    const foreignToken = `${lockPath}.reclaim-${lockStat.dev}-${lockStat.ino + 1}`;
+    writeFileSync(foreignToken, "999999998\n", { mode: 0o600 });
+
+    const store = new MigrationSidecarStore({
+      sidecarPath,
+      legacyStorePath: legacy,
+    });
+
+    // A token for a different lock identity must not wedge this reclaim, and the
+    // reclaim must not leak a token of its own.
+    expect(store.repair()).toBeNull();
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(foreignToken)).toBe(true);
+    expect(
+      readdirSync(root).filter((entry) => entry.includes(".reclaim-")),
+    ).toEqual([basename(foreignToken)]);
   });
 
   test("rejects group/world-readable existing sidecars before use", () => {
