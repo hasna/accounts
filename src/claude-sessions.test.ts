@@ -84,6 +84,15 @@ function canonicalPath(path: string): string {
   return realpathSync.native(path);
 }
 
+/**
+ * Compare paths without committing to a separator. Tool `extraEnv` templates
+ * embed literal forward slashes (`{profileDir}/channels/telegram`), so a
+ * rendered value on Windows legitimately mixes both separators.
+ */
+function samePathText(path: string): string {
+  return path.replaceAll("\\", "/");
+}
+
 function bulkUuid(index: number): string {
   return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
 }
@@ -1038,9 +1047,16 @@ describe("accounts sessions CLI", () => {
       args: ["--resume", UUID_A],
       cwd: canonicalPath(project),
       configDir: owner.dir,
-      telegramStateDir: join(owner.dir, "channels", "telegram"),
       awsProfile: "same-binding-route",
     });
+    // `TELEGRAM_STATE_DIR` comes from the tool template
+    // `{profileDir}/channels/telegram` (src/lib/builtin-tools.ts), so on Windows
+    // the rendered value mixes the profile's backslashes with the template's
+    // forward slashes. The assertion is about which directory is handed to the
+    // launch, not about separator style.
+    expect(samePathText(String(launches[0]?.telegramStateDir))).toBe(
+      samePathText(join(owner.dir, "channels", "telegram")),
+    );
     // Request-debug diagnostics dump HTTP request headers, including the
     // provider Authorization header, to the launched process's stderr.
     expect(launches[0]?.nodeDebug).toBeUndefined();
