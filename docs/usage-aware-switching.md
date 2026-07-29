@@ -165,9 +165,10 @@ accounts usage-hook            # the UserPromptSubmit handler (fail-open, cached
 accounts usage-hook --print-install          # the settings.json snippet — NOT auto-installed
 ```
 
-Expired-OAuth profiles are reported as `expired` (never crash the report);
-profiles with no credentials as `no-credentials`; dirs that don't exist are
-skipped.
+Unavailable profiles are reported as `occupied` when all of their profile dirs
+currently run a different account; otherwise they retain their credential state
+(`expired` or `no-credentials`) without crashing the report. Dirs that don't
+exist are skipped.
 
 ## The hook
 

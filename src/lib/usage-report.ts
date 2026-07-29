@@ -23,11 +23,13 @@ import { activeCooldowns, readExhaustionLedger } from "./exhaustion-ledger.js";
  */
 
 export type UsageSource = "cache" | "fetch" | "none";
+export type UsageReportStatus = AccountStatus | "occupied";
 
 export interface AccountUsageEntry {
   accountUuid: string;
   email?: string;
-  status: AccountStatus;
+  /** Credential state, or occupied when every own profile runs another account. */
+  status: UsageReportStatus;
   /** Profiles whose OWN identity is this account. */
   profiles: string[];
   /** Profiles whose dir currently RUNS as this account (occupancy). */
@@ -63,14 +65,17 @@ export async function collectAccountsUsage(
       const base: AccountUsageEntry = {
         accountUuid: identity.accountUuid,
         ...(identity.email ? { email: identity.email } : {}),
-        status: identity.status,
+        status:
+          identity.status !== "ok" && allOwnDoorsOccupied(identity, identities)
+            ? "occupied"
+            : identity.status,
         profiles: doorNames(identity, "own-identity"),
         occupies: doorNames(identity, "current-occupant"),
         source: "none",
       };
       if (identity.status !== "ok") {
-        // Expired / credential-less accounts are REPORTED, never queried and
-        // never crashed on — expiry is a state, not an error.
+        // Unavailable accounts are REPORTED, never queried and never crashed
+        // on. A fully squatted set of profile dirs is occupancy, not expiry.
         return base;
       }
 
@@ -101,6 +106,20 @@ export async function collectAccountsUsage(
       return { ...base, error: result.error, source: "fetch" };
     }),
   );
+}
+
+function allOwnDoorsOccupied(identity: AccountIdentity, identities: readonly AccountIdentity[]): boolean {
+  const ownDirs = [...new Set(identity.doors.filter((d) => d.role === "own-identity").map((d) => d.dir))];
+  if (ownDirs.length === 0) return false;
+
+  const foreignOccupants = new Set(
+    identities
+      .filter((candidate) => candidate.accountUuid !== identity.accountUuid)
+      .flatMap((candidate) => candidate.doors)
+      .filter((door) => door.role === "current-occupant")
+      .map((door) => door.dir),
+  );
+  return ownDirs.every((dir) => foreignOccupants.has(dir));
 }
 
 function doorNames(identity: AccountIdentity, role: "own-identity" | "current-occupant"): string[] {
