@@ -43,9 +43,12 @@
     "dev": "bun run src/cli.ts",
     "sdk:generate": "bun run src/sdk/generate-sdk.ts",
     "test:compat": "tsc --noEmit -p tsconfig.compat.json",
+    "test:provenance-crypto": "node scripts/verify-sigstore-smoke.mjs",
+    "verify:pack": "bun run scripts/release-provenance.ts pack",
     "vendor-kit:check": "bunx @hasna/contracts vendor-kit --check .",
     "conformance": "bunx @hasna/contracts repo-conformance .",
     "prepack": "bun run build",
+    "prepublishOnly": "bun run scripts/release-provenance.ts reject-direct-publish",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:postgres": "bun run ./test/run-postgres.ts"
@@ -102,9 +105,13 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "@sigstore/bundle": "4.0.0",
+    "@sigstore/protobuf-specs": "0.5.1",
+    "@sigstore/verify": "3.1.1",
     "@types/bun": "^1.2.4",
     "@types/pg": "^8.11.10",
     "fast-uri": "3.1.4",
+    "semver": "7.7.2",
     "typescript": "^5.7.3"
   }
 }
