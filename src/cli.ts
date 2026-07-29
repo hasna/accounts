@@ -39,7 +39,12 @@ import {
   sweepCentralAuth,
   type SyncResult,
 } from "./lib/auth-store.js";
-import { ensureProfileAuthSnapshot, recoverParkedCredential } from "./lib/claude-auth.js";
+import {
+  ensureProfileAuthSnapshot,
+  parkedRecoveryDisposition,
+  planParkedRecovery,
+  recoverParkedCredential,
+} from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -87,17 +92,14 @@ import {
   usageDoorSummary,
   type AccountUsageEntry,
 } from "./lib/usage-report.js";
+import { adoptOrphanOccupant, findOrphanOccupants } from "./lib/orphan-occupant.js";
 import {
   DEFAULT_HOOK_NOTICE_INTERVAL_MS,
   DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS,
   hookOutputJson,
   runUsageHook,
 } from "./lib/usage-hook.js";
-import {
-  describeCredentialState,
-  parkedCredentialVerdict,
-  profileCredentialLayers,
-} from "./lib/credential-state.js";
+import { profileCredentialLayers } from "./lib/credential-state.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -714,17 +716,29 @@ program
         );
         if (opts.json) {
           console.log(JSON.stringify(picked, null, 2));
-          if (!picked.selection.candidate) process.exitCode = 1;
+          // Exit on REACHABILITY, not on ranking: a candidate no profile owns
+          // cannot be switched to, so reporting success would hand the caller
+          // a name it does not have.
+          if (!picked.candidate) process.exitCode = 1;
           return;
         }
-        const candidate = picked.selection.candidate;
+        const candidate = picked.candidate;
         if (!candidate || !picked.profileName) {
+          // `doorless > 0` is its own diagnosis and must not be folded into
+          // "nothing eligible": accounts WITH headroom were found and the only
+          // thing missing is a profile naming them. Telling an operator to add
+          // capacity when the capacity already exists sends them the wrong way.
           die(
-            picked.selection.reason === "all-limited"
-              ? `every account with usage data is below ${opts.minHeadroom}% headroom — nothing worth switching to`
-              : picked.selection.reason === "no-usage-data"
-                ? "no account has usage data yet — run `accounts usage --refresh` first"
-                : "no eligible account (valid credentials, not the current one) was found",
+            picked.doorless > 0
+              ? `${picked.doorless} account${picked.doorless === 1 ? "" : "s"} with headroom ` +
+                  `${picked.doorless === 1 ? "is" : "are"} unreachable — no profile on this machine owns ` +
+                  `${picked.doorless === 1 ? "it" : "them"}. Give one a name with \`accounts auth adopt <name>\` ` +
+                  "(see `accounts auth adopt --list`), or `accounts login <name>`."
+              : picked.selection.reason === "all-limited"
+                ? `every account with usage data is below ${opts.minHeadroom}% headroom — nothing worth switching to`
+                : picked.selection.reason === "no-usage-data"
+                  ? "no account has usage data yet — run `accounts usage --refresh` first"
+                  : "no eligible account (valid credentials, not the current one) was found",
           );
         }
         console.log(
@@ -1225,18 +1239,26 @@ program
       const profiles = (await store.listProfiles(opts.tool)).filter((p) => (name ? p.name === name : true));
       if (name && profiles.length === 0) throw new AccountsError(`no profile named "${name}" for tool "${opts.tool}"`);
 
+      // The WHOLE profile list — every profile, every tool, not the filtered
+      // one. The cross-directory gate asks "is this account live in another
+      // dir", and narrowing the search to the single profile being repaired
+      // would answer "no" every time: a gate that cannot fail. Unfiltered by
+      // tool as well, because a Claude account can be sitting live in a dir
+      // registered under some other tool, and that copy rotates tokens just the
+      // same. `--dry-run` and the real run share this list for the same reason
+      // they share the planner: any input they do not share is a way for the
+      // preview to disagree with the operation.
+      const allProfiles = await store.listProfiles();
+
       const rows = profiles.map((profile) => {
         const layers = profileCredentialLayers(profile.dir, tool);
-        const verdict = parkedCredentialVerdict(layers);
-        // --dry-run must not write, so it reports the verdict instead of acting.
+        // --dry-run runs the SAME decision function as the real path and differs
+        // only in not executing it. It used to compute `parkedCredentialVerdict`
+        // instead — pure content ranking with no identity gate — and so promised
+        // recoveries the real run refused.
         const result = opts.dryRun
-          ? {
-              outcome: verdict.recoverable ? ("would-recover" as const) : ("nothing-to-do" as const),
-              detail: verdict.recoverable
-                ? `parked copy in the ${verdict.restorableLayers.join(" and ")} would be restored`
-                : `live credential is ${describeCredentialState(layers.live.state)}`,
-            }
-          : recoverParkedCredential(profile.dir, tool, profile.name);
+          ? planParkedRecovery(profile.dir, tool, profile.name, { profiles: allProfiles })
+          : recoverParkedCredential(profile.dir, tool, profile.name, { profiles: allProfiles });
         return {
           profile: profile.name,
           dir: profile.dir,
@@ -1252,12 +1274,15 @@ program
         console.log(JSON.stringify({ dryRun: Boolean(opts.dryRun), profiles: rows }, null, 2));
         return;
       }
-      const acted = rows.filter((r) => r.outcome === "recovered" || r.outcome === "would-recover");
-      const blocked = rows.filter((r) => r.outcome === "identity-would-change" || r.outcome === "no-parked-credential");
+      // Rendered from the outcome's DISPOSITION, not from a hand-kept list of
+      // outcome strings. The old list named two refusals and silently dropped
+      // the rest, so a profile the command had refused printed nothing at all.
+      const acted = rows.filter((r) => parkedRecoveryDisposition(r.outcome) === "acted");
+      const blocked = rows.filter((r) => parkedRecoveryDisposition(r.outcome) === "blocked");
       console.log("");
       for (const row of [...acted, ...blocked]) {
         const colour =
-          row.outcome === "recovered" || row.outcome === "would-recover"
+          parkedRecoveryDisposition(row.outcome) === "acted"
             ? chalk.green
             : row.outcome === "no-parked-credential"
               ? chalk.red
@@ -1659,6 +1684,101 @@ auth
       if (!result.deleted) console.log(chalk.dim("dry run — pass --delete to move these to auth-trash"));
       if (result.unresolved.length > 0 && !result.deleted) {
         console.log(chalk.yellow("note: unresolved profile bindings above will block --delete"));
+      }
+    }),
+  );
+
+auth
+  .command("adopt")
+  .argument("[name]", "name for the new profile")
+  .description("give a profile of its own to an account this machine holds credentials for but has no name for")
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("-a, --account <uuid-or-email>", "which occupant to adopt (required unless exactly one exists)")
+  .option("--list", "list orphan occupants and exit")
+  .option("--dry-run", "report the plan without moving anything")
+  .option("--allow-host-relogin", "proceed even though the host profile will need `accounts login` afterwards")
+  .option("--json", "output JSON")
+  .action(
+    action(async (name: string | undefined, opts: {
+      tool: string;
+      account?: string;
+      list?: boolean;
+      dryRun?: boolean;
+      allowHostRelogin?: boolean;
+      json?: boolean;
+    }) => {
+      const store = resolveStore();
+      const tool = await store.resolveTool(opts.tool);
+      const profiles = (await store.listProfiles(opts.tool)).map((p) => ({ name: p.name, dir: p.dir }));
+      const orphans = findOrphanOccupants(profiles, tool);
+
+      if (opts.list || (!name && !opts.account)) {
+        if (opts.json) {
+          console.log(JSON.stringify({ orphans }, null, 2));
+          return;
+        }
+        if (orphans.length === 0) {
+          console.log("no orphan occupants — every account this machine holds is named by a profile");
+          return;
+        }
+        for (const orphan of orphans) {
+          const where = orphan.occupies.map((o) => o.profileName ?? o.dir).join(", ");
+          const busy = orphan.liveSessions > 0 ? chalk.yellow(` ${orphan.liveSessions} live session(s)`) : "";
+          console.log(
+            `${chalk.cyan(orphan.accountUuid)} ${orphan.email ?? chalk.dim("(no email)")} ` +
+              `[${orphan.usable ? chalk.green(orphan.status) : chalk.yellow(orphan.status)}] ` +
+              chalk.dim(`running in: ${where}`) + busy,
+          );
+        }
+        if (!opts.list) {
+          console.log(
+            chalk.dim(`\nadopt one with: accounts auth adopt <name> --account ${orphans[0]!.email ?? orphans[0]!.accountUuid}`),
+          );
+        }
+        return;
+      }
+
+      if (!name) throw new AccountsError("a profile name is required — accounts auth adopt <name> --account <uuid-or-email>");
+      // With exactly one orphan the selector is unambiguous, so requiring it
+      // would be ceremony. With more than one, guessing is how the wrong
+      // account gets a name.
+      const account = opts.account ?? (orphans.length === 1 ? orphans[0]!.accountUuid : undefined);
+      if (!account) {
+        throw new AccountsError(
+          `${orphans.length} orphan occupants exist — name one with --account <uuid-or-email> (see \`accounts auth adopt --list\`)`,
+        );
+      }
+
+      const result = await adoptOrphanOccupant(
+        {
+          account,
+          name,
+          tool: opts.tool,
+          ...(opts.dryRun ? { dryRun: true } : {}),
+          ...(opts.allowHostRelogin ? { allowHostRelogin: true } : {}),
+        },
+        store,
+      );
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        if (result.outcome === "refused") process.exitCode = 1;
+        return;
+      }
+      if (result.outcome === "refused") {
+        die(`${result.refusal}: ${result.detail}`);
+      }
+      if (result.outcome === "would-adopt") {
+        console.log(chalk.cyan(`dry run — ${result.detail}`));
+        console.log(chalk.dim(`  host afterwards: ${result.plan.hostRestore}`));
+        return;
+      }
+      console.log(chalk.green(`✓ adopted as ${chalk.bold(result.profile.name)}`));
+      console.log(chalk.dim(`  ${result.detail}`));
+      if (result.hostRestore === "host-needs-login") {
+        console.log(
+          chalk.yellow(`  ${result.plan.fromProfile ?? result.plan.fromDir} now has no credential — accounts login ${result.plan.fromProfile ?? "NAME"}`),
+        );
       }
     }),
   );

@@ -4,11 +4,14 @@ import type { ToolDef } from "../types.js";
 import {
   CREDENTIALS_SNAPSHOT,
   OAUTH_SNAPSHOT,
+  dirCredentialsFile,
   profileAccountJsonPaths,
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
 } from "./claude-layout.js";
 import { centralAuthRoot, isAccountUuid } from "./auth-store.js";
+import { classifyCredentialFile, isRestorableState, type CredentialState } from "./credential-state.js";
+import { canonicalConfigDir, sameConfigDir } from "./safe-path.js";
 
 /**
  * UUID-keyed account enumeration. Directories are DOORS; accounts are the
@@ -401,6 +404,73 @@ export function buildIdentityIndex(
         : "no-credentials",
     }))
     .sort((a, b) => a.accountUuid.localeCompare(b.accountUuid));
+}
+
+export interface LiveAccountDoor {
+  dir: string;
+  profileName?: string;
+  /** State of that dir's live `.credentials.json` — never a token value. */
+  state: CredentialState;
+}
+
+/**
+ * Other directories whose LIVE slot is currently serving `accountUuid`.
+ *
+ * WHY THIS EXISTS: restoring a parked credential into a dir while another dir
+ * already runs the same account puts TWO live copies of one credential on disk,
+ * and the next refresh rotates the token — revoking whichever copy loses the
+ * race, server-side and irreversibly. That is the confirmed destructive hazard
+ * in this area, and no gate asked about it: `recoverParkedCredential`'s identity
+ * check only compared the dir's own live identity against the profile's own, so
+ * a profile holding a SUPERSEDED PREDECESSOR of an account that is alive
+ * elsewhere passed straight through. Measured 2026-07-29: three profiles on this
+ * fleet were in exactly that shape, and `repair-auth` with no profile argument
+ * attempts every profile, so a single blanket run would have taken out all
+ * three working copies.
+ *
+ * LIVENESS, NOT DOOR EXISTENCE. A door whose live credential is itself a husk
+ * holds nothing that a rotation could revoke, and refusing on those would strand
+ * an account with no working copy anywhere — the exact recovery this feature was
+ * built for. So the filter is `isRestorableState`, not "a door exists".
+ *
+ * Directory identity is `sameConfigDir`, the same canonicalisation profile
+ * creation uses. Comparing raw strings would let a symlinked alias of one
+ * directory read as two, and read a dir as being in conflict with itself.
+ */
+export function accountLiveDoorsElsewhere(
+  index: ReadonlyArray<AccountIdentity>,
+  accountUuid: string,
+  excludeDir: string,
+): LiveAccountDoor[] {
+  const wanted = accountUuid.toLowerCase();
+  // Match case-insensitively: `buildIdentityIndex` lowercases well-formed uuids
+  // but passes malformed ones through verbatim, and a malformed uuid must not
+  // silently fall out of the gate.
+  const identity = index.find((entry) => entry.accountUuid.toLowerCase() === wanted);
+  if (!identity) return [];
+
+  const seen = new Set<string>();
+  const live: LiveAccountDoor[] = [];
+  for (const door of identity.doors) {
+    // Only the CURRENT OCCUPANT of a dir can be rotated by that dir's tool. A
+    // dir that merely has the account parked in `.accounts-auth/` is not
+    // running it and takes part in no rotation race.
+    if (door.role !== "current-occupant") continue;
+    if (sameConfigDir(door.dir, excludeDir)) continue;
+    // Dedupe on the CANONICAL path, matching the exclusion above: two registry
+    // entries spelling one directory differently are one door, not two.
+    const canonical = canonicalConfigDir(door.dir);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    const state = classifyCredentialFile(dirCredentialsFile(door.dir)).state;
+    if (!isRestorableState(state)) continue;
+    live.push({
+      dir: door.dir,
+      ...(door.profileName ? { profileName: door.profileName } : {}),
+      state,
+    });
+  }
+  return live;
 }
 
 /** The accountUuid currently occupying a config dir's live account file. */

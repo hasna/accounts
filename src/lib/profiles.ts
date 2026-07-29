@@ -1,10 +1,11 @@
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { type Profile, type Store, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
+import { sameConfigDir } from "./safe-path.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
@@ -95,29 +96,6 @@ function resolveProfileFromStore(store: Store, name: string, toolId?: string): P
 function isManagedProfileDir(dir: string): boolean {
   const rel = relative(resolve(profilesDir()), resolve(dir));
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
-}
-
-function canonicalConfigDir(dir: string): string {
-  const resolved = resolve(dir);
-  const missing: string[] = [];
-  let cursor = resolved;
-
-  while (!existsSync(cursor)) {
-    const parent = dirname(cursor);
-    if (parent === cursor) return resolved;
-    missing.unshift(basename(cursor));
-    cursor = parent;
-  }
-
-  try {
-    return join(realpathSync(cursor), ...missing);
-  } catch {
-    return resolved;
-  }
-}
-
-function sameConfigDir(a: string, b: string): boolean {
-  return canonicalConfigDir(a) === canonicalConfigDir(b);
 }
 
 export function findProfile(name: string, toolId?: string): Profile | undefined {
