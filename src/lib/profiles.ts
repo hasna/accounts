@@ -1,11 +1,12 @@
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
 import { type Profile, type Store, AccountsError, profileNameSchema } from "../types.js";
-import { loadStore, saveStore, profilesDir } from "../storage.js";
+import { archiveRoot, loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
+import { assertSafeWritePath } from "./safe-path.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
 export type ProfileMetadata = Record<string, ProfileMetadataValue>;
@@ -229,7 +230,7 @@ export interface RemoveOptions {
 export function removeProfile(
   name: string,
   opts: RemoveOptions | boolean = {},
-): { profile: Profile; purged: boolean; purgeNote?: string } {
+): { profile: Profile; purged: boolean; archivedTo?: string; purgeNote?: string } {
   const options = typeof opts === "boolean" ? { purge: opts } : opts;
   const store = loadStore();
   const matches = store.profiles
@@ -254,18 +255,27 @@ export function removeProfile(
   saveStore(store);
 
   let purged = false;
+  let archivedTo: string | undefined;
   let purgeNote: string | undefined;
   if (options.purge) {
     const managed = isManagedProfileDir(profile.dir);
     const isDefault = profile.dir === getTool(profile.tool).defaultDir;
     if (managed && !isDefault && existsSync(profile.dir)) {
-      rmSync(profile.dir, { recursive: true, force: true });
+      archivedTo = join(
+        archiveRoot(),
+        new Date().toISOString().replace(/[:.]/g, "-"),
+        "profiles",
+        profile.tool,
+        profile.name,
+      );
+      assertSafeWritePath(archivedTo, { mustStayUnder: archiveRoot() });
+      renameSync(profile.dir, archivedTo);
       purged = true;
     } else {
-      purgeNote = `refused to delete ${profile.dir} (not a managed profile dir); remove it manually if intended`;
+      purgeNote = `refused to archive ${profile.dir} (not a managed profile dir); move it manually if intended`;
     }
   }
-  return { profile, purged, purgeNote };
+  return { profile, purged, archivedTo, purgeNote };
 }
 
 export function renameProfile(oldName: string, newName: string, toolId?: string): Profile {

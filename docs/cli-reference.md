@@ -16,7 +16,7 @@ command. Arguments after a variadic `[args...]` are passed to the target tool.
 | `accounts set <name>` | `-t, --tool`, `-e, --email`, `--display-name`, `--identity`, `--card-last4`, repeatable `--metadata`, `--description`, `-d, --dir`; at least one update is required |
 | `accounts detect <name>` | `-t, --tool`; re-detects email from the tool’s account file |
 | `accounts rename <name> <new-name>` | `-t, --tool` |
-| `accounts remove <name>` | Alias `rm`; `-t, --tool`, `--purge` to delete a managed config directory |
+| `accounts remove <name>` | Alias `rm`; `-t, --tool`, `--purge` to archive a managed config directory |
 | `accounts path <name>` | `-t, --tool`; prints only the config directory |
 
 Names are lowercase alphanumeric/hyphen slugs and are keyed by tool plus name.

@@ -60,10 +60,10 @@ legacy, and are removed only by an explicit sweep verb — never automatically.
 
 ## Purge and orphans
 
-`accounts remove --purge` deletes the profile dir (including its legacy
-mirror) and **never** touches the central store — credential survival across
-dir deletion is the store's whole point. Central entries no longer referenced
-by any profile are handled by the explicit verb:
+`accounts remove --purge` moves the profile dir (including its legacy mirror)
+to a timestamped `profiles/` path under `auth-trash` and **never** touches the
+central store. Central entries no longer referenced by any profile are handled
+by the explicit verb:
 
 ```
 accounts auth sweep            # dry-run: list orphaned central entries

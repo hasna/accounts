@@ -559,12 +559,15 @@ test("remove clears the current pointer", () => {
   expect(findProfile("work")).toBeUndefined();
 });
 
-test("remove --purge deletes a managed dir", () => {
+test("remove --purge archives a managed dir", () => {
   const p = addProfile({ name: "work" });
+  writeFileSync(join(p.dir, "credential-marker"), "survives\n");
   expect(existsSync(p.dir)).toBe(true);
   const res = removeProfile("work", true);
   expect(res.purged).toBe(true);
   expect(existsSync(p.dir)).toBe(false);
+  expect(res.archivedTo?.startsWith(join(home, "auth-trash"))).toBe(true);
+  expect(readFileSync(join(res.archivedTo!, "credential-marker"), "utf8")).toBe("survives\n");
 });
 
 test("remove --purge refuses to delete an unmanaged dir", () => {

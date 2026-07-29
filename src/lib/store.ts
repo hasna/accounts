@@ -72,6 +72,7 @@ export interface CurrentEntry {
 export interface RemoveResult {
   profile: Profile;
   purged: boolean;
+  archivedTo?: string;
   purgeNote?: string;
 }
 

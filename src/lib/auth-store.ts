@@ -25,7 +25,7 @@
 
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { accountsHome, loadStore } from "../storage.js";
+import { accountsHome, archiveRoot, loadStore } from "../storage.js";
 import { resolveStore } from "./store.js";
 import { getTool } from "./tools.js";
 import type { ToolDef } from "../types.js";
@@ -456,7 +456,7 @@ function dirHasAuthMaterial(dir: string, tool?: ToolDef): boolean {
 /**
  * Central entries no registered claude profile is bound to. `--purge` on a
  * profile deliberately NEVER touches the central store (credential survival
- * across dir deletion is the store's whole point), so orphans accumulate only
+ * across profile removal is the store's whole point), so orphans accumulate only
  * through explicit removals — and are only ever cleaned by this explicit verb.
  *
  * Safety posture (this is credential data):
@@ -512,8 +512,7 @@ export function sweepCentralAuth(opts: { delete?: boolean } = {}): SweepResult {
 
   if (opts.delete && orphans.length > 0) {
     const batchDir = join(
-      accountsHome(),
-      CENTRAL_AUTH_TRASH_DIR_NAME,
+      archiveRoot(),
       new Date().toISOString().replace(/[:.]/g, "-"),
     );
     for (const orphan of orphans) {

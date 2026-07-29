@@ -328,8 +328,8 @@ test("a literal {} credentials payload never beats a real credential and is upgr
 
 // --- purge policy ------------------------------------------------------------
 
-test("removeProfile --purge deletes the managed dir but never the central entry", async () => {
-  // Managed dir (under profilesDir) so purge actually deletes it.
+test("removeProfile --purge archives the managed dir and never touches the central entry", async () => {
+  // Managed dir (under profilesDir) so purge archives it.
   const src = mkdtempSync(join(tmpdir(), "authstore-purgesrc-"));
   writeIdentity(src, { uuid: UUID_A, email: "p@example.com" });
   const profile = await importProfile({ name: "purgeme", dir: src, copy: true });
@@ -338,6 +338,8 @@ test("removeProfile --purge deletes the managed dir but never the central entry"
   const result = removeProfile("purgeme", { purge: true });
   expect(result.purged).toBe(true);
   expect(existsSync(profile.dir)).toBe(false);
+  expect(result.archivedTo?.startsWith(join(home, "auth-trash"))).toBe(true);
+  expect(existsSync(join(result.archivedTo!, ".accounts-auth", "credentials.json"))).toBe(true);
   expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(true);
 });
 

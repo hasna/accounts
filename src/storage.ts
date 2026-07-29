@@ -41,6 +41,11 @@ export function profilesDir(): string {
   return join(accountsHome(), "profiles");
 }
 
+/** Root for state retired by explicit destructive-looking commands. */
+export function archiveRoot(): string {
+  return join(accountsHome(), "auth-trash");
+}
+
 const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
 
 /**

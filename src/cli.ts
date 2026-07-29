@@ -1851,15 +1851,15 @@ program
   .argument("<name>", "profile name")
   .description("remove a profile from the registry")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
-  .option("--purge", "also delete the managed config dir on disk")
+  .option("--purge", "also archive the managed config dir on disk")
   .action(
     action(async (name: string, opts: { tool?: string; purge?: boolean }) => {
-      const { profile, purged, purgeNote } = await resolveStore().removeProfile(name, {
+      const { profile, purged, archivedTo, purgeNote } = await resolveStore().removeProfile(name, {
         tool: opts.tool,
         purge: opts.purge,
       });
       console.log(chalk.green(`✓ removed ${chalk.bold(profile.name)}`));
-      if (purged) console.log(chalk.dim(`  deleted ${profile.dir}`));
+      if (purged) console.log(chalk.dim(`  archived ${profile.dir} → ${archivedTo}`));
       if (purgeNote) console.log(chalk.yellow(`  ${purgeNote}`));
     }),
   );

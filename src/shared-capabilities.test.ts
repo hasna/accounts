@@ -234,7 +234,7 @@ test("linked capability dirs do not break the profile's own safe writes", () => 
   ).not.toThrow();
 });
 
-test("purge removes the profile without touching the shared corpus", () => {
+test("purge archives the profile without touching the shared corpus", () => {
   const p = addProfile({ name: "purgeme" });
   expect(realpathSync(join(p.dir, "skills"))).toBe(realpathSync(join(sharedHome, "skills")));
   expect(corpusIntact(sharedHome)).toBe(true);
@@ -242,20 +242,22 @@ test("purge removes the profile without touching the shared corpus", () => {
   const result = removeProfile("purgeme", { purge: true });
   expect(result.purged).toBe(true);
   expect(existsSync(p.dir)).toBe(false);
+  expect(existsSync(result.archivedTo!)).toBe(true);
   expect(corpusIntact(sharedHome)).toBe(true);
 });
 
-test("positive control: corpusIntact does detect a purge that really deletes a corpus", () => {
-  // Plant the defect deliberately — a corpus reachable by real path under the
-  // purged tree is exactly what a dereferencing copy/link would produce.
+test("purge preserves a profile-owned corpus inside the archive", () => {
+  // A real corpus under the profile moves with it; only shared symlink targets
+  // remain outside the archived tree.
   process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
   const p = addProfile({ name: "control" });
   const insideCorpus = join(p.dir, "inside-corpus");
   seedSharedCorpus(insideCorpus);
   expect(corpusIntact(insideCorpus)).toBe(true);
 
-  removeProfile("control", { purge: true });
+  const result = removeProfile("control", { purge: true });
   expect(corpusIntact(insideCorpus)).toBe(false);
+  expect(corpusIntact(join(result.archivedTo!, "inside-corpus"))).toBe(true);
 });
 
 test("import --copy keeps shared capabilities shared instead of duplicating the corpus", async () => {
