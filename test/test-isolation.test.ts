@@ -17,6 +17,21 @@ import { controlledTestsRoot, executableFilename } from "./support/isolation-pat
 
 const nestedProbe = process.env.ACCOUNTS_TEST_NESTED_PROBE === "1";
 
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// This test intentionally launches a complete nested `bun test` run. The suite
+// is large enough that a healthy nested run can exceed Bun's default 120s test
+// timeout on a loaded workstation, so keep this budget separate and overridable.
+const nestedFullSuiteTimeoutMs = positiveIntegerEnv(
+  "ACCOUNTS_TEST_NESTED_FULL_SUITE_TIMEOUT_MS",
+  300_000,
+);
+
 const inheritedToolHomeKeys = [
   "CLAUDE_CONFIG_DIR",
   "CODEX_HOME",
@@ -244,7 +259,7 @@ test("bare Bun tests make zero inherited network, database, keychain, or tool si
     postgresServer.stop(true);
     rmSync(sentinelRoot, { recursive: true, force: true });
   }
-}, 120_000);
+}, nestedFullSuiteTimeoutMs);
 
 test("PostgreSQL variables survive only the exact integration target plus explicit opt-in", async () => {
   if (nestedProbe) {
