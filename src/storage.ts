@@ -43,6 +43,24 @@ export function profilesDir(): string {
 
 const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
 
+function formatValidationPath(path: (string | number)[]): string {
+  let rendered = "";
+  for (const segment of path) {
+    if (typeof segment === "number") {
+      rendered += `[${segment}]`;
+    } else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment)) {
+      rendered += `${rendered ? "." : ""}${segment}`;
+    } else {
+      rendered += `[${JSON.stringify(segment)}]`;
+    }
+  }
+  return rendered || "<root>";
+}
+
+function formatValidationIssues(issues: { path: (string | number)[]; message: string }[]): string {
+  return issues.map((issue) => `${formatValidationPath(issue.path)}: ${issue.message}`).join("; ");
+}
+
 /**
  * Parse and schema-validate the on-box registry file WITHOUT the profile
  * cross-pruning that `loadStore()` applies. Returns the empty store when the
@@ -63,7 +81,7 @@ function parseStoreFile(): Store {
   }
   const parsed = storeSchema.safeParse(raw);
   if (!parsed.success) {
-    throw new AccountsError(`invalid store at ${path}: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
+    throw new AccountsError(`invalid store at ${path}: ${formatValidationIssues(parsed.error.issues)}`);
   }
   return parsed.data;
 }
@@ -164,7 +182,7 @@ export function saveStore(store: Store): void {
   const path = storePath();
   const parsed = storeSchema.safeParse(store);
   if (!parsed.success) {
-    throw new AccountsError(`invalid store: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
+    throw new AccountsError(`invalid store: ${formatValidationIssues(parsed.error.issues)}`);
   }
   writeFileAtomic(path, JSON.stringify(parsed.data, null, 2) + "\n", {
     mode: 0o600,

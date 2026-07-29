@@ -59,3 +59,31 @@ test("doctor passes a profile created with the shared home available", () => {
   expect(result.status).toBe(0);
   expect(result.stdout).toContain("healthy.");
 });
+
+test("doctor names a non-portable extraEnv key in a stored custom tool", () => {
+  writeFileSync(
+    join(home, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      current: {},
+      applied: {},
+      toolLocks: {},
+      profiles: [],
+      tools: [
+        {
+          id: "legacy-tool",
+          label: "Legacy Tool",
+          envVar: "LEGACY_TOOL_HOME",
+          extraEnv: { "BAD-NAME": "legacy-value" },
+          defaultDir: join(home, "legacy-tool"),
+          bin: "legacy-tool",
+        },
+      ],
+    }),
+  );
+
+  const result = runCli(sharedHome, "doctor");
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('tools[0].extraEnv["BAD-NAME"]');
+  expect(result.stderr).toContain("must be a portable environment variable name");
+});
