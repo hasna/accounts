@@ -36,8 +36,6 @@ export {
   listProfiles,
   findProfile,
   getProfile,
-  getProfileToolLock,
-  lockProfileTool,
   addProfile,
   removeProfile,
   renameProfile,

@@ -24,7 +24,6 @@ function writeStore(): void {
     version: 1,
     current: {},
     applied: {},
-    toolLocks: {},
     tools: [],
     profiles: [
       { name: "known", tool: "claude", dir: join(home, "known"), createdAt: "2026-01-01T00:00:00.000Z" },

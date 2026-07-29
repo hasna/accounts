@@ -13,7 +13,7 @@
 //
 // SCOPE: the Store owns the shared registry — profiles, their metadata, and the
 // per-tool "current" selection. Genuinely machine-local state (a profile's
-// on-disk config `dir`, the `applied` auth map, tool locks, launching a tool)
+// on-disk config `dir`, the `applied` auth map, launching a tool)
 // is not part of the shared registry and is handled by the local orchestration
 // modules (apply.ts, switch.ts, launch). Those read the profile record through
 // this Store, then act on the local machine.

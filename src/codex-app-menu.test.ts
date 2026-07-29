@@ -61,7 +61,6 @@ test("codex app menu state preserves applied marker for API-only profiles", asyn
     version: 1,
     current: {},
     applied: { "codex-app": "desktop" },
-    toolLocks: {},
     profiles: [],
     tools: [],
   });

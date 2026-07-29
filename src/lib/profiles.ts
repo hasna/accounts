@@ -77,13 +77,6 @@ function resolveProfileFromStore(store: Store, name: string, toolId?: string): P
     const suffix = toolId ? ` for tool "${toolId}"` : "";
     throw new AccountsError(`no profile named "${name}"${suffix}. Run \`accounts list\` to see profiles.`);
   }
-  if (!toolId) {
-    const lockedTool = store.toolLocks[name];
-    if (lockedTool) {
-      const locked = matches.find((p) => p.tool === lockedTool);
-      if (locked) return locked;
-    }
-  }
   if (matches.length > 1) {
     throw new AccountsError(
       `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
@@ -129,22 +122,6 @@ export function getProfile(name: string, toolId?: string): Profile {
   return resolveProfileFromStore(loadStore(), name, toolId);
 }
 
-export function getProfileToolLock(name: string): string | undefined {
-  return loadStore().toolLocks[name];
-}
-
-export function lockProfileTool(name: string, toolId: string): void {
-  getTool(toolId);
-  const nameCheck = profileNameSchema.safeParse(name);
-  if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
-  const store = loadStore();
-  if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
-    throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
-  }
-  store.toolLocks[name] = toolId;
-  saveStore(store);
-}
-
 export interface AddOptions {
   name: string;
   tool?: string;
@@ -163,8 +140,8 @@ export interface AddOptions {
  * multiple tools` the moment two rows share a name, breaking every bare
  * `accounts <cmd> <name>`. Same rule and error wording as the api transport
  * (AccountsRepo.nameConflict, src/server/repo.ts) so both transports refuse a
- * duplicate identically. Grandfathered collisions already in the store stay
- * resolvable (via --tool or a tool lock); only NEW collisions are refused.
+ * duplicate identically. Grandfathered collisions already in the store remain
+ * resolvable with --tool; only NEW collisions are refused.
  */
 function nameConflict(name: string, holderTool: string, tool: string): AccountsError {
   return holderTool === tool
@@ -250,7 +227,6 @@ export function removeProfile(
   store.profiles.splice(idx, 1);
   if (store.current[profile.tool] === name) delete store.current[profile.tool];
   if (store.applied[profile.tool] === name) delete store.applied[profile.tool];
-  if (store.toolLocks[profile.name] === profile.tool) delete store.toolLocks[profile.name];
   saveStore(store);
 
   let purged = false;
@@ -293,10 +269,6 @@ export function renameProfile(oldName: string, newName: string, toolId?: string)
 
   if (store.current[profile.tool] === oldName) store.current[profile.tool] = newName;
   if (store.applied[profile.tool] === oldName) store.applied[profile.tool] = newName;
-  if (store.toolLocks[oldName] === profile.tool) {
-    delete store.toolLocks[oldName];
-    if (!store.toolLocks[newName]) store.toolLocks[newName] = profile.tool;
-  }
   profile.name = newName;
   saveStore(store);
   return profile;
@@ -375,7 +347,6 @@ export function useProfile(name: string, toolId?: string): { profile: Profile; t
   const store = loadStore();
   const profile = resolveProfileFromStore(store, name, toolId);
   store.current[profile.tool] = name;
-  store.toolLocks[profile.name] = profile.tool;
   profile.lastUsedAt = nowIso();
   saveStore(store);
   return { profile, toolId: profile.tool };

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile } from "./lib/profiles.js";
@@ -58,7 +58,6 @@ test("raw machine pointers survive cloud-only profiles and reconcile rename/remo
     version: 1,
     current: { acme: "old" },
     applied: { acme: "old" },
-    toolLocks: { old: "acme" },
     profiles: [],
     tools: [],
   });
@@ -69,19 +68,29 @@ test("raw machine pointers survive cloud-only profiles and reconcile rename/remo
   reconcileMachineProfileRename("acme", "old", "new");
   expect(loadMachineStore().current).toEqual({ acme: "new" });
   expect(loadMachineStore().applied).toEqual({ acme: "new" });
-  expect(loadMachineStore().toolLocks).toEqual({ new: "acme" });
 
   reconcileMachineProfileRemove("acme", "new");
   expect(loadMachineStore().current).toEqual({});
   expect(loadMachineStore().applied).toEqual({});
-  expect(loadMachineStore().toolLocks).toEqual({});
 });
 
 test("saveStore atomically replaces the registry without leaving temp files", () => {
-  saveStore({ version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] });
-  saveStore({ version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] });
+  saveStore({ version: 1, current: {}, applied: {}, profiles: [], tools: [] });
+  saveStore({ version: 1, current: {}, applied: {}, profiles: [], tools: [] });
   expect(JSON.parse(readFileSync(storePath(), "utf8")).version).toBe(1);
   expect(readdirSync(accountsHome()).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+});
+
+test("legacy tool locks are ignored and omitted on the next save", () => {
+  writeFileSync(
+    storePath(),
+    JSON.stringify({ version: 1, current: {}, applied: {}, toolLocks: { work: "claude" }, profiles: [], tools: [] }),
+  );
+  const store = loadMachineStore();
+  expect(store).not.toHaveProperty("toolLocks");
+
+  saveStore(store);
+  expect(JSON.parse(readFileSync(storePath(), "utf8"))).not.toHaveProperty("toolLocks");
 });
 
 function runCli(env: Record<string, string>, ...args: string[]) {

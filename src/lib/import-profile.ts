@@ -7,7 +7,6 @@ import {
   addProfile,
   expandPath,
   findProfile,
-  lockProfileTool,
   type AddOptions,
 } from "./profiles.js";
 import { DEFAULT_TOOL } from "./tools.js";
@@ -108,11 +107,5 @@ export function ensureProfileForLogin(name: string, toolId = DEFAULT_TOOL): Prof
     );
   }
   const existing = findProfile(name, toolId);
-  if (existing) {
-    lockProfileTool(existing.name, existing.tool);
-    return existing;
-  }
-  const profile = addProfile({ name, tool: toolId, description: "created for login" });
-  lockProfileTool(profile.name, profile.tool);
-  return profile;
+  return existing ?? addProfile({ name, tool: toolId, description: "created for login" });
 }

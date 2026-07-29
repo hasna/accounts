@@ -41,7 +41,7 @@ export function profilesDir(): string {
   return join(accountsHome(), "profiles");
 }
 
-const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
+const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, profiles: [], tools: [] };
 
 /**
  * Parse and schema-validate the on-box registry file WITHOUT the profile
@@ -108,11 +108,6 @@ export function reconcileMachineProfileRename(toolId: string, oldName: string, n
     store.applied[toolId] = newName;
     changed = true;
   }
-  if (store.toolLocks[oldName] === toolId) {
-    delete store.toolLocks[oldName];
-    store.toolLocks[newName] = toolId;
-    changed = true;
-  }
   if (changed) saveStore(store);
 }
 
@@ -125,10 +120,6 @@ export function reconcileMachineProfileRemove(toolId: string, name: string): voi
   }
   if (store.applied[toolId] === name) {
     delete store.applied[toolId];
-    changed = true;
-  }
-  if (store.toolLocks[name] === toolId) {
-    delete store.toolLocks[name];
     changed = true;
   }
   if (changed) saveStore(store);
@@ -151,11 +142,6 @@ export function loadStore(): Store {
     const name = store.applied[toolId];
     if (!name || !profileNameSchema.safeParse(name).success) delete store.applied[toolId];
     else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.applied[toolId];
-  }
-  for (const name of Object.keys(store.toolLocks)) {
-    const toolId = store.toolLocks[name];
-    if (!profileNameSchema.safeParse(name).success || !toolId) delete store.toolLocks[name];
-    else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.toolLocks[name];
   }
   return store;
 }

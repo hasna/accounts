@@ -6,7 +6,6 @@ import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
-import { getProfileToolLock, lockProfileTool } from "./profiles.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
@@ -182,7 +181,7 @@ export function nonInteractiveToolSelectionMessage(name: string, choices: LoginT
   const commands = choices
     .map((choice) => `  accounts login ${name} --tool ${choice.tool.id}${choice.availability.available ? "" : "  # requires install"}`);
   return [
-    `profile "${name}" is not locked to a tool.`,
+    `profile "${name}" does not resolve to one tool.`,
     "Run one of these commands to choose the tool explicitly:",
     ...commands,
     installed.length > 0 ? `Installed tools: ${installed.join(", ")}` : "No supported tool binaries were found on PATH.",
@@ -299,12 +298,7 @@ async function promptForUnavailableTool(
 
 async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<Profile> {
   const existing = await store.findProfile(name, tool.id);
-  const profile = existing ?? (await store.addProfile({ name, tool: tool.id, description: "created for login" }));
-  // The tool lock is a machine-local disambiguation for bare commands; only the
-  // LocalStore keeps it. In api mode the shared registry (+ explicit --tool)
-  // resolves the profile, so there is no local lock to write.
-  if (store.transport === "local") lockProfileTool(profile.name, profile.tool);
-  return profile;
+  return existing ?? (await store.addProfile({ name, tool: tool.id, description: "created for login" }));
 }
 
 async function selectLoginTool(
@@ -314,11 +308,6 @@ async function selectLoginTool(
   store: AccountsStore,
 ): Promise<ToolDef> {
   if (opts.toolId) return store.resolveTool(opts.toolId);
-
-  if (store.transport === "local") {
-    const lockedTool = getProfileToolLock(name);
-    if (lockedTool) return store.resolveTool(lockedTool);
-  }
 
   const matches = (await store.listProfiles()).filter((profile) => profile.name === name);
   if (matches.length === 1) {

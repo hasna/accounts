@@ -15,8 +15,7 @@
 // Registry vs local: the cloud is the source of truth for account metadata
 // (name, tool, email, displayName, identity, cardLast4, metadata, description,
 // createdAt, lastUsedAt) and current selections. A profile's local config `dir`,
-// the per-machine `applied` map and `toolLocks` are inherently machine-local and
-// stay local; launch/apply/env commands therefore remain local operations.
+// the per-machine `applied` map, and launch/apply/env commands remain local.
 //
 // SAFETY: the API key never appears in logs or return values; it lives only
 // inside the contracts transport.

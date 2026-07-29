@@ -239,7 +239,6 @@ function executeHandoffCommand(commandLine: string) {
 
 function readStore() {
   return JSON.parse(readFileSync(join(home, "accounts.json"), "utf8")) as {
-    toolLocks?: Record<string, string>;
     profiles?: Array<{ name: string; tool: string; dir: string }>;
   };
 }
@@ -820,7 +819,7 @@ test("accounts shell removes request debugging while preserving same-binding env
   expectSafeProviderObservation();
 });
 
-test("login infers and locks the tool for an existing unambiguous profile", () => {
+test("login infers the tool for an existing unambiguous profile", () => {
   writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
   addFakeLoginTool();
   expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
@@ -832,10 +831,9 @@ test("login infers and locks the tool for an existing unambiguous profile", () =
   expect(entries).toHaveLength(1);
   expect(entries[0]?.args).toBe("auth login");
   expect(entries[0]?.home).toContain("fake-login/acct");
-  expect(readStore().toolLocks?.acct).toBe("fake-login");
 });
 
-test("login requires an explicit choice for shared profile names when non-interactive and unlocked", () => {
+test("login requires an explicit choice for shared profile names when non-interactive", () => {
   writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
   writeFakeTool("fake-variant-tool", "FAKE_VARIANT_HOME", "fake-variant");
   addFakeLoginTool("fake-login", "Fake Login", "FAKE_LOGIN_HOME", "fake-login-tool");
@@ -849,7 +847,7 @@ test("login requires an explicit choice for shared profile names when non-intera
   const result = runCli("login", "acct");
 
   expect(result.status).toBe(1);
-  expect(result.stderr).toContain('profile "acct" is not locked to a tool');
+  expect(result.stderr).toContain('profile "acct" does not resolve to one tool');
   expect(result.stderr).toContain("accounts login acct --tool fake-login");
   expect(result.stderr).toContain("accounts login acct --tool fake-variant");
   expect(readLogEntries()).toHaveLength(0);
@@ -875,7 +873,7 @@ test("login refuses to create a profile whose name is already held by another to
   expect(rows.map((entry) => entry.tool)).toEqual(["fake-login"]);
 });
 
-test("login chooser creates a new account with a custom registered tool variant and persists the lock", () => {
+test("login chooser creates a new account with a custom registered tool variant", () => {
   writeFakeTool("fake-variant-tool", "FAKE_VARIANT_HOME", "fake-variant");
   addFakeLoginTool("fake-variant", "Fake Variant", "FAKE_VARIANT_HOME", "fake-variant-tool");
 
@@ -892,7 +890,6 @@ test("login chooser creates a new account with a custom registered tool variant 
   expect(entries[0]?.tool).toBe("fake-variant");
   expect(entries[0]?.args).toBe("auth login");
   expect(entries[0]?.home).toContain("fake-variant/acct");
-  expect(readStore().toolLocks?.acct).toBe("fake-variant");
 
   const show = runCli("show", "acct");
   expect(show.status).toBe(0);
@@ -919,7 +916,7 @@ test("non-interactive login for a new account does not prompt or create partial 
   const result = runCliWith(["login", "acct"], { path: binDir });
 
   expect(result.status).toBe(1);
-  expect(result.stderr).toContain('profile "acct" is not locked to a tool');
+  expect(result.stderr).toContain('profile "acct" does not resolve to one tool');
   expect(readLogEntries()).toHaveLength(0);
   expect(existsSync(join(home, "accounts.json"))).toBe(false);
 });
@@ -938,7 +935,7 @@ test("explicit cursor login with missing Cursor install fails with accounts-leve
   expect(existsSync(join(home, "accounts.json"))).toBe(false);
 });
 
-test("missing explicit cursor install can choose another installed tool and re-lock", () => {
+test("missing explicit cursor install can choose another installed tool", () => {
   writeFakeTool("cursor-agent", "CURSOR_CONFIG_DIR", "cursor");
   writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
   addFakeLoginTool();
@@ -954,7 +951,7 @@ test("missing explicit cursor install can choose another installed tool and re-l
   const entries = readLogEntries();
   expect(entries).toHaveLength(1);
   expect(entries[0]?.tool).toBe("fake-login");
-  expect(readStore().toolLocks?.acct).toBe("fake-login");
+  expect(readStore().profiles?.some((profile) => profile.name === "acct" && profile.tool === "fake-login")).toBe(true);
 });
 
 test("missing explicit cursor install can keep cursor selected without launching it", () => {
@@ -970,11 +967,10 @@ test("missing explicit cursor install can keep cursor selected without launching
   expect(result.stderr).toContain("Selected tool kept: cursor");
   expect(readLogEntries()).toHaveLength(0);
   const store = readStore();
-  expect(store.toolLocks?.acct).toBe("cursor");
   expect(store.profiles?.some((profile) => profile.name === "acct" && profile.tool === "cursor")).toBe(true);
 });
 
-test("cancelling an inferred missing existing profile does not write a tool lock", () => {
+test("cancelling an inferred missing existing profile leaves it unchanged", () => {
   expect(
     runCli(
       "tools",
@@ -998,5 +994,7 @@ test("cancelling an inferred missing existing profile does not write a tool lock
 
   expect(result.status).toBe(1);
   expect(result.stderr).toContain("Cancel without changes");
-  expect(readStore().toolLocks?.acct).toBeUndefined();
+  expect(readStore().profiles?.filter((profile) => profile.name === "acct").map((profile) => profile.tool)).toEqual([
+    "missing-review",
+  ]);
 });

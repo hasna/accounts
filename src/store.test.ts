@@ -325,7 +325,6 @@ describe("ApiStore routes registry ops to /v1", () => {
         version: 1,
         current: { acme: "old" },
         applied: { acme: "old" },
-        toolLocks: { old: "acme" },
         profiles: [],
         tools: [],
       });

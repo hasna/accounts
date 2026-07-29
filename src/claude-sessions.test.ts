@@ -766,7 +766,6 @@ describe("accounts sessions CLI", () => {
         version: 1,
         current: {},
         applied: {},
-        toolLocks: {},
         tools: [],
         profiles,
       }),
