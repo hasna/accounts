@@ -201,23 +201,35 @@ function uuidFromOAuthRecord(oauth: JsonRecord | undefined): string | undefined 
   return typeof uuid === "string" && UUID_RE.test(uuid) ? uuid.toLowerCase() : undefined;
 }
 
-/**
- * An identity token for CONFLICT DETECTION only — deliberately NOT filtered
- * through `UUID_RE` the way `uuidFromOAuthRecord` is.
- *
- * The two jobs differ. Binding resolution turns a uuid into a filesystem path
- * under the central store, so it must reject anything malformed. Conflict
- * detection only has to notice that two identities DIFFER, and treating a
- * malformed-but-present uuid as "no identity" would wave a destroying write
- * straight through on exactly the inputs least likely to be well-formed.
- * Empty and whitespace-only are still unknown: they carry no identity to
- * compare.
- */
-function identityToken(oauth: JsonRecord | undefined): string | undefined {
-  const uuid = oauth?.accountUuid;
-  if (typeof uuid !== "string") return undefined;
-  const token = uuid.trim().toLowerCase();
+/** Normalize one identity field for conflict detection. */
+function identityToken(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const token = value.trim().toLowerCase();
   return token.length > 0 ? token : undefined;
+}
+
+/**
+ * Compare the strongest identity evidence both OAuth records share.
+ *
+ * UUIDs are authoritative when both sides carry one. They are deliberately
+ * NOT filtered through `UUID_RE` the way `uuidFromOAuthRecord` is: binding
+ * resolution turns a uuid into a filesystem path, while conflict detection
+ * only has to notice that two present values differ. Treating a malformed uuid
+ * as unknown would wave a destroying write through on corrupt input.
+ *
+ * Older/sparser OAuth records often have no `accountUuid`, so fall back to the
+ * normalized email when either side lacks one. Comparing `uuid-or-email`
+ * tokens directly would falsely reject the same account when a later record
+ * gains a uuid; the email is the common evidence in that mixed-shape case.
+ */
+function oauthIdentitiesConflict(own: JsonRecord | undefined, live: JsonRecord | undefined): boolean {
+  const ownUuid = identityToken(own?.accountUuid);
+  const liveUuid = identityToken(live?.accountUuid);
+  if (ownUuid && liveUuid) return ownUuid !== liveUuid;
+
+  const ownEmail = identityToken(own?.emailAddress);
+  const liveEmail = identityToken(live?.emailAddress);
+  return Boolean(ownEmail && liveEmail && ownEmail !== liveEmail);
 }
 
 /**
@@ -232,11 +244,10 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
  * degraded; it cannot separate two healthy credentials belonging to different
  * accounts. Only an identity check can.
  *
- * THE RULE, matching `recoverParkedCredential`'s gate: own must be KNOWN, live
- * may be unknown, compared case-insensitively. The asymmetry is deliberate —
- * `own` is what gets written, so it must be established before it can be
- * defended; `live` only ever detects a conflict, so an unreadable live identity
- * cannot prove one and must not block a legitimate refresh.
+ * THE RULE: compare accountUuid when both sides have one, otherwise compare
+ * emailAddress. Own must have identity evidence the live record also carries;
+ * an unreadable or incomparable live identity cannot prove a conflict and must
+ * not block a legitimate refresh.
  *
  * An unknown `own` is the FIRST-CAPTURE case, not a conflict: a profile that
  * has never been snapshotted has no claim to defend, and refusing here would
@@ -246,11 +257,10 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
  * which is active harm rather than a missing precondition.
  */
 export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): boolean {
-  const own = identityToken(oauthRecordFromSnapshot(profileDir));
-  if (!own) return false;
-  const live = identityToken(liveOAuthRecordUnfiltered(profileDir, tool));
-  if (!live) return false;
-  return own !== live;
+  return oauthIdentitiesConflict(
+    oauthRecordFromSnapshot(profileDir),
+    liveOAuthRecordUnfiltered(profileDir, tool),
+  );
 }
 
 /**

@@ -68,6 +68,10 @@ function identityJson(uuid: string, label: string): string {
   return JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: `${label}@example.com` } });
 }
 
+function emailIdentityJson(label: string): string {
+  return JSON.stringify({ oauthAccount: { emailAddress: `${label}@example.com` } });
+}
+
 /** Backdate a file so mtime-based freshness comparisons see it as old. */
 function backdate(path: string, secondsAgo: number): void {
   const t = new Date(Date.now() - secondsAgo * 1000);
@@ -87,6 +91,16 @@ function makeHostProfile(name: string): string {
   return dir;
 }
 
+/** A legacy/sparse profile whose OAuth record identifies the owner by email. */
+function makeEmailOnlyHostProfile(name: string): string {
+  const dir = mkdtempSync(join(tmpdir(), `foreign-${name}-`));
+  writeFileSync(join(dir, ".claude.json"), emailIdentityJson("host"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("host"));
+  addProfile({ name, dir });
+  ensureProfileAuthSnapshot(dir, tool());
+  return dir;
+}
+
 /**
  * The on-disk residue of an in-session `/login` to another account: the dir's
  * live identity AND live credential both become the guest's, both newer than
@@ -95,13 +109,21 @@ function makeHostProfile(name: string): string {
 function inSessionLoginTo(dir: string, uuid: string, label: string): void {
   backdate(profileCredentialsSnapshot(dir), 3600);
   backdate(profileOAuthSnapshot(dir), 3600);
-  backdate(centralCredentialsSnapshot(UUID_HOST), 3600);
+  const central = centralCredentialsSnapshot(UUID_HOST);
+  if (existsSync(central)) backdate(central, 3600);
   writeFileSync(join(dir, ".claude.json"), identityJson(uuid, label));
   writeFileSync(join(dir, ".credentials.json"), credentialJson(label));
   expect(
     existsSync(join(dir, ".accounts-auth", "switched-account.json")),
     "fixture must reproduce the NO-MARKER path — a marker would exercise a branch that is already guarded",
   ).toBe(false);
+}
+
+function inSessionLoginWithoutUuidTo(dir: string, label: string): void {
+  backdate(profileCredentialsSnapshot(dir), 3600);
+  backdate(profileOAuthSnapshot(dir), 3600);
+  writeFileSync(join(dir, ".claude.json"), emailIdentityJson(label));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson(label));
 }
 
 // --- the parked copy must survive a foreign in-session login -----------------
@@ -156,6 +178,44 @@ test("repeated calls do not erode the parked credential (the guard holds, it doe
   for (let i = 0; i < 3; i++) ensureProfileAuthSnapshot(dir, tool());
 
   expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
+  expect(readFileSync(centralCredentialsSnapshot(UUID_HOST))).toEqual(central);
+});
+
+test("an email-only profile rejects a foreign email-only identity and credential", () => {
+  const dir = makeEmailOnlyHostProfile("emailonly");
+  const parkedCredential = readFileSync(profileCredentialsSnapshot(dir));
+  const parkedIdentity = readFileSync(profileOAuthSnapshot(dir));
+  inSessionLoginWithoutUuidTo(dir, "guest");
+
+  for (let i = 0; i < 3; i++) ensureProfileAuthSnapshot(dir, tool());
+
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parkedCredential);
+  expect(readFileSync(profileOAuthSnapshot(dir))).toEqual(parkedIdentity);
+});
+
+test("an email-only profile rejects a foreign live identity that has a uuid", () => {
+  const dir = makeEmailOnlyHostProfile("parkedemailonly");
+  const parkedCredential = readFileSync(profileCredentialsSnapshot(dir));
+  const parkedIdentity = readFileSync(profileOAuthSnapshot(dir));
+  inSessionLoginTo(dir, UUID_GUEST, "guest");
+
+  ensureProfileAuthSnapshot(dir, tool());
+
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parkedCredential);
+  expect(readFileSync(profileOAuthSnapshot(dir))).toEqual(parkedIdentity);
+});
+
+test("a uuid-bound profile rejects a foreign live identity that has only email", () => {
+  const dir = makeHostProfile("liveemailonly");
+  const parkedCredential = readFileSync(profileCredentialsSnapshot(dir));
+  const parkedIdentity = readFileSync(profileOAuthSnapshot(dir));
+  const central = readFileSync(centralCredentialsSnapshot(UUID_HOST));
+  inSessionLoginWithoutUuidTo(dir, "guest");
+
+  ensureProfileAuthSnapshot(dir, tool());
+
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parkedCredential);
+  expect(readFileSync(profileOAuthSnapshot(dir))).toEqual(parkedIdentity);
   expect(readFileSync(centralCredentialsSnapshot(UUID_HOST))).toEqual(central);
 });
 
@@ -233,18 +293,35 @@ test("a case-variant uuid is the SAME account, so the refresh still happens", ()
   );
 });
 
-test("an UNKNOWN live identity cannot prove a conflict, so the refresh still happens", () => {
+test("an empty live uuid falls back to the matching email, so the refresh still happens", () => {
   const dir = makeHostProfile("liveunknown");
   backdate(profileCredentialsSnapshot(dir), 3600);
   backdate(centralCredentialsSnapshot(UUID_HOST), 3600);
-  // Empty-string uuid: present but carrying no identity. `own` is known, `live`
-  // is not. Deliberately permissive, matching `recoverParkedCredential` — `own`
-  // is what gets written, `live` only detects conflict.
+  // Empty-string uuid carries no UUID identity, but the matching email still
+  // proves this is the host account rather than a foreign login.
   writeFileSync(join(dir, ".claude.json"), identityJson("", "host"));
   writeFileSync(join(dir, ".credentials.json"), credentialJson("host-rotated"));
 
   ensureProfileAuthSnapshot(dir, tool());
 
+  expect(JSON.parse(readFileSync(profileCredentialsSnapshot(dir), "utf8")).claudeAiOauth.accessToken).toBe(
+    "host-rotated-access",
+  );
+});
+
+test("an email-only profile accepts the same account when the live record gains a uuid", () => {
+  const dir = makeEmailOnlyHostProfile("emailuuid");
+  backdate(profileCredentialsSnapshot(dir), 3600);
+  backdate(profileOAuthSnapshot(dir), 3600);
+  writeFileSync(join(dir, ".claude.json"), identityJson(UUID_HOST, "host"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("host-rotated"));
+
+  ensureProfileAuthSnapshot(dir, tool());
+
+  const parkedIdentity = JSON.parse(readFileSync(profileOAuthSnapshot(dir), "utf8")) as {
+    oauthAccount?: { accountUuid?: string };
+  };
+  expect(parkedIdentity.oauthAccount?.accountUuid).toBe(UUID_HOST);
   expect(JSON.parse(readFileSync(profileCredentialsSnapshot(dir), "utf8")).claudeAiOauth.accessToken).toBe(
     "host-rotated-access",
   );
@@ -270,4 +347,3 @@ test("a malformed-but-DIFFERENT live uuid is still a conflict", () => {
 
   expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
 });
-
