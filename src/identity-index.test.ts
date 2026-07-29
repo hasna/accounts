@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -88,6 +88,42 @@ test("two dirs holding the same accountUuid collapse into ONE identity with two 
   expect(identity.email).toBe("one@example.com");
   expect(new Set(identity.doors.map((d) => d.dir))).toEqual(new Set([a, b]));
   expect(identity.status).toBe("ok");
+});
+
+test("a registered live-only profile is an owning door before any auth snapshot exists", () => {
+  const uuid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  const dir = makeDir("live-only");
+  writeLive(dir, { uuid, email: "live-only@example.com" });
+
+  // This is the first-capture state from the defect: neither the legacy
+  // per-profile snapshot nor its central mirror has been created yet.
+  expect(existsSync(join(dir, ".accounts-auth", "oauth-account.json"))).toBe(false);
+  expect(existsSync(centralAuthDir(uuid))).toBe(false);
+
+  const index = buildIdentityIndex([{ name: "live-only", dir }], tool());
+  const identity = index.find((entry) => entry.accountUuid === uuid)!;
+
+  expect(identity.credential?.source).toBe("dir-live");
+  expect(identity.doors).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ dir, role: "own-identity", profileName: "live-only" }),
+      expect.objectContaining({ dir, role: "current-occupant", profileName: "live-only" }),
+    ]),
+  );
+});
+
+test("a switch marker prevents a live-only occupant from becoming the profile owner", () => {
+  const uuid = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+  const dir = makeDir("marked-live-only");
+  writeLive(dir, { uuid, email: "guest@example.com" });
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(join(dir, ".accounts-auth", "switched-account.json"), JSON.stringify({ profile: "guest" }));
+
+  const index = buildIdentityIndex([{ name: "marked-live-only", dir }], tool());
+  const identity = index.find((entry) => entry.accountUuid === uuid)!;
+
+  expect(identity.doors.some((door) => door.role === "current-occupant")).toBe(true);
+  expect(identity.doors.some((door) => door.role === "own-identity")).toBe(false);
 });
 
 test("a switched dir maps its LIVE occupant and its OWN snapshot to different identities", () => {
