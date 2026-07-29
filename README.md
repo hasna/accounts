@@ -85,13 +85,12 @@ accounts switch work --tool codex-app --launch
 accounts codex-app menubar
 ```
 
-`codex` and `codex-app` are separate tool ids for the same account name. If you
-run `accounts login personal` before either profile is locked, the chooser shows
-both options; choosing one locks bare commands for `personal` to that tool. Use
-`--tool codex` or `--tool codex-app` when you want to bypass or change that
-choice explicitly. The same rule applies to future registered variants such as a
-custom `claude-app` or `claude-cowork`: each tool id gets its own profile
-directory and can be selected without changing the account name.
+`codex` and `codex-app` are separate tool ids. If a registry created by an older
+version contains the same account name for both, pass `--tool codex` or
+`--tool codex-app` to choose explicitly; bare profile commands reject the
+ambiguous name even when login has stored a tool selection. The same rule
+applies to registered variants such as a custom `claude-app` or
+`claude-cowork`: each tool id gets its own profile directory.
 
 Each `codex-app` profile gets its own `CODEX_HOME` and
 `--user-data-dir=<profile>/electron-user-data`. Before login, launch, switch, or
