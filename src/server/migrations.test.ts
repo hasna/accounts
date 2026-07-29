@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { accountsMigrations, resolveMigrationsDir, APP_MIGRATION_FILES } from "./migrations.js";
+import {
+  ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID,
+  accountsMigrations,
+  resolveMigrationsDir,
+  APP_MIGRATION_FILES,
+} from "./migrations.js";
 
 describe("accounts migrations", () => {
   test("resolves the migrations dir and loads the app SQL files", () => {
@@ -18,6 +23,7 @@ describe("accounts migrations", () => {
     expect(ids).toContain("accounts_0003_custom_tools");
     expect(ids).toContain("accounts_0004_current_selection_account_fk");
     expect(ids).toContain("accounts_0005_custom_tool_tombstones");
+    expect(ids).toContain(ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID);
     expect(ids.some((id) => id.startsWith("hasna_auth_"))).toBe(true);
     for (const m of migrations) {
       expect(m.checksum.startsWith("sha256:")).toBe(true);

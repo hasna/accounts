@@ -6,6 +6,18 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Changed
+
+- **[BREAKING]** Cloud account names are now enforced as unique across tools by
+  PostgreSQL migration `0006`, after R6-9 added the same refusal to supported
+  writers. The migration preserves `PRIMARY KEY (tool, name)`, reports and
+  refuses pre-existing collisions without rewriting them, and rechecks under a
+  write-blocking table lock before adding `UNIQUE (name)`. See
+  [the rollout runbook](docs/account-name-uniqueness.md) for the mandatory
+  announcement, restored-snapshot rehearsal, immediate production report, and
+  rollback procedure. Multi-tenant derivatives must instead enforce
+  `UNIQUE (tenant_id, name)`.
+
 ### Added
 
 - Profile-dir policy for the cloud registry (`src/lib/profile-dir-policy.ts`).

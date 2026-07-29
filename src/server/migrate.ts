@@ -8,8 +8,10 @@
 
 import { createCloudPoolFromEnv, MigrationLedger, resolveStorageMode } from "../generated/storage-kit/index.js";
 import {
+  ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID,
   accountsMigrations,
   assertMigrationStatusCompatible,
+  readAccountNameCollisionReport,
   readMigrationStatus,
 } from "./migrations.js";
 import { APP_SLUG } from "./config.js";
@@ -36,6 +38,22 @@ async function main(): Promise<void> {
     // reapply the runtime role's direct grants.
     const status = await readMigrationStatus(client, migrations);
     assertMigrationStatusCompatible(status);
+    if (status.pending.includes(ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID)) {
+      const collisionReport = await readAccountNameCollisionReport(client);
+      console.log(
+        JSON.stringify(
+          { evt: "account_name_collision_report", ...collisionReport },
+          null,
+          2,
+        ),
+      );
+      if (collisionReport.conflictingNames > 0) {
+        throw new Error(
+          `Migration ${ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID} refused: ` +
+            `${collisionReport.conflictingNames} account-name collision(s) require reconciliation.`,
+        );
+      }
+    }
     if (status.ledgerPresent && status.pending.length === 0) {
       if (!dryRun) {
         const grant = await grantAccountsRuntimeRole(client, runtimeRole);

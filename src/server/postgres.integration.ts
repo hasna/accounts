@@ -8,8 +8,10 @@ import {
   type PoolQueryClient,
 } from "../generated/storage-kit/index.js";
 import {
+  ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID,
   accountsMigrations,
   assertMigrationStatusCompatible,
+  readAccountNameCollisionReport,
   readMigrationStatus,
 } from "./migrations.js";
 import {
@@ -267,14 +269,18 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migrations 0003/0004/0005 upgrade existing data and are restart-idempotent", async () => {
+  test("migrations 0003 through 0006 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
     const customToolsIndex = appMigrations.findIndex(
       (migration) => migration.id === "accounts_0003_custom_tools",
     );
+    const uniqueNamesIndex = appMigrations.findIndex(
+      (migration) => migration.id === ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID,
+    );
     const beforeCustomTools = appMigrations.slice(0, customToolsIndex);
+    const beforeUniqueNames = appMigrations.slice(0, uniqueNamesIndex);
 
     await new MigrationLedger(client, beforeCustomTools).migrate();
     expect(
@@ -292,7 +298,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       ["migration-probe", "valid", "migration-orphan", "missing"],
     );
 
-    const upgraded = await new MigrationLedger(client, appMigrations).migrate();
+    const upgraded = await new MigrationLedger(client, beforeUniqueNames).migrate();
     expect(
       upgraded.plan.find((item) => item.migration.id === "accounts_0003_custom_tools")?.state,
     ).toBe("pending");
@@ -315,6 +321,81 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         "SELECT to_regclass('custom_tool_tombstones')::text AS table_name",
       ),
     ).toEqual({ table_name: "custom_tool_tombstones" });
+
+    await client.execute(
+      "INSERT INTO accounts (tool, name) VALUES ($1, $2), ($3, $2)",
+      ["migration-collision-a", "migration-collision", "migration-collision-b"],
+    );
+    expect(await readAccountNameCollisionReport(client)).toEqual({
+      tablePresent: true,
+      conflictingNames: 1,
+      duplicateRows: 2,
+      collisions: [
+        {
+          name: "migration-collision",
+          tools: ["migration-collision-a", "migration-collision-b"],
+          rowCount: 2,
+        },
+      ],
+    });
+    await expect(new MigrationLedger(client, appMigrations).migrate()).rejects.toThrow(
+      /account-name collision report is not zero/,
+    );
+    expect(
+      await client.many<{ tool: string; name: string }>(
+        "SELECT tool, name FROM accounts WHERE name = $1 ORDER BY tool",
+        ["migration-collision"],
+      ),
+    ).toEqual([
+      { tool: "migration-collision-a", name: "migration-collision" },
+      { tool: "migration-collision-b", name: "migration-collision" },
+    ]);
+
+    await client.execute(
+      "UPDATE accounts SET name = $1 WHERE tool = $2 AND name = $3",
+      ["migration-collision-reconciled", "migration-collision-b", "migration-collision"],
+    );
+    expect(await readAccountNameCollisionReport(client)).toEqual({
+      tablePresent: true,
+      conflictingNames: 0,
+      duplicateRows: 0,
+      collisions: [],
+    });
+    const uniqueUpgrade = await new MigrationLedger(client, appMigrations).migrate();
+    expect(
+      uniqueUpgrade.plan.find(
+        (item) => item.migration.id === ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID,
+      )?.state,
+    ).toBe("pending");
+    expect(
+      await client.one<{ primary_columns: string[]; unique_columns: string[] }>(
+        `SELECT
+           (SELECT array_agg(attribute.attname ORDER BY key.ordinality)
+              FROM pg_constraint AS constraint_row
+              CROSS JOIN LATERAL unnest(constraint_row.conkey)
+                WITH ORDINALITY AS key(attnum, ordinality)
+              JOIN pg_attribute AS attribute
+                ON attribute.attrelid = constraint_row.conrelid
+               AND attribute.attnum = key.attnum
+             WHERE constraint_row.conrelid = 'accounts'::regclass
+               AND constraint_row.contype = 'p') AS primary_columns,
+           (SELECT array_agg(attribute.attname ORDER BY key.ordinality)
+              FROM pg_constraint AS constraint_row
+              CROSS JOIN LATERAL unnest(constraint_row.conkey)
+                WITH ORDINALITY AS key(attnum, ordinality)
+              JOIN pg_attribute AS attribute
+                ON attribute.attrelid = constraint_row.conrelid
+               AND attribute.attnum = key.attnum
+             WHERE constraint_row.conrelid = 'accounts'::regclass
+               AND constraint_row.contype = 'u') AS unique_columns`,
+      ),
+    ).toEqual({ primary_columns: ["tool", "name"], unique_columns: ["name"] });
+    await expect(
+      client.execute("INSERT INTO accounts (tool, name) VALUES ($1, $2)", [
+        "migration-constraint-probe",
+        "migration-collision",
+      ]),
+    ).rejects.toThrow(/accounts_name_key/);
     expect(
       await client.many<{ tool: string; name: string }>(
         "SELECT tool, name FROM current_selections WHERE tool LIKE 'migration-%' ORDER BY tool",
@@ -513,6 +594,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0003_custom_tools",
       "accounts_0004_current_selection_account_fk",
       "accounts_0005_custom_tool_tombstones",
+      ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID,
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,
@@ -948,9 +1030,9 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         const refused = results.find((r) => r.status === "rejected")!;
         expect(rejectionText(refused)).toContain("already exists");
         // The loser must be turned away by the domain check, not by a raw
-        // Postgres constraint violation surfacing as a 500. This change adds
-        // no UNIQUE(name); if one is ever added here, this assertion is what
-        // notices that the refusal path changed shape.
+        // Postgres constraint violation surfacing as a 500. The UNIQUE(name)
+        // constraint is the final backstop; coordinated repository writers
+        // must still return the domain-level conflict produced above it.
         expect(rejectionText(refused)).not.toMatch(/duplicate key value|unique constraint/i);
       } finally {
         await clientA.close();

@@ -24,7 +24,11 @@ export const APP_MIGRATION_FILES = [
   "0003_custom_tools.sql",
   "0004_current_selection_account_fk.sql",
   "0005_custom_tool_tombstones.sql",
+  "0006_unique_account_names.sql",
 ] as const;
+
+export const ACCOUNT_NAME_UNIQUENESS_MIGRATION_ID =
+  "accounts_0006_unique_account_names";
 
 function moduleDir(): string {
   try {
@@ -87,6 +91,68 @@ export interface MigrationStatus {
   unknown: string[];
   /** Applied ids whose recorded checksum differs from this build. */
   checksumMismatches: string[];
+}
+
+export interface AccountNameCollision {
+  name: string;
+  tools: string[];
+  rowCount: number;
+}
+
+export interface AccountNameCollisionReport {
+  /** False only on a brand-new schema before migration 0001 creates accounts. */
+  tablePresent: boolean;
+  conflictingNames: number;
+  duplicateRows: number;
+  collisions: AccountNameCollision[];
+}
+
+/**
+ * Report every name currently held by more than one tool.
+ *
+ * The migrator calls this immediately before applying migration 0006. The SQL
+ * migration repeats the check while holding a write-blocking table lock, so a
+ * concurrent machine cannot invalidate a zero report before enforcement.
+ */
+export async function readAccountNameCollisionReport(
+  client: TypedQueryClient,
+): Promise<AccountNameCollisionReport> {
+  const relation = await client.get<{ present: boolean }>(
+    "SELECT to_regclass('accounts') IS NOT NULL AS present",
+  );
+  if (!relation?.present) {
+    return {
+      tablePresent: false,
+      conflictingNames: 0,
+      duplicateRows: 0,
+      collisions: [],
+    };
+  }
+
+  const rows = await client.many<{
+    name: string;
+    tools: string[];
+    row_count: number;
+  }>(
+    `SELECT name,
+            array_agg(tool ORDER BY tool) AS tools,
+            count(*)::int AS row_count
+       FROM accounts
+      GROUP BY name
+     HAVING count(*) > 1
+      ORDER BY name`,
+  );
+  const collisions = rows.map((row) => ({
+    name: row.name,
+    tools: row.tools,
+    rowCount: row.row_count,
+  }));
+  return {
+    tablePresent: true,
+    conflictingNames: collisions.length,
+    duplicateRows: collisions.reduce((total, collision) => total + collision.rowCount, 0),
+    collisions,
+  };
 }
 
 export function assertMigrationStatusCompatible(status: MigrationStatus): void {

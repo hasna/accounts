@@ -16,8 +16,9 @@ The source change covers four related surfaces:
    profile registry operations.
 2. Retirement of the legacy provider-backed remote/hybrid subsystem, with
    source-compatible shims but no provider runtime.
-3. PostgreSQL migrations for custom-tool definitions, selection integrity, and
-   durable removed-tool tombstones, plus additive custom-tool/rename endpoints.
+3. PostgreSQL migrations for custom-tool definitions, selection integrity,
+   durable removed-tool tombstones, and account-name uniqueness, plus additive
+   custom-tool/rename endpoints.
 4. Readiness and server compatibility, including additive Tool responses and
    transactional account/current-selection updates.
 
@@ -59,8 +60,12 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    those orphans from the live table, preserves valid selections, then adds a
    cascading account foreign key. Migration `0005` additively creates
    `custom_tool_tombstones` and database guards that serialize account
-   creation, explicit removal, and explicit re-registration. All three
-   migrations are checksum-ledgered and restart-idempotent. The migrator
+   creation, explicit removal, and explicit re-registration. Migration `0006`
+   preserves `PRIMARY KEY (tool, name)` and adds a separate `UNIQUE (name)` only
+   after an immediate zero-collision report and an in-lock recheck; follow the
+   mandatory announcement and rehearsal in
+   [Breaking Account-Name Uniqueness Migration](account-name-uniqueness.md).
+   All four migrations are checksum-ledgered and restart-idempotent. The migrator
    reapplies and verifies the runtime grant contract after migrations and on a
    current-schema no-op run. Inspect and retain
    the orphan archive for reconciliation; do not treat it as disposable
@@ -125,15 +130,15 @@ schema migration so grants for the current manifest are revalidated.
 | Client | Server | Result |
 | --- | --- | --- |
 | Old | Old | Existing account and selection operations are unchanged. |
-| Old | New | Compatible after migration 0005. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected. |
+| Old | New | Compatible after migration 0006. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected, and a cross-tool name collision is refused. |
 | New | Old | Existing operations work. Minimal legacy built-in Tool responses are accepted. Rename and custom-tool mutations require a server upgrade and fail with an actionable error. |
-| New | New before migrations 0003/0004/0005 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003/0004/0005 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, rename/remove/current updates, and pointer reconciliation are available. |
+| New | New before migrations 0003/0004/0005/0006 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
+| New | New after migrations 0003/0004/0005/0006 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, database-enforced account-name uniqueness, rename/remove/current updates, and pointer reconciliation are available. |
 
 ## Rollback And Forward Fix
 
 - Before client rollout, the application server image may be rolled back.
-  Leave migrations `0003`, `0004`, and `0005` in place. Database triggers
+  Leave migrations `0003`, `0004`, `0005`, and `0006` in place. Database triggers
   make older account writers observe tombstones and turn older direct
   `custom_tools` deletes into durable removals. An explicit registration is
   the only operation that clears a tombstone.
@@ -141,7 +146,7 @@ schema migration so grants for the current manifest are revalidated.
   migration `0005` functions, their locked `search_path`, and the grants
   applied by the new owner-run migrator. Do not switch the server to the owner
   DSN as a rollback shortcut.
-- Never run a pre-`0003`/`0005` `accounts-migrate` binary after newer
+- Never run a pre-`0003`/`0005`/`0006` `accounts-migrate` binary after newer
   migrations are recorded. The checksum ledger rejects migrations unknown to
   the supplied manifest as a deterministic downgrade guard. An application
   rollback must retain the new migrator binary/job; otherwise forward-fix.
@@ -154,8 +159,9 @@ schema migration so grants for the current manifest are revalidated.
 - A client rollback does not remove cloud custom tools. Older clients may not
   resolve those tools for launch, but account and tool records remain intact.
 - Do not drop `custom_tools`, `custom_tool_tombstones`, their guard triggers,
-  or the selection foreign key as an application rollback. Restore service with
-  a corrected server build, then reconcile data through supported endpoints.
+  the account-name unique constraint, or the selection foreign key as an
+  application rollback. Restore service with a corrected server build, then
+  reconcile data through supported endpoints.
 
 ## Verification
 
@@ -164,7 +170,8 @@ schema migration so grants for the current manifest are revalidated.
 - `bun run test:postgres` requires
   `HASNA_ACCOUNTS_TEST_DATABASE_URL`. It uses an isolated schema to verify the
   `0003` upgrade, `0004` orphan archival and valid-row preservation, `0005`
-  direct-SQL idempotency, unseen legacy ids, durable removal rejection,
+  direct-SQL idempotency, unseen legacy ids, durable removal rejection, `0006`
+  collision refusal/preservation and composite-primary-key retention,
   old-server trigger behavior, both removal/creation orderings, restart
   idempotency, old-migrator downgrade rejection, rollback/forward-fix behavior,
   transaction rollback, and concurrent row/advisory locking. The suite creates
