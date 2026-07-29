@@ -37,6 +37,7 @@ import {
   centralOAuthRecordForProfile,
   credentialHealth,
   dirLiveIdentityIsForeign,
+  profileHasParkedIdentity,
   type CredentialHealthPresent,
   type SyncResult,
   syncProfileSnapshotToCentral,
@@ -669,11 +670,26 @@ export function ensureProfileAuthSnapshot(
     writeJsonFile(oauthSnap, { oauthAccount: oauthSource.oauth }, profileDir);
   }
 
+  // ATTRIBUTION PRECONDITION (task 1cf9bcaf, residual of 0e7069a9). Never park a
+  // credential this profile cannot attribute to an account. The two snapshot writes are
+  // governed by independent conditions, so before this check they could come apart: a dir
+  // holding `.credentials.json` with no account file yet parked the credential and not the
+  // identity, and the identity gate above reads its absence as "first capture, nothing to
+  // defend". A later in-session `/login` to another account then walked straight through
+  // and replaced the parked copy — measured, host token replaced by guest token.
+  //
+  // Nothing is lost by waiting. An unattributed parked credential is already useless to
+  // the restore path (`recoverParkedCredential` refuses when own identity is unknown), so
+  // it could only ever be destroyed, never used. The credential stays in the dir either
+  // way; it gets parked on the next call, once the account file exists.
+  const identityIsAttributable = profileHasParkedIdentity(profileDir);
+
   const credFile = profileCredentialFile(profileDir);
   const credSnap = profileCredentialsSnapshot(profileDir);
   if (
     existsSync(credFile) &&
     !liveIdentityIsForeign &&
+    identityIsAttributable &&
     (opts.overwrite || snapshotIsStale(credFile, credSnap)) &&
     !wouldDowngradeSnapshot(credFile, credSnap)
   ) {

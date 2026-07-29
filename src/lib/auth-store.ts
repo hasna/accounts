@@ -23,6 +23,7 @@
 // This module is a lower layer than claude-auth.ts (which imports it); it must
 // not import claude-auth.ts.
 
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { accountsHome, loadStore } from "../storage.js";
@@ -31,6 +32,7 @@ import { getTool } from "./tools.js";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import {
+  DIR_CREDENTIALS_FILE,
   profileAccountJsonPaths,
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
@@ -244,13 +246,82 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
  * `recoverParkedCredential`, where unknown own identity IS a refusal — there,
  * restoring would pair the guest's identity with this profile's credential,
  * which is active harm rather than a missing precondition.
+ *
+ * ...EXCEPT that "unknown own" and "nothing parked" are not the same state
+ * (residual of 0e7069a9). A dir can hold a parked CREDENTIAL with no parked
+ * IDENTITY, and then there IS a claim to defend and no way to attribute it. See
+ * `parkedCredentialIsUnattributable` for that leg.
  */
 export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): boolean {
   const own = identityToken(oauthRecordFromSnapshot(profileDir));
-  if (!own) return false;
+  if (!own) return parkedCredentialIsUnattributable(profileDir);
   const live = identityToken(liveOAuthRecordUnfiltered(profileDir, tool));
   if (!live) return false;
   return own !== live;
+}
+
+/**
+ * A NON-REVERSIBLE fingerprint of a credential's refresh token, for deciding
+ * whether two files hold the SAME credential. The token value is never
+ * returned, logged, or compared as plaintext by callers.
+ *
+ * The refresh token is the right field: it is what survives an access-token
+ * renewal, so two files holding one credential agree on it, and it is exactly
+ * what a rotation destroys for the loser.
+ */
+function credentialRefreshFingerprint(path: string): string | undefined {
+  const oauth = readJsonFile(path)?.claudeAiOauth;
+  if (!oauth || typeof oauth !== "object") return undefined;
+  const refresh = (oauth as JsonRecord).refreshToken;
+  if (typeof refresh !== "string" || refresh.length === 0) return undefined;
+  return createHash("sha256").update(refresh, "utf8").digest("hex");
+}
+
+/**
+ * Is there a parked credential this profile cannot attribute to any account?
+ *
+ * THE RESIDUAL THIS CLOSES (task 1cf9bcaf, on top of 0e7069a9). The identity
+ * gate keys on the parked OAUTH snapshot, and treats its absence as "first
+ * capture, nothing to defend". But the credential snapshot and the identity
+ * snapshot are written by two independent conditions, so they can come apart: a
+ * dir holding `.credentials.json` with no account file yet parks the credential
+ * and not the identity. From that state an in-session `/login` to another
+ * account walked straight through the gate and replaced the parked credential —
+ * measured, with the host's token replaced by the guest's.
+ *
+ * THE RULE. When nothing is parked, this is genuinely first capture: permit.
+ * When a credential IS parked but no identity is, compare the parked credential
+ * with the dir's live one by fingerprint:
+ *
+ *   - SAME credential — the dir still holds what we parked, so a live account
+ *     file that has just appeared plausibly describes it. Permit, so the profile
+ *     can finally acquire the identity it was missing. This is the ordinary
+ *     "credential written, account file written a moment later" sequence.
+ *   - DIFFERENT credential — the dir now holds someone else's material and we
+ *     cannot say whose the parked copy is. Refuse. Preserving an unattributable
+ *     credential costs a delayed refresh; overwriting it destroys the only copy.
+ *
+ * Note that `ensureProfileAuthSnapshot` no longer CREATES this state (it will
+ * not park a credential it cannot attribute), so this leg exists for dirs that
+ * already carry the residue. `accounts login <profile>` resolves any that are
+ * stuck, because that path passes `overwrite` and means "these files are this
+ * profile's truth again".
+ */
+export function parkedCredentialIsUnattributable(profileDir: string): boolean {
+  const parked = profileCredentialsSnapshot(profileDir);
+  if (!existsSync(parked)) return false; // genuine first capture
+  const parkedPrint = credentialRefreshFingerprint(parked);
+  const livePrint = credentialRefreshFingerprint(join(profileDir, DIR_CREDENTIALS_FILE));
+  // A fingerprint we cannot compute cannot prove a conflict. Failing open here
+  // is deliberate and narrow: the write it permits is still subject to
+  // `wouldDowngradeSnapshot`, so a refresh-token-less file cannot win.
+  if (!parkedPrint || !livePrint) return false;
+  return parkedPrint !== livePrint;
+}
+
+/** True when the profile has a parked identity it can attribute a credential to. */
+export function profileHasParkedIdentity(profileDir: string): boolean {
+  return identityToken(oauthRecordFromSnapshot(profileDir)) !== undefined;
 }
 
 /**
@@ -326,7 +397,7 @@ function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): 
   const liveFilesAreForeign = switchMarkerFilePresent(profileDir) || dirLiveIdentityIsForeign(profileDir, tool);
   const candidatePaths = liveFilesAreForeign
     ? [profileCredentialsSnapshot(profileDir)]
-    : [profileCredentialsSnapshot(profileDir), join(profileDir, ".credentials.json")];
+    : [profileCredentialsSnapshot(profileDir), join(profileDir, DIR_CREDENTIALS_FILE)];
   const candidates = candidatePaths
     .filter((path) => existsSync(path) && !lstatSync(path).isSymbolicLink())
     .map((path) => ({ path, health: credentialHealth(path) }))
