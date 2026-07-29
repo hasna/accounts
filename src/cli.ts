@@ -1579,12 +1579,12 @@ auth
   .description("mirror every claude profile's auth snapshot into the central store")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
-      const store = loadStore();
+    action(async (opts: { json?: boolean }) => {
+      const profiles = await resolveStore().listProfiles();
       type MigrateRow = { profile: string; dir: string; skipped?: string; error?: string } & Partial<SyncResult>;
       const rows: MigrateRow[] = [];
       let failures = 0;
-      for (const profile of store.profiles) {
+      for (const profile of profiles) {
         if (profile.tool !== "claude") {
           rows.push({ profile: profile.name, dir: profile.dir, skipped: `tool ${profile.tool} has no claude auth snapshot` });
           continue;

@@ -14,6 +14,22 @@ function runCli(...args: string[]) {
   });
 }
 
+async function runCliAsync(env: NodeJS.ProcessEnv, ...args: string[]) {
+  const child = Bun.spawn({
+    cmd: [process.execPath, "run", "src/cli.ts", ...args],
+    cwd: process.cwd(),
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [status, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { status, stdout, stderr };
+}
+
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-auth-cli-"));
 });
@@ -29,6 +45,21 @@ function writeIdentity(dir: string, uuid: string, email: string): void {
   writeFileSync(join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: email } }));
   writeFileSync(
     join(dir, ".credentials.json"),
+    JSON.stringify({
+      claudeAiOauth: { accessToken: `${email}-access`, refreshToken: `${email}-refresh`, expiresAt: Date.now() + 60_000 },
+    }),
+  );
+}
+
+function writeParkedIdentity(dir: string, uuid: string, email: string): void {
+  const authDir = join(dir, ".accounts-auth");
+  mkdirSync(authDir, { recursive: true });
+  writeFileSync(
+    join(authDir, "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: email } }),
+  );
+  writeFileSync(
+    join(authDir, "credentials.json"),
     JSON.stringify({
       claudeAiOauth: { accessToken: `${email}-access`, refreshToken: `${email}-refresh`, expiresAt: Date.now() + 60_000 },
     }),
@@ -62,6 +93,72 @@ test("auth migrate populates the central store and auth status reports it", () =
   expect(account?.central).toBe(true);
   expect(account?.email).toBe("cli@example.com");
   expect(account?.doors.some((d) => d.role === "own-identity" && d.profileName === "cliprof")).toBe(true);
+});
+
+test("auth migrate reads every profile from the active API registry, not the local registry", async () => {
+  const localDir = join(home, "local-only");
+  writeIdentity(localDir, "44444444-dddd-4ddd-8ddd-444444444444", "local@example.com");
+  expect(runCli("add", "local-only", "--dir", localDir).status).toBe(0);
+
+  const remoteProfiles = [
+    {
+      name: "remote-one",
+      tool: "claude",
+      dir: join(home, "remote-one"),
+      uuid: "55555555-eeee-4eee-8eee-555555555555",
+      email: "remote-one@example.com",
+    },
+    {
+      name: "remote-two",
+      tool: "claude",
+      dir: join(home, "remote-two"),
+      uuid: "66666666-ffff-4fff-8fff-666666666666",
+      email: "remote-two@example.com",
+    },
+  ];
+  for (const profile of remoteProfiles) writeParkedIdentity(profile.dir, profile.uuid, profile.email);
+
+  const requestedUrls: string[] = [];
+  const api = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      requestedUrls.push(request.url);
+      return Response.json({
+        accounts: remoteProfiles.map(({ uuid: _uuid, email, ...profile }) => ({
+          ...profile,
+          email,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        })),
+      });
+    },
+  });
+
+  try {
+    const migrate = await runCliAsync(
+      {
+        ...process.env,
+        ACCOUNTS_HOME: home,
+        HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: `http://127.0.0.1:${api.port}`,
+        HASNA_ACCOUNTS_API_KEY: "hasna_accounts_testkey_0000",
+      },
+      "auth",
+      "migrate",
+      "--json",
+    );
+    expect(migrate.status, migrate.stderr).toBe(0);
+    const rows = JSON.parse(migrate.stdout) as Array<{ profile: string; synced?: boolean }>;
+    expect(rows.map((row) => row.profile)).toEqual(["remote-one", "remote-two"]);
+    expect(rows.every((row) => row.synced)).toBe(true);
+    expect(requestedUrls.some((url) => new URL(url).pathname === "/v1/accounts")).toBe(true);
+    for (const profile of remoteProfiles) {
+      expect(existsSync(join(home, "auth", profile.uuid, "credentials.json"))).toBe(true);
+      expect(existsSync(join(home, "auth", profile.uuid, "oauth-account.json"))).toBe(true);
+    }
+  } finally {
+    api.stop(true);
+  }
 });
 
 test("auth sweep dry-runs by default and only --delete trashes orphans", () => {
