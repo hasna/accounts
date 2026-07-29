@@ -39,7 +39,7 @@ import {
   sweepCentralAuth,
   type SyncResult,
 } from "./lib/auth-store.js";
-import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
+import { ensureProfileAuthSnapshot, recoverParkedCredential } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
@@ -49,7 +49,7 @@ import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
-import { resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
 import { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
 import {
   DEFAULT_COOLDOWN_MS,
@@ -81,6 +81,11 @@ import {
   hookOutputJson,
   runUsageHook,
 } from "./lib/usage-hook.js";
+import {
+  describeCredentialState,
+  parkedCredentialVerdict,
+  profileCredentialLayers,
+} from "./lib/credential-state.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -1122,6 +1127,9 @@ program
             // every other session for ten minutes, silently.
             readState: () => readAutoSwitchState(configDir),
             writeState: (state) => writeAutoSwitchState(state, configDir),
+            // Contention detection: an account another dir is actively running
+            // must not be taken as a switch target.
+            liveSessionsIn: (dir) => listDirLiveSessions(dir).filter((session) => session.alive).length,
             readNotices: () => readHookNoticeState(),
             writeNotices: (state) => writeHookNoticeState(state),
             activeCooldowns: (at) => activeCooldowns(readExhaustionLedger(), at),
@@ -1170,6 +1178,68 @@ program
       }
       process.exitCode = 0;
     },
+  );
+
+program
+  .command("repair-auth")
+  .argument("[name]", "profile to repair (all Claude profiles when omitted)")
+  .description("put a profile's parked credential back when its live copy was rotated away by another copy of the same account")
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("--dry-run", "report what would be repaired without writing anything")
+  .option("--json", "output JSON")
+  .action(
+    action(async (name: string | undefined, opts: { tool: string; dryRun?: boolean; json?: boolean }) => {
+      const tool = getTool(opts.tool);
+      const store = resolveStore();
+      const profiles = (await store.listProfiles(opts.tool)).filter((p) => (name ? p.name === name : true));
+      if (name && profiles.length === 0) throw new AccountsError(`no profile named "${name}" for tool "${opts.tool}"`);
+
+      const rows = profiles.map((profile) => {
+        const layers = profileCredentialLayers(profile.dir, tool);
+        const verdict = parkedCredentialVerdict(layers);
+        // --dry-run must not write, so it reports the verdict instead of acting.
+        const result = opts.dryRun
+          ? {
+              outcome: verdict.recoverable ? ("would-recover" as const) : ("nothing-to-do" as const),
+              detail: verdict.recoverable
+                ? `parked copy in the ${verdict.restorableLayers.join(" and ")} would be restored`
+                : `live credential is ${describeCredentialState(layers.live.state)}`,
+            }
+          : recoverParkedCredential(profile.dir, tool, profile.name);
+        return {
+          profile: profile.name,
+          dir: profile.dir,
+          live: layers.live.state,
+          snapshot: layers.snapshot.state,
+          ...(layers.central ? { central: layers.central.state } : {}),
+          outcome: result.outcome,
+          detail: result.detail,
+        };
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify({ dryRun: Boolean(opts.dryRun), profiles: rows }, null, 2));
+        return;
+      }
+      const acted = rows.filter((r) => r.outcome === "recovered" || r.outcome === "would-recover");
+      const blocked = rows.filter((r) => r.outcome === "identity-would-change" || r.outcome === "no-parked-credential");
+      console.log("");
+      for (const row of [...acted, ...blocked]) {
+        const colour =
+          row.outcome === "recovered" || row.outcome === "would-recover"
+            ? chalk.green
+            : row.outcome === "no-parked-credential"
+              ? chalk.red
+              : chalk.yellow;
+        console.log(`  ${chalk.bold(row.profile)} — ${colour(row.outcome)}`);
+        console.log(chalk.dim(`    live=${row.live} snapshot=${row.snapshot}${row.central ? ` central=${row.central}` : ""}`));
+        console.log(chalk.dim(`    ${row.detail}`));
+      }
+      if (acted.length === 0 && blocked.length === 0) {
+        console.log(chalk.dim(`  nothing to repair across ${rows.length} profile(s)`));
+      }
+      console.log("");
+    }),
   );
 
 const hook = program.command("hook").description("install a shell wrapper for claude");

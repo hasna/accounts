@@ -96,13 +96,23 @@ export interface SwitchCandidate {
 export type NoCandidateReason = "no-accounts" | "no-usage-data" | "all-limited";
 
 /**
- * Why an account was not a candidate. The two exhaustion reasons are kept
- * distinct on purpose: `weekly-exhausted` means unusable for days,
- * `session-exhausted` means unusable for minutes-to-hours.
+ * Why an account was not a candidate.
+ *
+ * `contended` is the one that is not about the account's own health: another
+ * config dir on this machine is already running a live session as it. Switching
+ * a second dir onto the same account puts two Claude Code processes behind one
+ * OAuth refresh token, and refresh tokens ROTATE — the first to refresh
+ * invalidates the copy the other still holds, the loser's refresh fails, and its
+ * `.credentials.json` is blanked in place. Measured on this fleet 2026-07-29:
+ * six of twenty-three profile dirs had been blanked that way, each within
+ * seconds to minutes of a sibling dir holding the same account refreshing.
+ * Because the usage hook switches automatically, every unguarded switch could
+ * add another pair.
  */
 export type ExclusionReason =
   | "current-account"
   | "credential"
+  | "contended"
   | "no-usage-data"
   | "weekly-exhausted"
   | "session-exhausted"
@@ -146,6 +156,12 @@ export interface SelectionOptions {
   minSessionHeadroom?: number;
   /** uuid -> ISO time before which the account must not be re-selected. */
   cooldowns?: ReadonlyMap<string, string>;
+  /**
+   * Accounts a live session in ANOTHER config dir is already running. Switching
+   * onto one of these creates the two-copies-one-account state that
+   * refresh-token rotation then resolves by destroying a credential.
+   */
+  contendedAccounts?: ReadonlySet<string>;
   now?: Date;
 }
 
@@ -210,6 +226,13 @@ export function selectHealthiestAccount(
     // below every currently-valid one. See isUsableIdentity.
     if (!isUsableIdentity(entry.identity)) {
       excluded.push({ accountUuid: uuid, reason: "credential" });
+      continue;
+    }
+    // Before health, because this is not a question about the account: taking a
+    // second live copy of it is what destroys credentials, however healthy it
+    // looks.
+    if (opts.contendedAccounts?.has(uuid)) {
+      excluded.push({ accountUuid: uuid, reason: "contended" });
       continue;
     }
     if (!entry.usage) {
