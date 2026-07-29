@@ -171,6 +171,18 @@ test("selector reports no-usage-data when nothing eligible has been measured", (
   expect(picked.reason).toBe("no-usage-data");
 });
 
+test("selector does not call a mixed limited and unmeasured pool all-limited", () => {
+  const picked = selectHealthiestAccount(
+    [
+      { identity: identity("uuid-limited", "limited@x.com"), usage: usage(0) },
+      { identity: identity("uuid-unmeasured", "unknown@x.com") },
+    ],
+    { currentUuid: "uuid-current", minHeadroom: 25 },
+  );
+  expect(picked.candidate).toBeUndefined();
+  expect(picked.reason).toBe("no-usage-data");
+});
+
 test("selector is deterministic on headroom ties (lowest uuid wins)", () => {
   const entries = [
     { identity: identity("uuid-zzz", "z@x.com"), usage: usage(80) },
@@ -232,6 +244,26 @@ test("usage cache round-trips per account uuid and expires by max age", () => {
   expect(readUsageCache("uuid-cache", 60_000)?.usage?.headroom).toBe(55);
   expect(readUsageCache("uuid-cache", 60_000, new Date(Date.now() + 120_000))).toBeUndefined();
   expect(readUsageCache("uuid-unknown", 60_000)).toBeUndefined();
+});
+
+test("usage endpoint HTTP 429 preserves the last successful cache reading", () => {
+  const fetchedAt = new Date(Date.now() - 60_000).toISOString();
+  writeUsageCache({
+    accountUuid: "uuid-throttled",
+    usage: usage(80),
+    fetchedAt,
+  });
+
+  writeUsageCache({
+    accountUuid: "uuid-throttled",
+    fetchedAt: new Date().toISOString(),
+    error: { kind: "http", message: "usage endpoint returned HTTP 429", status: 429 },
+  });
+
+  const cached = readUsageCache("uuid-throttled", 120_000);
+  expect(cached?.usage?.headroom).toBe(80);
+  expect(cached?.fetchedAt).toBe(fetchedAt);
+  expect(cached?.error).toBeUndefined();
 });
 
 test("usage cache refuses path-hostile account uuids", () => {

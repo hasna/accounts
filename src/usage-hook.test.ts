@@ -198,6 +198,32 @@ test("all accounts limited: reports honestly, switches nothing, does not flap", 
   expect(outcome.systemMessage).toMatch(/all .*limited|no account has headroom/i);
 });
 
+test("a usage-endpoint 429 is unknown health, not evidence that all accounts are limited", async () => {
+  const { deps, calls } = harness({
+    currentUuid: "uuid-cur",
+    cache: {
+      "uuid-cur": { accountUuid: "uuid-cur", usage: usage(5), fetchedAt: "x" },
+      "uuid-limited": { accountUuid: "uuid-limited", usage: usage(3), fetchedAt: "x" },
+      "uuid-throttled": {
+        accountUuid: "uuid-throttled",
+        fetchedAt: "x",
+        error: { kind: "http", message: "usage endpoint returned HTTP 429", status: 429 },
+      },
+    },
+    identities: [
+      identity("uuid-cur", "tired@example.com", "tired-profile"),
+      identity("uuid-limited", "also-tired@example.com", "limited-profile"),
+      identity("uuid-throttled", "unknown@example.com", "unknown-profile"),
+    ],
+  });
+
+  const outcome = await runUsageHook(OPTS, deps);
+  expect(outcome.action).toBe("none");
+  expect(outcome.reason).toBe("no-usage-data");
+  expect(calls.switches).toHaveLength(0);
+  expect(outcome.systemMessage).not.toMatch(/all known accounts are limited/i);
+});
+
 test("hookOutputJson emits UserPromptSubmit hookSpecificOutput and omits empty outcomes", () => {
   expect(hookOutputJson({ action: "none" })).toBeUndefined();
   const json = hookOutputJson({

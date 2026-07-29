@@ -377,12 +377,13 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
       });
     }
     const contended = selection.excluded.filter((e) => e.reason === "contended").length;
+    const unmeasured = selection.excluded.filter((e) => e.reason === "no-usage-data").length;
     const detail =
       contended > 0
         ? `${contended} account${contended === 1 ? " is" : "s are"} already being run by another session and ` +
           `cannot be shared — a second copy would get its token rotated away`
         : selection.reason === "no-usage-data"
-          ? `no other account has been measured yet (${selection.excluded.length} known)`
+          ? `${unmeasured} other account${unmeasured === 1 ? " has" : "s have"} no usable usage measurement`
           : `no other usable account is registered on this machine`;
     return degraded(opts, deps, clock, "no-candidate", {
       action: "none",

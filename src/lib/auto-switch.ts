@@ -46,6 +46,15 @@ export interface UsageCacheEntry {
 }
 
 export function writeUsageCache(entry: UsageCacheEntry): void {
+  // The usage endpoint can throttle the cache warmer independently of the
+  // account's model quota. Do not let that transient 429 erase the last
+  // successful measurement: the hook can safely use the old reading until its
+  // normal stale bound expires. Keep the original fetchedAt as well, otherwise
+  // a failed refresh would make old usage look fresh forever.
+  if (entry.error?.kind === "http" && entry.error.status === 429 && !entry.usage) {
+    const previous = readUsageCache(entry.accountUuid, Number.POSITIVE_INFINITY);
+    if (previous?.usage) return;
+  }
   const path = usageCachePath(entry.accountUuid);
   mkdirSync(usageCacheDir(), { recursive: true });
   writeFileAtomic(path, JSON.stringify(entry, null, 2) + "\n", {
@@ -296,8 +305,11 @@ export function selectHealthiestAccount(
   }
 
   if (eligible.length === 0) {
-    if (considered > 0) return { ranked: [], reason: "all-limited", considered, excluded };
+    // `all-limited` is only honest when every usable alternative was measured.
+    // A usage-endpoint failure (notably HTTP 429) leaves an account unmeasured;
+    // it is not evidence that the account itself has exhausted its model quota.
     if (measurable > 0) return { ranked: [], reason: "no-usage-data", considered, excluded };
+    if (considered > 0) return { ranked: [], reason: "all-limited", considered, excluded };
     return { ranked: [], reason: "no-accounts", considered, excluded };
   }
 
