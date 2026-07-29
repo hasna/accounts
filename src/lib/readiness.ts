@@ -36,6 +36,13 @@ export interface AccountsProfileLoginReadiness {
   credentialExpiresAt?: string;
   keychainSnapshotPresent?: boolean;
   snapshotPresent?: boolean;
+  /**
+   * The profile's config dir currently carries a DIFFERENT account. Every
+   * credential field above then describes this profile's own parked copy, and
+   * the profile cannot launch until the dir is reconciled — so this is reported
+   * explicitly rather than left to be inferred from an expiry.
+   */
+  dirOccupiedByAnotherAccount?: boolean;
   reasons: string[];
   nextActions: string[];
 }
@@ -202,10 +209,22 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
   const health = claudeProfileAuthHealth(profile.dir, tool);
   const status: AccountsReadinessStatus =
     health.status === "ok" ? "ok" : health.status === "unknown" ? "degraded" : "unavailable";
-  const nextActions =
-    status === "ok"
+  // An occupied dir needs reconciling, not re-authenticating: the profile's own
+  // credential is parked and intact, and telling an operator to re-login would
+  // send them through a browser flow that fixes nothing. Named first so it is
+  // the action they read.
+  const nextActions = [
+    ...(health.dirOccupiedByAnotherAccount
+      ? [
+          `Profile ${profile.name}'s config dir currently carries another account. ` +
+            `Reconcile it with accounts switch-account ${profile.name} --dir ${profile.dir} ` +
+            `(its own credential is parked, so re-authenticating is not the fix).`,
+        ]
+      : []),
+    ...(status === "ok"
       ? []
-      : [`Run accounts login ${profile.name} --tool ${tool.id} to refresh the Claude auth snapshot.`];
+      : [`Run accounts login ${profile.name} --tool ${tool.id} to refresh the Claude auth snapshot.`]),
+  ];
   return {
     status,
     validator: "claude-auth-snapshot",
@@ -218,6 +237,7 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
     ...(health.credentialExpiresAt ? { credentialExpiresAt: health.credentialExpiresAt } : {}),
     keychainSnapshotPresent: health.keychainSnapshotPresent,
     snapshotPresent: health.snapshotPresent,
+    dirOccupiedByAnotherAccount: health.dirOccupiedByAnotherAccount,
     reasons: health.reasons,
     nextActions,
   };

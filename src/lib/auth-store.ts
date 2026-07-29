@@ -246,11 +246,33 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
  * which is active harm rather than a missing precondition.
  */
 export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): boolean {
+  return dirLiveIdentityRelation(profileDir, tool) === "foreign";
+}
+
+/**
+ * How the dir's LIVE account relates to the profile's OWN parked identity.
+ *
+ * `dirLiveIdentityIsForeign` above collapses everything that is not a proven
+ * conflict into `false`, which is the right answer for the WRITE paths it
+ * guards: they must fail OPEN on an unreadable identity or a profile would
+ * never acquire its first snapshot. Read paths need the third answer as well.
+ * "The dir is provably its own" and "we cannot tell" call for different
+ * fallbacks — the first lets a stale switch marker be disregarded, the second
+ * must fail CLOSED on it — and a boolean cannot express that.
+ *
+ *   own          both identities readable and equal
+ *   foreign      both readable and different
+ *   own-unknown  the profile has no parked identity (first capture)
+ *   live-unknown the dir's live account file carries no readable identity
+ */
+export type DirLiveIdentityRelation = "own" | "foreign" | "own-unknown" | "live-unknown";
+
+export function dirLiveIdentityRelation(profileDir: string, tool?: ToolDef): DirLiveIdentityRelation {
   const own = identityToken(oauthRecordFromSnapshot(profileDir));
-  if (!own) return false;
+  if (!own) return "own-unknown";
   const live = identityToken(liveOAuthRecordUnfiltered(profileDir, tool));
-  if (!live) return false;
-  return own !== live;
+  if (!live) return "live-unknown";
+  return own === live ? "own" : "foreign";
 }
 
 /**
