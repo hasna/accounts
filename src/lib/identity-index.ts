@@ -345,10 +345,13 @@ export function buildIdentityIndex(
 
     // Layer A — whoever's account currently occupies the dir's live files.
     // Read BEFORE layer B so the owner's door can record that it is displaced;
-    // both layers are read from the same dir in the same pass, so this is a
-    // reordering, not an extra read.
-    const livePaths = profileAccountJsonPaths(dir, tool);
-    const occupant = oauthIdentityFrom(livePaths.length > 0 ? readJson(livePaths[0]!) : undefined);
+    // both layers are read from the same profile layout in one pass, so this is
+    // a reordering rather than a second profile scan.
+    let occupant: OAuthIdentity | undefined;
+    for (const path of profileAccountJsonPaths(dir, tool)) {
+      occupant = oauthIdentityFrom(readJson(path));
+      if (occupant) break;
+    }
 
     // Layer B — the dir's OWN identity (survives in-place switches away).
     //
@@ -380,7 +383,7 @@ export function buildIdentityIndex(
         },
         snapshotOwn
           ? credentialRef(profileCredentialsSnapshot(dir), "profile-snapshot")
-          : credentialRef(join(dir, ".credentials.json"), "dir-live"),
+          : credentialRef(dirCredentialsFile(dir), "dir-live"),
       );
     }
 

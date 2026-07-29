@@ -112,6 +112,30 @@ test("a registered live-only profile is an owning door before any auth snapshot 
   );
 });
 
+test("a live-only default profile reads its identity from the parent account file", () => {
+  const uuid = "cccccccc-3333-4333-8333-cccccccccccc";
+  const fakeHome = makeDir("default-home");
+  const dir = join(fakeHome, ".claude");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(fakeHome, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: "default@example.com" } }),
+  );
+  writeFileSync(join(dir, ".credentials.json"), credentialJson({ uuid, email: "default@example.com" }));
+
+  const defaultTool = { ...tool(), defaultDir: dir };
+  const index = buildIdentityIndex([{ name: "default", dir }], defaultTool);
+  const identity = index.find((entry) => entry.accountUuid === uuid);
+
+  expect(identity).toBeDefined();
+  expect(identity!.doors).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ dir, role: "own-identity", profileName: "default" }),
+      expect.objectContaining({ dir, role: "current-occupant", profileName: "default" }),
+    ]),
+  );
+});
+
 test("a switch marker prevents a live-only occupant from becoming the profile owner", () => {
   const uuid = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
   const dir = makeDir("marked-live-only");
