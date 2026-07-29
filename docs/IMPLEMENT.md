@@ -4,9 +4,13 @@ For contributors and coding agents working in this repo.
 
 ## Three-pointer model
 
-Profiles are keyed by **tool + name**. The same name can be reused across tools
-(`work` for Claude, Codex, Cursor, etc.). Bare name lookup is allowed only when
-it resolves to one profile; otherwise commands must pass `--tool`.
+Profiles are keyed by **tool + name**, and an account name is unique to exactly
+one tool: creating or renaming into a name already held under a different tool
+is refused on both transports (`nameConflict` in `src/lib/profiles.ts` and
+`src/server/repo.ts`). Registries written before that rule may still hold the
+same name under several tools; those rows stay resolvable — bare name lookup is
+allowed only when it resolves to one profile (or a tool lock disambiguates),
+otherwise commands must pass `--tool`.
 
 Each tool (e.g. `claude`) tracks **two registry pointers** plus an optional **isolated runtime** mode:
 
