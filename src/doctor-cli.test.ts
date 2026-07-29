@@ -16,6 +16,29 @@ function runCli(sharedHomeForRun: string, ...args: string[]) {
   });
 }
 
+async function runCloudDoctor(sharedHomeForRun: string, apiUrl: string) {
+  const child = Bun.spawn({
+    cmd: [process.execPath, "run", "src/cli.ts", "doctor"],
+    cwd: process.cwd(),
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      ACCOUNTS_HOME: home,
+      ACCOUNTS_SHARED_HOME_CLAUDE: sharedHomeForRun,
+      HASNA_ACCOUNTS_STORAGE_MODE: "self_hosted",
+      HASNA_ACCOUNTS_API_URL: apiUrl,
+      HASNA_ACCOUNTS_API_KEY: "hasna_accounts_testkey_0000",
+    },
+  });
+  const [status, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { status, stdout, stderr };
+}
+
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-doctor-cli-"));
   sharedHome = join(home, "shared-claude");
@@ -58,4 +81,27 @@ test("doctor passes a profile created with the shared home available", () => {
   const result = runCli(sharedHome, "doctor");
   expect(result.status).toBe(0);
   expect(result.stdout).toContain("healthy.");
+});
+
+test("doctor prints the hosted registry location in cloud mode", async () => {
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/v1/accounts") return Response.json({ accounts: [] });
+      if (path === "/v1/current") return Response.json({ current: [] });
+      return Response.json({ error: "not found" }, { status: 404 });
+    },
+  });
+  const apiUrl = `http://127.0.0.1:${server.port}`;
+
+  try {
+    const result = await runCloudDoctor(sharedHome, apiUrl);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`store: ${apiUrl}/v1`);
+    expect(result.stdout).not.toContain(join(home, "accounts.json"));
+  } finally {
+    server.stop(true);
+  }
 });

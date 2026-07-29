@@ -30,6 +30,7 @@ import {
   profilesDir,
   reconcileMachineProfileRemove,
   reconcileMachineProfileRename,
+  storePath,
 } from "../storage.js";
 import {
   DEFAULT_TOOL,
@@ -102,6 +103,7 @@ export interface AccountsStore {
 /** On-box JSON registry. Delegates to the core profile library. */
 class LocalStore implements AccountsStore {
   readonly transport = "local" as const;
+  readonly registryLocation = storePath();
 
   async listProfiles(tool?: string): Promise<Profile[]> {
     return localList(tool);
@@ -159,8 +161,11 @@ class LocalStore implements AccountsStore {
  */
 class ApiStore implements AccountsStore {
   readonly transport = "api" as const;
+  readonly registryLocation: string;
 
-  constructor(private readonly api: AccountsCloudApi) {}
+  constructor(private readonly api: AccountsCloudApi) {
+    this.registryLocation = api.baseUrl;
+  }
 
   async listProfiles(tool?: string): Promise<Profile[]> {
     const profiles = await this.api.list(tool);
@@ -386,7 +391,7 @@ function prepareProfileDirectory(dir: string, managed: boolean): boolean {
 export function resolveStore(
   env: NodeJS.ProcessEnv = process.env,
   overrides?: Parameters<typeof resolveAccountsCloud>[1],
-): AccountsStore {
+): AccountsStore & { readonly registryLocation: string } {
   const cloud = resolveAccountsCloud(env, overrides);
   if (cloud.transport === "cloud-http") return new ApiStore(cloud.api);
   clearCustomToolsCache();

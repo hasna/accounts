@@ -7,7 +7,7 @@ import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
 import { loginToolChoices, prepareLogin } from "./lib/login.js";
 import { importProfile } from "./lib/import-profile.js";
-import { loadMachineStore, saveStore } from "./storage.js";
+import { loadMachineStore, saveStore, storePath } from "./storage.js";
 
 const BASE = "https://accounts.hasna.xyz";
 const KEY = "hasna_accounts_testkey_0000";
@@ -32,11 +32,15 @@ function mockFetch(routes: (call: Call) => { status: number; body: unknown }) {
 
 describe("resolveStore transport selection", () => {
   test("LocalStore when API env is unset", () => {
-    expect(resolveStore({} as NodeJS.ProcessEnv).transport).toBe("local");
+    const store = resolveStore({} as NodeJS.ProcessEnv);
+    expect(store.transport).toBe("local");
+    expect(store.registryLocation).toBe(storePath());
   });
 
   test("ApiStore when API URL+KEY are set", () => {
-    expect(resolveStore(cloudEnv).transport).toBe("api");
+    const store = resolveStore(cloudEnv);
+    expect(store.transport).toBe("api");
+    expect(store.registryLocation).toBe(`${BASE}/v1`);
   });
 
   test("forced local mode uses LocalStore even with URL+KEY", () => {

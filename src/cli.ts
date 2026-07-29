@@ -30,7 +30,6 @@ import {
   storagePull,
   storagePush,
   storageSync,
-  storePath,
 } from "./storage.js";
 import {
   centralCredentialsSnapshot,
@@ -1982,8 +1981,8 @@ program
   )
   .action(
     action(async (opts: { acceptCapabilityBaseline?: boolean }) => {
-      console.log(chalk.bold(`store: ${storePath()}`));
       const store = resolveStore();
+      console.log(chalk.bold(`store: ${store.registryLocation}`));
       if (opts.acceptCapabilityBaseline) {
         for (const tool of listTools()) resetCapabilityBaseline(tool);
         console.log(chalk.dim("  capability corpus floors re-recorded at their current size"));
