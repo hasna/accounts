@@ -9,6 +9,7 @@ dist/
 .hasna/
 .secrets/
 coverage/
+.drain-npm-cache/
 
 # projects CLI generates a machine-specific CLAUDE.md (local only)
 CLAUDE.md
