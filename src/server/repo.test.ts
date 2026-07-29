@@ -165,9 +165,18 @@ describe("AccountsRepo advisory lock keys", () => {
     expect(fixture.lockKeys).toEqual([accountNameLockKey("alpha")]);
   });
 
-  test("rename takes no tool lock, so tool and name locks cannot cycle", async () => {
+  test("rename takes name locks and NO tool lock, so the two lock kinds cannot cycle", async () => {
+    // Deadlock freedom rests on rename never wanting a tool lock while holding
+    // a name lock, since `create` takes them the other way round.
+    //
+    // The tool-lock half alone is not evidence: before this change `rename`
+    // took no advisory lock of any kind, so asserting "no tool lock" passed
+    // identically pre- and post-fix. The name-lock assertion is what makes this
+    // test able to fail — it is empty on the old code — and the two together
+    // state the actual invariant rather than half of it.
     const fixture = lockRecordingClient("alpha");
     await new AccountsRepo(fixture.client).rename("claude", "alpha", "beta");
+    expect(fixture.lockKeys.filter((key) => key.startsWith("accounts:name:")).length).toBeGreaterThan(0);
     expect(fixture.lockKeys.filter((key) => key.startsWith("accounts:tool:"))).toEqual([]);
   });
 });

@@ -192,12 +192,22 @@ export class AccountsRepo implements AccountsStore {
   /**
    * Find the account holding `name` under ANY tool.
    *
-   * An account name identifies exactly one tool: the name is also the profile
-   * DIRECTORY name, and two tools claiming one directory name is the ambiguity
-   * this whole change exists to close. So the conflict a writer has to look for
-   * is name-scoped, not (tool,name)-scoped — the callers below hold the name
-   * lock while they ask, which is what makes the answer still true by the time
-   * they act on it.
+   * An account name has to identify exactly one tool because RESOLUTION is
+   * name-first: `resolveProfileFromStore` (src/lib/profiles.ts) looks a profile
+   * up by name and, when no `--tool` is given, throws `profile "<name>" exists
+   * for multiple tools` the moment two rows share it. A name claimed by two
+   * tools therefore breaks every bare `accounts <cmd> <name>` for that name —
+   * that is the ambiguity this change closes.
+   *
+   * NOT because the name is the profile directory name. It is not: managed dirs
+   * are tool-namespaced — `join(profilesDir(), toolId, name)` in
+   * src/lib/profiles.ts, src/lib/login.ts and src/lib/store.ts — so two tools
+   * sharing a name produce two DISTINCT directories, and directory collision
+   * has its own independent guard (`sameConfigDir`, src/lib/profiles.ts).
+   *
+   * So the conflict a writer has to look for is name-scoped, not
+   * (tool,name)-scoped — and the callers below hold the name lock while they
+   * ask, which is what makes the answer still true by the time they act on it.
    */
   private async findByName(
     client: TypedQueryClient,
