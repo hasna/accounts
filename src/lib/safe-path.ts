@@ -12,7 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { AccountsError } from "../types.js";
 
 function lstatIfExists(path: string) {
@@ -116,6 +116,40 @@ function ensureDirectoryChainSafe(parent: string, startAt?: string): void {
       assertDirectory(cursor, "refusing to write under symlink directory");
     }
   }
+}
+
+/**
+ * A config dir's canonical identity: the deepest existing ancestor resolved
+ * through symlinks, with the not-yet-created tail appended.
+ *
+ * Lives in this leaf module rather than in the registry so that everything
+ * asking "are these two entries the same directory" — profile creation, profile
+ * updates, and the identity index's cross-directory reasoning — answers it the
+ * same way. Two answers to that question is how one directory becomes two
+ * doors, which is the shape of the credential-destroying bug this codebase
+ * keeps circling.
+ */
+export function canonicalConfigDir(dir: string): string {
+  const resolved = resolve(dir);
+  const missing: string[] = [];
+  let cursor = resolved;
+
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) return resolved;
+    missing.unshift(basename(cursor));
+    cursor = parent;
+  }
+
+  try {
+    return join(realpathSync(cursor), ...missing);
+  } catch {
+    return resolved;
+  }
+}
+
+export function sameConfigDir(a: string, b: string): boolean {
+  return canonicalConfigDir(a) === canonicalConfigDir(b);
 }
 
 /** Refuse writes through symlinks; optionally confine to a base directory. */

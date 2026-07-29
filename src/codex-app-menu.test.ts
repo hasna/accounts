@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, currentProfile, useProfile } from "./lib/profiles.js";
+import { saveStore } from "./storage.js";
+import type { AccountsStore } from "./lib/store.js";
 import {
   codexAppMenuState,
   codexAppMenuSwiftSource,
@@ -12,6 +14,16 @@ import {
 
 let home: string;
 let previousStorageMode: string | undefined;
+
+function apiProfile() {
+  return {
+    name: "desktop",
+    tool: "codex-app",
+    email: "desktop@example.com",
+    dir: join(home, "remote-profile-dir"),
+    createdAt: "2026-07-27T00:00:00.000Z",
+  };
+}
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-menu-test-"));
@@ -41,6 +53,31 @@ test("codex app menu state lists profiles with active marker", async () => {
   expect(state.profiles.map((profile) => profile.name)).toEqual(["personal", "work"]);
   expect(state.profiles.find((profile) => profile.name === "work")?.active).toBe(true);
   expect(state.profiles.find((profile) => profile.name === "personal")?.active).toBe(false);
+});
+
+test("codex app menu state preserves applied marker for API-only profiles", async () => {
+  const profile = apiProfile();
+  saveStore({
+    version: 1,
+    current: {},
+    applied: { "codex-app": "desktop" },
+    toolLocks: {},
+    profiles: [],
+    tools: [],
+  });
+  const apiStore = {
+    transport: "api",
+    currentProfile: async () => profile,
+    listProfiles: async () => [profile],
+  } as AccountsStore;
+
+  const state = await codexAppMenuState(apiStore);
+
+  expect(state.activeProfileName).toBe("desktop");
+  expect(state.appliedProfileName).toBe("desktop");
+  expect(state.profiles).toHaveLength(1);
+  expect(state.profiles[0]?.active).toBe(true);
+  expect(state.profiles[0]?.applied).toBe(true);
 });
 
 test("codex app menu switch can update active profile without launching", async () => {
@@ -76,6 +113,43 @@ test("codex app menu switch relaunches with isolated profile environment", async
   expect(calls.at(-1)?.command).toBe("/Applications/Codex.app/Contents/MacOS/Codex");
   expect(calls.at(-1)?.args).toEqual([`--user-data-dir=${join(profile.dir, "electron-user-data")}`]);
   expect(calls.at(-1)?.env?.CODEX_HOME).toBe(profile.dir);
+});
+
+test("codex app relaunch suppresses request debugging without erasing routing", async () => {
+  addProfile({ name: "desktop", tool: "codex-app" });
+  const previous = {
+    BUN_CONFIG_VERBOSE_FETCH: process.env.BUN_CONFIG_VERBOSE_FETCH,
+    NODE_DEBUG: process.env.NODE_DEBUG,
+    NODE_DEBUG_NATIVE: process.env.NODE_DEBUG_NATIVE,
+  };
+  const inheritedPath = process.env.PATH;
+  let launchedEnv: Record<string, string> | undefined;
+  const runner: CodexAppProcessRunner = {
+    spawnSync() {
+      return { status: 0 };
+    },
+    spawn(_command, _args, opts) {
+      launchedEnv = opts?.env as Record<string, string> | undefined;
+      return { unref() {} };
+    },
+  };
+
+  try {
+    process.env.BUN_CONFIG_VERBOSE_FETCH = "1";
+    process.env.NODE_DEBUG = "http,http2";
+    process.env.NODE_DEBUG_NATIVE = "http";
+    await switchCodexAppFromMenu("desktop", { quit: false, runner });
+
+    expect(launchedEnv?.BUN_CONFIG_VERBOSE_FETCH).toBeUndefined();
+    expect(launchedEnv?.NODE_DEBUG).toBeUndefined();
+    expect(launchedEnv?.NODE_DEBUG_NATIVE).toBeUndefined();
+    expect(launchedEnv?.PATH).toBe(inheritedPath);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 test("swift source calls the codex app menu JSON commands", () => {

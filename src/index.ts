@@ -76,8 +76,8 @@ export type {
   PrepareLoginOptions,
   ToolAvailability,
 } from "./lib/login.js";
-export { switchProfile } from "./lib/switch.js";
-export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
+export { publicSwitchResult, switchProfile } from "./lib/switch.js";
+export type { PublicSwitchResult, SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
 export { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
 export type {
   DirSessionInfo,
@@ -200,7 +200,13 @@ export type {
 // THE uuid-keyed account enumerator (central store first, per-profile stores
 // as compat fallback). Consumers must reason over this instead of walking
 // profile dirs themselves.
-export { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+export {
+  buildIdentityIndex,
+  describeAccountStatus,
+  dirAccountUuid,
+  statusNeedsOperator,
+  statusWithoutValidAccessToken,
+} from "./lib/identity-index.js";
 export type {
   AccountDoor,
   AccountDoorRole,

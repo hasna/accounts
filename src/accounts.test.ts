@@ -1,5 +1,6 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -27,7 +28,7 @@ import {
   normalizePermissionPreset,
   permissionArgsFor,
 } from "./lib/tools.js";
-import { formatExportLines, profileEnv } from "./lib/env.js";
+import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -55,6 +56,35 @@ test("add creates a profile with a managed config dir", () => {
 test("add rejects duplicate names", () => {
   addProfile({ name: "work" });
   expect(() => addProfile({ name: "work" })).toThrow(AccountsError);
+});
+
+// One-account-one-tool: an account name identifies exactly one tool, because
+// resolution is name-first (resolveProfileFromStore) — a shared name breaks
+// every bare `accounts <cmd> <name>`. Same rule and error wording as the api
+// transport (AccountsRepo.nameConflict in src/server/repo.ts).
+test("add refuses a name already held by another tool", () => {
+  addProfile({ name: "work", tool: "claude" });
+  expect(() => addProfile({ name: "work", tool: "codex" })).toThrow(
+    'a profile named "work" already exists for tool "claude"; account names must be unique across tools',
+  );
+  // The refused create must not leave a row behind.
+  expect(listProfiles().map((p) => `${p.tool}/${p.name}`)).toEqual(["claude/work"]);
+});
+
+test("rename refuses a name already held by another tool", () => {
+  addProfile({ name: "a", tool: "claude" });
+  addProfile({ name: "b", tool: "codex" });
+  expect(() => renameProfile("a", "b", "claude")).toThrow(
+    'a profile named "b" already exists for tool "codex"; account names must be unique across tools',
+  );
+  expect(getProfile("a", "claude").name).toBe("a");
+});
+
+test("rename to the profile's own name is a no-op, matching the api transport", () => {
+  addProfile({ name: "solo", tool: "claude" });
+  const renamed = renameProfile("solo", "solo", "claude");
+  expect(renamed.name).toBe("solo");
+  expect(getProfile("solo", "claude").tool).toBe("claude");
 });
 
 test("add rejects invalid names", () => {
@@ -127,15 +157,42 @@ test("unsupported permission preset fails clearly", () => {
   expect(permissionArgsFor(getTool("opencode"), "none")).toEqual([]);
 });
 
-test("same profile name is allowed across tools and ambiguous without tool", () => {
-  addProfile({ name: "work", tool: "claude" });
-  addProfile({ name: "work", tool: "codex" });
+// Registries created before the one-account-one-tool rule can hold the same
+// name under several tools. Those rows are grandfathered: still resolvable
+// (with --tool, or a tool lock), still switchable — but the name cannot spread
+// to yet another tool.
+function seedGrandfatheredDuplicates(name: string, tools: string[]): void {
+  const store = loadStore();
+  for (const tool of tools) {
+    store.profiles.push({
+      name,
+      tool,
+      dir: join(home, "profiles", tool, name),
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+  }
+  saveStore(store);
+}
+
+test("grandfathered cross-tool duplicates stay resolvable and ambiguous without tool", () => {
+  seedGrandfatheredDuplicates("work", ["claude", "codex"]);
   expect(() => getProfile("work")).toThrow(AccountsError);
   expect(getProfile("work", "codex").tool).toBe("codex");
   useProfile("work", "codex");
   expect(currentProfile("codex")?.name).toBe("work");
   expect(currentProfile("codex")?.tool).toBe("codex");
   expect(currentProfile("claude")).toBeUndefined();
+});
+
+test("a grandfathered duplicate name cannot spread to a third tool", () => {
+  seedGrandfatheredDuplicates("work", ["claude", "codex"]);
+  expect(() => addProfile({ name: "work", tool: "opencode" })).toThrow(
+    /account names must be unique across tools/,
+  );
+  addProfile({ name: "other", tool: "opencode" });
+  expect(() => renameProfile("other", "work", "opencode")).toThrow(
+    /account names must be unique across tools/,
+  );
 });
 
 test("profileEnv renders extra per-tool environment templates", () => {
@@ -145,6 +202,103 @@ test("profileEnv renders extra per-tool environment templates", () => {
   expect(env.XDG_CONFIG_HOME).toBe(join(p.dir, "xdg-config"));
   expect(env.XDG_DATA_HOME).toBe(join(p.dir, "xdg-data"));
   expect(formatExportLines(env)).toContain("export OPENCODE_CONFIG_DIR=");
+});
+
+test("POSIX export handoffs preserve hostile bytes without command substitution", () => {
+  const markerDollar = join(home, "export-dollar-marker");
+  const markerBacktick = join(home, "export-backtick-marker");
+  const value =
+    `-leading "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch export-dollar-marker) \`touch export-backtick-marker\``;
+  const rendered = formatExportLines({ HOSTILE_VALUE: value }, {});
+
+  const result = spawnSync("/bin/sh", ["-s"], {
+    cwd: home,
+    encoding: "utf8",
+    input: `${rendered}\nprintf '%s' "$HOSTILE_VALUE"`,
+    env: { ...process.env, DOLLAR: "expanded-by-shell" },
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toBe(value);
+  expect(existsSync(markerDollar)).toBe(false);
+  expect(existsSync(markerBacktick)).toBe(false);
+});
+
+test("POSIX env assignments preserve hostile bytes, option boundaries, and parent state", () => {
+  const markerDollar = join(home, "assignment-dollar-marker");
+  const markerBacktick = join(home, "assignment-backtick-marker");
+  const observation = join(home, "assignment-observation");
+  const provider = join(home, "-assignment-provider");
+  const value =
+    `-leading "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch assignment-dollar-marker) \`touch assignment-backtick-marker\``;
+  writeFileSync(provider, '#!/bin/sh\nprintf %s "$HOSTILE_VALUE" > "$OBSERVATION_PATH"\n');
+  chmodSync(provider, 0o755);
+
+  const result = spawnSync("/bin/sh", ["-s"], {
+    cwd: home,
+    encoding: "utf8",
+    input: [
+      "HOSTILE_VALUE=parent-value",
+      `${formatEnvAssignments({ HOSTILE_VALUE: value }, {})} -assignment-provider`,
+      'printf %s "$HOSTILE_VALUE"',
+    ].join("\n"),
+    env: {
+      ...process.env,
+      DOLLAR: "expanded-by-shell",
+      OBSERVATION_PATH: observation,
+      PATH: `${home}:${process.env.PATH ?? ""}`,
+    },
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(existsSync(observation), result.stderr).toBe(true);
+  expect(readFileSync(observation, "utf8")).toBe(value);
+  expect(result.stdout).toBe("parent-value");
+  expect(existsSync(markerDollar)).toBe(false);
+  expect(existsSync(markerBacktick)).toBe(false);
+});
+
+test("generated handoffs reject non-portable environment variable names", () => {
+  expect(() => formatExportLines({ "BAD-NAME": "value" }, {})).toThrow(AccountsError);
+  expect(() => formatEnvAssignments({ "1BAD": "value" }, {})).toThrow(AccountsError);
+  expect(() => formatExportLines({ GOOD_NAME: "before\0after" }, {})).toThrow(AccountsError);
+  expect(() =>
+    addCustomTool({
+      id: "bad-extra-env",
+      label: "Bad Extra Env",
+      envVar: "GOOD_HOME",
+      extraEnv: { "BAD-NAME": "value" },
+      defaultDir: join(home, "bad-extra-env"),
+      bin: "bad-extra-env",
+    }),
+  ).toThrow(AccountsError);
+});
+
+test("profileEnv cannot restore request-debug keys from custom tool settings", () => {
+  const tool = addCustomTool({
+    id: "debug-overlay",
+    label: "Debug Overlay",
+    envVar: "DEBUG_OVERLAY_HOME",
+    extraEnv: {
+      BUN_CONFIG_VERBOSE_FETCH: "1",
+      node_debug: "http,http2",
+      Node_Debug_Native: "http",
+      KEEP_ME: "ordinary-setting",
+    },
+    defaultDir: join(home, "debug-overlay-default"),
+    bin: "debug-overlay",
+  });
+  const profile = addProfile({ name: "ops", tool: tool.id });
+
+  const env = profileEnv(profile, tool);
+
+  expect(Object.keys(env).filter((name) =>
+    ["bun_config_verbose_fetch", "node_debug", "node_debug_native"].includes(name.toLowerCase())
+  )).toEqual([]);
+  expect(env.KEEP_ME).toBe("ordinary-setting");
+  expect(env.DEBUG_OVERLAY_HOME).toBe(profile.dir);
 });
 
 test("claude profile env isolates Telegram channel state", () => {
@@ -254,9 +408,8 @@ test("use sets the active profile per tool and bumps lastUsedAt", () => {
   expect(getProfileToolLock("play")).toBe("codex");
 });
 
-test("tool lock resolves shared profile names for bare commands", () => {
-  addProfile({ name: "work", tool: "claude" });
-  addProfile({ name: "work", tool: "codex" });
+test("tool lock resolves grandfathered shared profile names for bare commands", () => {
+  seedGrandfatheredDuplicates("work", ["claude", "codex"]);
   expect(() => getProfile("work")).toThrow(AccountsError);
 
   useProfile("work", "codex");

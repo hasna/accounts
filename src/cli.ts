@@ -39,26 +39,44 @@ import {
   sweepCentralAuth,
   type SyncResult,
 } from "./lib/auth-store.js";
-import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
+import {
+  ensureProfileAuthSnapshot,
+  parkedRecoveryDisposition,
+  planParkedRecovery,
+  recoverParkedCredential,
+} from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.js";
-import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
+import { formatEnvAssignments, formatExportLines, profileEnv, providerLaunchEnv } from "./lib/env.js";
+import { redactText } from "./lib/redaction.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
-import { switchProfile, type SwitchMode } from "./lib/switch.js";
-import { resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
-import { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+import {
+  publicSwitchResult,
+  publicToolLabel,
+  switchProfile,
+  type SwitchMode,
+} from "./lib/switch.js";
+import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+import {
+  buildIdentityIndex,
+  describeAccountStatus,
+  dirAccountUuid,
+  statusNeedsOperator,
+} from "./lib/identity-index.js";
 import {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_MIN_HEADROOM,
   DEFAULT_MIN_SESSION_HEADROOM,
   DEFAULT_SWITCH_THRESHOLD,
   readAutoSwitchState,
+  readHookNoticeState,
   readUsageCache,
   writeAutoSwitchState,
+  writeHookNoticeState,
 } from "./lib/auto-switch.js";
 import {
   activeCooldowns,
@@ -71,9 +89,17 @@ import {
   collectAccountsUsage,
   DEFAULT_USAGE_CACHE_MAX_AGE_MS,
   pickHealthiestAccount,
+  usageDoorSummary,
   type AccountUsageEntry,
 } from "./lib/usage-report.js";
-import { hookOutputJson, runUsageHook } from "./lib/usage-hook.js";
+import { adoptOrphanOccupant, findOrphanOccupants } from "./lib/orphan-occupant.js";
+import {
+  DEFAULT_HOOK_NOTICE_INTERVAL_MS,
+  DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS,
+  hookOutputJson,
+  runUsageHook,
+} from "./lib/usage-hook.js";
+import { profileCredentialLayers } from "./lib/credential-state.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
@@ -633,9 +659,15 @@ program
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
-        env: { ...process.env, ...env },
+        env: providerLaunchEnv(process.env, env),
       });
-      if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
+      if (res.error) {
+        die(
+          `failed to launch ${redactText(tool.bin)}: ${redactText(
+            res.error.message,
+          )}`,
+        );
+      }
       if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
       const finalized = await finalizeLogin(name, tool.id, store);
       if (finalized.applied) {
@@ -684,17 +716,29 @@ program
         );
         if (opts.json) {
           console.log(JSON.stringify(picked, null, 2));
-          if (!picked.selection.candidate) process.exitCode = 1;
+          // Exit on REACHABILITY, not on ranking: a candidate no profile owns
+          // cannot be switched to, so reporting success would hand the caller
+          // a name it does not have.
+          if (!picked.candidate) process.exitCode = 1;
           return;
         }
-        const candidate = picked.selection.candidate;
+        const candidate = picked.candidate;
         if (!candidate || !picked.profileName) {
+          // `doorless > 0` is its own diagnosis and must not be folded into
+          // "nothing eligible": accounts WITH headroom were found and the only
+          // thing missing is a profile naming them. Telling an operator to add
+          // capacity when the capacity already exists sends them the wrong way.
           die(
-            picked.selection.reason === "all-limited"
-              ? `every account with usage data is below ${opts.minHeadroom}% headroom — nothing worth switching to`
-              : picked.selection.reason === "no-usage-data"
-                ? "no account has usage data yet — run `accounts usage --refresh` first"
-                : "no eligible account (valid credentials, not the current one) was found",
+            picked.doorless > 0
+              ? `${picked.doorless} account${picked.doorless === 1 ? "" : "s"} with headroom ` +
+                  `${picked.doorless === 1 ? "is" : "are"} unreachable — no profile on this machine owns ` +
+                  `${picked.doorless === 1 ? "it" : "them"}. Give one a name with \`accounts auth adopt <name>\` ` +
+                  "(see `accounts auth adopt --list`), or `accounts login <name>`."
+              : picked.selection.reason === "all-limited"
+                ? `every account with usage data is below ${opts.minHeadroom}% headroom — nothing worth switching to`
+                : picked.selection.reason === "no-usage-data"
+                  ? "no account has usage data yet — run `accounts usage --refresh` first"
+                  : "no eligible account (valid credentials, not the current one) was found",
           );
         }
         console.log(
@@ -801,7 +845,7 @@ addConfigsOptions(program
             { allowMissing: true },
           );
           if (!response) {
-            die(`no running accounts supervisor for ${getTool(profile.tool).label}. Start one with \`accounts run ${profile.tool}\`.`);
+            die(`no running accounts supervisor for ${publicToolLabel(profile.tool)}. Start one with \`accounts run ${profile.tool}\`.`);
           }
           if (!response.ok) die(response.error);
           if (opts.json) {
@@ -822,12 +866,13 @@ addConfigsOptions(program
           args,
           permissions: opts.permissions,
         }, store);
+        const output = publicSwitchResult(result);
         if (opts.json) {
-          console.log(JSON.stringify(result, null, 2));
+          console.log(JSON.stringify(output, null, 2));
         } else {
-          console.log(chalk.green(`✓ ${result.message}`));
+          console.log(chalk.green(`✓ ${output.message}`));
           if (result.applied) console.log(chalk.dim("  live/default auth updated"));
-          console.log(chalk.dim(`  restart command: ${result.commandLine}`));
+          console.log(chalk.dim(`  restart command: ${output.commandLine}`));
           if (!opts.launch) {
             console.log(chalk.yellow("  Exit the current agent session, then run the restart command above."));
           }
@@ -837,9 +882,15 @@ addConfigsOptions(program
           const [bin, ...launchArgs] = result.command;
           const res = spawnSync(bin!, launchArgs, {
             stdio: "inherit",
-            env: { ...process.env, ...result.env },
+            env: providerLaunchEnv(process.env, result.env),
           });
-          if (res.error) die(`failed to launch ${bin}: ${res.error.message}`);
+          if (res.error) {
+            die(
+              `failed to launch ${redactText(bin!)}: ${redactText(
+                res.error.message,
+              )}`,
+            );
+          }
           process.exit(res.status ?? 0);
         }
       },
@@ -853,12 +904,16 @@ program
   .option("-t, --tool <tool>", "tool id (in-place switching supports claude only)", DEFAULT_TOOL)
   .option("--dir <path>", "session config dir (default: $CLAUDE_CONFIG_DIR, else the live default)")
   .option("--yes", "proceed even when several live sessions share the config dir")
+  .option(
+    "--allow-unregistered-dir",
+    "write credentials into a dir that is neither the live config dir nor a registered profile dir",
+  )
   .option("--json", "output JSON")
   .action(
     action(
       async (
         name: string | undefined,
-        opts: { tool?: string; dir?: string; yes?: boolean; json?: boolean },
+        opts: { tool?: string; dir?: string; yes?: boolean; allowUnregisteredDir?: boolean; json?: boolean },
       ) => {
         let target = name;
         if (!target) {
@@ -870,6 +925,8 @@ program
           tool: opts.tool,
           dir: opts.dir,
           yes: opts.yes,
+          // Deliberate, human-typed override only. `usage-hook` never sets it.
+          allowUnregisteredDir: opts.allowUnregisteredDir,
         });
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
@@ -898,7 +955,15 @@ function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): strin
   const marker = entry.accountUuid === currentUuid ? chalk.cyan(" (this session)") : "";
   const lines: string[] = [];
   if (entry.status !== "ok") {
-    lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.yellow(entry.status)}`);
+    // A bare status word sent an operator to re-authenticate a live account, so
+    // the status always carries its gloss. `needs-refresh` is the routine state
+    // of any parked copy older than the 8-hour access-token life and is painted
+    // as a non-problem; only the statuses that need a human are highlighted.
+    const paint = statusNeedsOperator(entry.status) ? chalk.yellow : chalk.dim;
+    lines.push(
+      `  ${chalk.bold(who)}${marker} — ${paint(entry.status)} ` +
+        chalk.dim(`(${describeAccountStatus(entry.status)})`),
+    );
   } else if (entry.error) {
     lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.red(`${entry.error.kind}: ${entry.error.message}`)}`);
   } else if (entry.usage) {
@@ -932,9 +997,7 @@ function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): strin
       lines.push(chalk.dim(`      ${w.id} [${cls}]: ${used}${reset}`) + active);
     }
   }
-  const doors: string[] = [];
-  if (entry.profiles.length) doors.push(`profiles: ${entry.profiles.join(", ")}`);
-  if (entry.occupies.length) doors.push(`running in: ${entry.occupies.join(", ")}`);
+  const doors = usageDoorSummary(entry);
   if (doors.length) lines.push(chalk.dim(`      ${doors.join(" · ")}`));
   return lines.join("\n");
 }
@@ -999,8 +1062,13 @@ existing "UserPromptSubmit" hooks, do not replace them:
 
 Tuning (env or flags): ACCOUNTS_USAGE_SWITCH_THRESHOLD (default ${DEFAULT_SWITCH_THRESHOLD}),
 ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM (${DEFAULT_MIN_HEADROOM}), ACCOUNTS_USAGE_SWITCH_COOLDOWN_S (${DEFAULT_COOLDOWN_MS / 1000}),
-ACCOUNTS_USAGE_CACHE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000}).
-Decisions use cached usage only; warm it with a cron/loop running: accounts usage --refresh --quiet`;
+ACCOUNTS_USAGE_CACHE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000}),
+ACCOUNTS_USAGE_CACHE_STALE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS / 1000}),
+ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S (${DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000}).
+Decisions use cached usage only; warm it with a cron/loop running: accounts usage --refresh --quiet
+A reading past the freshness age still decides — usage inside a window only rises, so a stale
+number can miss a switch but never invent one. Past the stale age the hook says so out loud.
+The cooldown is per config dir, so one session's switch never blocks another's.`;
 
 function usageHookLog(line: string): void {
   try {
@@ -1023,8 +1091,10 @@ program
   .option("--threshold <percent>", "switch when any unscoped usage window is at/over this percent used")
   .option("--min-headroom <percent>", "a switch target must have at least this much WEEKLY headroom")
   .option("--min-session-headroom <percent>", "a switch target must have at least this much 5-hour headroom")
-  .option("--cooldown <seconds>", "minimum time between auto-switch attempts")
-  .option("--max-age <seconds>", "usage cache tolerance for decisions")
+  .option("--cooldown <seconds>", "minimum time between auto-switch attempts FOR THIS CONFIG DIR")
+  .option("--max-age <seconds>", "usage cache age still considered fresh")
+  .option("--stale-max-age <seconds>", "oldest usage cache still worth deciding from")
+  .option("--notice-interval <seconds>", "minimum gap between repeats of the same degraded notice")
   .option("--print-install", "print the settings.json snippet that enables the hook, then exit")
   .action(
     async (opts: {
@@ -1035,6 +1105,8 @@ program
       minSessionHeadroom?: string;
       cooldown?: string;
       maxAge?: string;
+      staleMaxAge?: string;
+      noticeInterval?: string;
       printInstall?: boolean;
     }) => {
       if (opts.printInstall) {
@@ -1060,6 +1132,18 @@ program
             cooldownMs: hookNumber(opts.cooldown, "ACCOUNTS_USAGE_SWITCH_COOLDOWN_S", DEFAULT_COOLDOWN_MS / 1000) * 1000,
             cacheMaxAgeMs:
               hookNumber(opts.maxAge, "ACCOUNTS_USAGE_CACHE_MAX_AGE_S", DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000) * 1000,
+            staleCacheMaxAgeMs:
+              hookNumber(
+                opts.staleMaxAge,
+                "ACCOUNTS_USAGE_CACHE_STALE_MAX_AGE_S",
+                DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS / 1000,
+              ) * 1000,
+            noticeIntervalMs:
+              hookNumber(
+                opts.noticeInterval,
+                "ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S",
+                DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000,
+              ) * 1000,
           },
           {
             currentAccountUuid: (dir) => dirAccountUuid(dir, tool),
@@ -1083,8 +1167,16 @@ program
               const result = await switchAccount(profileName, { tool: opts.tool, dir, yes: true }, store);
               return { liveSessions: result.liveSessions };
             },
-            readState: () => readAutoSwitchState(),
-            writeState: (state) => writeAutoSwitchState(state),
+            // Anti-flap state is keyed by THIS session's config dir. It used to
+            // be one file per machine, so an unrelated session's switch blocked
+            // every other session for ten minutes, silently.
+            readState: () => readAutoSwitchState(configDir),
+            writeState: (state) => writeAutoSwitchState(state, configDir),
+            // Contention detection: an account another dir is actively running
+            // must not be taken as a switch target.
+            liveSessionsIn: (dir) => listDirLiveSessions(dir).filter((session) => session.alive).length,
+            readNotices: () => readHookNoticeState(),
+            writeNotices: (state) => writeHookNoticeState(state),
             activeCooldowns: (at) => activeCooldowns(readExhaustionLedger(), at),
             recordExhaustion: (input) => {
               recordExhaustion(input);
@@ -1092,14 +1184,118 @@ program
             clearExhaustion: (accountUuid) => clearExhaustion(accountUuid),
           },
         );
-        usageHookLog(`${outcome.action}${outcome.reason ? ` reason=${JSON.stringify(outcome.reason)}` : ""}`);
+        // The destination is logged on every invocation: it is the directory a
+        // switch would write credentials into, and an unexpected value here is
+        // the first sign of a caller steering the hook somewhere it should not.
+        usageHookLog(
+          `${outcome.action}${outcome.reason ? ` reason=${JSON.stringify(outcome.reason)}` : ""}` +
+            ` dir=${JSON.stringify(configDir)}`,
+        );
         const output = hookOutputJson(outcome);
         if (output) console.log(output);
       } catch (error) {
-        usageHookLog(`fail-open error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+        // Anything thrown BEFORE runUsageHook could install its own handler:
+        // resolving the tool, the store, or the session dir. runUsageHook's
+        // internal catch speaks; without this one, those earlier failures stay
+        // exactly as silent as the outcomes this change exists to expose — a
+        // misconfigured registry would kill auto-switching with no symptom but
+        // a log line nobody reads.
+        const reason = error instanceof Error ? error.message : String(error);
+        usageHookLog(`fail-open error=${JSON.stringify(reason)}`);
+        try {
+          const notices = readHookNoticeState() ?? {};
+          const last = Date.parse(notices["fail-open"] ?? "");
+          const now = Date.now();
+          if (!Number.isFinite(last) || now - last >= DEFAULT_HOOK_NOTICE_INTERVAL_MS) {
+            writeHookNoticeState({ ...notices, "fail-open": new Date(now).toISOString() });
+            console.log(
+              JSON.stringify({
+                systemMessage:
+                  `accounts: usage-based auto-switching is NOT running for this session — ${reason}. ` +
+                  `The session keeps working, but nothing will move it off an account that runs out.`,
+              }),
+            );
+          }
+        } catch {
+          // The notice is best-effort. An unwritable ACCOUNTS_HOME must not
+          // turn fail-open into a non-zero exit.
+        }
       }
       process.exitCode = 0;
     },
+  );
+
+program
+  .command("repair-auth")
+  .argument("[name]", "profile to repair (all Claude profiles when omitted)")
+  .description("put a profile's parked credential back when its live copy was rotated away by another copy of the same account")
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("--dry-run", "report what would be repaired without writing anything")
+  .option("--json", "output JSON")
+  .action(
+    action(async (name: string | undefined, opts: { tool: string; dryRun?: boolean; json?: boolean }) => {
+      const tool = getTool(opts.tool);
+      const store = resolveStore();
+      const profiles = (await store.listProfiles(opts.tool)).filter((p) => (name ? p.name === name : true));
+      if (name && profiles.length === 0) throw new AccountsError(`no profile named "${name}" for tool "${opts.tool}"`);
+
+      // The WHOLE profile list — every profile, every tool, not the filtered
+      // one. The cross-directory gate asks "is this account live in another
+      // dir", and narrowing the search to the single profile being repaired
+      // would answer "no" every time: a gate that cannot fail. Unfiltered by
+      // tool as well, because a Claude account can be sitting live in a dir
+      // registered under some other tool, and that copy rotates tokens just the
+      // same. `--dry-run` and the real run share this list for the same reason
+      // they share the planner: any input they do not share is a way for the
+      // preview to disagree with the operation.
+      const allProfiles = await store.listProfiles();
+
+      const rows = profiles.map((profile) => {
+        const layers = profileCredentialLayers(profile.dir, tool);
+        // --dry-run runs the SAME decision function as the real path and differs
+        // only in not executing it. It used to compute `parkedCredentialVerdict`
+        // instead — pure content ranking with no identity gate — and so promised
+        // recoveries the real run refused.
+        const result = opts.dryRun
+          ? planParkedRecovery(profile.dir, tool, profile.name, { profiles: allProfiles })
+          : recoverParkedCredential(profile.dir, tool, profile.name, { profiles: allProfiles });
+        return {
+          profile: profile.name,
+          dir: profile.dir,
+          live: layers.live.state,
+          snapshot: layers.snapshot.state,
+          ...(layers.central ? { central: layers.central.state } : {}),
+          outcome: result.outcome,
+          detail: result.detail,
+        };
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify({ dryRun: Boolean(opts.dryRun), profiles: rows }, null, 2));
+        return;
+      }
+      // Rendered from the outcome's DISPOSITION, not from a hand-kept list of
+      // outcome strings. The old list named two refusals and silently dropped
+      // the rest, so a profile the command had refused printed nothing at all.
+      const acted = rows.filter((r) => parkedRecoveryDisposition(r.outcome) === "acted");
+      const blocked = rows.filter((r) => parkedRecoveryDisposition(r.outcome) === "blocked");
+      console.log("");
+      for (const row of [...acted, ...blocked]) {
+        const colour =
+          parkedRecoveryDisposition(row.outcome) === "acted"
+            ? chalk.green
+            : row.outcome === "no-parked-credential"
+              ? chalk.red
+              : chalk.yellow;
+        console.log(`  ${chalk.bold(row.profile)} — ${colour(row.outcome)}`);
+        console.log(chalk.dim(`    live=${row.live} snapshot=${row.snapshot}${row.central ? ` central=${row.central}` : ""}`));
+        console.log(chalk.dim(`    ${row.detail}`));
+      }
+      if (acted.length === 0 && blocked.length === 0) {
+        console.log(chalk.dim(`  nothing to repair across ${rows.length} profile(s)`));
+      }
+      console.log("");
+    }),
   );
 
 const hook = program.command("hook").description("install a shell wrapper for claude");
@@ -1220,7 +1416,7 @@ addConfigsOptions(program
         );
         process.exit(code);
       }
-      console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
+      console.error(chalk.green(`✓ accounts supervisor running ${publicToolLabel(plan.tool.id)} as ${chalk.bold(plan.profile.name)}`));
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
       console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
       const code = await runSupervisedTool(plan.profile, plan.tool, runArgs, {
@@ -1298,7 +1494,7 @@ addConfigsOptions(supervisor
         },
         { allowMissing: true },
       );
-      if (!response) die(`no running accounts supervisor for ${getTool(profile.tool).label}`);
+      if (!response) die(`no running accounts supervisor for ${publicToolLabel(profile.tool)}`);
       if (!response.ok) die(response.error);
       if (opts.json) {
         console.log(JSON.stringify(response, null, 2));
@@ -1342,7 +1538,7 @@ program
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(shell, ["-i"], {
         stdio: "inherit",
-        env: { ...process.env, ...env, ACCOUNTS_ACTIVE: profile.name },
+        env: providerLaunchEnv(process.env, env, { ACCOUNTS_ACTIVE: profile.name }),
       });
       process.exit(res.status ?? 0);
     }),
@@ -1492,6 +1688,101 @@ auth
     }),
   );
 
+auth
+  .command("adopt")
+  .argument("[name]", "name for the new profile")
+  .description("give a profile of its own to an account this machine holds credentials for but has no name for")
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("-a, --account <uuid-or-email>", "which occupant to adopt (required unless exactly one exists)")
+  .option("--list", "list orphan occupants and exit")
+  .option("--dry-run", "report the plan without moving anything")
+  .option("--allow-host-relogin", "proceed even though the host profile will need `accounts login` afterwards")
+  .option("--json", "output JSON")
+  .action(
+    action(async (name: string | undefined, opts: {
+      tool: string;
+      account?: string;
+      list?: boolean;
+      dryRun?: boolean;
+      allowHostRelogin?: boolean;
+      json?: boolean;
+    }) => {
+      const store = resolveStore();
+      const tool = await store.resolveTool(opts.tool);
+      const profiles = (await store.listProfiles(opts.tool)).map((p) => ({ name: p.name, dir: p.dir }));
+      const orphans = findOrphanOccupants(profiles, tool);
+
+      if (opts.list || (!name && !opts.account)) {
+        if (opts.json) {
+          console.log(JSON.stringify({ orphans }, null, 2));
+          return;
+        }
+        if (orphans.length === 0) {
+          console.log("no orphan occupants — every account this machine holds is named by a profile");
+          return;
+        }
+        for (const orphan of orphans) {
+          const where = orphan.occupies.map((o) => o.profileName ?? o.dir).join(", ");
+          const busy = orphan.liveSessions > 0 ? chalk.yellow(` ${orphan.liveSessions} live session(s)`) : "";
+          console.log(
+            `${chalk.cyan(orphan.accountUuid)} ${orphan.email ?? chalk.dim("(no email)")} ` +
+              `[${orphan.usable ? chalk.green(orphan.status) : chalk.yellow(orphan.status)}] ` +
+              chalk.dim(`running in: ${where}`) + busy,
+          );
+        }
+        if (!opts.list) {
+          console.log(
+            chalk.dim(`\nadopt one with: accounts auth adopt <name> --account ${orphans[0]!.email ?? orphans[0]!.accountUuid}`),
+          );
+        }
+        return;
+      }
+
+      if (!name) throw new AccountsError("a profile name is required — accounts auth adopt <name> --account <uuid-or-email>");
+      // With exactly one orphan the selector is unambiguous, so requiring it
+      // would be ceremony. With more than one, guessing is how the wrong
+      // account gets a name.
+      const account = opts.account ?? (orphans.length === 1 ? orphans[0]!.accountUuid : undefined);
+      if (!account) {
+        throw new AccountsError(
+          `${orphans.length} orphan occupants exist — name one with --account <uuid-or-email> (see \`accounts auth adopt --list\`)`,
+        );
+      }
+
+      const result = await adoptOrphanOccupant(
+        {
+          account,
+          name,
+          tool: opts.tool,
+          ...(opts.dryRun ? { dryRun: true } : {}),
+          ...(opts.allowHostRelogin ? { allowHostRelogin: true } : {}),
+        },
+        store,
+      );
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        if (result.outcome === "refused") process.exitCode = 1;
+        return;
+      }
+      if (result.outcome === "refused") {
+        die(`${result.refusal}: ${result.detail}`);
+      }
+      if (result.outcome === "would-adopt") {
+        console.log(chalk.cyan(`dry run — ${result.detail}`));
+        console.log(chalk.dim(`  host afterwards: ${result.plan.hostRestore}`));
+        return;
+      }
+      console.log(chalk.green(`✓ adopted as ${chalk.bold(result.profile.name)}`));
+      console.log(chalk.dim(`  ${result.detail}`));
+      if (result.hostRestore === "host-needs-login") {
+        console.log(
+          chalk.yellow(`  ${result.plan.fromProfile ?? result.plan.fromDir} now has no credential — accounts login ${result.plan.fromProfile ?? "NAME"}`),
+        );
+      }
+    }),
+  );
+
 const storage = program.command("storage").description("deprecated storage compatibility commands");
 
 storage
@@ -1562,13 +1853,25 @@ program
         }
         for (const a of r.agents) {
           if (a.kind === "process") {
+            if (
+              typeof a.pid !== "number" ||
+              !Number.isSafeInteger(a.pid) ||
+              a.pid <= 0
+            ) {
+              continue;
+            }
             const cfg = typeof a.configDir === "string" ? chalk.dim(`  cfg=${a.configDir}`) : "";
             const cmd = typeof a.command === "string" ? chalk.dim(`  ${a.command.slice(0, 100)}`) : "";
             console.log(`  ${chalk.yellow("process    ")} pid ${a.pid}${cfg}${cmd}`);
             continue;
           }
           const kind = a.kind === "background" ? chalk.magenta("background ") : chalk.dim("interactive");
-          const state = String(a.state ?? a.status ?? "");
+          const state =
+            typeof a.state === "string"
+              ? a.state
+              : typeof a.status === "string"
+                ? a.status
+                : "";
           const stateFmt = state === "working" || state === "busy" ? chalk.green(state) : chalk.dim(state);
           const name = typeof a.name === "string" ? ` ${a.name}` : "";
           const session = typeof a.sessionId === "string" ? chalk.dim(`  ${a.sessionId.slice(0, 8)}`) : "";

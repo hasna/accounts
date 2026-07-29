@@ -98,12 +98,16 @@ const sharedConfigSourceSchema = z
     return parts.every((part, index) => part !== ".." || index === 0);
   }, "may only ascend one level above the tool's shared home");
 
+const portableEnvNameSchema = z
+  .string()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "must be a portable environment variable name");
+
 /** Validator for a (custom) tool definition stored in the registry. */
 export const toolDefSchema = z.object({
   id: slugSchema,
   label: z.string().min(1).max(64),
   envVar: z.string().min(1).regex(/^[A-Z_][A-Z0-9_]*$/, "envVar must look like AN_ENV_VAR"),
-  extraEnv: z.record(z.string()).optional(),
+  extraEnv: z.record(portableEnvNameSchema, z.string()).optional(),
   defaultDir: z.string().min(1),
   bin: z.string().min(1),
   loginArgs: z.array(z.string()).optional(),
