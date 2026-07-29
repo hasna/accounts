@@ -487,7 +487,15 @@ export type ClaudeProfileAuthStatus = "ok" | "missing" | "expired" | "invalid" |
 
 export interface ClaudeProfileAuthHealth {
   status: ClaudeProfileAuthStatus;
+  /** Usable as is: an unexpired credential carrying a refresh token. */
   valid: boolean;
+  /**
+   * Not valid, but recoverable: the access token aged out while the refresh
+   * token is intact. Kept separate from `valid` so each caller picks its own
+   * bar — `doctor` should still call this unhealthy and prompt a re-login,
+   * while a session switch can accept it rather than refuse the only route out.
+   */
+  renewable: boolean;
   oauthAccountPresent: boolean;
   credentialPayloadPresent: boolean;
   credentialPayloadValid: boolean;
@@ -575,6 +583,7 @@ export function claudeProfileAuthHealth(
     return {
       status: "unknown",
       valid: false,
+      renewable: false,
       oauthAccountPresent: false,
       credentialPayloadPresent: false,
       credentialPayloadValid: false,
@@ -602,6 +611,10 @@ export function claudeProfileAuthHealth(
   const credentialPayloadPresent = existingCredentials.length > 0;
   const validCredential = existingCredentials.find((credential) => credential.valid);
   const expiredCredential = existingCredentials.find((credential) => credential.expired);
+  // Aged out but still holding a refresh token: the tool renews this on use.
+  const renewableCredential = existingCredentials.find(
+    (credential) => credential.expired && credential.refreshTokenPresent,
+  );
   const parseableInvalidCredential = existingCredentials.find(
     (credential) => credential.parseableOauth && !credential.refreshTokenPresent,
   );
@@ -626,6 +639,7 @@ export function claudeProfileAuthHealth(
   return {
     status,
     valid: status === "ok",
+    renewable: status !== "ok" && oauthAccountPresent && Boolean(renewableCredential),
     oauthAccountPresent,
     credentialPayloadPresent,
     credentialPayloadValid: Boolean(validCredential),

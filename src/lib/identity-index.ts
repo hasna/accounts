@@ -42,7 +42,23 @@ export interface AccountCredentialRef {
   expiresAt: number;
   hasAccessToken: boolean;
   hasRefreshToken: boolean;
+  /** Usable AS IS: an unexpired access token. */
   valid: boolean;
+  /**
+   * Usable AFTER the tool renews it: a refresh token is present, so an aged-out
+   * access token is a stale artefact rather than a dead account.
+   *
+   * Measured on this fleet 2026-07-29: Claude Code mints 8-hour access tokens
+   * and renews them IN PLACE. One profile dir was observed holding
+   * `expiresAt = 05:43:02Z` at 05:23Z and `expiresAt = 13:38:04Z` at 05:38Z —
+   * same file, same account, a fresh 8-hour token written over the old one
+   * without any operator action. An access token past its expiry therefore says
+   * nothing about whether the account works; only the refresh token does.
+   *
+   * `renewable` never OUTRANKS `valid` anywhere it is consumed: it widens the
+   * usable set, it does not reorder it.
+   */
+  renewable: boolean;
 }
 
 export type AccountStatus = "ok" | "expired" | "no-credentials";
@@ -114,7 +130,29 @@ function credentialRef(path: string, source: CredentialSource): AccountCredentia
     hasAccessToken,
     hasRefreshToken,
     valid: hasAccessToken && normalizedExpiry > Date.now(),
+    renewable: hasRefreshToken,
   };
+}
+
+/**
+ * Can this account take a session over — now, or after the tool renews it?
+ *
+ * `status === "expired"` is not a verdict of unusable: it means the ACCESS
+ * token aged out, which on a fleet that idles overnight is the majority state
+ * (access tokens live 8 hours). Excluding those shrinks the switch pool exactly
+ * when unattended sessions need it, so the pool is "valid OR renewable" and
+ * ranking — not filtering — keeps valid credentials first.
+ *
+ * A credential with no refresh token is still unusable. That distinction is the
+ * whole point: `needs-refresh` and `unusable` are different verdicts.
+ */
+export function isUsableIdentity(identity: AccountIdentity): boolean {
+  // Status-led on purpose, so this is a strict SUPERSET of the rule it
+  // replaces (`status === "ok"`): everything that was usable stays usable, and
+  // the aged-out-but-refreshable case is added. A widening fix must not be able
+  // to narrow anything by accident.
+  if (identity.status === "ok") return true;
+  return identity.status === "expired" && identity.credential?.renewable === true;
 }
 
 const SOURCE_RANK: Record<CredentialSource, number> = { central: 3, "profile-snapshot": 2, "dir-live": 1 };
