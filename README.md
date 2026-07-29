@@ -115,6 +115,16 @@ selected profile's isolated `CODEX_HOME` and Electron user data directory.
 | **Isolated** | `accounts launch`, `accounts env`, `accounts shell` | Terminal, two accounts at once |
 | **Apply** | `accounts apply <name>` | Cursor, VS Code, single global auth |
 | **Picker** | `accounts pick` | Interactive choose; default applies to live paths |
+| **In-place** | `accounts switch-account <name>` | Change the RUNNING Claude session's account mid-conversation, no restart |
+
+**In-place switching** works because Claude Code re-reads `<configDir>/.credentials.json`
+from disk on every API request (measured on 2.1.220): `switch-account` snapshots the
+dir's outgoing credentials back to their owning profile, installs the target profile's
+credentials + `oauthAccount` into the session's config dir, and the session's next
+message runs as the new account with the conversation intact. Every live session
+sharing that config dir switches together, so the command refuses multi-session dirs
+without `--yes`. If a target profile's auth is expired it fails loudly before touching
+anything.
 
 `accounts use` alone does **not** change Cursor — run `accounts apply` for IDE auth.
 
@@ -403,6 +413,7 @@ per machine with `ACCOUNTS_SHARED_HOME_<TOOL_ID>` (e.g. `ACCOUNTS_SHARED_HOME_CL
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
 | `accounts switch <name>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. Use `--tool` only when ambiguous. |
 | `accounts switch <name> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. Supports `--permissions <preset>`. |
+| `accounts switch-account [name]` | Switch the CURRENT session's account in place — no restart, conversation intact (Claude-only; the running session re-reads `.credentials.json` on its next request). Picker when no name; `--dir`, `--yes`, `--json`. |
 | `accounts use <name>` | Mark profile active; prints apply/env hints. |
 | `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
 | `accounts show <name> --tool <tool>` | Profile details including active/applied flags. |
