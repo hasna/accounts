@@ -173,17 +173,25 @@ function findOAuthSource(paths: string[]): { path: string; oauth: JsonRecord } |
  * this way, surviving only because the central store refused the same downgrade.
  *
  * The central store never had this hole — `syncCredentialsFile` in auth-store.ts
- * replaces central only with a strict `betterCredential` winner. This restores
- * the symmetry the comment above already claims: the two layers rank credentials
- * identically. `betterCredential` orders on refresh-token presence, then
- * usability, then mtime, so it subsumes the staleness rule rather than
- * contradicting it — a genuinely rotated token still wins, and a blank never
- * does.
+ * replaces central only with a strict `betterCredential` winner. That ordering
+ * remains the baseline here, with one snapshot-specific addition: a non-empty
+ * token that loses more than half its length is treated as a likely truncated
+ * write. A genuinely rotated token with a plausible length still wins, and a
+ * blank or badly truncated token never does.
  */
 function wouldDowngradeSnapshot(sourcePath: string, snapshotPath: string): boolean {
   const source = credentialHealth(sourcePath);
   const snapshot = credentialHealth(snapshotPath);
   if (!snapshot.exists || !source.exists) return false;
+  // Presence alone cannot distinguish a complete token from a truncated,
+  // non-empty prefix. Keep this stricter check local to snapshot preservation:
+  // other credential merges intentionally retain betterCredential's ordering.
+  if (
+    source.refreshTokenLength > 0 &&
+    source.refreshTokenLength * 2 < snapshot.refreshTokenLength
+  ) {
+    return true;
+  }
   return betterCredential(source, snapshot) !== source;
 }
 
@@ -196,8 +204,8 @@ function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
   }
 }
 
-// credentialHealth/betterCredential live in auth-store.ts (the lower layer)
-// so the central store and these read paths rank credentials identically.
+// credentialHealth/betterCredential live in auth-store.ts (the lower layer),
+// so duplicate candidates on the read paths are ranked identically.
 
 /**
  * Best restorable credential snapshot for a profile: the per-profile copy vs

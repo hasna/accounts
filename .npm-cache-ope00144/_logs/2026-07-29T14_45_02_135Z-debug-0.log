@@ -1,0 +1,201 @@
+0 verbose cli /usr/bin/node /usr/lib/node_modules/npm/bin/npm-cli.js
+1 info using npm@10.9.8
+2 info using node@v22.23.1
+3 silly config load:file:/usr/lib/node_modules/npm/npmrc
+4 silly config load:file:/home/user/work/.npmrc
+5 silly config load:file:/home/user/.npmrc
+6 silly config load:file:/usr/etc/npmrc
+7 verbose title npm exec bun install --frozen-lockfile
+8 verbose argv "exec" "--yes" "--" "bun" "install" "--frozen-lockfile"
+9 verbose logfile logs-max:10 dir:/home/user/work/.npm-cache-ope00144/_logs/2026-07-29T14_45_02_135Z-
+10 verbose logfile /home/user/work/.npm-cache-ope00144/_logs/2026-07-29T14_45_02_135Z-debug-0.log
+11 silly logfile done cleaning log files
+12 silly packumentCache heap:4345298944 maxSize:1086324736 maxEntrySize:543162368
+13 http fetch GET 200 https://registry.npmjs.org/npm 136ms
+14 http fetch GET 200 https://registry.npmjs.org/bun 161ms (cache miss)
+15 silly packumentCache heap:4345298944 maxSize:1086324736 maxEntrySize:543162368
+16 silly packumentCache heap:4345298944 maxSize:1086324736 maxEntrySize:543162368
+17 silly idealTree buildDeps
+18 silly fetch manifest bun@1.3.14
+19 silly packumentCache full:https://registry.npmjs.org/bun cache-miss
+20 http fetch GET 200 https://registry.npmjs.org/bun 118ms (cache miss)
+21 silly packumentCache full:https://registry.npmjs.org/bun set size:undefined disposed:false
+22 silly placeDep ROOT bun@1.3.14 OK for:  want: 1.3.14
+23 silly fetch manifest @oven/bun-darwin-aarch64@1.3.14
+24 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-darwin-aarch64 cache-miss
+25 silly fetch manifest @oven/bun-darwin-x64@1.3.14
+26 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-darwin-x64 cache-miss
+27 silly fetch manifest @oven/bun-darwin-x64-baseline@1.3.14
+28 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-darwin-x64-baseline cache-miss
+29 silly fetch manifest @oven/bun-linux-aarch64@1.3.14
+30 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-aarch64 cache-miss
+31 silly fetch manifest @oven/bun-linux-x64@1.3.14
+32 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64 cache-miss
+33 silly fetch manifest @oven/bun-linux-x64-baseline@1.3.14
+34 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-baseline cache-miss
+35 silly fetch manifest @oven/bun-linux-aarch64-musl@1.3.14
+36 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-aarch64-musl cache-miss
+37 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-darwin-x64 139ms (cache miss)
+38 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-darwin-x64 set size:undefined disposed:false
+39 silly fetch manifest @oven/bun-linux-x64-musl@1.3.14
+40 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-musl cache-miss
+41 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-darwin-aarch64 155ms (cache miss)
+42 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-darwin-aarch64 set size:undefined disposed:false
+43 silly fetch manifest @oven/bun-linux-x64-musl-baseline@1.3.14
+44 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-musl-baseline cache-miss
+45 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-aarch64-musl 205ms (cache miss)
+46 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-aarch64-musl set size:undefined disposed:false
+47 silly fetch manifest @oven/bun-linux-aarch64-android@1.3.14
+48 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-aarch64-android cache-miss
+49 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-aarch64-android 45ms (cache miss)
+50 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-aarch64-android set size:undefined disposed:false
+51 silly fetch manifest @oven/bun-linux-x64-android@1.3.14
+52 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-android cache-miss
+53 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-x64-musl 109ms (cache miss)
+54 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-musl set size:undefined disposed:false
+55 silly fetch manifest @oven/bun-freebsd-aarch64@1.3.14
+56 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-freebsd-aarch64 cache-miss
+57 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-darwin-x64-baseline 271ms (cache miss)
+58 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-darwin-x64-baseline set size:undefined disposed:false
+59 silly fetch manifest @oven/bun-freebsd-x64@1.3.14
+60 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-freebsd-x64 cache-miss
+61 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-x64-musl-baseline 119ms (cache miss)
+62 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-musl-baseline set size:undefined disposed:false
+63 silly fetch manifest @oven/bun-windows-x64@1.3.14
+64 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-windows-x64 cache-miss
+65 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-x64 291ms (cache miss)
+66 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64 set size:undefined disposed:false
+67 silly fetch manifest @oven/bun-windows-x64-baseline@1.3.14
+68 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-windows-x64-baseline cache-miss
+69 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-aarch64 305ms (cache miss)
+70 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-aarch64 set size:undefined disposed:false
+71 silly fetch manifest @oven/bun-windows-aarch64@1.3.14
+72 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-windows-aarch64 cache-miss
+73 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-x64-android 70ms (cache miss)
+74 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-android set size:undefined disposed:false
+75 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-freebsd-aarch64 64ms (cache miss)
+76 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-freebsd-aarch64 set size:undefined disposed:false
+77 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-freebsd-x64 46ms (cache miss)
+78 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-freebsd-x64 set size:undefined disposed:false
+79 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-linux-x64-baseline 327ms (cache miss)
+80 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-linux-x64-baseline set size:undefined disposed:false
+81 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-windows-aarch64 49ms (cache miss)
+82 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-windows-aarch64 set size:undefined disposed:false
+83 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-windows-x64-baseline 82ms (cache miss)
+84 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-windows-x64-baseline set size:undefined disposed:false
+85 http fetch GET 200 https://registry.npmjs.org/@oven%2fbun-windows-x64 104ms (cache miss)
+86 silly packumentCache full:https://registry.npmjs.org/@oven%2fbun-windows-x64 set size:undefined disposed:false
+87 silly placeDep ROOT @oven/bun-darwin-aarch64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+88 silly placeDep ROOT @oven/bun-darwin-x64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+89 silly placeDep ROOT @oven/bun-darwin-x64-baseline@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+90 silly placeDep ROOT @oven/bun-freebsd-aarch64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+91 silly placeDep ROOT @oven/bun-freebsd-x64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+92 silly placeDep ROOT @oven/bun-linux-aarch64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+93 silly placeDep ROOT @oven/bun-linux-aarch64-android@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+94 silly placeDep ROOT @oven/bun-linux-aarch64-musl@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+95 silly placeDep ROOT @oven/bun-linux-x64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+96 silly placeDep ROOT @oven/bun-linux-x64-android@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+97 silly placeDep ROOT @oven/bun-linux-x64-baseline@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+98 silly placeDep ROOT @oven/bun-linux-x64-musl@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+99 silly placeDep ROOT @oven/bun-linux-x64-musl-baseline@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+100 silly placeDep ROOT @oven/bun-windows-aarch64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+101 silly placeDep ROOT @oven/bun-windows-x64@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+102 silly placeDep ROOT @oven/bun-windows-x64-baseline@1.3.14 OK for: bun@1.3.14 want: 1.3.14
+103 silly reify moves {}
+104 silly audit bulk request {
+104 silly audit   bun: [ '1.3.14' ],
+104 silly audit   '@oven/bun-darwin-aarch64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-darwin-x64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-darwin-x64-baseline': [ '1.3.14' ],
+104 silly audit   '@oven/bun-freebsd-aarch64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-freebsd-x64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-aarch64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-aarch64-android': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-aarch64-musl': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-x64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-x64-android': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-x64-baseline': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-x64-musl': [ '1.3.14' ],
+104 silly audit   '@oven/bun-linux-x64-musl-baseline': [ '1.3.14' ],
+104 silly audit   '@oven/bun-windows-aarch64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-windows-x64': [ '1.3.14' ],
+104 silly audit   '@oven/bun-windows-x64-baseline': [ '1.3.14' ]
+104 silly audit }
+105 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-windows-x64-baseline
+106 silly reify mark deleted [
+106 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-windows-x64-baseline'
+106 silly reify ]
+107 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-windows-x64
+108 silly reify mark deleted [
+108 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-windows-x64'
+108 silly reify ]
+109 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-windows-aarch64
+110 silly reify mark deleted [
+110 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-windows-aarch64'
+110 silly reify ]
+111 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-x64-android
+112 silly reify mark deleted [
+112 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-x64-android'
+112 silly reify ]
+113 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-aarch64-musl
+114 silly reify mark deleted [
+114 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-aarch64-musl'
+114 silly reify ]
+115 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-aarch64-android
+116 silly reify mark deleted [
+116 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-aarch64-android'
+116 silly reify ]
+117 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-aarch64
+118 silly reify mark deleted [
+118 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-aarch64'
+118 silly reify ]
+119 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-freebsd-x64
+120 silly reify mark deleted [
+120 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-freebsd-x64'
+120 silly reify ]
+121 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-freebsd-aarch64
+122 silly reify mark deleted [
+122 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-freebsd-aarch64'
+122 silly reify ]
+123 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-darwin-x64-baseline
+124 silly reify mark deleted [
+124 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-darwin-x64-baseline'
+124 silly reify ]
+125 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-darwin-x64
+126 silly reify mark deleted [
+126 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-darwin-x64'
+126 silly reify ]
+127 verbose reify failed optional dependency /home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-darwin-aarch64
+128 silly reify mark deleted [
+128 silly reify   '/home/user/work/.npm-cache-ope00144/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-darwin-aarch64'
+128 silly reify ]
+129 http cache @oven/bun-linux-x64-baseline@https://registry.npmjs.org/@oven/bun-linux-x64-baseline/-/bun-linux-x64-baseline-1.3.14.tgz 0ms (cache hit)
+130 http cache @oven/bun-linux-x64-musl-baseline@https://registry.npmjs.org/@oven/bun-linux-x64-musl-baseline/-/bun-linux-x64-musl-baseline-1.3.14.tgz 0ms (cache hit)
+131 http cache bun@https://registry.npmjs.org/bun/-/bun-1.3.14.tgz 0ms (cache hit)
+132 http cache @oven/bun-linux-x64@https://registry.npmjs.org/@oven/bun-linux-x64/-/bun-linux-x64-1.3.14.tgz 0ms (cache hit)
+133 http cache @oven/bun-linux-x64-musl@https://registry.npmjs.org/@oven/bun-linux-x64-musl/-/bun-linux-x64-musl-1.3.14.tgz 0ms (cache hit)
+134 silly tarball no local data for @oven/bun-linux-x64-baseline@https://registry.npmjs.org/@oven/bun-linux-x64-baseline/-/bun-linux-x64-baseline-1.3.14.tgz. Extracting by manifest.
+135 silly tarball no local data for @oven/bun-linux-x64-musl-baseline@https://registry.npmjs.org/@oven/bun-linux-x64-musl-baseline/-/bun-linux-x64-musl-baseline-1.3.14.tgz. Extracting by manifest.
+136 silly tarball no local data for bun@https://registry.npmjs.org/bun/-/bun-1.3.14.tgz. Extracting by manifest.
+137 silly tarball no local data for @oven/bun-linux-x64@https://registry.npmjs.org/@oven/bun-linux-x64/-/bun-linux-x64-1.3.14.tgz. Extracting by manifest.
+138 silly tarball no local data for @oven/bun-linux-x64-musl@https://registry.npmjs.org/@oven/bun-linux-x64-musl/-/bun-linux-x64-musl-1.3.14.tgz. Extracting by manifest.
+139 http fetch POST 200 https://registry.npmjs.org/-/npm/v1/security/advisories/bulk 151ms
+140 silly audit report {}
+141 http fetch GET 200 https://registry.npmjs.org/bun/-/bun-1.3.14.tgz 152ms (cache miss)
+142 http fetch GET 200 https://registry.npmjs.org/@oven/bun-linux-x64-musl-baseline/-/bun-linux-x64-musl-baseline-1.3.14.tgz 3032ms (cache miss)
+143 http fetch GET 200 https://registry.npmjs.org/@oven/bun-linux-x64-musl/-/bun-linux-x64-musl-1.3.14.tgz 3032ms (cache miss)
+144 http fetch GET 200 https://registry.npmjs.org/@oven/bun-linux-x64-baseline/-/bun-linux-x64-baseline-1.3.14.tgz 3088ms (cache miss)
+145 http fetch GET 200 https://registry.npmjs.org/@oven/bun-linux-x64/-/bun-linux-x64-1.3.14.tgz 3096ms (cache miss)
+146 info run bun@1.3.14 postinstall node_modules/bun node install.js
+147 info run bun@1.3.14 postinstall { code: 0, signal: null }
+148 verbose cwd /home/user/work
+149 verbose os Linux 6.1.158+
+150 verbose node v22.23.1
+151 verbose npm  v10.9.8
+152 notice
+152 notice New major version of npm available! 10.9.8 -> 12.0.1
+152 notice Changelog: https://github.com/npm/cli/releases/tag/v12.0.1
+152 notice To update run: npm install -g npm@12.0.1
+152 notice  { force: true, [Symbol(proc-log.meta)]: true }
+153 verbose exit 0
+154 info ok

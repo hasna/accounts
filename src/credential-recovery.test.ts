@@ -165,6 +165,21 @@ test("a rotated-away live file must NOT overwrite the parked snapshot", () => {
   expect(classifyCredentialFile(profileCredentialsSnapshot(dir)).state).toBe("usable");
 });
 
+test("a truncated non-empty refresh token must NOT overwrite the parked snapshot", () => {
+  const dir = makeProfile("alpha", UUID_A, "alpha");
+  const parked = readFileSync(profileCredentialsSnapshot(dir));
+
+  // Both credentials remain "usable" to the general ranking rule, so the
+  // newer one-character token would otherwise win on mtime.
+  writeFileSync(join(dir, ".credentials.json"), credentialJson({ label: "truncated", refreshToken: "x" }));
+  const snapMtimeBefore = statSync(profileCredentialsSnapshot(dir)).mtimeMs;
+  utimesSync(join(dir, ".credentials.json"), new Date(), new Date(snapMtimeBefore + 60_000));
+
+  ensureProfileAuthSnapshot(dir, tool());
+
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
+});
+
 test("POSITIVE CONTROL: a genuinely rotated NEWER credential still replaces the snapshot", () => {
   // Without this, the test above is satisfied by never refreshing snapshots at
   // all — which would reintroduce the bug the mtime rule exists to prevent:
@@ -173,7 +188,12 @@ test("POSITIVE CONTROL: a genuinely rotated NEWER credential still replaces the 
   const dir = makeProfile("alpha", UUID_A, "alpha");
   const before = readFileSync(profileCredentialsSnapshot(dir), "utf8");
 
-  writeFileSync(join(dir, ".credentials.json"), credentialJson({ label: "rotated-fresh" }));
+  // A modest length change is plausible across rotations and must not be
+  // mistaken for the large regression guarded above.
+  writeFileSync(
+    join(dir, ".credentials.json"),
+    credentialJson({ label: "rotated-fresh", refreshToken: "new-refresh" }),
+  );
   const snapMtime = statSync(profileCredentialsSnapshot(dir)).mtimeMs;
   utimesSync(join(dir, ".credentials.json"), new Date(), new Date(snapMtime + 60_000));
 
