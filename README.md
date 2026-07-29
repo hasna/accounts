@@ -130,8 +130,145 @@ anything.
 
 `accounts use` alone does **not** change Cursor — run `accounts apply` for IDE auth.
 
-A child process cannot change your parent shell — use `eval "$(accounts env …)"` or the
+A child process cannot change your parent shell — from a POSIX shell
+(sh/bash/zsh), use `eval "$(accounts env …)"`, or use the
 [shell hook](docs/hook.md) (terminal `claude` only, not IDE extensions).
+Other shells should use `accounts launch`; fish/nushell users may also use
+`accounts shell` when `SHELL` identifies that shell. Accounts does not
+currently emit fish, nushell, or PowerShell assignment syntax.
+
+### Request-debug environment policy
+
+Credential-bearing launches, probes, subshells, and generated handoffs
+intentionally remove exactly three request-dump controls:
+`BUN_CONFIG_VERBOSE_FETCH`, `NODE_DEBUG`, and `NODE_DEBUG_NATIVE`.
+`accounts env` and `accounts pick --env` print an `unset` before their exports;
+non-launch `accounts switch` commands and the optional `claude()` shell hook
+use `env -u` for the same keys. The hook changes only the provider child, not
+the parent shell. This also prevents a custom tool's profile environment from
+restoring those controls.
+
+Controlled launch and prelaunch errors also redact complete
+`Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` records,
+including folded quoted values, token fragments, arbitrary extension
+parameters, and cookie attributes. Generic credential fields such as
+`x-api-key`, `client-secret`, and token fields use the same folded-record
+boundary instead of redacting only their first token. Folded input is scanned
+linearly and fails closed until a clear record boundary, so blank folds,
+escaped quotes, and malformed or unfamiliar credential syntax are not emitted
+merely because a parameter name resembles a diagnostic or serialized field.
+Only structurally quoted serialized siblings are retained. Captured stderr and
+stdout are separated as distinct records before bounded redaction, preventing a
+missing trailing newline from fusing a diagnostic prefix with a
+credential-bearing header.
+Credential keys are classified through one separator/camel-case-aware policy,
+so dot-, space-, separator-, and camel-case forms such as `oauth.key`,
+`oauth key`, `oauth_token`, `consumerSecret`, `sessionKey`, and
+`webhookCredential`, plus stemmed forms such as `credentials`,
+`secret-key`, `service-account-key`, `auth-header`, `service-auth`, and
+`bearer`, receive the same treatment. Any distinct normalized `key` token is
+sensitive, including `encryption-key`, `client-key`, and `access-key-id`,
+without matching unsplit words such as `keyboard`, `keynote`, or `monkey`.
+Valid JSON is redacted recursively after
+decoding escaped keys, while malformed serialized fragments remain
+fail-closed. Supervisor child arguments stay raw only for the immediate spawn;
+persisted state, restart responses, legacy state reads, and text/JSON status
+surfaces store or return argument-aware redacted command arrays. Long options
+using `=`, `:`, or a following value and the supported short `-k` forms share
+that policy. Combined short clusters ending in `k` and compatibility-normalized
+Unicode dash/letter forms are treated as credential options too. If a
+syntactically bare credential option appears while a prior option is still
+awaiting a value, the new option is redacted as syntax and becomes the pending
+option instead of being consumed as the earlier value. Credential-shaped
+fragments inside opaque or non-option dash-leading argv items remain bound
+values. An exact `--` marker ends argv option interpretation in ordinary or
+pending state. Later positional arguments remain positional values, but each is
+independently passed through generic text redaction before the public command
+or rendered handoff is emitted. Attached credential fields are redacted in
+place. Empty-value credential fields redact their next non-empty positional
+value without consuming empty padding. Because authorization schemes may span
+multiple argv items, `Authorization` and `Proxy-Authorization` fail closed by
+redacting every later non-empty positional item; empty items remain empty.
+Wrapper-bound separate options such as `env=--api-key` preserve their wrapper
+syntax and carry exactly one pending positional value across empty padding.
+Structured URL, URN, email, and drive-path values remain data even when an
+interior segment is named `authorization`, so later safe tokens remain
+visible. Other benign values remain unchanged. The same
+bounded, quote-aware option scanner redacts command-shaped values embedded in
+captured stdout, stderr, and error strings. A separate credential option keeps
+one pending value across LF, CRLF, or bare CR and consumes the next syntactic
+value; quoting, escaping, or opaque non-bare syntax keeps dash-leading text
+bound as that value. Only a complete bare option or a complete sensitive
+attached form replaces pending state. Bare option syntax is exactly one or two
+compatibility-normalized leading dashes, an alphanumeric body start, then only
+alphanumerics, dots, underscores, or dashes; exact `--` is reserved for the
+end-of-options marker. Compatibility normalization applies to option names,
+not this control token: only one complete raw, unquoted, unescaped, standalone
+ASCII `--` token ends interpretation. Unicode dash pairs, quoted or escaped
+markers, wrappers, and punctuation-adjacent fragments remain value or text
+data, so they cannot expose a later credential option. Three-or-more dash runs
+and dot- or underscore-leading bodies, including malformed attached
+credential-looking forms, remain one opaque bound value. Attached values that
+resemble options,
+including `--api-key=--client-key` and its colon form, are redacted in place
+without consuming the next safe token. While a separate value is pending, the
+complete physical token is classified before embedded punctuation. Unless the
+whole token is proven option syntax, it is redacted as one bound value and the
+next whitespace-separated token remains unchanged. An open quote or odd
+trailing backslash activates one carried logical-value scanner across later
+physical fragments. While active, it redacts through quote closure and every
+adjacent non-whitespace suffix without treating punctuation, complete bare
+options, sensitive-looking options, or exact `--` text as fresh syntax. Option
+classification resumes only after that logical token reaches whitespace. A
+blank physical line or an explicit
+`status`, `message`, `stack`, or `detail` record ends the pending command
+record, including an active quote or backslash continuation; this explicit
+record boundary takes precedence over incomplete shell syntax so sensitive
+state cannot carry into independent diagnostics. When no separate value is
+pending or active, options may begin after the package's safe punctuation boundaries
+(`:`, `=`, `|`, `/`, `<`, `>`, brackets, parentheses,
+commas, and semicolons), while embedded word, URL, email, and arithmetic forms
+remain ordinary text. Balanced punctuation inside structured URL/email values
+stays data, while a closing outer wrapper or quote resumes option parsing. The
+scanner still retains later whitespace-separated options and explicit unquoted
+standalone ASCII `--` boundaries, and
+its line, token, and quoted-segment passes remain forward-only for bounded
+linear work.
+Captured stderr and stdout are bounded and redacted as separate process
+records, so a missing value at the end of one stream never consumes the first
+token from the other stream.
+
+Switch output is an explicit `hasna.accounts.switch-output/v1` DTO. It exposes
+only bounded profile/tool identifiers, status booleans, a redacted command and
+handoff line, and the user-facing message; internal profile metadata, tool
+configuration, environment maps, and export scripts do not cross that output
+boundary. Built-in labels come from the package-owned registry; caller-defined
+tool labels are represented as the opaque `Custom tool` label on switch and
+supervisor output. Raw arguments and environment values remain available only
+to the immediate provider spawn. Legacy prelaunch state is projected through
+its explicit schema rather than recursively copying unknown fields, and public
+recursive redaction uses null-prototype objects populated only from own
+enumerable data descriptors. Accessors, inherited fields, pollution keys,
+proxies, and non-plain objects are not evaluated or copied.
+
+Unix supervisor directories, state files, and sockets are owner-only (`0700`,
+`0600`, and `0600`). Accounts refuses symlinked `ACCOUNTS_HOME` or supervisor
+components, refuses non-socket control-path replacement, snapshots directory
+identity, and revalidates the boundary before state writes, unlinks, chmods,
+listens, provider spawn, and post-prelaunch persistence.
+
+Printed POSIX handoffs validate every environment-variable name, single-quote
+every value and command word without expansion, and place an explicit `env --`
+option boundary before assignments. Profile directories and custom `extraEnv`
+values therefore retain spaces, quotes, newlines, backslashes, dollars,
+backticks, and leading hyphens as data rather than shell syntax.
+
+Accounts otherwise preserves the caller's same-binding environment, including
+`PATH`, proxy and TLS settings, Bedrock/Vertex selection, and AWS/Google SDK
+configuration. Those settings, provider-specific flags/config files, and any
+other logging controls remain caller-trusted: Accounts does not claim to
+sanitize arbitrary provider configuration or a command the caller edits after
+generation.
 
 Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 
@@ -290,7 +427,7 @@ tree is in [CLI reference](docs/cli-reference.md) and is also available from
 | `accounts current` | Active profile per tool (with applied hint). |
 | `accounts active [tool]` | Print active profile name (scripting). |
 | `accounts applied [tool]` | Print applied profile name (scripting). |
-| `accounts env [name]` | Print one or more `export ...` lines for the profile. Use `--tool` only when ambiguous or when no name is passed. |
+| `accounts env [name]` | Print POSIX sh/bash/zsh `export ...` lines for the profile. Use `--tool` only when ambiguous or when no name is passed. |
 | `accounts launch <name>` | Launch tool once with profile env. Supports `--permissions <preset>`. |
 | `accounts run <target> [args...]` | Run a tool or profile under the supervisor so MCP/CLI can switch and restart it. A tool target accepts `--profile`; a profile target accepts `--tool`. Supports `--resume` and `--permissions`. Claude `--headless`/`--background` runs bypass the supervisor. |
 | `accounts supervisor status [tool]` | Show running supervisors. |
@@ -300,7 +437,7 @@ tree is in [CLI reference](docs/cli-reference.md) and is also available from
 | `accounts hook install` | Install `claude()` wrapper — see [docs/hook.md](docs/hook.md). |
 | `accounts hook uninstall` | Remove hook script. |
 | `accounts hook path` | Print hook script path. |
-| `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). `--background`, `--profile <name>`, `--json`. |
+| `accounts agents` | List Claude agent sessions across **all** profiles, the default `~/.claude` dir, and untracked processes (`claude agents` only shows the current account). Provider records and process command lines are recursively projected through the public redaction boundary before human or JSON output. Live process attribution requires the kernel-reported PID executable to match the configured direct executable, its exact current `PATH` target/real path, or the native version root. Node/Bun wrapper rows fail closed because the kernel executable proves only the mutable interpreter, not the child script; missing PID identity also fails closed. `--background`, `--profile <name>`, `--json`. |
 | `accounts sessions` (`sessions list`) | Read-only catalog of root Claude sessions owned by registered local profiles. `--profile`, `--project`, `--uuid`, `--json`. |
 | `accounts sessions merge` | Union Claude transcripts/history into the shared home; `--link` opts registered profiles into shared history. Supports `--dry-run`, `--profile`, `--from`, and `--json`. |
 | `accounts usage` | Read cached Claude usage per account, or query the usage endpoint with `--refresh`. See [usage-aware switching](docs/usage-aware-switching.md). |
@@ -479,7 +616,7 @@ Claude process, and restarts it with the selected profile. Claude uses
 
 If the agent was not started through `accounts run`, MCP falls back to the safe
 handoff behavior and returns a command such as:
-`CLAUDE_CONFIG_DIR=... claude --continue`.
+`env -u BUN_CONFIG_VERBOSE_FETCH -u NODE_DEBUG -u NODE_DEBUG_NATIVE CLAUDE_CONFIG_DIR=... claude --continue`.
 
 Human equivalent:
 

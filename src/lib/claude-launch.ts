@@ -13,6 +13,10 @@ import {
   securityExecutable,
   writeClaudeKeychain,
 } from "./keychain.js";
+import { providerLaunchEnv } from "./env.js";
+import { redactText } from "./redaction.js";
+
+export { redactArgv, redactText } from "./redaction.js";
 
 export interface ClaudeLaunchOptions {
   headless?: boolean;
@@ -178,33 +182,6 @@ export function planClaudeLaunch(
   if (rawBackground) return { mode: "background", args: [...rawArgs], nonInteractive: true };
   if (rawPrint) return { mode: "headless", args: [...rawArgs], nonInteractive: true };
   return { mode: "interactive", args: [...rawArgs], nonInteractive: false };
-}
-
-const SECRET_VALUE_FLAG = /(?:api[-_]?key|auth(?:orization)?|credential|password|secret|token)$/i;
-const SECRET_PATTERN = /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,}|gh[oprsu]_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b/g;
-
-export function redactText(value: string): string {
-  return value.replace(SECRET_PATTERN, "[REDACTED]");
-}
-
-export function redactArgv(argv: string[]): string[] {
-  const redacted: string[] = [];
-  let redactNext = false;
-  for (const arg of argv) {
-    if (redactNext) {
-      redacted.push("[REDACTED]");
-      redactNext = false;
-      continue;
-    }
-    const equals = arg.indexOf("=");
-    if (equals > 0 && SECRET_VALUE_FLAG.test(arg.slice(0, equals).replace(/^--?/, ""))) {
-      redacted.push(`${arg.slice(0, equals + 1)}[REDACTED]`);
-      continue;
-    }
-    redacted.push(redactText(arg));
-    if (SECRET_VALUE_FLAG.test(arg.replace(/^--?/, ""))) redactNext = true;
-  }
-  return redacted;
 }
 
 function numericTestSetting(name: string, fallback: number): number {
@@ -391,7 +368,11 @@ async function relayProcess(tool: ToolDef, args: string[], env: NodeJS.ProcessEn
     };
     child.once("error", (error) => {
       cleanup();
-      reject(new AccountsError(`failed to launch ${tool.bin}: ${redactText(error.message)}`));
+      reject(
+        new AccountsError(
+          `failed to launch ${redactText(tool.bin)}: ${redactText(error.message)}`,
+        ),
+      );
     });
     child.once("exit", (code, signal) => {
       cleanup();
@@ -408,9 +389,10 @@ export async function runClaudeLaunch(
   env: NodeJS.ProcessEnv,
   cwd: string,
 ): Promise<number> {
-  if (tool.id !== "claude" || !keychainSupported()) return relayProcess(tool, args, env, cwd);
+  const launchEnv = providerLaunchEnv(env);
+  if (tool.id !== "claude" || !keychainSupported()) return relayProcess(tool, args, launchEnv, cwd);
   const credential = claudeKeychainCredentialFromProfile(profile.dir, profile.name);
-  if (!credential) return relayProcess(tool, args, env, cwd);
+  if (!credential) return relayProcess(tool, args, launchEnv, cwd);
 
   const release = await acquireKeychainLock();
   let pendingSignal: NodeJS.Signals | undefined;
@@ -424,7 +406,7 @@ export async function runClaudeLaunch(
     prior = captureClaudeKeychain();
     keychainTouched = true;
     writeClaudeKeychain(credential);
-    const code = await relayProcess(tool, args, env, cwd);
+    const code = await relayProcess(tool, args, launchEnv, cwd);
     return pendingSignal ? signalExitCode(pendingSignal) : code;
   } finally {
     try {

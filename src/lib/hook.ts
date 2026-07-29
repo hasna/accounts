@@ -38,7 +38,7 @@ claude() {
       fi
     fi
   fi
-  command "$_bin" "$@"
+  command env -u BUN_CONFIG_VERBOSE_FETCH -u NODE_DEBUG -u NODE_DEBUG_NATIVE "$_bin" "$@"
 }
 `;
 }

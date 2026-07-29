@@ -1,5 +1,6 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -27,7 +28,7 @@ import {
   normalizePermissionPreset,
   permissionArgsFor,
 } from "./lib/tools.js";
-import { formatExportLines, profileEnv } from "./lib/env.js";
+import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -145,6 +146,103 @@ test("profileEnv renders extra per-tool environment templates", () => {
   expect(env.XDG_CONFIG_HOME).toBe(join(p.dir, "xdg-config"));
   expect(env.XDG_DATA_HOME).toBe(join(p.dir, "xdg-data"));
   expect(formatExportLines(env)).toContain("export OPENCODE_CONFIG_DIR=");
+});
+
+test("POSIX export handoffs preserve hostile bytes without command substitution", () => {
+  const markerDollar = join(home, "export-dollar-marker");
+  const markerBacktick = join(home, "export-backtick-marker");
+  const value =
+    `-leading "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch export-dollar-marker) \`touch export-backtick-marker\``;
+  const rendered = formatExportLines({ HOSTILE_VALUE: value }, {});
+
+  const result = spawnSync("/bin/sh", ["-s"], {
+    cwd: home,
+    encoding: "utf8",
+    input: `${rendered}\nprintf '%s' "$HOSTILE_VALUE"`,
+    env: { ...process.env, DOLLAR: "expanded-by-shell" },
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toBe(value);
+  expect(existsSync(markerDollar)).toBe(false);
+  expect(existsSync(markerBacktick)).toBe(false);
+});
+
+test("POSIX env assignments preserve hostile bytes, option boundaries, and parent state", () => {
+  const markerDollar = join(home, "assignment-dollar-marker");
+  const markerBacktick = join(home, "assignment-backtick-marker");
+  const observation = join(home, "assignment-observation");
+  const provider = join(home, "-assignment-provider");
+  const value =
+    `-leading "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch assignment-dollar-marker) \`touch assignment-backtick-marker\``;
+  writeFileSync(provider, '#!/bin/sh\nprintf %s "$HOSTILE_VALUE" > "$OBSERVATION_PATH"\n');
+  chmodSync(provider, 0o755);
+
+  const result = spawnSync("/bin/sh", ["-s"], {
+    cwd: home,
+    encoding: "utf8",
+    input: [
+      "HOSTILE_VALUE=parent-value",
+      `${formatEnvAssignments({ HOSTILE_VALUE: value }, {})} -assignment-provider`,
+      'printf %s "$HOSTILE_VALUE"',
+    ].join("\n"),
+    env: {
+      ...process.env,
+      DOLLAR: "expanded-by-shell",
+      OBSERVATION_PATH: observation,
+      PATH: `${home}:${process.env.PATH ?? ""}`,
+    },
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(existsSync(observation), result.stderr).toBe(true);
+  expect(readFileSync(observation, "utf8")).toBe(value);
+  expect(result.stdout).toBe("parent-value");
+  expect(existsSync(markerDollar)).toBe(false);
+  expect(existsSync(markerBacktick)).toBe(false);
+});
+
+test("generated handoffs reject non-portable environment variable names", () => {
+  expect(() => formatExportLines({ "BAD-NAME": "value" }, {})).toThrow(AccountsError);
+  expect(() => formatEnvAssignments({ "1BAD": "value" }, {})).toThrow(AccountsError);
+  expect(() => formatExportLines({ GOOD_NAME: "before\0after" }, {})).toThrow(AccountsError);
+  expect(() =>
+    addCustomTool({
+      id: "bad-extra-env",
+      label: "Bad Extra Env",
+      envVar: "GOOD_HOME",
+      extraEnv: { "BAD-NAME": "value" },
+      defaultDir: join(home, "bad-extra-env"),
+      bin: "bad-extra-env",
+    }),
+  ).toThrow(AccountsError);
+});
+
+test("profileEnv cannot restore request-debug keys from custom tool settings", () => {
+  const tool = addCustomTool({
+    id: "debug-overlay",
+    label: "Debug Overlay",
+    envVar: "DEBUG_OVERLAY_HOME",
+    extraEnv: {
+      BUN_CONFIG_VERBOSE_FETCH: "1",
+      node_debug: "http,http2",
+      Node_Debug_Native: "http",
+      KEEP_ME: "ordinary-setting",
+    },
+    defaultDir: join(home, "debug-overlay-default"),
+    bin: "debug-overlay",
+  });
+  const profile = addProfile({ name: "ops", tool: tool.id });
+
+  const env = profileEnv(profile, tool);
+
+  expect(Object.keys(env).filter((name) =>
+    ["bun_config_verbose_fetch", "node_debug", "node_debug_native"].includes(name.toLowerCase())
+  )).toEqual([]);
+  expect(env.KEEP_ME).toBe("ordinary-setting");
+  expect(env.DEBUG_OVERLAY_HOME).toBe(profile.dir);
 });
 
 test("claude profile env isolates Telegram channel state", () => {
