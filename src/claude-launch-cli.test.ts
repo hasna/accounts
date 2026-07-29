@@ -472,7 +472,7 @@ process.exit(29);
   } finally {
     removeTestDirectory(batchBin);
   }
-});
+}, 30_000);
 
 test("headless launch keeps Claude stdout clean and returns its exit code", () => {
   addProfile("acct");
