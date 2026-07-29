@@ -221,6 +221,15 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
 }
 
 /**
+ * Does the profile have a parked credential but no parked OAuth identity at
+ * all? In this state the live identity is not a safe substitute: it may belong
+ * to an in-session login to another account.
+ */
+export function profileHasParkedCredentialWithoutIdentity(profileDir: string): boolean {
+  return existsSync(profileCredentialsSnapshot(profileDir)) && !oauthRecordFromSnapshot(profileDir);
+}
+
+/**
  * Does the dir's LIVE account contradict the profile's OWN parked identity?
  *
  * THE HOLE THIS CLOSES (defect 0e7069a9): an in-session `/login` to a different
@@ -238,12 +247,13 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
  * defended; `live` only ever detects a conflict, so an unreadable live identity
  * cannot prove one and must not block a legitimate refresh.
  *
- * An unknown `own` is the FIRST-CAPTURE case, not a conflict: a profile that
- * has never been snapshotted has no claim to defend, and refusing here would
- * stop it ever acquiring one. That is the one leg where this differs from
- * `recoverParkedCredential`, where unknown own identity IS a refusal — there,
- * restoring would pair the guest's identity with this profile's credential,
- * which is active harm rather than a missing precondition.
+ * An absent own snapshot is the FIRST-CAPTURE case only when no credential is
+ * parked: a profile that has never been snapshotted has no claim to defend, and
+ * refusing there would stop it ever acquiring one. A parked credential with no
+ * parked identity is handled separately by
+ * `profileHasParkedCredentialWithoutIdentity`; it must be preserved because
+ * the live identity cannot establish who owns the older credential. A present
+ * legacy identity without a comparable uuid remains permissive here.
  */
 export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): boolean {
   const own = identityToken(oauthRecordFromSnapshot(profileDir));
@@ -355,6 +365,14 @@ function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): 
  * old binary's fresher rotation is picked up rather than clobbered).
  */
 export function syncProfileSnapshotToCentral(profileDir: string, tool?: ToolDef): SyncResult {
+  // Never bind an existing credential snapshot to the dir's live identity when
+  // its own identity snapshot is missing. The live files may be a foreign
+  // in-session login, and assigning the parked credential to that account would
+  // create a false central-store association.
+  if (profileHasParkedCredentialWithoutIdentity(profileDir)) {
+    return { synced: false, reason: "parked credential has no parked account identity" };
+  }
+
   const oauthSource = oauthRecordFromSnapshot(profileDir) ?? oauthRecordFromAccountFiles(profileDir, tool);
   const uuid = uuidFromOAuthRecord(oauthSource);
   if (!oauthSource || !uuid) {

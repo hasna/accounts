@@ -37,6 +37,7 @@ import {
   centralOAuthRecordForProfile,
   credentialHealth,
   dirLiveIdentityIsForeign,
+  profileHasParkedCredentialWithoutIdentity,
   type CredentialHealthPresent,
   type SyncResult,
   syncProfileSnapshotToCentral,
@@ -875,13 +876,19 @@ export function ensureProfileAuthSnapshot(
   // alone would still let the parked identity become the guest's, making `own`
   // equal `live` on the next call — a one-invocation delay, not a fix.
   //
-  // `overwrite` is the deliberate rebinding path (`finalizeLogin`): it means
-  // the dir's files are this profile's truth again, so it crosses the gate.
-  const liveIdentityIsForeign = !opts.overwrite && dirLiveIdentityIsForeign(profileDir, tool);
+  // Missing parked identity is safe only for a true first capture. If a
+  // credential is already parked, the live identity cannot prove that the
+  // newer live credential belongs to the same account, so both snapshot writes
+  // must fail closed. `overwrite` is the deliberate rebinding path
+  // (`finalizeLogin`): it means the dir's files are this profile's truth again,
+  // so it crosses the gate.
+  const liveAuthMayBeForeign =
+    !opts.overwrite &&
+    (profileHasParkedCredentialWithoutIdentity(profileDir) || dirLiveIdentityIsForeign(profileDir, tool));
 
   const oauthSource = findOAuthSource(profileAccountJsonPaths(profileDir, tool));
   const oauthSnap = profileOAuthSnapshot(profileDir);
-  if (oauthSource && !liveIdentityIsForeign && (opts.overwrite || snapshotIsStale(oauthSource.path, oauthSnap))) {
+  if (oauthSource && !liveAuthMayBeForeign && (opts.overwrite || snapshotIsStale(oauthSource.path, oauthSnap))) {
     writeJsonFile(oauthSnap, { oauthAccount: oauthSource.oauth }, profileDir);
   }
 
@@ -889,7 +896,7 @@ export function ensureProfileAuthSnapshot(
   const credSnap = profileCredentialsSnapshot(profileDir);
   if (
     existsSync(credFile) &&
-    !liveIdentityIsForeign &&
+    !liveAuthMayBeForeign &&
     (opts.overwrite || snapshotIsStale(credFile, credSnap)) &&
     !wouldDowngradeSnapshot(credFile, credSnap)
   ) {

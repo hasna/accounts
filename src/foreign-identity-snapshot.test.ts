@@ -159,6 +159,26 @@ test("repeated calls do not erode the parked credential (the guard holds, it doe
   expect(readFileSync(centralCredentialsSnapshot(UUID_HOST))).toEqual(central);
 });
 
+test("a foreign credential cannot replace an unattributed parked credential", () => {
+  const dir = mkdtempSync(join(tmpdir(), "foreign-no-parked-identity-"));
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(profileCredentialsSnapshot(dir), credentialJson("host"));
+  backdate(profileCredentialsSnapshot(dir), 3600);
+
+  // Legacy/incomplete state: the host credential is parked, but its identity
+  // snapshot is missing. The newer live files belong to a guest account.
+  writeFileSync(join(dir, ".claude.json"), identityJson(UUID_GUEST, "guest"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("guest"));
+  addProfile({ name: "no-parked-identity", dir });
+  const parked = readFileSync(profileCredentialsSnapshot(dir));
+
+  for (let i = 0; i < 3; i++) ensureProfileAuthSnapshot(dir, tool());
+
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
+  expect(existsSync(profileOAuthSnapshot(dir))).toBe(false);
+  expect(existsSync(centralCredentialsSnapshot(UUID_GUEST))).toBe(false);
+});
+
 // --- positive controls: the guard must not freeze the legitimate paths -------
 // Each of these must survive the fix. A mutant that satisfies the tests above
 // by refusing every snapshot refresh has to break at least one of them.
@@ -178,7 +198,7 @@ test("POSITIVE CONTROL: the same account rotating its token still refreshes the 
   expect(JSON.parse(after.toString()).claudeAiOauth.accessToken).toBe("host-rotated-access");
 });
 
-test("POSITIVE CONTROL: a profile with no parked identity still captures its first snapshot", () => {
+test("POSITIVE CONTROL: a profile with no parked identity or credential captures its first snapshot", () => {
   const dir = mkdtempSync(join(tmpdir(), "foreign-firstcapture-"));
   writeFileSync(join(dir, ".claude.json"), identityJson(UUID_HOST, "host"));
   writeFileSync(join(dir, ".credentials.json"), credentialJson("host"));
@@ -187,13 +207,33 @@ test("POSITIVE CONTROL: a profile with no parked identity still captures its fir
 
   ensureProfileAuthSnapshot(dir, tool());
 
-  // Unknown own identity is the FIRST-CAPTURE case, not a conflict: there is no
-  // parked claim to defend, and refusing here would stop a profile ever
-  // acquiring one. This is the deliberate asymmetry with
+  // Unknown own identity with no parked credential is the FIRST-CAPTURE case:
+  // there is no parked claim to defend, and refusing here would stop a profile
+  // ever acquiring one. This is the deliberate asymmetry with
   // `recoverParkedCredential`, where unknown own identity IS a refusal.
   expect(existsSync(profileCredentialsSnapshot(dir))).toBe(true);
   expect(JSON.parse(readFileSync(profileCredentialsSnapshot(dir), "utf8")).claudeAiOauth.accessToken).toBe(
     "host-access",
+  );
+});
+
+test("POSITIVE CONTROL: overwrite can rebind an unattributed parked credential", () => {
+  const dir = mkdtempSync(join(tmpdir(), "foreign-unattributed-rebind-"));
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(profileCredentialsSnapshot(dir), credentialJson("host"));
+  backdate(profileCredentialsSnapshot(dir), 3600);
+  writeFileSync(join(dir, ".claude.json"), identityJson(UUID_GUEST, "guest"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("guest"));
+  addProfile({ name: "unattributed-rebind", dir });
+
+  ensureProfileAuthSnapshot(dir, tool(), { overwrite: true });
+
+  const parkedIdentity = JSON.parse(readFileSync(profileOAuthSnapshot(dir), "utf8")) as {
+    oauthAccount?: { accountUuid?: string };
+  };
+  expect(parkedIdentity.oauthAccount?.accountUuid).toBe(UUID_GUEST);
+  expect(JSON.parse(readFileSync(profileCredentialsSnapshot(dir), "utf8")).claudeAiOauth.accessToken).toBe(
+    "guest-access",
   );
 });
 
@@ -270,4 +310,3 @@ test("a malformed-but-DIFFERENT live uuid is still a conflict", () => {
 
   expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
 });
-
