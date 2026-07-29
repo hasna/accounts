@@ -115,6 +115,43 @@ test("codex app menu switch relaunches with isolated profile environment", async
   expect(calls.at(-1)?.env?.CODEX_HOME).toBe(profile.dir);
 });
 
+test("codex app relaunch suppresses request debugging without erasing routing", async () => {
+  addProfile({ name: "desktop", tool: "codex-app" });
+  const previous = {
+    BUN_CONFIG_VERBOSE_FETCH: process.env.BUN_CONFIG_VERBOSE_FETCH,
+    NODE_DEBUG: process.env.NODE_DEBUG,
+    NODE_DEBUG_NATIVE: process.env.NODE_DEBUG_NATIVE,
+  };
+  const inheritedPath = process.env.PATH;
+  let launchedEnv: Record<string, string> | undefined;
+  const runner: CodexAppProcessRunner = {
+    spawnSync() {
+      return { status: 0 };
+    },
+    spawn(_command, _args, opts) {
+      launchedEnv = opts?.env as Record<string, string> | undefined;
+      return { unref() {} };
+    },
+  };
+
+  try {
+    process.env.BUN_CONFIG_VERBOSE_FETCH = "1";
+    process.env.NODE_DEBUG = "http,http2";
+    process.env.NODE_DEBUG_NATIVE = "http";
+    await switchCodexAppFromMenu("desktop", { quit: false, runner });
+
+    expect(launchedEnv?.BUN_CONFIG_VERBOSE_FETCH).toBeUndefined();
+    expect(launchedEnv?.NODE_DEBUG).toBeUndefined();
+    expect(launchedEnv?.NODE_DEBUG_NATIVE).toBeUndefined();
+    expect(launchedEnv?.PATH).toBe(inheritedPath);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
 test("swift source calls the codex app menu JSON commands", () => {
   const source = codexAppMenuSwiftSource("/opt/accounts");
 

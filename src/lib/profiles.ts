@@ -1,10 +1,11 @@
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { type Profile, type Store, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
+import { sameConfigDir } from "./safe-path.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
@@ -97,29 +98,6 @@ function isManagedProfileDir(dir: string): boolean {
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
-function canonicalConfigDir(dir: string): string {
-  const resolved = resolve(dir);
-  const missing: string[] = [];
-  let cursor = resolved;
-
-  while (!existsSync(cursor)) {
-    const parent = dirname(cursor);
-    if (parent === cursor) return resolved;
-    missing.unshift(basename(cursor));
-    cursor = parent;
-  }
-
-  try {
-    return join(realpathSync(cursor), ...missing);
-  } catch {
-    return resolved;
-  }
-}
-
-function sameConfigDir(a: string, b: string): boolean {
-  return canonicalConfigDir(a) === canonicalConfigDir(b);
-}
-
 export function findProfile(name: string, toolId?: string): Profile | undefined {
   const matches = profileMatches(name, toolId);
   return matches.length === 1 ? matches[0] : undefined;
@@ -157,6 +135,24 @@ export interface AddOptions {
   description?: string;
 }
 
+/**
+ * One-account-one-tool: an account name identifies exactly one tool, because
+ * resolution is name-first — `resolveProfileFromStore` throws `exists for
+ * multiple tools` the moment two rows share a name, breaking every bare
+ * `accounts <cmd> <name>`. Same rule and error wording as the api transport
+ * (AccountsRepo.nameConflict, src/server/repo.ts) so both transports refuse a
+ * duplicate identically. Grandfathered collisions already in the store stay
+ * resolvable (via --tool or a tool lock); only NEW collisions are refused.
+ */
+function nameConflict(name: string, holderTool: string, tool: string): AccountsError {
+  return holderTool === tool
+    ? new AccountsError(`a ${tool} profile named "${name}" already exists`)
+    : new AccountsError(
+        `a profile named "${name}" already exists for tool "${holderTool}"; ` +
+          "account names must be unique across tools",
+      );
+}
+
 export function addProfile(opts: AddOptions): Profile {
   const name = opts.name;
   const nameCheck = profileNameSchema.safeParse(name);
@@ -166,8 +162,9 @@ export function addProfile(opts: AddOptions): Profile {
   const tool = getTool(toolId);
 
   const store = loadStore();
-  if (store.profiles.some((p) => p.name === name && p.tool === toolId)) {
-    throw new AccountsError(`a ${toolId} profile named "${name}" already exists`);
+  const holder = store.profiles.find((p) => p.name === name);
+  if (holder) {
+    throw nameConflict(name, holder.tool, toolId);
   }
 
   const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, name);
@@ -265,8 +262,11 @@ export function renameProfile(oldName: string, newName: string, toolId?: string)
     );
   }
   const profile = matches[0]!;
-  if (store.profiles.some((p) => p.name === newName && p.tool === profile.tool)) {
-    throw new AccountsError(`a ${profile.tool} profile named "${newName}" already exists`);
+  // Name-scoped, and skipped for a rename onto itself — the same semantics as
+  // AccountsRepo.rename (src/server/repo.ts), so both transports behave alike.
+  if (oldName !== newName) {
+    const holder = store.profiles.find((p) => p.name === newName);
+    if (holder) throw nameConflict(newName, holder.tool, profile.tool);
   }
 
   if (store.current[profile.tool] === oldName) store.current[profile.tool] = newName;

@@ -16,10 +16,10 @@ import {
 import { liveClaudePaths, profileKeychainSnapshot, profileOAuthSnapshot } from "./lib/claude-layout.js";
 import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook.js";
 import { resolvePickMode } from "./lib/pick.js";
-import { switchProfile } from "./lib/switch.js";
-import { profileEnv } from "./lib/env.js";
+import { publicSwitchResult, switchProfile } from "./lib/switch.js";
+import { controlledProbeEnv, profileEnv, providerLaunchEnv } from "./lib/env.js";
 import { loadStore } from "./storage.js";
-import { getTool } from "./lib/tools.js";
+import { addCustomTool, getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -209,6 +209,192 @@ test("profileEnv clears Claude API auth environment variables", async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("public switch projection redacts credential-bearing positional tails after exact end-of-options", async () => {
+  addProfile({ name: "marker", tool: "codex" });
+  const publicProjectKey = ["sk", "proj", "public-positional-secret"].join("-");
+  const internal = await switchProfile("marker", {
+    tool: "codex",
+    mode: "active",
+    args: [
+      "--api-key",
+      "--",
+      "--client-key",
+      "keep-public-positional-plain-value",
+      "--api-key=public-positional-attached-secret",
+      "Authorization: Bearer public-positional-bearer-secret",
+      publicProjectKey,
+      "keep-public-positional-control",
+    ],
+  });
+
+  const output = publicSwitchResult(internal);
+
+  expect(JSON.stringify(output)).not.toContain("public-positional-attached-secret");
+  expect(JSON.stringify(output)).not.toContain("public-positional-bearer-secret");
+  expect(JSON.stringify(output)).not.toContain(publicProjectKey);
+  expect(output.command.slice(-8)).toEqual([
+    "--api-key",
+    "--",
+    "--client-key",
+    "keep-public-positional-plain-value",
+    "--api-key=[REDACTED]",
+    "Authorization: [REDACTED]",
+    "[REDACTED]",
+    "[REDACTED]",
+  ]);
+  expect(output.commandLine).toContain(
+    "'--api-key' '--' '--client-key' 'keep-public-positional-plain-value'",
+  );
+  expect(output.commandLine).toContain(
+    "'--api-key=[REDACTED]' 'Authorization: [REDACTED]' '[REDACTED]' '[REDACTED]'",
+  );
+  expect(output.commandLine).not.toContain("keep-public-positional-control");
+});
+
+test("public switch projection redacts pending opaque tokens with internal punctuation", async () => {
+  addProfile({ name: "complete-token", tool: "codex" });
+  const internal = await switchProfile("complete-token", {
+    tool: "codex",
+    mode: "active",
+    args: [
+      "--api-key",
+      "--label=opaque/--label=public-switch-hidden",
+      "keep-public-complete-token",
+    ],
+  });
+
+  const output = publicSwitchResult(internal);
+  expect(JSON.stringify(output)).not.toContain("public-switch-hidden");
+  expect(output.command.slice(-3)).toEqual([
+    "--api-key",
+    "[REDACTED]",
+    "keep-public-complete-token",
+  ]);
+  expect(output.commandLine).toContain(
+    "'--api-key' '[REDACTED]' 'keep-public-complete-token'",
+  );
+});
+
+test("public switch projection carries wrapper-bound split state without widening structured values", async () => {
+  addProfile({ name: "wrapper-split", tool: "codex" });
+  const internal = await switchProfile("wrapper-split", {
+    tool: "codex",
+    mode: "active",
+    args: [
+      "--",
+      "env=--api-key",
+      "",
+      "public-wrapper-split-secret",
+      "keep-public-wrapper-split",
+      "url=urn:authorization:public",
+      "keep-public-urn",
+      "url=https://example.test/authorization:public",
+      "keep-public-url",
+    ],
+  });
+
+  const output = publicSwitchResult(internal);
+  expect(JSON.stringify(output)).not.toContain("public-wrapper-split-secret");
+  expect(output.command.slice(-9)).toEqual([
+    "--",
+    "env=--api-key",
+    "",
+    "[REDACTED]",
+    "keep-public-wrapper-split",
+    "url=urn:authorization:public",
+    "keep-public-urn",
+    "url=https://example.test/authorization:public",
+    "keep-public-url",
+  ]);
+  expect(output.commandLine).toContain(
+    "'env=--api-key' '' '[REDACTED]' 'keep-public-wrapper-split'",
+  );
+  expect(output.commandLine).toContain(
+    "'url=urn:authorization:public' 'keep-public-urn'",
+  );
+  expect(output.commandLine).toContain(
+    "'url=https://example.test/authorization:public' 'keep-public-url'",
+  );
+});
+
+test("public switch projection keeps a cleared auth variable cleared in the restart command", async () => {
+  addProfile({ name: "cleared-auth", tool: "claude" });
+
+  const internal = await switchProfile("cleared-auth", { tool: "claude", mode: "active" });
+  const output = publicSwitchResult(internal);
+
+  // `commandLine` is printed with "run the restart command above" and is executed
+  // verbatim by users and by the MCP `switch_profile` instruction. A cleared
+  // credential variable therefore has to stay cleared: substituting a literal
+  // placeholder hands the provider a non-empty bogus API key and a non-empty
+  // bogus key-helper command instead of the profile's own credential.
+  expect(internal.env.ANTHROPIC_API_KEY).toBe("");
+  expect(output.commandLine).toContain("ANTHROPIC_API_KEY=''");
+  expect(output.commandLine).toContain("ANTHROPIC_AUTH_TOKEN=''");
+  expect(output.commandLine).toContain("CLAUDE_CODE_API_KEY_HELPER=''");
+  expect(output.commandLine).not.toContain("[REDACTED]");
+});
+
+test("public switch projection still redacts a non-empty credential-named launch variable", async () => {
+  addCustomTool({
+    id: "env-secret-tool",
+    label: "Env Secret Tool",
+    envVar: "ENV_SECRET_HOME",
+    extraEnv: { TOOL_API_KEY: "switch-env-secret-value" },
+    defaultDir: join(home, "env-secret-default"),
+    bin: "env-secret-provider",
+  });
+  addProfile({ name: "env-secret", tool: "env-secret-tool" });
+
+  const internal = await switchProfile("env-secret", { tool: "env-secret-tool", mode: "active" });
+  const output = publicSwitchResult(internal);
+
+  expect(internal.env.TOOL_API_KEY).toBe("switch-env-secret-value");
+  expect(output.commandLine).toContain("TOOL_API_KEY='[REDACTED]'");
+  expect(output.commandLine).not.toContain("switch-env-secret-value");
+  expect(JSON.stringify(output)).not.toContain("switch-env-secret-value");
+});
+
+test("launch environment policy is case-insensitive and preserves same-binding routing", () => {
+  const inherited = {
+    Path: "/trusted/bin",
+    BUN_CONFIG_VERBOSE_FETCH: "1",
+    node_debug: "http,http2",
+    Node_Debug_Native: "http",
+    HTTP_PROXY: "http://proxy.example.test:8080",
+    HTTPS_PROXY: "http://proxy.example.test:8443",
+    NO_PROXY: "127.0.0.1,localhost",
+    CLAUDE_CODE_USE_BEDROCK: "1",
+    CLAUDE_CODE_USE_VERTEX: "1",
+    AWS_PROFILE: "work",
+    GOOGLE_APPLICATION_CREDENTIALS: "/profiles/work/google.json",
+  };
+  const overlay = {
+    NODE_DEBUG: "http",
+    CODEX_HOME: "/profiles/work/codex",
+  };
+
+  const provider = providerLaunchEnv(inherited, overlay);
+  const probe = controlledProbeEnv({ ...inherited, ...overlay });
+
+  for (const env of [provider, probe]) {
+    expect(Object.keys(env).filter((name) => name.toLowerCase() === "bun_config_verbose_fetch")).toEqual([]);
+    expect(Object.keys(env).filter((name) => name.toLowerCase() === "node_debug")).toEqual([]);
+    expect(Object.keys(env).filter((name) => name.toLowerCase() === "node_debug_native")).toEqual([]);
+    expect(env).toMatchObject({
+      Path: "/trusted/bin",
+      HTTP_PROXY: "http://proxy.example.test:8080",
+      HTTPS_PROXY: "http://proxy.example.test:8443",
+      NO_PROXY: "127.0.0.1,localhost",
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      CLAUDE_CODE_USE_VERTEX: "1",
+      AWS_PROFILE: "work",
+      GOOGLE_APPLICATION_CREDENTIALS: "/profiles/work/google.json",
+      CODEX_HOME: "/profiles/work/codex",
+    });
+  }
+});
+
 test("applyProfile writes oauth to live paths", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-"));
   writeOAuth(workDir, "work@example.com");
@@ -300,6 +486,96 @@ test("hook install writes script with name validation", async () => {
   expect(hookScript()).toContain("=~ ^[a-z0-9][a-z0-9-]*$");
 });
 
+test("hook scrubs request debugging only for the provider child", () => {
+  const binDir = mkdtempSync(join(tmpdir(), "accounts hook 'bin-"));
+  const generatedHook = join(home, "generated hook 'script.sh");
+  const observationPath = join(home, "hook-observation.txt");
+  const fakeAccounts = join(binDir, "accounts");
+  const fakeClaude = join(binDir, "claude");
+  const args = ["space arg", "single'quote", '"double quote"', "$literal", "*"];
+
+  writeFileSync(
+    fakeAccounts,
+    [
+      "#!/bin/sh",
+      'case "${1:-}" in',
+      "  active|applied) exit 0 ;;",
+      "  apply) exit 99 ;;",
+      "esac",
+      "exit 0",
+    ].join("\n"),
+  );
+  writeFileSync(
+    fakeClaude,
+    [
+      "#!/bin/sh",
+      "{",
+      '  printf "debug=%s,%s,%s\\n" "${BUN_CONFIG_VERBOSE_FETCH+x}" "${NODE_DEBUG+x}" "${NODE_DEBUG_NATIVE+x}"',
+      '  printf "path=%s\\n" "$PATH"',
+      '  printf "https_proxy=%s\\n" "${HTTPS_PROXY:-}"',
+      '  printf "tls=%s\\n" "${NODE_EXTRA_CA_CERTS:-}"',
+      '  printf "bedrock=%s\\n" "${CLAUDE_CODE_USE_BEDROCK:-}"',
+      '  printf "vertex=%s\\n" "${CLAUDE_CODE_USE_VERTEX:-}"',
+      '  printf "aws=%s\\n" "${AWS_PROFILE:-}"',
+      '  printf "google=%s\\n" "${GOOGLE_APPLICATION_CREDENTIALS:-}"',
+      '  for arg in "$@"; do printf "arg=%s\\n" "$arg"; done',
+      '} > "$HOOK_OBSERVATION"',
+    ].join("\n"),
+  );
+  chmodSync(fakeAccounts, 0o755);
+  chmodSync(fakeClaude, 0o755);
+  writeFileSync(generatedHook, hookScript(), { mode: 0o755 });
+
+  const result = spawnSync(
+    "/bin/bash",
+    [
+      "--noprofile",
+      "--norc",
+      "-c",
+      [
+        'source "$1"',
+        "shift",
+        'claude "$@"',
+        'printf "parent-debug=%s,%s,%s\\n" "${BUN_CONFIG_VERBOSE_FETCH+x}" "${NODE_DEBUG+x}" "${NODE_DEBUG_NATIVE+x}"',
+      ].join("\n"),
+      "accounts-hook-test",
+      generatedHook,
+      ...args,
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        HOOK_OBSERVATION: observationPath,
+        BUN_CONFIG_VERBOSE_FETCH: "1",
+        NODE_DEBUG: "http,http2",
+        NODE_DEBUG_NATIVE: "http",
+        HTTPS_PROXY: "http://proxy.example.test:8443",
+        NODE_EXTRA_CA_CERTS: "/profiles/work/ca.pem",
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        CLAUDE_CODE_USE_VERTEX: "1",
+        AWS_PROFILE: "work",
+        GOOGLE_APPLICATION_CREDENTIALS: "/profiles/work/google.json",
+      },
+    },
+  );
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toContain("parent-debug=x,x,x");
+  const observation = readFileSync(observationPath, "utf8");
+  expect(observation).toContain("debug=,,");
+  expect(observation).toContain(`path=${binDir}:`);
+  expect(observation).toContain("https_proxy=http://proxy.example.test:8443");
+  expect(observation).toContain("tls=/profiles/work/ca.pem");
+  expect(observation).toContain("bedrock=1");
+  expect(observation).toContain("vertex=1");
+  expect(observation).toContain("aws=work");
+  expect(observation).toContain("google=/profiles/work/google.json");
+  expect(observation.match(/^arg=.*$/gm)?.map((line) => line.slice(4))).toEqual(args);
+  rmSync(binDir, { recursive: true, force: true });
+});
+
 test("resolvePickMode maps Commander --no-act to none", async () => {
   expect(resolvePickMode({ act: false })).toBe("none");
   expect(resolvePickMode({ env: true })).toBe("env");
@@ -318,7 +594,7 @@ test("switchProfile applies Claude and returns a continue handoff command", asyn
   expect(result.restartRequired).toBe(true);
   expect(result.command).toEqual(["claude", "--continue"]);
   expect(result.commandLine).not.toContain("CLAUDE_CONFIG_DIR=");
-  expect(result.commandLine).toContain('ANTHROPIC_API_KEY=""');
+  expect(result.commandLine).toContain("ANTHROPIC_API_KEY=''");
   expect(result.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   expect(result.env.ANTHROPIC_API_KEY).toBe("");
   expect(appliedProfile("claude")?.name).toBe("switcher");
@@ -370,6 +646,72 @@ test("switchProfile launches Codex App with isolated app state", async () => {
   expect(result.commandLine).toContain("--user-data-dir=");
   expect(currentProfile("codex-app")?.name).toBe("desktop");
   expect(appliedProfile("codex-app")).toBeUndefined();
+});
+
+test("switch handoff safely preserves hostile profile and extra env bytes", async () => {
+  const markerProfileDollar = join(home, "switch-profile-dollar-marker");
+  const markerProfileBacktick = join(home, "switch-profile-backtick-marker");
+  const markerExtraDollar = join(home, "switch-extra-dollar-marker");
+  const markerExtraBacktick = join(home, "switch-extra-backtick-marker");
+  const observation = join(home, "switch-observation");
+  const provider = join(home, "-switch-provider");
+  const hostileDir = join(
+    home,
+    `-leading "double" 'single'\nline\\backslash $DOLLAR ` +
+      `$(touch switch-profile-dollar-marker) \`touch switch-profile-backtick-marker\``,
+  );
+  const extraTemplate =
+    `-extra "double" 'single'\nline\\backslash $DOLLAR ` +
+    `$(touch switch-extra-dollar-marker) \`touch switch-extra-backtick-marker\`::{profileDir}`;
+  const expectedExtra = extraTemplate.replaceAll("{profileDir}", hostileDir);
+
+  writeFileSync(
+    provider,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n---EXTRA---\\n%s' "$HOSTILE_HOME" "$EXTRA_VALUE" > "$OBSERVATION_PATH"`,
+    ].join("\n"),
+  );
+  chmodSync(provider, 0o755);
+  addCustomTool({
+    id: "hostile-handoff",
+    label: "Hostile Handoff",
+    envVar: "HOSTILE_HOME",
+    extraEnv: { EXTRA_VALUE: extraTemplate },
+    defaultDir: join(home, "hostile-default"),
+    bin: "-switch-provider",
+  });
+  addProfile({ name: "hostile", tool: "hostile-handoff", dir: hostileDir });
+
+  const switched = await switchProfile("hostile", { tool: "hostile-handoff", mode: "active" });
+  const result = spawnSync("/bin/sh", ["-s"], {
+    cwd: home,
+    encoding: "utf8",
+    input: [
+      "HOSTILE_HOME=parent-value",
+      switched.commandLine,
+      'printf %s "$HOSTILE_HOME"',
+    ].join("\n"),
+    env: {
+      ...process.env,
+      DOLLAR: "expanded-by-shell",
+      OBSERVATION_PATH: observation,
+      PATH: `${home}:${process.env.PATH ?? ""}`,
+    },
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(existsSync(observation), result.stderr).toBe(true);
+  expect(readFileSync(observation, "utf8")).toBe(`${hostileDir}\n---EXTRA---\n${expectedExtra}`);
+  expect(result.stdout).toBe("parent-value");
+  for (const marker of [
+    markerProfileDollar,
+    markerProfileBacktick,
+    markerExtraDollar,
+    markerExtraBacktick,
+  ]) {
+    expect(existsSync(marker)).toBe(false);
+  }
 });
 
 test("switchProfile puts Codex dangerous permissions before the resume subcommand", async () => {
