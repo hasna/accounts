@@ -2686,12 +2686,22 @@ export function redactPublicValue(value: unknown): unknown {
   return publicValue(value);
 }
 
-/** Redact environment values by both semantic key and embedded diagnostic form. */
+/**
+ * Redact environment values by both semantic key and embedded diagnostic form.
+ *
+ * An empty value is returned unchanged even under a credential-bearing key: it
+ * carries no secret to withhold, and the projected environment is also what the
+ * printed restart/handoff command line is built from. Substituting a placeholder
+ * there would turn a deliberately *cleared* variable — Accounts blanks the
+ * Claude API auth keys on every launch so a subscription profile is not
+ * overridden by an inherited API key — into a non-empty bogus credential the
+ * moment the user runs the command they were told to run.
+ */
 export function redactEnvironment(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
     Object.entries(env).map(([key, value]) => [
       key,
-      isSensitiveCredentialKey(key) ? "[REDACTED]" : redactText(value),
+      value !== "" && isSensitiveCredentialKey(key) ? "[REDACTED]" : redactText(value),
     ]),
   );
 }

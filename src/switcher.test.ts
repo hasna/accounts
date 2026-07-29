@@ -317,6 +317,44 @@ test("public switch projection carries wrapper-bound split state without widenin
   );
 });
 
+test("public switch projection keeps a cleared auth variable cleared in the restart command", async () => {
+  addProfile({ name: "cleared-auth", tool: "claude" });
+
+  const internal = await switchProfile("cleared-auth", { tool: "claude", mode: "active" });
+  const output = publicSwitchResult(internal);
+
+  // `commandLine` is printed with "run the restart command above" and is executed
+  // verbatim by users and by the MCP `switch_profile` instruction. A cleared
+  // credential variable therefore has to stay cleared: substituting a literal
+  // placeholder hands the provider a non-empty bogus API key and a non-empty
+  // bogus key-helper command instead of the profile's own credential.
+  expect(internal.env.ANTHROPIC_API_KEY).toBe("");
+  expect(output.commandLine).toContain("ANTHROPIC_API_KEY=''");
+  expect(output.commandLine).toContain("ANTHROPIC_AUTH_TOKEN=''");
+  expect(output.commandLine).toContain("CLAUDE_CODE_API_KEY_HELPER=''");
+  expect(output.commandLine).not.toContain("[REDACTED]");
+});
+
+test("public switch projection still redacts a non-empty credential-named launch variable", async () => {
+  addCustomTool({
+    id: "env-secret-tool",
+    label: "Env Secret Tool",
+    envVar: "ENV_SECRET_HOME",
+    extraEnv: { TOOL_API_KEY: "switch-env-secret-value" },
+    defaultDir: join(home, "env-secret-default"),
+    bin: "env-secret-provider",
+  });
+  addProfile({ name: "env-secret", tool: "env-secret-tool" });
+
+  const internal = await switchProfile("env-secret", { tool: "env-secret-tool", mode: "active" });
+  const output = publicSwitchResult(internal);
+
+  expect(internal.env.TOOL_API_KEY).toBe("switch-env-secret-value");
+  expect(output.commandLine).toContain("TOOL_API_KEY='[REDACTED]'");
+  expect(output.commandLine).not.toContain("switch-env-secret-value");
+  expect(JSON.stringify(output)).not.toContain("switch-env-secret-value");
+});
+
 test("launch environment policy is case-insensitive and preserves same-binding routing", () => {
   const inherited = {
     Path: "/trusted/bin",
