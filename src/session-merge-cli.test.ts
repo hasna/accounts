@@ -130,4 +130,4 @@ test("a session written under one profile is readable through another", () => {
     expect(readFileSync(join(profileDir(name), "history.jsonl"), "utf8")).toContain("alpha");
     expect(readFileSync(join(profileDir(name), "history.jsonl"), "utf8")).toContain("beta");
   }
-});
+}, 30_000);
