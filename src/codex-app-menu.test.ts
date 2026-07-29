@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, currentProfile, useProfile } from "./lib/profiles.js";
+import { saveStore } from "./storage.js";
+import type { AccountsStore } from "./lib/store.js";
 import {
   codexAppMenuState,
   codexAppMenuSwiftSource,
@@ -12,6 +14,16 @@ import {
 
 let home: string;
 let previousStorageMode: string | undefined;
+
+function apiProfile() {
+  return {
+    name: "desktop",
+    tool: "codex-app",
+    email: "desktop@example.com",
+    dir: join(home, "remote-profile-dir"),
+    createdAt: "2026-07-27T00:00:00.000Z",
+  };
+}
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-menu-test-"));
@@ -41,6 +53,31 @@ test("codex app menu state lists profiles with active marker", async () => {
   expect(state.profiles.map((profile) => profile.name)).toEqual(["personal", "work"]);
   expect(state.profiles.find((profile) => profile.name === "work")?.active).toBe(true);
   expect(state.profiles.find((profile) => profile.name === "personal")?.active).toBe(false);
+});
+
+test("codex app menu state preserves applied marker for API-only profiles", async () => {
+  const profile = apiProfile();
+  saveStore({
+    version: 1,
+    current: {},
+    applied: { "codex-app": "desktop" },
+    toolLocks: {},
+    profiles: [],
+    tools: [],
+  });
+  const apiStore = {
+    transport: "api",
+    currentProfile: async () => profile,
+    listProfiles: async () => [profile],
+  } as AccountsStore;
+
+  const state = await codexAppMenuState(apiStore);
+
+  expect(state.activeProfileName).toBe("desktop");
+  expect(state.appliedProfileName).toBe("desktop");
+  expect(state.profiles).toHaveLength(1);
+  expect(state.profiles[0]?.active).toBe(true);
+  expect(state.profiles[0]?.applied).toBe(true);
 });
 
 test("codex app menu switch can update active profile without launching", async () => {

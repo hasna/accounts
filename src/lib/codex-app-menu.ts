@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { accountsHome } from "../storage.js";
-import { appliedProfile } from "./apply.js";
+import { appliedProfileName } from "./apply.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool } from "./tools.js";
 import { switchProfile, type SwitchResult } from "./switch.js";
@@ -82,9 +82,9 @@ function toMenuProfile(profile: Profile, activeName?: string, appliedName?: stri
 export async function codexAppMenuState(store: AccountsStore = resolveStore()): Promise<CodexAppMenuState> {
   const tool = getTool("codex-app");
   const activeName = (await store.currentProfile("codex-app"))?.name;
-  // appliedProfile is the machine-local applied-auth map, not the shared
-  // registry — it stays local by design (see store.ts scope notes).
-  const appliedName = appliedProfile("codex-app")?.name;
+  // The applied pointer is machine-local and remains valid in API mode even
+  // when the profile record itself only exists in the remote registry.
+  const appliedName = appliedProfileName("codex-app");
   const profiles = await store.listProfiles("codex-app");
   return {
     tool: {
