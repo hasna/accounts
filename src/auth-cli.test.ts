@@ -14,6 +14,22 @@ function runCli(...args: string[]) {
   });
 }
 
+async function runCliAsync(env: NodeJS.ProcessEnv, ...args: string[]) {
+  const child = Bun.spawn({
+    cmd: [process.execPath, "run", "src/cli.ts", ...args],
+    cwd: process.cwd(),
+    env: { ...process.env, ACCOUNTS_HOME: home, ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [status, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { status, stdout, stderr };
+}
+
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-auth-cli-"));
 });
@@ -62,6 +78,72 @@ test("auth migrate populates the central store and auth status reports it", () =
   expect(account?.central).toBe(true);
   expect(account?.email).toBe("cli@example.com");
   expect(account?.doors.some((d) => d.role === "own-identity" && d.profileName === "cliprof")).toBe(true);
+});
+
+test("auth status resolves profile bindings from the cloud registry in api mode", async () => {
+  const staleUuid = "11111111-aaaa-4aaa-8aaa-111111111111";
+  const staleDir = join(home, "stale-local-profile");
+  writeIdentity(staleDir, staleUuid, "stale@example.com");
+  expect(runCli("add", "stale-local", "--dir", staleDir).status).toBe(0);
+
+  const cloudDir = join(home, "cloud-profile");
+  writeIdentity(cloudDir, UUID, "cloud@example.com");
+  mkdirSync(join(cloudDir, ".accounts-auth"), { recursive: true });
+  writeFileSync(
+    join(cloudDir, ".accounts-auth", "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: UUID, emailAddress: "cloud@example.com" } }),
+  );
+
+  const api = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch() {
+      return Response.json({
+        accounts: [
+          {
+            name: "cloud-only",
+            tool: "claude",
+            email: "cloud@example.com",
+            dir: cloudDir,
+            createdAt: "2026-07-29T00:00:00.000Z",
+          },
+        ],
+      });
+    },
+  });
+
+  try {
+    const status = await runCliAsync(
+      {
+        HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: `http://127.0.0.1:${api.port}`,
+        HASNA_ACCOUNTS_API_KEY: "test-placeholder",
+      },
+      "auth",
+      "status",
+      "--json",
+    );
+    expect(status.status).toBe(0);
+    expect(status.stderr).toBe("");
+    const rows = JSON.parse(status.stdout) as Array<{
+      accountUuid: string;
+      doors: Array<{ role: string; profileName?: string }>;
+    }>;
+    const cloud = rows.find((row) => row.accountUuid === UUID);
+    expect(cloud?.doors).toContainEqual({
+      dir: cloudDir,
+      role: "own-identity",
+      profileName: "cloud-only",
+      email: "cloud@example.com",
+    });
+    expect(
+      rows.some(
+        (row) => row.accountUuid === staleUuid && row.doors.some((door) => door.profileName === "stale-local"),
+      ),
+    ).toBe(false);
+  } finally {
+    api.stop(true);
+  }
 });
 
 test("auth sweep dry-runs by default and only --delete trashes orphans", () => {

@@ -1534,13 +1534,10 @@ auth
   .description("list accounts known to this machine (central store first, then profile stores)")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
+    action(async (opts: { json?: boolean }) => {
       // ONE enumerator: the same uuid-keyed identity index the usage-aware
       // switcher consumes, annotated with central-store presence.
-      const store = loadStore();
-      const claudeProfiles = store.profiles
-        .filter((p) => p.tool === "claude")
-        .map((p) => ({ name: p.name, dir: p.dir }));
+      const claudeProfiles = (await resolveStore().listProfiles("claude")).map((p) => ({ name: p.name, dir: p.dir }));
       const index = buildIdentityIndex(claudeProfiles, getTool("claude"));
       const rows = index.map((identity) => ({
         ...identity,
