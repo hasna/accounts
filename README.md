@@ -270,7 +270,9 @@ other logging controls remain caller-trusted: Accounts does not claim to
 sanitize arbitrary provider configuration or a command the caller edits after
 generation.
 
-Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
+Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md). The additive v2
+migration preflight and durability contract is documented in
+[docs/V2_MIGRATION_SIDECAR.md](docs/V2_MIGRATION_SIDECAR.md).
 
 ## What is isolated, and what is shared
 

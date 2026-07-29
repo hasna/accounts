@@ -185,8 +185,8 @@ const metadataValueSchema = z.union([
   z.boolean(),
   z.null(),
 ]);
-type MetadataValue = z.infer<typeof metadataValueSchema>;
-const metadataSchema = z
+export type MetadataValue = z.infer<typeof metadataValueSchema>;
+export const metadataSchema = z
   .unknown()
   .superRefine((value, ctx) => {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {

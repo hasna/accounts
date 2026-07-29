@@ -6,7 +6,53 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Changed
+
+- **Behaviour change to the published package root — read this before releasing.**
+  The synchronous registry exports from `@hasna/accounts` (as opposed to
+  `resolveStore()`, `@hasna/accounts/storage`, the CLI, the MCP server or the
+  SDK, none of which change) are now explicit local-only v1 compatibility, and
+  behave differently when hosted authority is configured
+  (`HASNA_ACCOUNTS_API_URL` + `HASNA_ACCOUNTS_API_KEY`, or an explicit
+  `cloud`/`self_hosted` storage mode):
+  - **Writes now throw** before any local I/O: `saveStore`, `addProfile`,
+    `removeProfile`, `renameProfile`, `updateProfile`, `redetectEmail`,
+    `useProfile`, `lockProfileTool`, `addCustomTool`, `removeCustomTool`, and
+    the deprecated `ensureProfileForLogin`. Such a write would land in the
+    machine's local JSON file while the registry of record is elsewhere.
+  - **Reads are unchanged in what they return** — `loadStore`, `listTools`,
+    `getTool`, `listProfiles`, `findProfile`, `getProfile`,
+    `getProfileToolLock`, `currentProfile`, `appliedProfile` still answer from
+    the machine-local registry — but now emit a `DeprecationWarning` with code
+    `HASNA_ACCOUNTS_LOCAL_COMPAT_READ`, once per operation per process.
+  - `appliedProfileName` is exempt in every mode; it returns only the
+    machine-local applied pointer, never a registry record.
+  - `HASNA_ACCOUNTS_STRICT_ROOT_COMPAT=1` opts a process into the end state,
+    where reads throw as well. Do not set it fleet-wide until every root-import
+    consumer has moved to `resolveStore()` or `@hasna/accounts/v2`:
+    `@hasna/economy` (0.3.7) resolves per-agent cost attribution through these
+    reads and wraps every call in `try {} catch {}`, so a throw there is not a
+    loud failure — it is a silent loss of attribution.
+  Migration: async v1 callers use `resolveStore()`; new callers use
+  `@hasna/accounts/v2`. Rationale and the fleet measurement are in
+  `docs/V2_FOUNDATION.md`.
+
+- Storage-mode precedence no longer lets a retired mode word mask a canonical
+  one. `HASNA_ACCOUNTS_STORAGE_MODE`, `ACCOUNTS_STORAGE_MODE` and
+  `HASNA_ACCOUNTS_MODE` are scanned in that order and a retired
+  `remote`/`hybrid`/`s3` value is skipped as absent authority instead of
+  stopping the scan. Previously a retired word on a higher-precedence key
+  suppressed every lower one and fell through to local. A machine that sets a
+  retired word on a higher-precedence key *and* `local`/`self_hosted`/`cloud`
+  on a lower one therefore changes storage authority on upgrade; a machine that
+  sets at most one mode key is unaffected.
+
 ### Added
+
+- `@hasna/accounts/v2` subpath export: a scoped, contract-first registry
+  foundation (`AccountsRegistry` domain, local/HTTP/PostgreSQL adapters,
+  machine binding). Nothing routes through it yet — it ships as a foundation
+  for the later wire/schema migration slice. See `docs/V2_FOUNDATION.md`.
 
 - Profile-dir policy for the cloud registry (`src/lib/profile-dir-policy.ts`).
   `POST /v1/accounts` and `PATCH /v1/accounts/:tool/:name` now refuse a `dir`

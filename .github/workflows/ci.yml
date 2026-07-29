@@ -3,8 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run on every pull request, not only pull requests based on `main`. A stacked
+  # pull request targets the branch below it, so a `branches: [main]` filter here
+  # made hosted CI structurally unable to run against stacked work at all - and
+  # the `secret-scan` job below is pull-request-only, so that gate never executed
+  # for those branches either. Every green result on a stacked branch was
+  # therefore local-only, which is exactly the class of evidence that has already
+  # let a broken release through.
   pull_request:
-    branches: [main]
+  # Allow re-running the gates on demand, for example after a base branch moves
+  # or a flaky external download needs a retry.
+  workflow_dispatch:
 
 jobs:
   secret-scan:

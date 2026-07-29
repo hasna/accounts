@@ -64,6 +64,45 @@ describe("resolveAccountsCloud", () => {
     ).toThrow(/invalid accounts storage mode/);
   });
 
+  test("retired aliases do not mask a lower canonical hosted authority", () => {
+    expect(() =>
+      resolveAccountsCloud({
+        HASNA_ACCOUNTS_STORAGE_MODE: "remote",
+        ACCOUNTS_STORAGE_MODE: "hybrid",
+        HASNA_ACCOUNTS_MODE: "cloud",
+        HASNA_ACCOUNTS_API_URL: BASE,
+      } as NodeJS.ProcessEnv),
+    ).toThrow(/cloud storage mode requires HASNA_ACCOUNTS_API_KEY/);
+
+    expect(() =>
+      resolveAccountsCloud({
+        HASNA_ACCOUNTS_STORAGE_MODE: "s3",
+        ACCOUNTS_STORAGE_MODE: "self_hosted",
+        HASNA_ACCOUNTS_API_KEY: KEY,
+      } as NodeJS.ProcessEnv),
+    ).toThrow(/self_hosted storage mode requires HASNA_ACCOUNTS_API_URL/);
+  });
+
+  test("retired aliases do not mask a lower explicit local authority", () => {
+    expect(
+      resolveAccountsCloud({
+        ...cloudEnv,
+        HASNA_ACCOUNTS_STORAGE_MODE: "remote",
+        ACCOUNTS_STORAGE_MODE: "hybrid",
+        HASNA_ACCOUNTS_MODE: "local",
+      } as NodeJS.ProcessEnv).transport,
+    ).toBe("local");
+  });
+
+  test("retired aliases do not mask an invalid lower authority", () => {
+    expect(() =>
+      resolveAccountsCloud({
+        HASNA_ACCOUNTS_STORAGE_MODE: "remote",
+        ACCOUNTS_STORAGE_MODE: "typo",
+      } as NodeJS.ProcessEnv),
+    ).toThrow(/invalid accounts storage mode/);
+  });
+
   test("cloud-http when URL+KEY set; baseUrl is <url>/v1", () => {
     const r = resolveAccountsCloud(cloudEnv);
     expect(r.transport).toBe("cloud-http");

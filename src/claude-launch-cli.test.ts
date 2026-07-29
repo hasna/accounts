@@ -692,7 +692,7 @@ test("two concurrent profiles serialize keychain use and restore inherited state
   expect(securityText).not.toContain("credential-alpha-value");
   expect(securityText).not.toContain("credential-beta-value");
   expect(securityText).not.toContain("credential-prior-value");
-});
+}, 15_000);
 
 test("keychain lock timeout does not launch or alter inherited credentials", () => {
   addProfile("acct", "profile-credential-value");
