@@ -46,9 +46,15 @@ import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.js";
-import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
+import { formatEnvAssignments, formatExportLines, profileEnv, providerLaunchEnv } from "./lib/env.js";
+import { redactText } from "./lib/redaction.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
-import { switchProfile, type SwitchMode } from "./lib/switch.js";
+import {
+  publicSwitchResult,
+  publicToolLabel,
+  switchProfile,
+  type SwitchMode,
+} from "./lib/switch.js";
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
 import { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
 import {
@@ -645,9 +651,15 @@ program
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
-        env: { ...process.env, ...env },
+        env: providerLaunchEnv(process.env, env),
       });
-      if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
+      if (res.error) {
+        die(
+          `failed to launch ${redactText(tool.bin)}: ${redactText(
+            res.error.message,
+          )}`,
+        );
+      }
       if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
       const finalized = await finalizeLogin(name, tool.id, store);
       if (finalized.applied) {
@@ -813,7 +825,7 @@ addConfigsOptions(program
             { allowMissing: true },
           );
           if (!response) {
-            die(`no running accounts supervisor for ${getTool(profile.tool).label}. Start one with \`accounts run ${profile.tool}\`.`);
+            die(`no running accounts supervisor for ${publicToolLabel(profile.tool)}. Start one with \`accounts run ${profile.tool}\`.`);
           }
           if (!response.ok) die(response.error);
           if (opts.json) {
@@ -834,12 +846,13 @@ addConfigsOptions(program
           args,
           permissions: opts.permissions,
         }, store);
+        const output = publicSwitchResult(result);
         if (opts.json) {
-          console.log(JSON.stringify(result, null, 2));
+          console.log(JSON.stringify(output, null, 2));
         } else {
-          console.log(chalk.green(`✓ ${result.message}`));
+          console.log(chalk.green(`✓ ${output.message}`));
           if (result.applied) console.log(chalk.dim("  live/default auth updated"));
-          console.log(chalk.dim(`  restart command: ${result.commandLine}`));
+          console.log(chalk.dim(`  restart command: ${output.commandLine}`));
           if (!opts.launch) {
             console.log(chalk.yellow("  Exit the current agent session, then run the restart command above."));
           }
@@ -849,9 +862,15 @@ addConfigsOptions(program
           const [bin, ...launchArgs] = result.command;
           const res = spawnSync(bin!, launchArgs, {
             stdio: "inherit",
-            env: { ...process.env, ...result.env },
+            env: providerLaunchEnv(process.env, result.env),
           });
-          if (res.error) die(`failed to launch ${bin}: ${res.error.message}`);
+          if (res.error) {
+            die(
+              `failed to launch ${redactText(bin!)}: ${redactText(
+                res.error.message,
+              )}`,
+            );
+          }
           process.exit(res.status ?? 0);
         }
       },
@@ -1360,7 +1379,7 @@ addConfigsOptions(program
         );
         process.exit(code);
       }
-      console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
+      console.error(chalk.green(`✓ accounts supervisor running ${publicToolLabel(plan.tool.id)} as ${chalk.bold(plan.profile.name)}`));
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
       console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
       const code = await runSupervisedTool(plan.profile, plan.tool, runArgs, {
@@ -1438,7 +1457,7 @@ addConfigsOptions(supervisor
         },
         { allowMissing: true },
       );
-      if (!response) die(`no running accounts supervisor for ${getTool(profile.tool).label}`);
+      if (!response) die(`no running accounts supervisor for ${publicToolLabel(profile.tool)}`);
       if (!response.ok) die(response.error);
       if (opts.json) {
         console.log(JSON.stringify(response, null, 2));
@@ -1482,7 +1501,7 @@ program
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(shell, ["-i"], {
         stdio: "inherit",
-        env: { ...process.env, ...env, ACCOUNTS_ACTIVE: profile.name },
+        env: providerLaunchEnv(process.env, env, { ACCOUNTS_ACTIVE: profile.name }),
       });
       process.exit(res.status ?? 0);
     }),
@@ -1702,13 +1721,25 @@ program
         }
         for (const a of r.agents) {
           if (a.kind === "process") {
+            if (
+              typeof a.pid !== "number" ||
+              !Number.isSafeInteger(a.pid) ||
+              a.pid <= 0
+            ) {
+              continue;
+            }
             const cfg = typeof a.configDir === "string" ? chalk.dim(`  cfg=${a.configDir}`) : "";
             const cmd = typeof a.command === "string" ? chalk.dim(`  ${a.command.slice(0, 100)}`) : "";
             console.log(`  ${chalk.yellow("process    ")} pid ${a.pid}${cfg}${cmd}`);
             continue;
           }
           const kind = a.kind === "background" ? chalk.magenta("background ") : chalk.dim("interactive");
-          const state = String(a.state ?? a.status ?? "");
+          const state =
+            typeof a.state === "string"
+              ? a.state
+              : typeof a.status === "string"
+                ? a.status
+                : "";
           const stateFmt = state === "working" || state === "busy" ? chalk.green(state) : chalk.dim(state);
           const name = typeof a.name === "string" ? ` ${a.name}` : "";
           const session = typeof a.sessionId === "string" ? chalk.dim(`  ${a.sessionId.slice(0, 8)}`) : "";
