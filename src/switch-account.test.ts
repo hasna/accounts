@@ -145,13 +145,42 @@ test("switchAccount rejects an unknown profile", async () => {
   await expect(switchAccount("ghost", { env: {} })).rejects.toThrow(AccountsError);
 });
 
-test("switchAccount rejects a profile with expired credentials, loudly", async () => {
-  makeProfile("dead", { email: "dead@example.com", expiresInMs: -60_000 });
+// --- 63e642c1: aged-out access token vs genuinely dead credential ------------
+//
+// These two tests are a matched pair and must stay one. The first proves the
+// refusal still fires for a credential that cannot be recovered; the second
+// proves it no longer fires for one that only needs a token refresh. Either
+// alone is compatible with a broken fix — the first alone with the deadlock
+// that locked five profiles out, the second alone with never checking expiry.
+
+test("switchAccount rejects a profile whose credential has NO refresh token, loudly", async () => {
+  makeProfile("dead", { email: "dead@example.com", expiresInMs: -60_000, refreshToken: null });
   const sessionDir = mkdtempSync(join(tmpdir(), "swa-session-"));
   writeIdentity(sessionDir, { email: "live@example.com" });
   await expect(switchAccount("dead", { dir: sessionDir, env: {} })).rejects.toThrow(/expired/);
   // The session dir must be untouched by a failed switch.
   expect(dirEmail(sessionDir)).toBe("live@example.com");
+  rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("switchAccount accepts an aged-out access token when the refresh token is intact", async () => {
+  // The shape that deadlocked the CLI: `login` refuses because the dir carries
+  // another account and points at `switch-account`; `switch-account` refused
+  // because the access token had aged out and pointed back at `login`. The
+  // credential was never dead — its refresh token had weeks left.
+  makeProfile("aged", { email: "aged@example.com", expiresInMs: -60_000 });
+  const sessionDir = mkdtempSync(join(tmpdir(), "swa-aged-session-"));
+  writeIdentity(sessionDir, { email: "live@example.com" });
+
+  const result = await switchAccount("aged", { dir: sessionDir, env: {} });
+
+  // The switch really happened — the dir now carries the target's account and
+  // its credential bytes, not just an absence of an exception.
+  expect(result.alreadyActive).toBe(false);
+  expect(dirEmail(sessionDir)).toBe("aged@example.com");
+  expect(dirAccessToken(sessionDir)).toBe("aged@example.com-access");
+  // ...and it says so, rather than pretending the credential was healthy.
+  expect(result.warnings.join(" ")).toMatch(/aged-out access token/);
   rmSync(sessionDir, { recursive: true, force: true });
 });
 

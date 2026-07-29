@@ -2,7 +2,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AccountIdentity } from "./lib/identity-index.js";
+import type { AccountCredentialRef, AccountIdentity } from "./lib/identity-index.js";
 import type { AccountUsage } from "./lib/usage.js";
 import {
   cooldownActive,
@@ -27,8 +27,37 @@ afterEach(() => {
   delete process.env.ACCOUNTS_HOME;
 });
 
-function identity(uuid: string, email: string, status: AccountIdentity["status"] = "ok"): AccountIdentity {
-  return { accountUuid: uuid, email, doors: [], status };
+/**
+ * `status` is DERIVED from the credential in the real index, so a fixture that
+ * sets one without the other describes a state that cannot occur. Renewability
+ * is an explicit parameter because it is exactly what separates an account that
+ * merely needs a token refresh from one that is genuinely dead.
+ */
+function credentialFor(
+  status: AccountIdentity["status"],
+  renewable: boolean,
+): AccountCredentialRef | undefined {
+  if (status === "no-credentials") return undefined;
+  const valid = status === "ok";
+  return {
+    path: "/fake/credentials.json",
+    source: "central",
+    expiresAt: Date.now() + (valid ? 60_000 : -60_000),
+    hasAccessToken: true,
+    hasRefreshToken: valid || renewable,
+    valid,
+    renewable: valid || renewable,
+  };
+}
+
+function identity(
+  uuid: string,
+  email: string,
+  status: AccountIdentity["status"] = "ok",
+  renewable = false,
+): AccountIdentity {
+  const credential = credentialFor(status, renewable);
+  return { accountUuid: uuid, email, doors: [], ...(credential ? { credential } : {}), status };
 }
 
 function usage(headroom: number, opts: { binding?: string; resetsAt?: string } = {}): AccountUsage {
@@ -60,16 +89,48 @@ test("selector returns the account with the most headroom, never the current one
   expect(picked.candidate?.accountUuid).toBe("uuid-best");
 });
 
-test("selector excludes expired and credential-less accounts", () => {
+// --- 63e642c1: `expired` means aged-out, not unusable ------------------------
+//
+// Both arms are asserted deliberately. A test that only proved the renewable
+// case is accepted would ship a hole: it could not tell the fix from "stop
+// checking expiry at all", which would hand sessions genuinely dead accounts.
+
+test("selector excludes credential-less accounts and credentials with NO refresh token", () => {
   const picked = selectHealthiestAccount(
     [
-      { identity: identity("uuid-exp", "exp@x.com", "expired"), usage: usage(100) },
+      // Expired AND no refresh token: genuinely dead, however much headroom.
+      { identity: identity("uuid-exp", "exp@x.com", "expired", false), usage: usage(100) },
       { identity: identity("uuid-nc", "nc@x.com", "no-credentials") },
       { identity: identity("uuid-ok", "ok@x.com"), usage: usage(40) },
     ],
     { currentUuid: "uuid-other" },
   );
   expect(picked.candidate?.accountUuid).toBe("uuid-ok");
+  expect(picked.excluded.find((e) => e.accountUuid === "uuid-exp")?.reason).toBe("credential");
+});
+
+test("an aged-out access token WITH a refresh token is still a candidate", () => {
+  // The measured state of an idle fleet: access tokens live 8 hours, so most
+  // profiles read `expired` overnight while holding a refresh token good for
+  // weeks. Excluding them empties the pool exactly when unattended sessions
+  // depend on it.
+  const picked = selectHealthiestAccount(
+    [{ identity: identity("uuid-renewable", "r@x.com", "expired", true), usage: usage(90) }],
+    { currentUuid: "uuid-other" },
+  );
+  expect(picked.candidate?.accountUuid).toBe("uuid-renewable");
+  expect(picked.reason).toBeUndefined();
+});
+
+test("a valid credential outranks a renewable one even with far less headroom", () => {
+  const picked = selectHealthiestAccount(
+    [
+      { identity: identity("uuid-renewable", "r@x.com", "expired", true), usage: usage(95) },
+      { identity: identity("uuid-valid", "v@x.com"), usage: usage(40) },
+    ],
+    { currentUuid: "uuid-other" },
+  );
+  expect(picked.candidate?.accountUuid).toBe("uuid-valid");
 });
 
 test("selector reports all-limited honestly instead of flapping to an exhausted account", () => {

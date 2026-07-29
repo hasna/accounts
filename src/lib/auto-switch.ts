@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { accountsHome } from "../storage.js";
 import { AccountsError } from "../types.js";
-import type { AccountIdentity } from "./identity-index.js";
+import { isUsableIdentity, type AccountIdentity } from "./identity-index.js";
 import type { AccountUsage, UsageFetchError, UsageWindow } from "./usage.js";
 import { deriveWindowHealth, type AccountWindowHealth } from "./usage-windows.js";
 import { writeFileAtomic } from "./safe-path.js";
@@ -194,7 +194,10 @@ export function selectHealthiestAccount(
       excluded.push({ accountUuid: uuid, reason: "current-account" });
       continue;
     }
-    if (entry.identity.status !== "ok") {
+    // "valid OR renewable", not "status === ok": an account whose access token
+    // aged out but whose refresh token is intact is a usable target, ranked
+    // below every currently-valid one. See isUsableIdentity.
+    if (!isUsableIdentity(entry.identity)) {
       excluded.push({ accountUuid: uuid, reason: "credential" });
       continue;
     }
@@ -266,6 +269,10 @@ export function selectHealthiestAccount(
 
   const ranked = [...eligible].sort(
     (a, b) =>
+      // A credential that works NOW beats one the tool must renew first. This
+      // is deliberately the FIRST key: widening the pool must never demote a
+      // healthy account behind one that needs a round trip to become usable.
+      Number(b.entry.identity.status === "ok") - Number(a.entry.identity.status === "ok") ||
       bindingHeadroom(b.windows) - bindingHeadroom(a.windows) ||
       b.windows.weeklyHeadroom - a.windows.weeklyHeadroom ||
       b.windows.sessionHeadroom - a.windows.sessionHeadroom ||
