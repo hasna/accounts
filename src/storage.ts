@@ -11,7 +11,13 @@
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { type Store, storeSchema, AccountsError, profileNameSchema } from "./types.js";
+import {
+  type Store,
+  storeSchema,
+  AccountsError,
+  portableEnvNameSchema,
+  profileNameSchema,
+} from "./types.js";
 import { writeFileAtomic } from "./lib/safe-path.js";
 
 function validateEnvPath(value: string, label: string): string {
@@ -44,6 +50,35 @@ export function profilesDir(): string {
 const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
 
 /**
+ * Older registries may contain extraEnv keys accepted before the POSIX handoff
+ * schema was tightened. Identify them before the full schema parse so the
+ * operator sees the tool and key to repair instead of Zod's generic record-key
+ * error.
+ */
+function storedExtraEnvKeyProblems(raw: unknown): string[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const tools = (raw as { tools?: unknown }).tools;
+  if (!Array.isArray(tools)) return [];
+
+  const problems: string[] = [];
+  for (const [index, tool] of tools.entries()) {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
+    const stored = tool as { id?: unknown; extraEnv?: unknown };
+    if (!stored.extraEnv || typeof stored.extraEnv !== "object" || Array.isArray(stored.extraEnv)) continue;
+    const subject =
+      typeof stored.id === "string" ? `stored custom tool ${JSON.stringify(stored.id)}` : `stored custom tool at tools[${index}]`;
+    for (const key of Object.keys(stored.extraEnv)) {
+      if (!portableEnvNameSchema.safeParse(key).success) {
+        problems.push(
+          `${subject} has non-portable extraEnv key ${JSON.stringify(key)}; rename it to match ^[A-Za-z_][A-Za-z0-9_]*$`,
+        );
+      }
+    }
+  }
+  return problems;
+}
+
+/**
  * Parse and schema-validate the on-box registry file WITHOUT the profile
  * cross-pruning that `loadStore()` applies. Returns the empty store when the
  * file is absent. Used by both `loadStore()` (which then prunes against the
@@ -60,6 +95,10 @@ function parseStoreFile(): Store {
     raw = JSON.parse(readFileSync(path, "utf8"));
   } catch (err) {
     throw new AccountsError(`could not parse store at ${path}: ${(err as Error).message}`);
+  }
+  const extraEnvProblems = storedExtraEnvKeyProblems(raw);
+  if (extraEnvProblems.length > 0) {
+    throw new AccountsError(`invalid store at ${path}: ${extraEnvProblems.join("; ")}`);
   }
   const parsed = storeSchema.safeParse(raw);
   if (!parsed.success) {

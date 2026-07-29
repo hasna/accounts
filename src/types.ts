@@ -98,7 +98,7 @@ const sharedConfigSourceSchema = z
     return parts.every((part, index) => part !== ".." || index === 0);
   }, "may only ascend one level above the tool's shared home");
 
-const portableEnvNameSchema = z
+export const portableEnvNameSchema = z
   .string()
   .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "must be a portable environment variable name");
 
