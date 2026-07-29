@@ -11,7 +11,7 @@ import {
   type ClaudeSessionCatalogOptions,
   type ClaudeSessionScanSkip,
 } from "./claude-sessions.js";
-import { formatEnvAssignments, profileEnv } from "./env.js";
+import { formatEnvAssignments, profileEnv, providerLaunchEnv } from "./env.js";
 import { runClaudeLaunch, redactArgv } from "./claude-launch.js";
 import { getTool } from "./tools.js";
 
@@ -414,11 +414,14 @@ async function resumeSession(
   const env = profileEnv(targetProfile, tool);
   console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv(plan.command).join(" ")}`));
   const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
+  // Resume attaches Claude to a credential-bearing provider session, so the
+  // inherited request-debug diagnostics that dump HTTP request headers must be
+  // scrubbed here rather than passed through with the rest of the routing env.
   const exitCode = await runClaudeLaunch(
     targetProfile,
     tool,
     plan.command.slice(1),
-    { ...parentEnv, ...env },
+    providerLaunchEnv(parentEnv, env),
     plan.cwd,
   );
   process.exit(exitCode);

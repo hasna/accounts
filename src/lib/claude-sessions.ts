@@ -238,6 +238,14 @@ function canonicalExistingDirectory(path: string, label: string): string {
   }
 }
 
+/**
+ * Reproduce Claude's own project-directory encoding. It is lossy — `/a.b`,
+ * `/a-b` and `/a_b` all encode to `-a-b` — so the fallback check in
+ * `canonicalResumeCwd` is only as strong as the encoded name, and admits
+ * sibling directories that differ solely in punctuation. That is the whole of
+ * the available data when the transcript recorded no cwd; the observed-cwd
+ * path above is an exact comparison and is preferred whenever it applies.
+ */
 function claudeProjectKey(cwd: string): string {
   return cwd.replace(/[^A-Za-z0-9]/g, "-");
 }

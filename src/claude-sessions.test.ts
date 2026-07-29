@@ -59,6 +59,21 @@ function profile(name: string, dir = join(profilesRoot, "claude", name)): Profil
   };
 }
 
+/**
+ * Every environment key the registry resolver consults to pick the local store
+ * versus the cloud HTTP transport. Mirrors `src/storage.ts` and
+ * `src/lib/cloud-accounts.ts`; spawned CLIs must not inherit any of them.
+ */
+const REGISTRY_TRANSPORT_ENV_KEYS = [
+  "HASNA_ACCOUNTS_STORAGE_MODE",
+  "ACCOUNTS_STORAGE_MODE",
+  "HASNA_ACCOUNTS_MODE",
+  "HASNA_ACCOUNTS_API_URL",
+  "ACCOUNTS_API_URL",
+  "HASNA_ACCOUNTS_API_KEY",
+  "ACCOUNTS_API_KEY",
+] as const;
+
 function sessionPath(profileDir: string, encodedProject: string, uuid: string): string {
   const projectDir = join(profileDir, "projects", encodedProject);
   mkdirSync(projectDir, { recursive: true });
@@ -750,7 +765,7 @@ describe("accounts sessions CLI", () => {
   }
 
   function cliEnv(): NodeJS.ProcessEnv {
-    return {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       NODE_ENV: "test",
       HOME: fakeHome,
@@ -758,6 +773,13 @@ describe("accounts sessions CLI", () => {
       ACCOUNTS_HOME: accountsHome,
       NO_COLOR: "1",
     };
+    // The spawned CLI must resolve the sandboxed ACCOUNTS_HOME registry. On a
+    // machine configured for the cloud transport, inheriting these keys points
+    // the child at the real registry with a live API key instead, so they are
+    // dropped from the inherited environment and the mode is pinned local.
+    for (const key of REGISTRY_TRANSPORT_ENV_KEYS) delete env[key];
+    env.HASNA_ACCOUNTS_STORAGE_MODE = "local";
+    return env;
   }
 
   function cliEnvWith(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -822,6 +844,7 @@ describe("accounts sessions CLI", () => {
         "  telegramStateDir: process.env.TELEGRAM_STATE_DIR,",
         "  awsProfile: process.env.AWS_PROFILE,",
         "  nodeDebug: process.env.NODE_DEBUG,",
+        "  nodeDebugNative: process.env.NODE_DEBUG_NATIVE,",
         "  bunVerboseFetch: process.env.BUN_CONFIG_VERBOSE_FETCH,",
         "}) + '\\n');",
       ].join("\n"),
@@ -995,6 +1018,7 @@ describe("accounts sessions CLI", () => {
         ...fake.env,
         AWS_PROFILE: "same-binding-route",
         NODE_DEBUG: "http",
+        NODE_DEBUG_NATIVE: "http2",
         BUN_CONFIG_VERBOSE_FETCH: "1",
       },
       "sessions",
@@ -1017,9 +1041,45 @@ describe("accounts sessions CLI", () => {
       telegramStateDir: join(owner.dir, "channels", "telegram"),
       awsProfile: "same-binding-route",
     });
+    // Request-debug diagnostics dump HTTP request headers, including the
+    // provider Authorization header, to the launched process's stderr.
     expect(launches[0]?.nodeDebug).toBeUndefined();
+    expect(launches[0]?.nodeDebugNative).toBeUndefined();
     expect(launches[0]?.bunVerboseFetch).toBeUndefined();
+    // The rest of the caller's routing environment is deliberately inherited,
+    // so the assertion above is a scrub and not a blanket environment wipe.
+    expect(launches[0]?.awsProfile).toBe("same-binding-route");
     expect(existsSync(join(alias.dir, "projects", "-resume-target-seed"))).toBe(false);
+  });
+
+  test("spawned CLI resolves the sandboxed registry despite an ambient cloud configuration", () => {
+    const work = profile("owner");
+    const project = join(root, "repo-ambient-cloud");
+    mkdirSync(project, { recursive: true });
+    writeSession(work.dir, "-repo-ambient-cloud", UUID_A, project);
+    writeStore([work]);
+
+    const saved = REGISTRY_TRANSPORT_ENV_KEYS.map(
+      (key) => [key, process.env[key]] as const,
+    );
+    try {
+      // A synthetic black-hole endpoint with a dummy key stands in for the
+      // fleet's real cloud registry: if the harness leaked the ambient
+      // configuration the child would resolve the HTTP transport and never
+      // reach the sandboxed ACCOUNTS_HOME store.
+      process.env.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
+      process.env.HASNA_ACCOUNTS_API_URL = "http://127.0.0.1:9";
+      process.env.HASNA_ACCOUNTS_API_KEY = "synthetic-not-a-real-key";
+      const result = runCli("sessions", "--json");
+      expect(result.status, result.stderr).toBe(0);
+      const catalog = parseCatalog(result) as Array<{ uuid: string }>;
+      expect(catalog.map((entry) => entry.uuid)).toEqual([UUID_A]);
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   test("fails closed for cross-binding targets, UUID refs, and mismatched explicit IDs", () => {
