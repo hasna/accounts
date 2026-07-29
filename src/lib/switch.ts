@@ -17,7 +17,12 @@ import {
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./tools.js";
-import { redactArgv, redactEnvironment, redactText } from "./redaction.js";
+import {
+  isSensitiveCredentialKey,
+  redactArgv,
+  redactEnvironment,
+  redactText,
+} from "./redaction.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
 
@@ -62,8 +67,28 @@ export interface PublicSwitchResult {
   message: string;
 }
 
-function commandLine(env: Record<string, string>, command: string[]): string {
-  return `${formatEnvAssignments(env)} ${command.map(quotePosixShellWord).join(" ")}`.trim();
+function commandLine(
+  env: Record<string, string>,
+  command: string[],
+  unsetEnvKeys: readonly string[] = [],
+): string {
+  return `${formatEnvAssignments(env, process.env, unsetEnvKeys)} ${command.map(quotePosixShellWord).join(" ")}`
+    .trim();
+}
+
+function publicCommandLine(env: Record<string, string>, command: string[]): string {
+  const publicEnv = redactEnvironment(env);
+  const credentialKeysToUnset: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value === "" || !isSensitiveCredentialKey(key)) continue;
+
+    // A public restart command cannot safely reproduce this value. Explicitly
+    // remove it rather than assigning a redaction marker that a provider could
+    // mistake for a real credential.
+    delete publicEnv[key];
+    credentialKeysToUnset.push(key);
+  }
+  return commandLine(publicEnv, command, credentialKeysToUnset);
 }
 
 /** Return a trusted display label without reflecting caller-controlled custom labels. */
@@ -98,7 +123,7 @@ export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
     applied: result.applied,
     active: result.active,
     command,
-    commandLine: commandLine(redactEnvironment(result.env), command),
+    commandLine: publicCommandLine(result.env, command),
     ...(result.permissions ? { permissions: redactText(result.permissions) } : {}),
     restartRequired: result.restartRequired,
     message: publicSwitchMessage(result.profile.name, toolLabel, result.applied),
