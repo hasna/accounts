@@ -39,6 +39,13 @@ describe("resolveStore transport selection", () => {
     expect(resolveStore(cloudEnv).transport).toBe("api");
   });
 
+  test("ACCOUNTS_HOME uses LocalStore even with inherited API URL+KEY", () => {
+    expect(
+      resolveStore({ ...cloudEnv, ACCOUNTS_HOME: "/tmp/accounts-probe" } as NodeJS.ProcessEnv)
+        .transport,
+    ).toBe("local");
+  });
+
   test("forced local mode uses LocalStore even with URL+KEY", () => {
     expect(
       resolveStore({ ...cloudEnv, HASNA_ACCOUNTS_STORAGE_MODE: "local" } as NodeJS.ProcessEnv).transport,

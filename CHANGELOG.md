@@ -25,6 +25,10 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ### Changed
 
+- `ACCOUNTS_HOME` now selects the local registry ahead of an inherited
+  `HASNA_ACCOUNTS_API_URL` + `HASNA_ACCOUNTS_API_KEY` pair, preventing scoped
+  agent and probe runs from silently reaching the production API. An explicit
+  `self_hosted` or `cloud` storage mode remains authoritative.
 - **The usage hook no longer refuses accounts that are live in another
   session.** The `contended` exclusion — "already being run by another session
   and cannot be shared — a second copy would get its token rotated away" — is
