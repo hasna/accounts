@@ -39,6 +39,7 @@ import {
   centralOAuthRecordForProfile,
   credentialHealth,
   dirLiveIdentityIsForeign,
+  dirLiveIdentityRelation,
   type CredentialHealthPresent,
   type SyncResult,
   syncProfileSnapshotToCentral,
@@ -123,6 +124,44 @@ export function writeSwitchedAccountMarker(dir: string, marker: SwitchedAccountM
 export function clearSwitchedAccountMarker(dir: string): void {
   const path = profileSwitchedAccountMarker(dir);
   if (existsSync(path)) unlinkSync(path);
+}
+
+/**
+ * Is this profile dir currently CARRYING another account?
+ *
+ * The single occupancy question for READ paths — health reporting, and the
+ * keychain secret a launch installs. Both used to ask it as "is a switch marker
+ * present", and that was wrong in both directions.
+ *
+ * TOO NARROW: an in-session `/login` writes no marker at all. Measured on this
+ * fleet 2026-07-29 — `.../profiles/claude/account006` carried `anya@ideawin.com`
+ * with no marker and no parked identity of its own, and every marker-keyed
+ * guard read straight past it.
+ *
+ * TOO BROAD: a marker left behind after the dir came back to its own account is
+ * stale. `ensureProfileAuthSnapshot` and `healSwitchedProfileDir` already treat
+ * a marker contradicted by the dir's live account as stale and delete it; a
+ * read path that still believed it would report a healthy profile off its
+ * parked copy while ignoring a perfectly good live credential.
+ *
+ * THE RULE. Identity decides when identity is legible: `foreign` is occupied,
+ * `own` is not, and the marker does not get a vote either way. When identity is
+ * NOT legible — no parked snapshot, or an unreadable live account file — there
+ * is nothing to compare, so the marker is the only evidence there is and it
+ * fails CLOSED. That keeps this predicate a superset of the marker-only rule it
+ * replaces in every case except the one where identity positively disproves the
+ * marker.
+ *
+ * `own-unknown` deliberately does NOT count as occupied on its own. A dir that
+ * has never been snapshotted has no identity to be foreign TO; its live files
+ * are the only truth it has. Treating first capture as occupation would report
+ * every freshly imported profile as carrying someone else's account.
+ */
+export function profileDirCarriesForeignAccount(profileDir: string, tool?: ToolDef): boolean {
+  const relation = dirLiveIdentityRelation(profileDir, tool);
+  if (relation === "foreign") return true;
+  if (relation === "own") return false;
+  return existsSync(profileSwitchedAccountMarker(profileDir));
 }
 
 function profileHasOAuthAccount(profileDir: string, tool: ToolDef): boolean {
@@ -954,6 +993,13 @@ export interface ClaudeProfileAuthHealth {
   credentialExpiresAt?: string;
   keychainSnapshotPresent: boolean;
   snapshotPresent: boolean;
+  /**
+   * The dir's live files carry a DIFFERENT account than this profile's parked
+   * identity, so every field above was computed from the profile's own parked
+   * copy and the dir cannot launch as this profile until it is reconciled.
+   * See {@link profileDirCarriesForeignAccount}.
+   */
+  dirOccupiedByAnotherAccount: boolean;
   reasons: string[];
 }
 
@@ -1041,22 +1087,41 @@ export function claudeProfileAuthHealth(
       credentialPayloadExpired: false,
       keychainSnapshotPresent: false,
       snapshotPresent: false,
+      // Occupancy is a Claude in-place-switch concept; for other tools the
+      // honest answer is "not applicable", and `false` is how that reads here.
+      dirOccupiedByAnotherAccount: false,
       reasons: [`auth validation is only available for Claude profiles, not ${tool.id}`],
     };
   }
 
   const oauthAccountPresent = profileHasOAuthAccount(profileDir, tool);
-  // In restore view, a switched-away dir's root credential belongs to another
-  // account — only the snapshot answers "can THIS profile's auth be restored".
   const centralCredentialPath = centralCredentialsPathForProfile(profileDir, tool);
-  const credentialPaths =
-    opts.restoreView && readSwitchedAccountMarker(profileDir)
-      ? [profileCredentialsSnapshot(profileDir), ...(centralCredentialPath ? [centralCredentialPath] : [])]
-      : [
-          profileCredentialFile(profileDir),
-          profileCredentialsSnapshot(profileDir),
-          ...(centralCredentialPath ? [centralCredentialPath] : []),
-        ];
+
+  // WHOSE CREDENTIAL IS THE DIR'S LIVE ONE? When the dir carries another
+  // account, `<dir>/.credentials.json` is the OCCUPANT's token and says nothing
+  // about this profile. Reading it here reported the guest's health as the
+  // host's: measured 2026-07-29, three occupied dirs (account003, account004,
+  // account030) returned `ok`/valid from a foreign unexpired token while their
+  // own parked copies were merely renewable — and `accounts launch account004`
+  // returned rc=1 at the same moment. Readiness said healthy; launch refused.
+  //
+  // This exclusion used to be conditional on `opts.restoreView`, which is why
+  // the default view — the one `getAccountsReadiness` uses — never applied it.
+  // The distinction was never real: "is this profile healthy" and "can this
+  // profile's auth be restored" have the same answer once the occupant's
+  // credential is out of the comparison, because it was never this profile's
+  // credential to begin with. `restoreView` is kept as an additional OR term so
+  // no caller ever gets a LESS conservative answer than before.
+  const dirOccupiedByAnotherAccount = profileDirCarriesForeignAccount(profileDir, tool);
+  const excludeLiveCredential =
+    dirOccupiedByAnotherAccount || Boolean(opts.restoreView && readSwitchedAccountMarker(profileDir));
+  const credentialPaths = excludeLiveCredential
+    ? [profileCredentialsSnapshot(profileDir), ...(centralCredentialPath ? [centralCredentialPath] : [])]
+    : [
+        profileCredentialFile(profileDir),
+        profileCredentialsSnapshot(profileDir),
+        ...(centralCredentialPath ? [centralCredentialPath] : []),
+      ];
   const credentials = credentialPaths.map((path) => credentialPayloadReadiness(path));
   const existingCredentials = credentials.filter((credential) => credential.exists);
   // A file that exists but carries no OAuth payload — `{}` is the shape this
@@ -1091,10 +1156,22 @@ export function claudeProfileAuthHealth(
   const layers = profileCredentialLayers(profileDir, tool);
   const verdict = parkedCredentialVerdict(layers);
   const reasons: string[] = [];
+  if (dirOccupiedByAnotherAccount) {
+    // Said FIRST and said even when the verdict is otherwise clean: without it
+    // an operator reads a renewable profile and concludes it can launch, which
+    // is the contradiction that started this. Everything below describes this
+    // profile's OWN parked credential, so the sentence has to establish that.
+    reasons.push(
+      "this dir's live files currently carry another account (in-place switch, or an in-session login); " +
+        "the credential state below is this profile's OWN parked copy, not the occupant's",
+    );
+  }
   if (!oauthAccountPresent) reasons.push("OAuth account snapshot is missing");
   if (!credentialPayloadPresent) reasons.push("credential payload is missing");
   if (!validCredential) {
-    if (layers.live.state === "rotated-away") {
+    // `layers.live` is the OCCUPANT's file on an occupied dir, so its state is
+    // not a fact about this profile and must not be narrated as one.
+    if (!dirOccupiedByAnotherAccount && layers.live.state === "rotated-away") {
       reasons.push(
         verdict.parkedRestorable
           ? `this dir's credential was ${describeCredentialState("rotated-away")}, and a restorable copy is ` +
@@ -1107,7 +1184,7 @@ export function claudeProfileAuthHealth(
     } else if (expiredCredential) {
       reasons.push("credential payload is expired");
     }
-    if (parseableInvalidCredential && layers.live.state !== "rotated-away") {
+    if (parseableInvalidCredential && (dirOccupiedByAnotherAccount || layers.live.state !== "rotated-away")) {
       reasons.push("credential payload has no refresh token");
     }
   }
@@ -1134,6 +1211,7 @@ export function claudeProfileAuthHealth(
       : {}),
     keychainSnapshotPresent,
     snapshotPresent,
+    dirOccupiedByAnotherAccount,
     reasons,
   };
 }
@@ -1149,11 +1227,20 @@ function profileCredentialSource(path: string):
 }
 
 function profileFileCredentialSecret(profileDir: string): string | undefined {
-  // A switched-away dir's root credential belongs to another profile; only the
+  // An occupied dir's root credential belongs to another account; only the
   // snapshot (and the central copy of the profile's own account, whose binding
   // resolves through that snapshot) still holds this profile's own tokens.
+  //
+  // THIS IS A READ WITH A WRITE CONSEQUENCE, which is why it is in scope here
+  // alongside the reporting fix: the value returned is what
+  // `prepareClaudeProfileKeychain` installs into the machine keychain AS THIS
+  // PROFILE. Asking the marker-only question let an in-session `/login` — which
+  // writes no marker — put the guest's secret into the host's keychain slot,
+  // crossing one account's credential into another's identity. The identity
+  // test catches the unmarked case; the marker still decides when identity is
+  // illegible.
   const central = centralCredentialsPathForProfile(profileDir);
-  const paths = readSwitchedAccountMarker(profileDir)
+  const paths = profileDirCarriesForeignAccount(profileDir)
     ? [profileCredentialsSnapshot(profileDir), ...(central ? [central] : [])]
     : [profileCredentialsSnapshot(profileDir), profileCredentialFile(profileDir), ...(central ? [central] : [])];
   const sources = paths
