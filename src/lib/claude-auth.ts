@@ -1032,12 +1032,22 @@ export function claudeProfileAuthHealth(
         ];
   const credentials = credentialPaths.map((path) => credentialPayloadReadiness(path));
   const existingCredentials = credentials.filter((credential) => credential.exists);
-  const credentialPayloadPresent = existingCredentials.length > 0;
+  // A file that exists but carries no OAuth payload — `{}` is the shape this
+  // fleet produced — holds no credential. Counting it as "present" made the
+  // profile unreadable rather than unauthenticated: expiry could not be
+  // determined, so the verdict came back `unknown` instead of `missing`, and a
+  // pool manager reading "no verdict" neither quarantined it nor asked anyone
+  // to log in. Presence is about the payload, not the inode.
+  const credentialPayloadPresent = existingCredentials.some((credential) => credential.parseableOauth);
   const validCredential = existingCredentials.find((credential) => credential.valid);
   const expiredCredential = existingCredentials.find((credential) => credential.expired);
-  // Aged out but still holding a refresh token: the tool renews this on use.
+  // Not usable as is, but still holding a refresh token: the tool renews this on
+  // use. Deliberately NOT gated on `expired`, because a payload with no recorded
+  // expiry is also unusable-as-is and also renewable — gating on the timestamp
+  // classified those as an unknown dead end and took live accounts out of every
+  // pool that reads this.
   const renewableCredential = existingCredentials.find(
-    (credential) => credential.expired && credential.refreshTokenPresent,
+    (credential) => credential.refreshTokenPresent && !credential.valid,
   );
   const parseableInvalidCredential = existingCredentials.find(
     (credential) => credential.parseableOauth && !credential.refreshTokenPresent,

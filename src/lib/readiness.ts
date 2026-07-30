@@ -28,6 +28,13 @@ export interface AccountsProfileLoginReadiness {
   status: AccountsReadinessStatus;
   validator: "claude-auth-snapshot" | "local-presence-only" | "unavailable";
   valid: boolean | null;
+  /**
+   * Not valid, but the tool renews it on use because the refresh token is
+   * intact. Consumers that pick profiles for real work MUST read this before
+   * treating a non-valid profile as dead: an aged-out access token is the
+   * normal resting state of a parked account, not a broken one.
+   */
+  renewable?: boolean;
   authStatus?: ClaudeProfileAuthStatus;
   oauthAccountPresent?: boolean;
   credentialPayloadPresent?: boolean;
@@ -200,8 +207,13 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
   }
 
   const health = claudeProfileAuthHealth(profile.dir, tool);
+  // `unavailable` means "this profile cannot be used". A renewable credential
+  // CAN be used — the tool mints a fresh access token from the intact refresh
+  // token on the next request — so it is `degraded`: usable, wants attention.
+  // Collapsing it to `unavailable` is what let a downstream pool manager
+  // quarantine ten live Claude accounts as dead.
   const status: AccountsReadinessStatus =
-    health.status === "ok" ? "ok" : health.status === "unknown" ? "degraded" : "unavailable";
+    health.status === "ok" ? "ok" : health.status === "unknown" || health.renewable ? "degraded" : "unavailable";
   const nextActions =
     status === "ok"
       ? []
@@ -210,6 +222,7 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
     status,
     validator: "claude-auth-snapshot",
     valid: health.valid,
+    renewable: health.renewable,
     authStatus: health.status,
     oauthAccountPresent: health.oauthAccountPresent,
     credentialPayloadPresent: health.credentialPayloadPresent,

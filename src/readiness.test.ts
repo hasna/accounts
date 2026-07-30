@@ -137,16 +137,21 @@ test("valid Claude credential wins over an older expired snapshot", async () => 
   expect(json).not.toContain("expired-fixture");
 });
 
-test("expired Claude credential is unavailable without leaking credential contents", async () => {
+test("expired Claude credential is degraded without leaking credential contents", async () => {
   writeFakeBin("claude");
   const profile = addProfile({ name: "expired", tool: "claude", email: "expired@example.test" });
+  // `writeClaudeAuth` writes a refresh token alongside the aged-out access
+  // token, so this fixture is RENEWABLE: the tool mints a new access token on
+  // the next request. It was previously graded `unavailable`, which a pool
+  // manager reads as dead — see src/renewable-credential-readiness.test.ts.
   writeClaudeAuth(profile.dir, "expired@example.test", Date.now() - 60_000, "super-secret-refresh-token");
 
   const readiness = await getAccountsReadiness({ env: readinessEnv() });
   const profileReadiness = readiness.profiles.find((entry) => entry.name === "expired");
   const json = JSON.stringify(readiness);
 
-  expect(profileReadiness?.status).toBe("unavailable");
+  expect(profileReadiness?.status).toBe("degraded");
+  expect(profileReadiness?.login.renewable).toBe(true);
   expect(profileReadiness?.login.authStatus).toBe("expired");
   expect(profileReadiness?.login.credentialPayloadExpired).toBe(true);
   expect(profileReadiness?.nextActions.join("\n")).toContain("accounts login expired --tool claude");
@@ -241,16 +246,20 @@ test("health CLI emits JSON and text readiness without leaking fixture secrets",
   const profile = addProfile({ name: "expired", tool: "claude", email: "expired@example.test" });
   writeClaudeAuth(profile.dir, "expired@example.test", Date.now() - 60_000, "cli-secret-token");
 
+  // Renewable, so the report is `degraded` and the CLI exits 0: the estate is
+  // usable but wants attention. The secret-leak assertions are the point of
+  // this test and are unchanged.
   const jsonResult = runHealthCli(["--json"]);
-  expect(jsonResult.status).toBe(1);
+  expect(jsonResult.status).toBe(0);
   const payload = JSON.parse(jsonResult.stdout) as Awaited<ReturnType<typeof getAccountsReadiness>>;
-  expect(payload.status).toBe("unavailable");
+  expect(payload.status).toBe("degraded");
   expect(payload.profiles[0]?.login.authStatus).toBe("expired");
+  expect(payload.profiles[0]?.login.renewable).toBe(true);
   expect(jsonResult.stdout).not.toContain("cli-secret-token");
   expect(jsonResult.stderr).not.toContain("cli-secret-token");
 
   const textResult = runHealthCli();
-  expect(textResult.status).toBe(1);
+  expect(textResult.status).toBe(0);
   expect(textResult.stdout).toContain("Profile availability");
   expect(textResult.stdout).not.toContain("cli-secret-token");
   expect(textResult.stderr).not.toContain("cli-secret-token");
