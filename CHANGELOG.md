@@ -6,12 +6,41 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- **Credential broker: an account can now be shared by any number of sessions —
+  many readers, one writer** (`accounts credential-sync`,
+  `src/lib/credential-broker.ts`, `src/lib/identity-lock.ts`). Every stored
+  copy of an account's credential (central store, profile snapshots, live
+  config dirs) converges on the newest rotation under a per-account
+  cross-process lock, and the `grant_type=refresh_token` exchange is performed
+  once, by one writer, with the rotation atomically persisted to the central
+  store first and fanned out after. Ported from the codewith lineage:
+  iapp-infinity's subscription broker (per-credential mkdir mutex,
+  re-read-under-lock, rotation-only atomic persist) over codewith's shared
+  auth.json optimistic-concurrency model. The `usage-hook` runs a convergence
+  pass before every prompt and spawns a detached `credential-sync
+  --ensure-fresh` when the access token nears expiry, so sessions essentially
+  never trigger the tool's own uncoordinated refresh.
+
 ### Changed
 
 - `ACCOUNTS_HOME` now selects the local registry ahead of an inherited
   `HASNA_ACCOUNTS_API_URL` + `HASNA_ACCOUNTS_API_KEY` pair, preventing scoped
   agent and probe runs from silently reaching the production API. An explicit
   `self_hosted` or `cloud` storage mode remains authoritative.
+- **The usage hook no longer refuses accounts that are live in another
+  session.** The `contended` exclusion — "already being run by another session
+  and cannot be shared — a second copy would get its token rotated away" — is
+  removed: the hazard it guarded against (two independent credential copies
+  behind one rotating refresh token) is dissolved by the credential broker
+  rather than avoided by refusal. A switch onto a shared account is announced
+  in the switch message. `switch-account` converges the target account's
+  credential before writing, so a switch installs the account's credential of
+  record, never a superseded predecessor. The identity gates are untouched: a
+  foreign account's credential still never lands over a profile's park, and
+  `repair-auth` still refuses to restore a park while the account is live
+  elsewhere.
 
 - **Behaviour change to the published package root — read this before releasing.**
   The synchronous registry exports from `@hasna/accounts` (as opposed to

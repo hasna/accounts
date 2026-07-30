@@ -17,6 +17,8 @@ import {
   writeSwitchedAccountMarker,
 } from "./claude-auth.js";
 import { listDirLiveSessions, liveClaudeBase, liveClaudePaths, type DirSessionInfo } from "./claude-layout.js";
+import { isAccountUuid, profileAccountUuid } from "./auth-store.js";
+import { convergeIdentityCredential } from "./credential-broker.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool } from "./tools.js";
 
@@ -189,6 +191,26 @@ export async function switchAccount(
   }
 
   const warnings: string[] = [];
+
+  // BROKER CONVERGENCE BEFORE ANYTHING READS THE PROFILE'S CREDENTIAL. When
+  // the target account is also live in another dir, this profile's parked copy
+  // can be a SUPERSEDED PREDECESSOR of the account's current credential —
+  // switching that stale copy in is precisely how the two-copies rotation race
+  // used to start. Convergence pulls the newest rotation across every store
+  // (central, snapshots, live dirs) under the account's cross-process lock, so
+  // the health check below and `restoreClaudeAuthIntoDir` both act on the
+  // credential of record. Best-effort: an unreadable sibling dir degrades to
+  // the pre-broker behaviour, and the switch itself still proceeds.
+  try {
+    const targetUuid = profileAccountUuid(profile.dir, tool);
+    if (targetUuid && isAccountUuid(targetUuid)) {
+      convergeIdentityCredential(targetUuid, { tool, extraDirs: [configDir] });
+    }
+  } catch (error) {
+    warnings.push(
+      `credential convergence skipped: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 
   // Fail loudly on UNUSABLE auth before touching anything: a switch onto a dead
   // profile would strand the running session mid-conversation.
