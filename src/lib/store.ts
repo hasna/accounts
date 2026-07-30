@@ -5,11 +5,12 @@
 //   - ApiStore:   the self-hosted/cloud HTTP API at `<API_URL>/v1` + bearer key.
 //
 // `resolveStore()` is the mode resolver: when `HASNA_ACCOUNTS_API_URL` +
-// `HASNA_ACCOUNTS_API_KEY` are set (and mode is not explicitly `local`), every
-// registry read/write routes to the cloud ApiStore. Explicit API modes fail
-// closed when either value is missing; an unset mode defaults to local. Both
-// `self_hosted` and `cloud` deployments use the SAME ApiStore code — only the
-// URL/key differ (server-side tenancy, not client logic).
+// `HASNA_ACCOUNTS_API_KEY` are set (and mode is not explicitly `local`, and
+// `ACCOUNTS_HOME` is not overridden), every registry read/write routes to the
+// cloud ApiStore. Explicit API modes fail closed when either value is missing;
+// an unset mode defaults to local. Both `self_hosted` and `cloud` deployments
+// use the SAME ApiStore code — only the URL/key differ (server-side tenancy,
+// not client logic).
 //
 // SCOPE: the Store owns the shared registry — profiles, their metadata, and the
 // per-tool "current" selection. Genuinely machine-local state (a profile's
@@ -380,8 +381,8 @@ function prepareProfileDirectory(dir: string, managed: boolean): boolean {
 
 /**
  * Resolve the active registry store for this process. ApiStore when the
- * self-hosted API is configured (URL + key present, mode not forced local),
- * else LocalStore.
+ * self-hosted API is configured (URL + key present, mode not forced local,
+ * and no local `ACCOUNTS_HOME` override), else LocalStore.
  */
 export function resolveStore(
   env: NodeJS.ProcessEnv = process.env,

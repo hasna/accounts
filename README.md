@@ -699,6 +699,8 @@ Registry access is selected through `AccountsStore`:
 
 - `local` uses the atomic on-machine JSON registry.
 - `self_hosted` and `cloud` use the authenticated Accounts HTTP API.
+- `ACCOUNTS_HOME` selects an isolated local registry even when API URL/key are
+  inherited; set an explicit `self_hosted`/`cloud` mode to override it.
 - Explicit `self_hosted`/`cloud` modes fail closed unless both the API URL
   and key are configured.
 - Retired `remote`, `hybrid`, and `s3` aliases are ignored for migration
