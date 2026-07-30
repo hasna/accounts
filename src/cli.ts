@@ -111,7 +111,7 @@ import {
   runUsageHook,
 } from "./lib/usage-hook.js";
 import { profileCredentialLayers } from "./lib/credential-state.js";
-import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
+import { configsSessionToolFor, resolveRequiredInstructionSourceIds, runConfigsPrelaunch, REQUIRED_INSTRUCTION_SOURCES_ENV, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
   listSupervisorStates,
@@ -375,6 +375,7 @@ interface ConfigsCliOptions {
   skipConfigs?: boolean;
   allowConfigsFailure?: boolean;
   allowEmptyInstructions?: boolean;
+  requiredInstructionSource?: string[];
   configsBin?: string;
   identitiesBin?: string;
   identityExport?: string[];
@@ -390,6 +391,12 @@ function configsPrelaunchOptions(opts: ConfigsCliOptions): ConfigsPrelaunchOptio
     identitiesBin: opts.identitiesBin,
     identityExports: opts.identityExport,
     allowEmptySources: opts.allowEmptyInstructions,
+    // Arms the shortfall guard with an expectation that does NOT come from the
+    // export being checked. Without this the guard compares a render against
+    // the artefact that produced it, which cannot fail — the reason it shipped
+    // inert. Empty here means "not configured", and prelaunch records that as
+    // `unarmed` rather than passing quietly.
+    requiredSourceIds: resolveRequiredInstructionSourceIds({ explicit: opts.requiredInstructionSource }),
     skipReason: opts.skipConfigs ? "--skip-configs" : mode === "skip" ? "--configs skip" : undefined,
   };
 }
@@ -401,6 +408,11 @@ function addConfigsOptions(command: Command): Command {
     .option("--skip-configs", "skip configs prelaunch")
     .option("--allow-configs-failure", "continue launch/run even if configs prelaunch fails")
     .option("--allow-empty-instructions", "render a home with no operating rules on purpose (fails closed otherwise)")
+    .option(
+      "--required-instruction-source <id>",
+      `instruction source id the rendered home must carry; repeatable. Defaults to ${REQUIRED_INSTRUCTION_SOURCES_ENV}`,
+      (value: string, previous: string[] = []) => [...previous, value],
+    )
     .option("--configs-bin <path>", "configs CLI binary", "configs")
     .option("--identities-bin <path>", "identities CLI binary used for profile identity exports", "identities")
     .option("--identity-export <path>", "OpenIdentities configs instruction export JSON; repeatable", collectRepeated, []);
