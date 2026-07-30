@@ -211,6 +211,89 @@ test("converge never writes this account's tokens into a dir occupied by ANOTHER
   });
 });
 
+/**
+ * THE CROSS-WRITE. `switch-account` calls
+ * `convergeIdentityCredential(targetUuid, { extraDirs: [configDir] })`, where
+ * `configDir` is the dir the OUTGOING account is still sitting in. That dir
+ * enters `enumerateCopies` as a `dir-live` candidate, and — before the read
+ * gate — was READ and RANKED with no identity check at all. The outgoing
+ * account has just been in use, so its file is the newest on disk and the
+ * mtime-ordered, identity-blind ranking crowns it. Fan-out then wrote it into
+ * `central/<INCOMING uuid>/.credentials.json`, whose write gate is the
+ * hardcoded `() => true`.
+ *
+ * One-directional by construction: every OTHER write target re-checks its
+ * dir's occupant, so the poison could only ever flow INTO central. Measured
+ * store state on this fleet: 18 uuid entries, 18 distinct identity files, but
+ * only 8 distinct credential blobs — one blob filed under eight uuids.
+ */
+test("CROSS-WRITE GATE: an extraDir occupied by ANOTHER account is not an eligible source", () => {
+  withHome((home) => {
+    const old = new Date(Date.now() - 2 * HOUR);
+    // The INCOMING account — the switch target. Its own copy is older, which
+    // is the ordinary case: the session has not been using it.
+    const incoming: Cred = { accessToken: "at-incoming", refreshToken: "rt-incoming", expiresAt: Date.now() + 6 * HOUR };
+    const targetDir = makeDir(home, "incoming", UUID, incoming, { mtime: old });
+
+    // The OUTGOING account, still occupying the session's config dir. It was
+    // refreshed moments ago, so it is the NEWEST credential file on disk —
+    // precisely what an identity-blind mtime ranking selects.
+    const outgoing: Cred = { accessToken: "at-outgoing", refreshToken: "rt-outgoing", expiresAt: Date.now() + 7 * HOUR };
+    const sessionDir = makeDir(home, "outgoing", OTHER_UUID, outgoing);
+
+    // Exactly switchAccount's call shape.
+    const report = convergeIdentityCredential(UUID, {
+      tool,
+      profiles: [
+        { name: "incoming", dir: targetDir },
+        { name: "outgoing", dir: sessionDir },
+      ],
+      extraDirs: [sessionDir],
+    });
+
+    // THE LOAD-BEARING ASSERTION: the incoming account's credential of record
+    // is its OWN credential, never the outgoing account's. This is the exact
+    // byte-level claim behind "18 uuids, 8 credential blobs".
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-incoming");
+
+    // The outgoing account's file must never be crowned for the incoming uuid.
+    expect(report.winner?.path).not.toBe(join(sessionDir, ".credentials.json"));
+    expect(report.winner?.path).toBe(join(targetDir, ".credentials.json"));
+
+    // And the outgoing account keeps its own material, untouched.
+    expect(readCred(join(sessionDir, ".credentials.json")).refreshToken).toBe("rt-outgoing");
+
+    // The refusal is REPORTED, not silent — the absence of any signal is how
+    // this survived to 0.2.26.
+    expect(
+      report.skipped.some((s) => s.path === join(sessionDir, ".credentials.json") && /does not carry this account/.test(s.reason)),
+    ).toBe(true);
+  });
+});
+
+test("CROSS-WRITE GATE, positive control: the SAME extraDir, carrying the target account, is used", () => {
+  withHome((home) => {
+    const old = new Date(Date.now() - 2 * HOUR);
+    // Same shape as above, except the session dir carries the TARGET account.
+    // If the gate were over-broad this would go dead and convergence would
+    // stop doing its job.
+    const parked: Cred = { accessToken: "at-parked", refreshToken: "rt-parked", expiresAt: Date.now() + 6 * HOUR };
+    const targetDir = makeDir(home, "incoming", UUID, parked, { mtime: old });
+    const live: Cred = { accessToken: "at-live", refreshToken: "rt-live", expiresAt: Date.now() + 7 * HOUR };
+    const sessionDir = makeDir(home, "session", UUID, live);
+
+    const report = convergeIdentityCredential(UUID, {
+      tool,
+      profiles: [{ name: "incoming", dir: targetDir }],
+      extraDirs: [sessionDir],
+    });
+
+    expect(report.winner?.path).toBe(join(sessionDir, ".credentials.json"));
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-live");
+    expect(readCred(join(targetDir, ".credentials.json")).refreshToken).toBe("rt-live");
+  });
+});
+
 test("EXFILTRATION GATE: converging an UNREGISTERED dir is refused outright", () => {
   withHome((home) => {
     const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
