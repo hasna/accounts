@@ -236,16 +236,40 @@ function identityToken(value: unknown): string | undefined {
  * precondition.
  */
 export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): boolean {
+  return dirLiveIdentityRelation(profileDir, tool) === "foreign";
+}
+
+/**
+ * How the dir's LIVE account relates to the profile's OWN parked identity.
+ *
+ * `dirLiveIdentityIsForeign` above collapses everything that is not a proven
+ * conflict into `false`, which is the right answer for the WRITE paths it
+ * guards: they must fail OPEN on an unreadable identity or a profile would
+ * never acquire its first snapshot. Read paths need the third answer as well.
+ * "The dir is provably its own" and "we cannot tell" call for different
+ * fallbacks — the first lets a stale switch marker be disregarded, the second
+ * must fail CLOSED on it — and a boolean cannot express that.
+ *
+ *   own          a field pair readable on both sides is equal
+ *   foreign      a field pair readable on both sides differs
+ *   own-unknown  the profile's parked record has neither identity field (first capture)
+ *   live-unknown the dir's live account carries no field comparable to the parked one
+ */
+export type DirLiveIdentityRelation = "own" | "foreign" | "own-unknown" | "live-unknown";
+
+export function dirLiveIdentityRelation(profileDir: string, tool?: ToolDef): DirLiveIdentityRelation {
   const own = oauthRecordFromSnapshot(profileDir);
   const live = liveOAuthRecordUnfiltered(profileDir, tool);
 
   const ownUuid = identityToken(own?.accountUuid);
   const liveUuid = identityToken(live?.accountUuid);
-  if (ownUuid && liveUuid) return ownUuid !== liveUuid;
+  if (ownUuid && liveUuid) return ownUuid === liveUuid ? "own" : "foreign";
 
   const ownEmail = identityToken(own?.emailAddress);
   const liveEmail = identityToken(live?.emailAddress);
-  return Boolean(ownEmail && liveEmail && ownEmail !== liveEmail);
+  if (ownEmail && liveEmail) return ownEmail === liveEmail ? "own" : "foreign";
+
+  return ownUuid || ownEmail ? "live-unknown" : "own-unknown";
 }
 
 /**
