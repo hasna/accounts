@@ -55,6 +55,7 @@ import {
   parkedRecoveryDisposition,
   planParkedRecovery,
   recoverParkedCredential,
+  readSwitchedAccountMarker,
 } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
@@ -257,14 +258,38 @@ function prelaunchSummaryFor(p: Profile): ConfigsPrelaunchSummary {
   return getConfigsPrelaunchSummary(p, tool, configsSessionToolFor(tool));
 }
 
+/**
+ * Why a launch would be refused, when the reason lives in the dir rather than in
+ * the registry row.
+ *
+ * `accounts launch account031` refused with "its config dir currently carries
+ * the account of account029", while `accounts show account031 --json` displayed
+ * the correct dir, the correct email, and no mention of account029 anywhere in
+ * its output. The CLI refused for a reason its own inspection command would not
+ * display, which makes the state undiagnosable from outside — the operator sees
+ * a healthy-looking profile and an error that contradicts it.
+ */
+function switchedAwayDetails(p: Profile): { switchedAway?: { profile: string; email?: string } } {
+  if (p.tool !== "claude") return {};
+  const marker = readSwitchedAccountMarker(p.dir);
+  if (!marker) return {};
+  return { switchedAway: { profile: marker.profile, ...(marker.email ? { email: marker.email } : {}) } };
+}
+
 function profileDetails(
   p: Profile,
   active: boolean,
-): Profile & { active: boolean; applied: boolean; prelaunch: ConfigsPrelaunchSummary } {
+): Profile & {
+  active: boolean;
+  applied: boolean;
+  prelaunch: ConfigsPrelaunchSummary;
+  switchedAway?: { profile: string; email?: string };
+} {
   return {
     ...p,
     active,
     applied: appliedProfileName(p.tool) === p.name,
+    ...switchedAwayDetails(p),
     prelaunch: prelaunchSummaryFor(p),
   };
 }
@@ -585,6 +610,13 @@ program
       }
       console.log(`  created:    ${p.createdAt}`);
       if (p.lastUsedAt) console.log(`  last used:  ${p.lastUsedAt}`);
+      if (details.switchedAway) {
+        console.log(
+          `  ${chalk.yellow("switched:")}   this dir currently carries the account of ` +
+            `${chalk.bold(details.switchedAway.profile)} (in-place switch) — ` +
+            `${p.name} cannot launch until it is reconciled: accounts switch-account ${p.name} --dir ${p.dir}`,
+        );
+      }
       printPrelaunchDetails(details.prelaunch);
     }),
   );
