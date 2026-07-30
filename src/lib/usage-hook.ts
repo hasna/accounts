@@ -93,10 +93,16 @@ export interface UsageHookDeps {
   readNotices?(): HookNoticeState | undefined;
   writeNotices?(state: HookNoticeState): void;
   /**
-   * Live sessions attached to a config dir. Used to refuse a switch onto an
-   * account another dir is already running — two live copies of one account
-   * end with refresh-token rotation destroying one of the credentials.
-   * Optional: without it the hook behaves as before and does not guard.
+   * Live sessions attached to a config dir. REPORTING ONLY: when the chosen
+   * target account is also live in other dirs, the switch message says so.
+   *
+   * This dep used to power an EXCLUSION — an account live in another dir could
+   * not be a switch target at all, because two independent credential copies
+   * behind one refresh token end with rotation destroying the loser. The
+   * credential broker (`credential-broker.ts`) removed the independent copies:
+   * every dir sharing an account now converges on the newest rotation and the
+   * refresh happens once, under the account's lock. Sharing an account across
+   * sessions is supported, exactly as it is within one config dir.
    */
   liveSessionsIn?(dir: string): number;
   now?: () => Date;
@@ -318,46 +324,23 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     return { identity, ...(entry?.usage ? { usage: entry.usage } : {}) };
   });
 
-  // An account another dir is actively running is not a safe target however
-  // much headroom it has: two Claude Code processes behind one refresh token
-  // end with the server rotating it and one copy being blanked. Our OWN dir is
-  // excluded from the check — it is the one being switched away from.
-  //
-  // KNOWN FALSE POSITIVE, accepted deliberately: liveness comes from pid files
-  // plus `kill(pid, 0)`, so a stale pid file whose number has been reused by an
-  // unrelated process reads as live and needlessly withholds that account. The
-  // failure directions are not symmetric — a false positive costs one switch
-  // option and is reported; a false negative destroys a credential — so this
-  // errs toward refusing. It is an exclusion rather than a ranking penalty for
-  // the same reason: a contended account ranked last would still be chosen
-  // whenever it is the only candidate, which is exactly the case that hurts.
-  const contendedAccounts = new Set<string>();
-  const liveSessionsIn = deps.liveSessionsIn;
-  if (liveSessionsIn) {
-    for (const identity of identities) {
-      for (const door of identity.doors) {
-        if (sameDir(door.dir, opts.configDir)) continue;
-        let live = 0;
-        try {
-          live = liveSessionsIn(door.dir);
-        } catch {
-          // A dir we cannot inspect is not evidence of contention.
-          continue;
-        }
-        if (live > 0) {
-          contendedAccounts.add(identity.accountUuid);
-          break;
-        }
-      }
-    }
-  }
+  // An account another dir is running IS a valid target. It used to be
+  // excluded here ("contended"): two independent credential copies behind one
+  // refresh token ended with rotation blanking the loser, so the hook refused
+  // to create the second copy — and on a busy fleet that refusal withheld
+  // every healthy account at once ("8 accounts are already being run by
+  // another session and cannot be shared"). The credential broker removed the
+  // independent copies: `switchAccount` converges the target account to its
+  // newest rotation before writing, every sharing dir converges on each
+  // prompt, and the refresh itself happens once under the account's
+  // cross-process lock (`credential-broker.ts`). Sharing across dirs is now
+  // the same regime as the long-supported sharing within one dir.
   const selection = selectHealthiestAccount(entries, {
     currentUuid,
     minHeadroom: opts.minHeadroom,
     ...(opts.minSessionHeadroom !== undefined ? { minSessionHeadroom: opts.minSessionHeadroom } : {}),
     now: clock,
     ...(deps.activeCooldowns ? { cooldowns: deps.activeCooldowns(clock) } : {}),
-    ...(contendedAccounts.size > 0 ? { contendedAccounts } : {}),
   });
 
   const breachedWindow = breach.window!;
@@ -376,14 +359,10 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
           `(${selection.considered} checked) — no account has headroom to switch to. Staying put.`,
       });
     }
-    const contended = selection.excluded.filter((e) => e.reason === "contended").length;
     const detail =
-      contended > 0
-        ? `${contended} account${contended === 1 ? " is" : "s are"} already being run by another session and ` +
-          `cannot be shared — a second copy would get its token rotated away`
-        : selection.reason === "no-usage-data"
-          ? `no other account has been measured yet (${selection.excluded.length} known)`
-          : `no other usable account is registered on this machine`;
+      selection.reason === "no-usage-data"
+        ? `no other account has been measured yet (${selection.excluded.length} known)`
+        : `no other usable account is registered on this machine`;
     return degraded(opts, deps, clock, "no-candidate", {
       action: "none",
       reason: selection.reason ?? "no-candidate",
@@ -477,6 +456,25 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     liveSessions > 1
       ? ` ${liveSessions} live sessions share this config dir and ALL of them switched together.`
       : "";
+  // Sharing is supported, not silent: a switch onto an account that is also
+  // live elsewhere says so, so "two sessions on one account" is always an
+  // announced state and never a surprise found in the logs.
+  let sharedDirs = 0;
+  if (deps.liveSessionsIn) {
+    for (const door of candidate.identity.doors) {
+      if (sameDir(door.dir, opts.configDir)) continue;
+      try {
+        if (deps.liveSessionsIn(door.dir) > 0) sharedDirs += 1;
+      } catch {
+        // A dir we cannot inspect contributes nothing to the note.
+      }
+    }
+  }
+  const sharedNote =
+    sharedDirs > 0
+      ? ` The account is also live in ${sharedDirs} other session dir${sharedDirs === 1 ? "" : "s"}; ` +
+        `the accounts credential broker keeps every copy on its newest rotation.`
+      : "";
   const staleNote = staleReading
     ? ` (decided from a ${minutes(ageMs ?? 0)}-old usage reading — a fresh one is being fetched)`
     : "";
@@ -497,7 +495,7 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     `accounts: auto-switched this session from ${currentEmail} (${breachText}) ` +
     `to ${targetEmail} (${pct(candidate.sessionHeadroom)} session / ` +
     `${pct(candidate.weeklyHeadroom)} weekly headroom)${staleNote}.` +
-    `${renewalNote}${skippedNote}${sessionsNote}`;
+    `${renewalNote}${sharedNote}${skippedNote}${sessionsNote}`;
   return {
     action: "switched",
     systemMessage: message,

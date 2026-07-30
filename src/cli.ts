@@ -36,9 +36,20 @@ import {
   centralCredentialsSnapshot,
   centralOAuthSnapshot,
   isAccountUuid,
+  profileAccountUuid,
   sweepCentralAuth,
   type SyncResult,
 } from "./lib/auth-store.js";
+import {
+  assertRegisteredConfigDir,
+  convergeDirCredential,
+  convergeIdentityCredential,
+  ensureFreshIdentityCredential,
+  DEFAULT_MIN_TTL_MS,
+  ENSURE_FRESH_TRIGGER_TTL_MS,
+  type ConvergeReport,
+  type EnsureFreshReport,
+} from "./lib/credential-broker.js";
 import {
   ensureProfileAuthSnapshot,
   parkedRecoveryDisposition,
@@ -950,6 +961,111 @@ program
     ),
   );
 
+function printBrokerReport(report: ConvergeReport | EnsureFreshReport, quiet: boolean): void {
+  if (quiet) return;
+  const refreshed = "refreshed" in report && report.refreshed;
+  const headline = report.winner
+    ? `${report.accountUuid}: ${refreshed ? "refreshed and " : ""}converged from ${report.winner.kind}` +
+      (report.expiresInMs !== undefined ? ` (access token ${Math.round(report.expiresInMs / 60000)}min left)` : "")
+    : `${report.accountUuid}: no restorable credential copy found`;
+  console.log(report.winner ? chalk.green(`✓ ${headline}`) : chalk.yellow(`• ${headline}`));
+  for (const write of report.writes) console.log(chalk.dim(`  ${write.action}: ${write.path} (${write.kind})`));
+  for (const skip of report.skipped) console.log(chalk.dim(`  skipped ${skip.path}: ${skip.reason}`));
+  const error = "error" in report ? report.error : undefined;
+  if (error) console.log(chalk.yellow(`  ! ${error}`));
+}
+
+program
+  .command("credential-sync")
+  .description(
+    "converge every stored copy of an account's credential to its newest rotation (the sharing broker); " +
+      "with --ensure-fresh, also refresh the access token ahead of expiry — once, under the account's lock",
+  )
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("--uuid <accountUuid>", "account to converge")
+  .option("--profile <name>", "converge the account this profile is bound to")
+  .option("--dir <path>", "converge the account occupying this config dir (default: the session's dir)")
+  .option("--all", "converge every account known to this machine")
+  .option("--ensure-fresh", "refresh the access token when it is near expiry (network)")
+  .option("--min-ttl <seconds>", `refresh when less than this many seconds remain (default ${DEFAULT_MIN_TTL_MS / 1000})`)
+  .option("--json", "output JSON")
+  .option("--quiet", "no output (hook/loop use)")
+  .action(
+    action(
+      async (opts: {
+        tool: string;
+        uuid?: string;
+        profile?: string;
+        dir?: string;
+        all?: boolean;
+        ensureFresh?: boolean;
+        minTtl?: string;
+        json?: boolean;
+        quiet?: boolean;
+      }) => {
+        const tool = getTool(opts.tool);
+        if (tool.id !== "claude") throw new AccountsError("credential-sync is Claude-only today");
+        const store = resolveStore();
+        const profiles = (await store.listProfiles()).map((p) => ({ name: p.name, dir: p.dir }));
+        const minTtlMs = opts.minTtl !== undefined ? Number(opts.minTtl) * 1000 : undefined;
+        if (minTtlMs !== undefined && !Number.isFinite(minTtlMs)) {
+          throw new AccountsError(`invalid --min-ttl: ${JSON.stringify(opts.minTtl)}`);
+        }
+
+        const uuids: string[] = [];
+        const extraDirs: string[] = [];
+        if (opts.uuid) {
+          uuids.push(opts.uuid);
+        } else if (opts.profile) {
+          const profile = await store.getProfile(opts.profile, opts.tool);
+          const uuid = profileAccountUuid(profile.dir, tool);
+          if (!uuid) throw new AccountsError(`profile "${opts.profile}" is not bound to an account`);
+          uuids.push(uuid);
+        } else if (opts.all) {
+          for (const identity of buildIdentityIndex(profiles, tool)) {
+            if (isAccountUuid(identity.accountUuid) && identity.credential) uuids.push(identity.accountUuid);
+          }
+        } else {
+          const dir = resolveSessionConfigDir(tool, opts.dir ? { dir: opts.dir } : {});
+          // Same destination allowlist as `switch-account`: this branch reads
+          // an account uuid out of the dir's own files and then writes that
+          // account's credential of record back into the dir — pointed at an
+          // unregistered dir carrying a planted `.claude.json`, it would be a
+          // credential-exfiltration primitive. No override flag on purpose.
+          assertRegisteredConfigDir(dir, profiles);
+          const uuid = dirAccountUuid(dir, tool);
+          if (!uuid || !isAccountUuid(uuid)) {
+            throw new AccountsError(`${dir} carries no well-formed account to converge`);
+          }
+          uuids.push(uuid);
+          extraDirs.push(dir);
+        }
+
+        const reports: Array<ConvergeReport | EnsureFreshReport> = [];
+        for (const uuid of uuids) {
+          const brokerOpts = {
+            tool,
+            profiles,
+            ...(extraDirs.length > 0 ? { extraDirs } : {}),
+          };
+          reports.push(
+            opts.ensureFresh
+              ? await ensureFreshIdentityCredential(uuid, {
+                  ...brokerOpts,
+                  ...(minTtlMs !== undefined ? { minTtlMs } : {}),
+                })
+              : convergeIdentityCredential(uuid, brokerOpts),
+          );
+        }
+        if (opts.json) {
+          console.log(JSON.stringify({ schema: "hasna.accounts.credential-sync/v1", reports }, null, 2));
+          return;
+        }
+        for (const report of reports) printBrokerReport(report, opts.quiet === true);
+      },
+    ),
+  );
+
 function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): string {
   const who = entry.email ?? entry.accountUuid;
   const marker = entry.accountUuid === currentUuid ? chalk.cyan(" (this session)") : "";
@@ -1119,6 +1235,43 @@ program
         const tool = getTool(opts.tool);
         const store = resolveStore();
         const configDir = resolveSessionConfigDir(tool, opts.dir ? { dir: opts.dir } : {});
+
+        // BROKER PASS, before the prompt runs. Two halves:
+        //  1. SYNCHRONOUS convergence (file I/O only): this dir must hold its
+        //     account's newest rotation before Claude Code re-reads the
+        //     credential at request time — a sibling session may have rotated
+        //     the shared account since the last prompt, and a request made on
+        //     the superseded copy is the old blanking race.
+        //  2. DETACHED ensure-fresh (network): when the access token nears
+        //     expiry, one broker process renews it under the account's lock so
+        //     the sessions themselves essentially never trigger the tool's own
+        //     uncoordinated refresh. Fire-and-forget, like the cache warmer.
+        // Both fail OPEN — the prompt always goes through.
+        try {
+          const converged = convergeDirCredential(configDir, { tool });
+          if (converged) {
+            usageHookLog(
+              `broker-converge uuid=${converged.accountUuid} writes=${converged.writes.length}` +
+                ` ttl_min=${converged.expiresInMs !== undefined ? Math.round(converged.expiresInMs / 60000) : "unknown"}`,
+            );
+            const ttl = converged.expiresInMs;
+            if (converged.winner && (ttl === undefined || ttl < ENSURE_FRESH_TRIGGER_TTL_MS)) {
+              const cliPath = process.argv[1];
+              if (cliPath) {
+                spawn(
+                  process.execPath,
+                  [cliPath, "credential-sync", "--tool", opts.tool, "--dir", configDir, "--ensure-fresh", "--quiet"],
+                  { detached: true, stdio: "ignore" },
+                ).unref();
+              }
+            }
+          }
+        } catch (error) {
+          usageHookLog(
+            `broker-converge failed error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+          );
+        }
+
         const outcome = await runUsageHook(
           {
             configDir,
