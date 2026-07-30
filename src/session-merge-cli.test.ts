@@ -9,6 +9,9 @@ let sharedHome: string;
 
 const PROJECT = "-home-hasna-workspace-alpha";
 const SESSION = "00000000-0000-4000-8000-0000000000aa";
+// This test launches the real CLI three times. Keep it clear of bun's 5s
+// default when the suite is running under load.
+const CLI_TIMEOUT_MS = 60_000;
 
 function runCli(...args: string[]) {
   return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
@@ -130,4 +133,4 @@ test("a session written under one profile is readable through another", () => {
     expect(readFileSync(join(profileDir(name), "history.jsonl"), "utf8")).toContain("alpha");
     expect(readFileSync(join(profileDir(name), "history.jsonl"), "utf8")).toContain("beta");
   }
-});
+}, CLI_TIMEOUT_MS);
