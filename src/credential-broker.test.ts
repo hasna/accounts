@@ -294,6 +294,74 @@ test("CROSS-WRITE GATE, positive control: the SAME extraDir, carrying the target
   });
 });
 
+/**
+ * THE DEFAULT-DIR LAYOUT. Claude Code's real default config dir keeps its
+ * `oauthAccount` in the PARENT `~/.claude.json`, not inside `~/.claude/`.
+ * `profileAccountJsonPaths` models that by returning a SECOND path — and only
+ * when `profileDir === tool.defaultDir` (claude-layout.ts:48).
+ *
+ * `buildIdentityIndex` loops every one of those paths, so the dir is still
+ * enumerated as a door. Any identity predicate that reads `paths[0]` alone
+ * therefore DISAGREES WITH THE ENUMERATOR on exactly the standard layout.
+ *
+ * Every fixture in this file until now put `.claude.json` INSIDE the profile
+ * dir (see `makeDir`), so the second path was never exercised — which is how a
+ * fully green suite could miss this.
+ */
+function makeDefaultDir(home: string, uuid: string, cred: Cred, opts: { mtime?: Date } = {}): { dir: string; tool: typeof tool } {
+  const fakeHome = join(home, "userhome");
+  const dir = join(fakeHome, ".claude");
+  mkdirSync(dir, { recursive: true });
+  // Identity lives in the PARENT only — the real default layout.
+  writeFileSync(join(fakeHome, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: "live@example.com" } }));
+  writeFileSync(join(dir, ".credentials.json"), credBytes(cred));
+  if (opts.mtime) utimesSync(join(dir, ".credentials.json"), opts.mtime, opts.mtime);
+  return { dir, tool: { ...tool, defaultDir: dir } };
+}
+
+test("DEFAULT-DIR SOURCE: the live default config dir donates for its own account", () => {
+  withHome((home) => {
+    const live: Cred = { accessToken: "at-live", refreshToken: "rt-live", expiresAt: Date.now() + 7 * HOUR };
+    const { dir, tool: defaultTool } = makeDefaultDir(home, UUID, live);
+
+    const report = convergeIdentityCredential(UUID, {
+      tool: defaultTool,
+      profiles: [{ name: "live", dir }],
+    });
+
+    // The account's ONLY credential is in this dir. Refusing it as a source
+    // makes convergence a no-op that reports "no restorable credential copy".
+    expect(report.winner?.path).toBe(join(dir, ".credentials.json"));
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-live");
+  });
+});
+
+test("DEFAULT-DIR SOURCE: a STALE sibling never outranks the live default dir", () => {
+  withHome((home) => {
+    // Worse than a no-op. If the default dir cannot donate, the only remaining
+    // candidate is the stale sibling — which is then crowned AND written to
+    // central with a FRESH mtime. `betterCredential` tie-breaks on mtime, so
+    // the stale copy would durably outrank the genuinely fresher live one.
+    const live: Cred = { accessToken: "at-live", refreshToken: "rt-live", expiresAt: Date.now() + 7 * HOUR };
+    const { dir, tool: defaultTool } = makeDefaultDir(home, UUID, live);
+    const old = new Date(Date.now() - 2 * HOUR);
+    const staleDir = makeDir(home, "stale-sibling", UUID, { accessToken: "at-stale", refreshToken: "rt-stale", expiresAt: Date.now() - HOUR }, { mtime: old });
+
+    const report = convergeIdentityCredential(UUID, {
+      tool: defaultTool,
+      profiles: [
+        { name: "live", dir },
+        { name: "stale", dir: staleDir },
+      ],
+    });
+
+    expect(report.winner?.path).toBe(join(dir, ".credentials.json"));
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-live");
+    // The stale sibling converged UP to the live rotation, not the reverse.
+    expect(readCred(join(staleDir, ".credentials.json")).refreshToken).toBe("rt-live");
+  });
+});
+
 test("EXFILTRATION GATE: converging an UNREGISTERED dir is refused outright", () => {
   withHome((home) => {
     const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
