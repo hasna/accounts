@@ -198,7 +198,7 @@ next version to the workflow.
 
 | Date (UTC) | Version | Operator | Reason | Follow-up |
 | --- | --- | --- | --- | --- |
-| _none yet_ | | | | |
+| 2026-07-30 11:31 | 0.2.24 | ops agent (station02, npm user andreihasna2) | Release run 30533148549 for tag `npm/accounts/v0.2.24` failed at the provisioning gate: the `npm-release` environment held zero secrets, and 0.2.22/0.2.23 carry no attestations so the npm trusted publisher was never configured. Both `RELEASE_GITHUB_ADMIN_TOKEN` (fine-grained PAT) and the trusted publisher require owner web-UI provisioning; 0.2.24 ships the #87 subscription broker fix needed fleet-wide. Published from a clean checkout of d4820677 after `typecheck` rc=0 and `bun test` 1265 pass / 0 fail. Declared in git-publishing (msg 607121) before acting. | Provision `NPM_DIST_TAG_TOKEN` + `RELEASE_GITHUB_ADMIN_TOKEN` in the `npm-release` environment and configure the npm trusted publisher, then return 0.2.25 to the workflow. |
 
 ## Pinned release substrate
 

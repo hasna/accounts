@@ -66,14 +66,14 @@ describe("root synchronous compatibility exports", () => {
     expect(addProfile({ name: "still-local", tool: "claude" }).name).toBe("still-local");
   });
 
+  test("ACCOUNTS_HOME wins over retained hosted URL and key", () => {
+    process.env.HASNA_ACCOUNTS_API_URL = "https://accounts.example.test";
+    process.env.HASNA_ACCOUNTS_API_KEY = "fixture-authority";
+    expect(loadStore().version).toBe(1);
+    expect(addProfile({ name: "scoped-local", tool: "claude" }).name).toBe("scoped-local");
+  });
+
   test.each([
-    [
-      "implicit hosted URL and key",
-      {
-        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
-        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
-      },
-    ],
     [
       "cloud mode",
       {
@@ -185,13 +185,6 @@ describe("root synchronous compatibility exports", () => {
 
   test.each([
     [
-      "implicit hosted URL and key",
-      {
-        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
-        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
-      },
-    ],
-    [
       "cloud mode",
       {
         HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
@@ -253,6 +246,13 @@ describe("root synchronous compatibility exports", () => {
         HASNA_ACCOUNTS_API_KEY: "fixture-authority",
       },
     ],
+    [
+      "ACCOUNTS_HOME with retained hosted URL and key",
+      {
+        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
+        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
+      },
+    ],
   ])("ensureProfileForLogin preserves the documented v1 local boundary for %s", (_label, env) => {
     Object.assign(process.env, env);
     const profile = ensureProfileForLogin("login-local");
@@ -262,14 +262,6 @@ describe("root synchronous compatibility exports", () => {
   });
 
   test.each([
-    [
-      "implicit hosted URL and key",
-      {
-        HASNA_ACCOUNTS_API_URL: "https://accounts.example.test",
-        HASNA_ACCOUNTS_API_KEY: "fixture-authority",
-      },
-      /local-only compatibility/,
-    ],
     [
       "explicit cloud with URL and key",
       {
