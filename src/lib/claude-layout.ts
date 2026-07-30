@@ -9,6 +9,7 @@ export const OAUTH_SNAPSHOT = "oauth-account.json";
 export const CREDENTIALS_SNAPSHOT = "credentials.json";
 export const KEYCHAIN_SNAPSHOT = "keychain.json";
 export const SWITCHED_ACCOUNT_MARKER = "switched-account.json";
+export const UNREADABLE_CREDENTIALS_DIR = "unreadable-credentials";
 export const DIR_CREDENTIALS_FILE = ".credentials.json";
 
 /**
@@ -62,6 +63,11 @@ export function profileCredentialsSnapshot(profileDir: string): string {
 
 export function profileKeychainSnapshot(profileDir: string): string {
   return join(profileAuthDir(profileDir), KEYCHAIN_SNAPSHOT);
+}
+
+/** Copies of unrecognised live credential payloads preserved before recovery. */
+export function profileUnreadableCredentialsDir(profileDir: string): string {
+  return join(profileAuthDir(profileDir), UNREADABLE_CREDENTIALS_DIR);
 }
 
 /**

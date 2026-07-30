@@ -9,7 +9,7 @@ import {
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
 } from "./claude-layout.js";
-import { centralAuthRoot, isAccountUuid } from "./auth-store.js";
+import { centralAuthRoot, isAccountUuid, profileAccountUuid } from "./auth-store.js";
 import { classifyCredentialFile, isRestorableState, type CredentialState } from "./credential-state.js";
 import { canonicalConfigDir, sameConfigDir } from "./safe-path.js";
 
@@ -345,13 +345,26 @@ export function buildIdentityIndex(
 
     // Layer A — whoever's account currently occupies the dir's live files.
     // Read BEFORE layer B so the owner's door can record that it is displaced;
-    // both layers are read from the same dir in the same pass, so this is a
-    // reordering, not an extra read.
-    const livePaths = profileAccountJsonPaths(dir, tool);
-    const occupant = oauthIdentityFrom(livePaths.length > 0 ? readJson(livePaths[0]!) : undefined);
+    // both layers are read from the same profile layout in one pass, so this is
+    // a reordering rather than a second profile scan.
+    let occupant: OAuthIdentity | undefined;
+    for (const path of profileAccountJsonPaths(dir, tool)) {
+      occupant = oauthIdentityFrom(readJson(path));
+      if (occupant) break;
+    }
 
     // Layer B — the dir's OWN identity (survives in-place switches away).
-    const own = oauthIdentityFrom(readJson(profileOAuthSnapshot(dir)));
+    //
+    // A newly registered profile can legitimately have only live auth: no
+    // legacy per-profile snapshot and no central mirror yet. In that first-
+    // capture state the live identity is also the profile binding, so expose an
+    // own-identity door for selectors to switch through. `profileAccountUuid`
+    // owns the binding rule and fails closed when a switch marker exists, so a
+    // switched guest is never promoted from current occupant to profile owner.
+    const snapshotOwn = oauthIdentityFrom(readJson(profileOAuthSnapshot(dir)));
+    const own =
+      snapshotOwn ??
+      (occupant && profileAccountUuid(dir, tool) === occupant.accountUuid ? occupant : undefined);
     if (own) {
       // Squatted only when someone else is actually in the dir. No occupant is
       // "parked and idle", and the owner occupying its own dir is the normal
@@ -368,7 +381,9 @@ export function buildIdentityIndex(
           ...(own.email ? { email: own.email } : {}),
           ...(displacedBy ? { occupiedBy: displacedBy } : {}),
         },
-        credentialRef(profileCredentialsSnapshot(dir), "profile-snapshot"),
+        snapshotOwn
+          ? credentialRef(profileCredentialsSnapshot(dir), "profile-snapshot")
+          : credentialRef(dirCredentialsFile(dir), "dir-live"),
       );
     }
 
