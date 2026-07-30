@@ -28,11 +28,24 @@ function cleanup() {
   delete process.env.ACCOUNTS_HOME;
 }
 
+// Prelaunch only renders when it has something to render FROM, so the default
+// fixture carries an instruction export. Tests about the no-sources path opt out
+// with `identity: undefined` and assert the skip instead.
+const FIXTURE_EXPORT = join(mkdtempSync(join(tmpdir(), "accounts-prelaunch-export-")), "fixture.configs.json");
+writeFileSync(
+  FIXTURE_EXPORT,
+  JSON.stringify({
+    contract: "hasna.identities.configs-instructions/v1",
+    sources: [{ id: "global-codewith", layer: "global", content: "rules" }],
+  }) + "\n",
+);
+
 function profile(tool: string): Profile {
   return {
     name: `${tool}-profile`,
     tool,
     dir: `/tmp/accounts/${tool}-profile`,
+    identity: FIXTURE_EXPORT,
     createdAt: "2026-07-01T00:00:00.000Z",
   };
 }
@@ -117,7 +130,6 @@ describe("configs prelaunch", () => {
       "/tmp/accounts/codex-profile",
       "--session-id",
       "accounts:codex:codex-profile",
-      "--allow-empty-sources",
     ]);
   });
 
@@ -129,7 +141,7 @@ describe("configs prelaunch", () => {
     expect(command.slice(1, 5)).toEqual(["session", "apply", "--tool", "claude"]);
     expect(command).toContain("--target-home");
     expect(command).toContain("/tmp/accounts/claude-profile");
-    expect(command).toContain("--allow-empty-sources");
+    expect(command).not.toContain("--allow-empty-sources");
   });
 
   test("passes OpenIdentities configs exports to the configs session command", () => {
@@ -149,15 +161,21 @@ describe("configs prelaunch", () => {
     ]);
   });
 
-  test("adds --allow-empty-sources only when there are no instruction sources", () => {
+  test("adds --allow-empty-sources only when the caller explicitly asks for an empty render", () => {
     const p = profile("claude");
 
+    // Having no identity export is the normal state of a pooled accountNNN
+    // profile. Inferring "render nothing" from it disarmed the renderer's own
+    // guard and produced agent homes with zero operating rules.
     const emptyImplicit = configsPrelaunchCommand(p, getTool("claude"));
-    expect(emptyImplicit).toContain("--allow-empty-sources");
+    expect(emptyImplicit).not.toContain("--allow-empty-sources");
     expect(emptyImplicit).not.toContain("--identity-export");
 
     const emptyExplicit = configsPrelaunchCommand(p, getTool("claude"), { identityExports: [] });
-    expect(emptyExplicit).toContain("--allow-empty-sources");
+    expect(emptyExplicit).not.toContain("--allow-empty-sources");
+
+    const deliberate = configsPrelaunchCommand(p, getTool("claude"), { allowEmptySources: true });
+    expect(deliberate).toContain("--allow-empty-sources");
 
     const withSources = configsPrelaunchCommand(p, getTool("claude"), {
       identityExports: ["/tmp/one.json"],
@@ -166,13 +184,17 @@ describe("configs prelaunch", () => {
     expect(withSources).not.toContain("--allow-empty-sources");
   });
 
-  test("identity-less profiles get --allow-empty-sources on the actual configs apply invocation", () => {
-    // Regression: `accounts launch`/`run`/supervisor prelaunch for a profile with
-    // zero identity exports (e.g. accountNNN) must request an explicit empty
-    // render, not fail closed with "Session render has no instruction sources".
+  test("identity-less profiles skip the render instead of emptying the home or aborting the launch", () => {
+    // This assertion was inverted once already. It used to require prelaunch to
+    // request an EMPTY render for a profile with zero identity exports — which
+    // is every pooled accountNNN profile — so homes were stripped of their
+    // operating rules while `accounts health` reported configs: ok. The
+    // opposite extreme is just as bad: refusing outright makes bare
+    // `accounts launch accountNNN` abort, which is the 0.2.9 breakage. The
+    // renderer is simply not invoked, and the existing home survives.
     resetHome();
     try {
-      const p = profileInHome("codewith");
+      const p = profileInHome("codewith", { identity: undefined });
       const calls: string[][] = [];
       const result = runConfigsPrelaunch(p, getTool("codewith"), {
         runner: (bin, args) => {
@@ -182,13 +204,11 @@ describe("configs prelaunch", () => {
         },
       });
 
-      expect(result.result).toBe("applied");
+      expect(calls).toHaveLength(0);
+      expect(result.skipped).toBe(true);
+      expect(result.result).toBe("skipped");
       expect(result.identityExports).toEqual([]);
-      expect(calls).toHaveLength(1);
-      expect(calls[0]?.slice(0, 3)).toEqual(["configs", "session", "apply"]);
-      expect(calls[0]).toContain("--allow-empty-sources");
-      expect(calls[0]).not.toContain("--identity-export");
-      expect(result.prelaunch.status).toBe("ok");
+      expect(result.prelaunch.status).not.toBe("ok");
     } finally {
       cleanup();
     }
@@ -1162,10 +1182,13 @@ describe("configs prelaunch", () => {
       });
 
       expect(calls[0]?.slice(0, 3)).toEqual(["identities", "instructions", "export"]);
-      expect(calls[1]?.slice(0, 4)).toEqual(["configs", "session", "apply", "--tool"]);
-      expect(calls[1]).not.toContain("--identity-export");
+      // The export failed, so there is nothing to render from. The renderer is
+      // never invoked — rendering here would have emptied the home — and the
+      // stale generated export is still not reused, which is what this test is for.
+      expect(calls).toHaveLength(1);
       expect(result.identityExports).toEqual([]);
       expect(result.result).toBe("bypassed");
+      expect(result.reason).toContain("identity instruction export failed");
       expect(result.prelaunch.status).toBe("bypassed");
     } finally {
       cleanup();
