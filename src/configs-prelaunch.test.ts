@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Profile } from "./types.js";
@@ -220,6 +220,827 @@ describe("configs prelaunch", () => {
     expect(bypassed.status).toBe(2);
     expect(bypassed.result).toBe("bypassed");
     expect(bypassed.prelaunch.status).toBe("bypassed");
+  });
+
+  test("controlled prelaunch probes suppress inherited request-debug output", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const probe = join(home, "configs-probe");
+    const dummyCredential = "dummy-controlled-probe-credential";
+    const previous = {
+      BUN_CONFIG_VERBOSE_FETCH: process.env.BUN_CONFIG_VERBOSE_FETCH,
+      NODE_DEBUG: process.env.NODE_DEBUG,
+      NODE_DEBUG_NATIVE: process.env.NODE_DEBUG_NATIVE,
+    };
+    writeFileSync(
+      probe,
+      [
+        "#!/bin/sh",
+        'if [ -n "${BUN_CONFIG_VERBOSE_FETCH:-}${NODE_DEBUG:-}${NODE_DEBUG_NATIVE:-}" ]; then',
+        `  printf 'Authorization: Bearer %s\\n' ${JSON.stringify(dummyCredential)}`,
+        `  printf 'x-api-key=%s\\n' ${JSON.stringify(dummyCredential)} >&2`,
+        "fi",
+        "exit 2",
+      ].join("\n"),
+    );
+    chmodSync(probe, 0o755);
+
+    try {
+      process.env.BUN_CONFIG_VERBOSE_FETCH = "1";
+      process.env.NODE_DEBUG = "http,http2";
+      process.env.NODE_DEBUG_NATIVE = "http";
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), { configsBin: probe });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("configs prelaunch apply failed");
+      expect(message).not.toContain(dummyCredential);
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      cleanup();
+    }
+  });
+
+  test("prelaunch errors redact normalized and escaped credential keys end to end", () => {
+    const p = profile("codex");
+    const samples: Array<[string, (secret: string) => string]> = [
+      ["prelaunch-oauth-secret", (secret) => `oauth_token=${secret}`],
+      ["prelaunch-bearer-secret", (secret) => `bearer-token=${secret}`],
+      ["prelaunch-signing-secret", (secret) => `signing_secret=${secret}`],
+      ["prelaunch-consumer-secret", (secret) => `consumerSecret=${secret}`],
+      ["prelaunch-database-secret", (secret) => `database_password=${secret}`],
+      ["prelaunch-webhook-secret", (secret) => `webhookCredential=${secret}`],
+      [
+        "prelaunch-escaped-auth-secret",
+        (secret) => String.raw`{"Authoriz\u0061tion":"${secret}","status":401}`,
+      ],
+      [
+        "prelaunch-escaped-api-secret",
+        (secret) => String.raw`{"x-\u0061pi-key":"${secret}","message"="malformed"}`,
+      ],
+    ];
+
+    for (const [secret, render] of samples) {
+      const output = render(secret);
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(output),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(message).toContain("configs prelaunch apply failed");
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain(secret);
+    }
+  });
+
+  test("prelaunch captured command text redacts credential options without erasing diagnostics", () => {
+    const p = profile("codex");
+    const cases = [
+      {
+        output: "provider --api-key prelaunch-api-secret --verbose keep-api-diagnostic",
+        secret: "prelaunch-api-secret",
+        retained: "--verbose keep-api-diagnostic",
+      },
+      {
+        output: 'provider "--secret-key=prelaunch-secret-key-secret" status=keep-secret-key-status',
+        secret: "prelaunch-secret-key-secret",
+        retained: "status=keep-secret-key-status",
+      },
+      {
+        output: "provider --service-auth 'prelaunch service auth secret' --mode keep-service-mode",
+        secret: "prelaunch service auth secret",
+        retained: "--mode keep-service-mode",
+      },
+      {
+        output: "provider --credentials prelaunch-credentials\\ escaped --trace keep-credentials-trace",
+        secret: "prelaunch-credentials escaped",
+        retained: "--trace keep-credentials-trace",
+      },
+      {
+        output: "provider -k prelaunch-short-secret --color keep-short-color",
+        secret: "prelaunch-short-secret",
+        retained: "--color keep-short-color",
+      },
+      {
+        output:
+          'provider -- outer=(env=--api-key) "" ' +
+          "prelaunch-wrapper-split-secret keep-prelaunch-wrapper-split",
+        secret: "prelaunch-wrapper-split-secret",
+        retained: "keep-prelaunch-wrapper-split",
+      },
+    ];
+
+    for (const sample of cases) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(sample.output),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain(sample.secret);
+      expect(message).toContain(sample.retained);
+    }
+  });
+
+  test("prelaunch captured command text preserves structured authorization near misses", () => {
+    const p = profile("codex");
+    const output =
+      "provider -- url=urn:authorization:public keep-prelaunch-urn " +
+      "url=https://example.test/authorization:public keep-prelaunch-url";
+    let message = "";
+    try {
+      runConfigsPrelaunch(p, getTool("codex"), {
+        runner: () => ({
+          status: 2,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(output),
+        }),
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain("url=urn:authorization:public");
+    expect(message).toContain("keep-prelaunch-urn");
+    expect(message).toContain(
+      "url=https://example.test/authorization:public",
+    );
+    expect(message).toContain("keep-prelaunch-url");
+  });
+
+  test("prelaunch AccountsError recovers credential syntax after unterminated quotes", () => {
+    const p = profile("codex");
+
+    for (const [lineIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+      const cases = [
+        {
+          output:
+            `provider "unterminated --api-key prelaunch-unmatched-${lineIndex}-separate-secret ` +
+            "--trace keep-prelaunch-unmatched-separate",
+          secret: `prelaunch-unmatched-${lineIndex}-separate-secret`,
+          retained: "keep-prelaunch-unmatched-separate",
+        },
+        {
+          output:
+            `provider 'unterminated --client-key=prelaunch-unmatched-${lineIndex}-attached-secret` +
+            "|--mode keep-prelaunch-unmatched-attached",
+          secret: `prelaunch-unmatched-${lineIndex}-attached-secret`,
+          retained: "keep-prelaunch-unmatched-attached",
+        },
+        {
+          output:
+            `provider "unterminated tail\\${lineEnding}` +
+            `diagnostic/--master-key prelaunch-unmatched-${lineIndex}-continued-secret ` +
+            "--color keep-prelaunch-unmatched-continued",
+          secret: `prelaunch-unmatched-${lineIndex}-continued-secret`,
+          retained: "keep-prelaunch-unmatched-continued",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+
+        expect(message, sample.output).toContain("configs prelaunch apply failed");
+        expect(message, sample.output).not.toContain(sample.secret);
+        expect(message, sample.output).toContain("[REDACTED]");
+        expect(message, sample.output).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch command redaction carries bound values across every physical line ending", () => {
+    const p = profile("codex");
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      const secrets = [
+        "prelaunch-multiline-plain-secret",
+        "--prelaunch-multiline-quoted-secret",
+        "--prelaunch-multiline-wrapper-secret",
+      ];
+      const cases = [
+        {
+          output: `provider --api-key${lineEnding}${secrets[0]}${lineEnding}status=keep-prelaunch-plain`,
+          secret: secrets[0]!,
+          retained: "status=keep-prelaunch-plain",
+        },
+        {
+          output: `provider --client-key${lineEnding}"${secrets[1]}"${lineEnding}message=keep-prelaunch-quoted`,
+          secret: secrets[1]!,
+          retained: "message=keep-prelaunch-quoted",
+        },
+        {
+          output: `provider --master-key${lineEnding}(\\"${secrets[2]}\\")${lineEnding}detail=keep-prelaunch-wrapper`,
+          secret: secrets[2]!,
+          retained: "detail=keep-prelaunch-wrapper",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(sample.secret);
+        expect(message).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch command redaction keeps opaque and attached option-looking values private", () => {
+    const p = profile("codex");
+    const cases: Array<{
+      output: string;
+      secret: string;
+      retained: string;
+    }> = [];
+
+    for (const [lineIndex, lineEnding] of [" ", "\n", "\r\n", "\r"].entries()) {
+      for (const [variantIndex, value] of [
+        `--label/client-key/prelaunch-hidden-${lineIndex}-0`,
+        `"--label/client-key/prelaunch-hidden-${lineIndex}-1"`,
+        `\\--label/client-key/prelaunch-hidden-${lineIndex}-2`,
+        `－label/client-key/prelaunch-hidden-${lineIndex}-3`,
+        `(--label/client-key/prelaunch-hidden-${lineIndex}-4)`,
+        `|--label/client-key/prelaunch-hidden-${lineIndex}-5`,
+        `--label=opaque/--label=prelaunch-hidden-${lineIndex}-6`,
+        `--label=opaque|--label=prelaunch-hidden-${lineIndex}-7`,
+        `--label=opaque<--label=prelaunch-hidden-${lineIndex}-8`,
+        `(--label=opaque/--label=prelaunch-hidden-${lineIndex}-9)`,
+        `－label=opaque/－label=prelaunch-hidden-${lineIndex}-10`,
+        `"--label=opaque/--label=prelaunch-hidden-${lineIndex}-11"`,
+        `\\--label=opaque/--label=prelaunch-hidden-${lineIndex}-12`,
+      ].entries()) {
+        cases.push({
+          output:
+            `provider --api-key${lineEnding}${value} ` +
+            `status=keep-prelaunch-opaque-${lineIndex}-${variantIndex}`,
+          secret: `prelaunch-hidden-${lineIndex}-${variantIndex}`,
+          retained: `status=keep-prelaunch-opaque-${lineIndex}-${variantIndex}`,
+        });
+      }
+    }
+    cases.push(
+      {
+        output:
+          "provider --api-key=--client-key status=keep-prelaunch-attached-equals",
+        secret: "--client-key",
+        retained: "status=keep-prelaunch-attached-equals",
+      },
+      {
+        output:
+          "provider --api-key:--client-key status=keep-prelaunch-attached-colon",
+        secret: "--client-key",
+        retained: "status=keep-prelaunch-attached-colon",
+      },
+    );
+
+    for (const sample of cases) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(sample.output),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message, sample.output).toContain("[REDACTED]");
+      expect(message, sample.output).not.toContain(sample.secret);
+      expect(message, sample.output).toContain(sample.retained);
+    }
+  });
+
+  test("prelaunch errors keep malformed bare-option tokens bound across line endings", () => {
+    const p = profile("codex");
+    const variants = [
+      { render: (_secret: string) => "-", exposed: "-" },
+      { render: (_secret: string) => "---", exposed: "---" },
+      { render: (_secret: string) => "----", exposed: "----" },
+      { render: (_secret: string) => "--.", exposed: "--." },
+      { render: (_secret: string) => "--_", exposed: "--_" },
+      { render: (_secret: string) => "-.", exposed: "-." },
+      { render: (_secret: string) => "-_", exposed: "-_" },
+      {
+        render: (secret: string) => `---api-key=${secret}`,
+        exposed: "---api-key=",
+      },
+      {
+        render: (secret: string) => `--.client-key:${secret}`,
+        exposed: "--.client-key:",
+      },
+      {
+        render: (secret: string) => `--_master-key=${secret}`,
+        exposed: "--_master-key=",
+      },
+      {
+        render: (secret: string) => `－－－api-key=${secret}`,
+        exposed: "－－－api-key=",
+      },
+      {
+        render: (secret: string) => `−−−client-key:${secret}`,
+        exposed: "−−−client-key:",
+      },
+    ];
+
+    for (const [lineIndex, lineEnding] of [" ", "\n", "\r\n", "\r"].entries()) {
+      for (const [variantIndex, variant] of variants.entries()) {
+        const secret =
+          `prelaunch-malformed-option-secret-${lineIndex}-${variantIndex}`;
+        const retained =
+          `status=keep-prelaunch-malformed-${lineIndex}-${variantIndex}`;
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(
+                `provider --api-key${lineEnding}${variant.render(secret)} ${retained}`,
+              ),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(secret);
+        expect(message).not.toContain(
+          `--api-key${lineEnding}${variant.exposed}`,
+        );
+        expect(message).toContain(retained);
+      }
+    }
+  });
+
+  test("prelaunch false end markers never expose later credential options", () => {
+    const p = profile("codex");
+    const falseMarkers = [
+      ...[
+        "\u2010",
+        "\u2011",
+        "\u2012",
+        "\u2013",
+        "\u2014",
+        "\u2015",
+        "\u2212",
+        "\uFE58",
+        "\uFE63",
+        "\uFF0D",
+      ].map((dash) => `${dash}${dash}`),
+      '"--"',
+      "'--'",
+      "\\--",
+      "\\-\\-",
+      "(--)",
+      "[--]",
+      "{--}",
+      "<-->",
+      "x|--",
+      "x/--",
+      "x:--",
+    ];
+
+    for (const [lineIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+      for (const [markerIndex, marker] of falseMarkers.entries()) {
+        for (const pending of [false, true]) {
+          const secret =
+            `prelaunch-false-marker-${lineIndex}-${markerIndex}-${pending}-secret`;
+          const retained =
+            `keep-prelaunch-false-marker-${lineIndex}-${markerIndex}-${pending}`;
+          const output = pending
+            ? `provider --api-key${lineEnding}${marker} --client-key=${secret} --trace ${retained}`
+            : `provider${lineEnding}${marker} --client-key=${secret} --trace ${retained}`;
+          let message = "";
+          try {
+            runConfigsPrelaunch(p, getTool("codex"), {
+              runner: () => ({
+                status: 2,
+                stdout: Buffer.from(""),
+                stderr: Buffer.from(output),
+              }),
+            });
+          } catch (error) {
+            message = error instanceof Error ? error.message : String(error);
+          }
+
+          expect(message, output).not.toContain(secret);
+          expect(message, output).toContain("[REDACTED]");
+          expect(message, output).toContain(retained);
+        }
+      }
+    }
+  });
+
+  test("prelaunch command redaction covers logical values continued across lines", () => {
+    const p = profile("codex");
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      const cases = [
+        {
+          output: `provider --api-key \\${lineEnding}prelaunch-bare-continuation-secret${lineEnding}status=keep-prelaunch-bare-continuation`,
+          secret: "prelaunch-bare-continuation-secret",
+          retained: "status=keep-prelaunch-bare-continuation",
+        },
+        {
+          output: `provider --client-key first-fragment\\${lineEnding}prelaunch-fragment-continuation-secret${lineEnding}message=keep-prelaunch-fragment-continuation`,
+          secret: "prelaunch-fragment-continuation-secret",
+          retained: "message=keep-prelaunch-fragment-continuation",
+        },
+        {
+          output: `provider --master-key "quoted-first-fragment${lineEnding}prelaunch-quoted-continuation-secret"${lineEnding}detail=keep-prelaunch-quoted-continuation`,
+          secret: "prelaunch-quoted-continuation-secret",
+          retained: "detail=keep-prelaunch-quoted-continuation",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(sample.secret);
+        expect(message).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch active logical values do not expose continuation suffixes", () => {
+    const p = profile("codex");
+
+    for (const [lineEndingIndex, lineEnding] of ["\n", "\r\n", "\r"].entries()) {
+      const cases = [
+        {
+          output:
+            `provider --api-key seed\\${lineEnding}` +
+            `tail/--label=prelaunch-active-${lineEndingIndex}-suffix-secret ` +
+            "--trace keep-prelaunch-active-escaped",
+          secrets: [`prelaunch-active-${lineEndingIndex}-suffix-secret`],
+          retained: "--trace keep-prelaunch-active-escaped",
+        },
+        {
+          output:
+            `provider --client-key="seed${lineEnding}tail"/-- ` +
+            `--master-key=prelaunch-active-${lineEndingIndex}-following-secret ` +
+            "--mode keep-prelaunch-active-quoted",
+          secrets: [`prelaunch-active-${lineEndingIndex}-following-secret`],
+          retained: "--mode keep-prelaunch-active-quoted",
+        },
+        {
+          output:
+            `provider -kseed\\${lineEnding}` +
+            `tail((/|<－－label:prelaunch-active-${lineEndingIndex}-layered-secret>)) ` +
+            "--color keep-prelaunch-active-short",
+          secrets: [`prelaunch-active-${lineEndingIndex}-layered-secret`],
+          retained: "--color keep-prelaunch-active-short",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message, sample.output).toContain("[REDACTED]");
+        for (const secret of sample.secrets) {
+          expect(message, sample.output).not.toContain(secret);
+        }
+        expect(message, sample.output).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch redacts attached multiline values without swallowing later options", () => {
+    const p = profile("codex");
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      const cases = [
+        {
+          output: `provider --api-key="first${lineEnding}prelaunch-attached-quoted-secret" --verbose keep-prelaunch-attached-quoted`,
+          secret: "prelaunch-attached-quoted-secret",
+          retained: "--verbose keep-prelaunch-attached-quoted",
+        },
+        {
+          output: `provider --client-key:first\\${lineEnding}prelaunch-attached-escaped-secret --mode keep-prelaunch-attached-escaped`,
+          secret: "prelaunch-attached-escaped-secret",
+          retained: "--mode keep-prelaunch-attached-escaped",
+        },
+        {
+          output: "provider x|--master-key=prelaunch-punctuation-secret|--trace keep-prelaunch-punctuation-suffix",
+          secret: "prelaunch-punctuation-secret",
+          retained: "|--trace keep-prelaunch-punctuation-suffix",
+        },
+        {
+          output: 'provider --api-key "prelaunch-separate-punctuation-secret"|--color keep-prelaunch-separate-punctuation',
+          secret: "prelaunch-separate-punctuation-secret",
+          retained: "keep-prelaunch-separate-punctuation",
+        },
+      ];
+
+      for (const sample of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stdout: Buffer.from(""),
+              stderr: Buffer.from(sample.output),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).not.toContain(sample.secret);
+        expect(message).toContain(sample.retained);
+      }
+    }
+  });
+
+  test("prelaunch command redaction recognizes safe punctuation boundaries", () => {
+    const p = profile("codex");
+    const safePrefixes = ["|", "/", "<", ">", "(", ")", "[", "]", "{", "}", ",", ";"];
+
+    for (const [index, prefix] of safePrefixes.entries()) {
+      const secret = `prelaunch-punctuation-secret-${index}`;
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(
+              `diagnostic${prefix}--api-key ${secret} --verbose keep-prelaunch-punctuation-${index}`,
+            ),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain(secret);
+      expect(message).toContain(`--verbose keep-prelaunch-punctuation-${index}`);
+    }
+
+    for (const nearMiss of [
+      "word--api-key keep-prelaunch-word-near-miss",
+      "https://example.invalid/--api-key keep-prelaunch-url-near-miss",
+      "https://example.invalid/?arg=--api-key keep-prelaunch-url-query-near-miss",
+      "https://example.invalid/path;--api-key keep-prelaunch-url-param-near-miss",
+      "mailto:person@example.invalid?subject=--api-key keep-prelaunch-mailto-near-miss",
+      "mailto:?subject=--api-key keep-prelaunch-empty-mailto-near-miss",
+      "person@--api-key keep-prelaunch-email-near-miss",
+      "1--api-key keep-prelaunch-arithmetic-near-miss",
+    ]) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stdout: Buffer.from(""),
+            stderr: Buffer.from(nearMiss),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain(nearMiss);
+    }
+  });
+
+  test("controlled prelaunch errors redact credential-shaped headers", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const probe = join(home, "configs-redaction-probe");
+    const credentialFragments = [
+      "controlled-cookie-alpha",
+      "controlled-cookie-beta",
+    ];
+    writeFileSync(
+      probe,
+      [
+        "#!/bin/sh",
+        "printf '%s\\n' 'Cookie: sid=controlled-cookie-alpha;' ' arbitrary=controlled-cookie-beta' 'stack=Error keep-stack' >&2",
+        "exit 2",
+      ].join("\n"),
+    );
+    chmodSync(probe, 0o755);
+
+    try {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), { configsBin: probe });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("[REDACTED]");
+      for (const fragment of credentialFragments) expect(message).not.toContain(fragment);
+      expect(message).toContain("stack=Error keep-stack");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("prelaunch error summaries keep stderr and stdout as separate records before redaction", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const fusedCredential = "controlled-fused-stream-credential";
+
+    try {
+      for (const stderrEnding of ["", "\n", "\r\n", "\r"]) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stderr: Buffer.from(`diagnostic-prefix${stderrEnding}`),
+              stdout: Buffer.from(`Authorization: Bearer ${fusedCredential}`),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("diagnostic-prefix");
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(fusedCredential);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("a missing stderr command value never consumes the independent stdout record", () => {
+    const p = profile("codex");
+
+    for (const stderrEnding of ["", "\n", "\r\n", "\r"]) {
+      let message = "";
+      try {
+        runConfigsPrelaunch(p, getTool("codex"), {
+          runner: () => ({
+            status: 2,
+            stderr: Buffer.from(`provider --api-key${stderrEnding}`),
+            stdout: Buffer.from("keep-independent-stdout-record"),
+          }),
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("provider --api-key");
+      expect(message).toContain("keep-independent-stdout-record");
+      expect(message).not.toContain("[REDACTED]");
+    }
+  });
+
+  test("controlled prelaunch errors fail closed on hostile folded credential records", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const cases: Array<{ output: string; secret: string }> = [];
+
+    for (const lineEnding of ["\n", "\r\n", "\r"]) {
+      for (const header of [
+        "Authorization",
+        "Proxy-Authorization",
+        "Cookie",
+        "Set-Cookie",
+      ]) {
+        const label = header.toLowerCase().replaceAll("-", "_");
+        cases.push(
+          {
+            output: [
+              `${header}: seed=${label}_seed`,
+              " \t",
+              ` ${label}_blank_fold_fragment`,
+            ].join(lineEnding),
+            secret: `${label}_blank_fold_fragment`,
+          },
+          {
+            output: `${header}: "${label}_quoted", extension=${label}_quoted_tail`,
+            secret: `${label}_quoted_tail`,
+          },
+        );
+      }
+    }
+    cases.push({
+      output: 'x-api-key: "generic_quoted_\\"fragment", suffix=generic_quoted_tail',
+      secret: "generic_quoted_tail",
+    });
+
+    try {
+      expect(cases).toHaveLength(25);
+      for (const hostile of cases) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), {
+            runner: () => ({
+              status: 2,
+              stderr: Buffer.from(hostile.output),
+              stdout: Buffer.from(""),
+            }),
+          });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(hostile.secret);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("prelaunch bounding preserves stream order without exposing truncated folds", () => {
+    resetHome();
+    const p = profileInHome("codex");
+    const truncatedSecret = "controlled-truncated-fold-fragment";
+    const orderedSecret = "controlled-ordered-header-fragment";
+
+    try {
+      for (const runner of [
+        () => ({
+          status: 2,
+          stderr: Buffer.from(`Authorization: Bearer ${orderedSecret}`),
+          stdout: Buffer.from("status=418 keep-stdout-record"),
+        }),
+        () => ({
+          status: 2,
+          stderr: Buffer.from("diagnostic-one\ndiagnostic-two"),
+          stdout: Buffer.from(
+            `Authorization: seed=bounded-seed,\n \t\n ${truncatedSecret}`,
+          ),
+        }),
+      ]) {
+        let message = "";
+        try {
+          runConfigsPrelaunch(p, getTool("codex"), { runner });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toContain("[REDACTED]");
+        expect(message).not.toContain(orderedSecret);
+        expect(message).not.toContain(truncatedSecret);
+      }
+    } finally {
+      cleanup();
+    }
   });
 
   test("fails closed when apply succeeds without a fresh manifest unless bypassed", () => {

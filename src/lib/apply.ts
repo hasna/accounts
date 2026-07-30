@@ -24,6 +24,8 @@ function singleMatch(profiles: Profile[]): Profile | undefined {
  * registry. In api mode the profile record itself lives in the cloud, so this
  * best-effort lookup only resolves a full record when the profile is also known
  * locally; callers that just need the name read `loadStore().applied` directly.
+ * Because it returns a registry record, the package-root export of this function
+ * is the gated lib/local-compat.js wrapper, not this in-repo entry point.
  */
 export function appliedProfile(toolId: string): Profile | undefined {
   const store = loadStore();

@@ -1,0 +1,156 @@
+name: Release npm package
+
+on:
+  push:
+    tags:
+      - "npm/accounts/v*"
+
+concurrency:
+  group: hasna-accounts-npm-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'hasna/accounts'
+    runs-on: ubuntu-latest
+    environment: npm-release
+    env:
+      NPM_DIST_TAG_TOKEN_CONFIGURED: ${{ secrets.NPM_DIST_TAG_TOKEN != '' }}
+      RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN != '' }}
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: accounts_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d accounts_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Fail before checkout, install, and preflight so a missing credential is
+      # reported as a provisioning gap by name instead of surfacing minutes later
+      # inside the preflight output.
+      - name: Verify release environment is provisioned
+        run: |
+          set -euo pipefail
+          missing=0
+          if [[ "$NPM_DIST_TAG_TOKEN_CONFIGURED" != "true" ]]; then
+            echo "::error::NPM_DIST_TAG_TOKEN is not configured in the npm-release environment of this repository"
+            missing=1
+          fi
+          if [[ "$RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED" != "true" ]]; then
+            echo "::error::RELEASE_GITHUB_ADMIN_TOKEN is not configured in the npm-release environment of this repository"
+            missing=1
+          fi
+          if [[ "$missing" != "0" ]]; then
+            echo "::error::See docs/RELEASING.md 'Release environment provisioning'. Until these exist no tag can publish."
+            exit 1
+          fi
+          echo "release environment secrets are present"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+
+      - name: Verify pinned release toolchain
+        run: node scripts/assert-toolchain.mjs
+
+      - name: Install locked dependencies with release-age quarantine
+        run: bun install --frozen-lockfile --minimum-release-age 604800
+
+      - name: Reject high-severity dependency advisories
+        run: bun audit --audit-level high
+
+      - name: Verify protected release identity and live tag ruleset
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Verify release
+        run: |
+          set -euo pipefail
+          bun run typecheck
+          bun run test:compat
+          bun test
+          bun run test:provenance-crypto
+          bun run build
+          bun run contracts:no-cloud-scan
+          bun test src/sdk.test.ts src/contracts.test.ts
+          bun run contracts:conformance
+          bun run vendor-kit:check
+          bun run conformance
+          ACCOUNTS_REQUIRE_POSTGRES=1 \
+            HASNA_ACCOUNTS_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/accounts_test \
+            bun run test:postgres
+
+      - name: Bind tag, commit, and deterministic package
+        run: >-
+          bun run scripts/release-provenance.ts candidate
+          --out "$RUNNER_TEMP/release-candidate.json"
+          --artifact "$RUNNER_TEMP/release-candidate.tgz"
+
+      - name: Reject an existing immutable version
+        run: >-
+          bun run scripts/release-provenance.ts ensure-unpublished
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Reverify live controls immediately before publication
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Publish preserved candidate under version quarantine
+        run: >-
+          bun run scripts/release-provenance.ts publish-staged
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Verify staged registry bytes, provenance, signatures, and CLI
+        run: >-
+          bun run scripts/release-provenance.ts verify-registry
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+          --phase staged
+
+      - name: Reverify live controls immediately before promotion
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Promote the verified version to its intended dist-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+        run: >-
+          bun run scripts/release-provenance.ts promote
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Verify final dist-tag agreement
+        run: >-
+          bun run scripts/release-provenance.ts verify-registry
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+          --phase promoted
