@@ -488,11 +488,32 @@ export function accountLiveDoorsElsewhere(
   return live;
 }
 
-/** The accountUuid currently occupying a config dir's live account file. */
+/**
+ * The accountUuid currently occupying a config dir's live account file.
+ *
+ * ITERATES EVERY CANDIDATE PATH, exactly as `buildIdentityIndex`'s layer A
+ * does (see the `occupant` loop above) — same order, same first-match-wins
+ * precedence. It must, because `profileAccountJsonPaths` returns a SECOND path
+ * — the PARENT `.claude.json` — precisely when the dir is `tool.defaultDir`,
+ * which is the standard Claude layout (claude-layout.ts:48).
+ *
+ * Reading only `paths[0]` made this function DISAGREE WITH THE ENUMERATOR on
+ * the default dir: the index still raised a door for it, while the predicate
+ * reported "no account here". While the predicate only gated WRITES that was
+ * latent — the dir merely could not receive. Once it also gates SOURCES, the
+ * disagreement means the live default dir cannot DONATE either, and
+ * convergence for a single-account default layout silently degrades to "no
+ * restorable credential copy". With a stale sibling present it is worse than a
+ * no-op: the stale copy is crowned and written to central with a FRESH mtime,
+ * and since `betterCredential` tie-breaks on mtime it then durably outranks
+ * the genuinely fresher live credential.
+ */
 export function dirAccountUuid(dir: string, tool: ToolDef): string | undefined {
-  const paths = profileAccountJsonPaths(dir, tool);
-  if (paths.length === 0) return undefined;
-  return oauthIdentityFrom(readJson(paths[0]!))?.accountUuid;
+  for (const path of profileAccountJsonPaths(dir, tool)) {
+    const identity = oauthIdentityFrom(readJson(path));
+    if (identity) return identity.accountUuid;
+  }
+  return undefined;
 }
 
 /**

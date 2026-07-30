@@ -61,6 +61,17 @@ import { getTool } from "./tools.js";
  * receive this account's tokens — the same identity discipline as
  * `syncProfileSnapshotToCentral` (PR #60) and `planParkedRecovery` (PR #65),
  * both of which remain in force and untouched.
+ *
+ * THE IDENTITY CHECK IS SYMMETRIC — it gates SOURCES as well as TARGETS.
+ * Through 0.2.26 it gated targets only, and the gap was a silent
+ * credential cross-write: `switchAccount` passes the session's config dir as
+ * an `extraDir` while the OUTGOING account still occupies it, that dir was
+ * read and ranked with no identity check, its just-refreshed file won on
+ * mtime, and fan-out filed it under the INCOMING account's uuid in the central
+ * store. Corruption ran one-directional INTO central precisely because every
+ * other target DID check. A credential is bound to an identity by CONTAINMENT
+ * — the dir's `oauthAccount.accountUuid`, or the central path's uuid segment —
+ * and containment is now enforced in both directions.
  */
 
 /**
@@ -110,8 +121,21 @@ interface BrokerCopy {
   stayUnder: string;
   /** Live credential files are update-only; the central store may be created. */
   mayCreate: boolean;
-  /** Re-checked immediately before any write. */
-  identityStillMatches: () => boolean;
+  /**
+   * Does this file's CONTAINER still claim this account? Evaluated live, in
+   * BOTH directions: a copy that fails is neither an eligible SOURCE nor an
+   * eligible TARGET.
+   *
+   * Containment is the only binding we have. A `.credentials.json` payload
+   * carries no identity field of its own (see `claudeAiOauth`, parsed at four
+   * sites, none of which reads one), so the sole answer to "whose credential
+   * is this?" is whatever its container asserts: a config dir's
+   * `.claude.json` `oauthAccount.accountUuid`, or the uuid segment of the
+   * central store path. Enforcing that on the write side alone — which is what
+   * shipped through 0.2.26 — leaves the read side free to adopt a stranger's
+   * tokens and then file them under this account.
+   */
+  carriesThisAccount: () => boolean;
 }
 
 export interface BrokerWrite {
@@ -210,7 +234,13 @@ function enumerateCopies(accountUuid: string, tool: ToolDef, opts: BrokerOptions
     kind: "central",
     stayUnder: accountsHome(),
     mayCreate: true,
-    identityStillMatches: () => true, // the path itself is keyed by the uuid
+    // The path IS the claim: this file lives at `<home>/auth/<uuid>/`, so its
+    // container asserts this account by construction and there is nothing
+    // further to check. Note precisely what that does and does not buy — it
+    // proves the SLOT is the right one, never that the BYTES in it were
+    // legitimately filed. Content-level binding would require stamping the
+    // uuid inside the credential payload, which is a file-format change.
+    carriesThisAccount: () => true,
   });
 
   const dirLiveCopy = (dir: string): BrokerCopy => ({
@@ -218,7 +248,7 @@ function enumerateCopies(accountUuid: string, tool: ToolDef, opts: BrokerOptions
     kind: "dir-live",
     stayUnder: dir,
     mayCreate: false,
-    identityStillMatches: () => dirAccountUuid(dir, tool)?.toLowerCase() === accountUuid,
+    carriesThisAccount: () => dirAccountUuid(dir, tool)?.toLowerCase() === accountUuid,
   });
 
   for (const door of identity?.doors ?? []) {
@@ -229,7 +259,7 @@ function enumerateCopies(accountUuid: string, tool: ToolDef, opts: BrokerOptions
         kind: "profile-snapshot",
         stayUnder: dir,
         mayCreate: false,
-        identityStillMatches: () => profileAccountUuid(dir, tool)?.toLowerCase() === accountUuid,
+        carriesThisAccount: () => profileAccountUuid(dir, tool)?.toLowerCase() === accountUuid,
       });
     } else if (door.role === "current-occupant") {
       add(dirLiveCopy(door.dir));
@@ -249,12 +279,46 @@ interface RankedCopy extends BrokerCopy {
   bytes: Buffer;
 }
 
-function rankedCopies(copies: BrokerCopy[]): RankedCopy[] {
+/**
+ * Admit the files eligible to be this account's SOURCE of truth, then rank them.
+ *
+ * THE IDENTITY GATE ON READ IS THE POINT. Enumeration is door-driven, and a
+ * door is only ever evidence that a dir was RELEVANT — never that it currently
+ * holds this account. `extraDirs` in particular is whatever the caller handed
+ * us: `switchAccount` passes the session's config dir, which at that moment is
+ * still occupied by the OUTGOING account. Ranking is identity-blind by
+ * construction — `betterCredential` compares health structs (refresh-token
+ * presence, usability, mtime, expiry) and health carries no identity — so an
+ * ineligible candidate that reaches the ranking WINS whenever it is the
+ * freshest file, which the account you just stopped using always is.
+ *
+ * Fan-out then re-checks each TARGET, so every other copy refused the payload
+ * and only the central store — whose target check is vacuously true, its path
+ * being uuid-keyed — accepted it. That asymmetry is the whole defect: it made
+ * the corruption silent, and one-directional INTO central, filing one
+ * credential blob under many uuids.
+ *
+ * Default-deny is deliberate. A dir with a credential file but no resolvable
+ * `oauthAccount` is UNATTRIBUTABLE, and an unattributable credential is
+ * exactly the thing that must not be adopted as an identity's record. Such a
+ * dir could already never RECEIVE; it can now no longer DONATE either.
+ */
+function rankedCopies(copies: BrokerCopy[], report: { skipped: BrokerSkip[] }): RankedCopy[] {
   const out: RankedCopy[] = [];
   for (const copy of copies) {
     if (!existsNotSymlink(copy.path)) continue;
     const health = credentialHealth(copy.path);
     if (!health.exists) continue;
+    if (!copy.carriesThisAccount()) {
+      // Reported, never silent: the absence of any signal is precisely how
+      // this survived from the broker's introduction through 0.2.26.
+      report.skipped.push({
+        path: copy.path,
+        kind: copy.kind,
+        reason: "does not carry this account (not eligible as a source)",
+      });
+      continue;
+    }
     out.push({ ...copy, health, bytes: readFileSync(copy.path) });
   }
   return out;
@@ -294,7 +358,7 @@ function fanOut(
         }
       }
     }
-    if (!copy.identityStillMatches()) {
+    if (!copy.carriesThisAccount()) {
       report.skipped.push({ path: copy.path, kind: copy.kind, reason: "dir no longer carries this account" });
       continue;
     }
@@ -315,7 +379,7 @@ function convergeLocked(accountUuid: string, tool: ToolDef, opts: BrokerOptions)
   const now = opts.now ?? Date.now;
   const report: ConvergeReport = { accountUuid, writes: [], skipped: [] };
   const copies = enumerateCopies(accountUuid, tool, opts);
-  const ranked = rankedCopies(copies);
+  const ranked = rankedCopies(copies, report);
   if (ranked.length === 0) return report;
 
   const winner = ranked.reduce((a, b) => (betterCredential(a.health, b.health) === a.health ? a : b));
