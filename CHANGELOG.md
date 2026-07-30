@@ -6,6 +6,41 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-07-30
+
+### Fixed
+
+- **Agents no longer launch into instruction homes that carry no rules**
+  (`src/lib/configs-prelaunch.ts`, `src/cli.ts`). `accounts launch <profile>`
+  appended `--allow-empty-sources` to the session render whenever a profile had
+  no identity export — the normal state of every pooled `accountNNN` profile —
+  which disarmed the renderer's own guard against rendering nothing. The render
+  then wrote a rules-free home, exited 0, produced a well-formed manifest, and
+  was recorded as `applied`. Twenty-six agent homes on one station carried a
+  four-line index with no operating rules, no review policy and no safety text,
+  and every surface reported them healthy. `--allow-empty-sources` is now opt-in
+  (`--allow-empty-instructions`); zero resolvable sources SKIP the render,
+  leaving the existing home intact and letting the launch proceed rather than
+  emptying the home or aborting every pooled launch; and a partial render is
+  rejected, not only an empty one, since one profile had been rendering 3 of 10
+  sources while looking identical to success. These outcomes are recorded as
+  skipped/bypassed rather than applied, so `accounts health` can fail on a
+  rules-free or partial home instead of reporting `configs: ok`.
+
+- **A Claude credential the tool renews on use is no longer reported as
+  unavailable** (`src/lib/readiness.ts`, `src/lib/claude-auth.ts`). An access
+  token that has aged out while its refresh token is intact is the normal
+  resting state of a parked account and self-heals on first use, but readiness
+  collapsed every non-ok status to `unavailable` and never emitted `renewable`
+  at all, so a pool manager could not tell "needs a human" from "renews
+  itself". One pool fell from 21 usable profiles to 11 on that basis; none of
+  the ten held out needed re-authenticating. `renewable` is now emitted, no
+  longer requires a recorded past expiry, and grades such a profile `degraded`.
+  A credential file that exists but carries no OAuth payload — a literal empty
+  JSON object — no longer counts as a payload being present; it reads as
+  `missing`, which routes it to a human instead of leaving it in a no-verdict
+  state that was never quarantined, never cleared, and still auto-pickable.
+
 ### Added
 
 - **Credential broker: an account can now be shared by any number of sessions —
