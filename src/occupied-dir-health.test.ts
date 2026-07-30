@@ -296,3 +296,66 @@ test("POSITIVE CONTROL: the fixture can produce the failure — ranking alone pi
   expect(health.valid).toBe(true);
   expect(health.status).toBe("ok");
 });
+
+// --- the INTERSECTION of two independently-reviewed changes ----------------
+//
+// `dirOccupiedByAnotherAccount` (#63) and `renewable` (#90) were written
+// against each other's absence: #63's tests exercise occupancy against the old
+// status logic, #90's exercise renewability against the old occupancy logic.
+// Both suites passing proves each half in isolation and says NOTHING about the
+// state where both hold at once — which is not a corner case but the ordinary
+// overnight condition of this fleet: a dir someone `/login`-ed into, whose host
+// profile's own parked credential has merely aged out.
+//
+// It is also the exact pairing that produces a contradiction if either half is
+// dropped in a merge. Report it `unavailable` and a scheduler benches a profile
+// that only needs its dir reconciled; report it `ok` and a scheduler hands work
+// to a profile whose dir carries someone else's account and whose launch will
+// refuse. The composed answer has to say BOTH things at once, and lead with the
+// action that actually fixes it.
+
+test("COMPOSED: an occupied dir whose own credential is renewable reports both facts, not one", async () => {
+  const { getAccountsReadiness } = await import("./lib/readiness.js");
+  const dir = makeHostProfile("composed");
+  occupyUnmarked(dir);
+
+  const readiness = await getAccountsReadiness({
+    env: { ...process.env, HASNA_ACCOUNTS_S3_BUCKET: "accounts-composed-test" },
+  });
+  const row = readiness.profiles.find((entry) => entry.name === "composed");
+  expect(row).toBeDefined();
+
+  // Usable once reconciled, so not `unavailable` — the half #90 restored.
+  expect(row?.login.status).toBe("degraded");
+  expect(row?.login.renewable).toBe(true);
+  // And occupied, so not silently `ok` either — the half #63 added.
+  expect(row?.login.dirOccupiedByAnotherAccount).toBe(true);
+
+  // Order is load-bearing: re-authenticating does not fix an occupied dir, so
+  // reconcile has to be the first action an operator reads.
+  const actions = row?.nextActions ?? [];
+  const reconcileAt = actions.findIndex((action) => action.includes("switch-account"));
+  const loginAt = actions.findIndex((action) => action.includes("accounts login"));
+  expect(reconcileAt).toBeGreaterThanOrEqual(0);
+  expect(loginAt).toBeGreaterThanOrEqual(0);
+  expect(reconcileAt).toBeLessThan(loginAt);
+
+  // The reason names the occupation, so the credential lines below it are not
+  // read as facts about the occupant.
+  expect(row?.login.reasons.join("\n")).toContain("currently carry another account");
+});
+
+test("COMPOSED POSITIVE CONTROL: the same profile unoccupied is renewable and NOT flagged occupied", async () => {
+  const { getAccountsReadiness } = await import("./lib/readiness.js");
+  makeHostProfile("composed-control");
+
+  const readiness = await getAccountsReadiness({
+    env: { ...process.env, HASNA_ACCOUNTS_S3_BUCKET: "accounts-composed-test" },
+  });
+  const row = readiness.profiles.find((entry) => entry.name === "composed-control");
+
+  expect(row?.login.renewable).toBe(true);
+  expect(row?.login.status).toBe("degraded");
+  expect(row?.login.dirOccupiedByAnotherAccount).toBe(false);
+  expect((row?.nextActions ?? []).some((action) => action.includes("switch-account"))).toBe(false);
+});
