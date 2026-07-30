@@ -79,6 +79,7 @@ import {
   dirAccountUuid,
   statusNeedsOperator,
 } from "./lib/identity-index.js";
+import { buildProfileRegistry, credentialKeyForEntry } from "./lib/profile-registry.js";
 import {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_MIN_HEADROOM,
@@ -1746,6 +1747,102 @@ program
         const val = p ? `${chalk.green.bold(p.name)}${p.email ? chalk.dim(" (" + p.email + ")") : ""}` : chalk.dim("(none)");
         const appliedVal = appliedName && appliedName !== p?.name ? chalk.magenta(` → applied: ${appliedName}`) : appliedName ? chalk.magenta(" (applied)") : "";
         console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}${appliedVal}`);
+      }
+    }),
+  );
+
+program
+  .command("registry")
+  .description("reconcile every profile's name, directory, identity and credential across all three stores")
+  .option("--tool <tool>", "tool id (default: claude)", "claude")
+  .option("--json", "output JSON")
+  .option("--contradictions", "only show credentials claimed by more than one account")
+  .action(
+    action(async (opts: { tool?: string; json?: boolean; contradictions?: boolean }) => {
+      const tool = getTool(opts.tool ?? "claude");
+      // resolveStore(), not loadStore(): the local-file store this CLI's `auth`
+      // verbs read holds a fraction of the registry (8 of 29 claude profiles on
+      // station01), so building the registry from it would silently omit two
+      // thirds of the machine's profiles and under-report every group.
+      const store = resolveStore();
+      const profiles = (await store.listProfiles(tool.id))
+        .filter((p) => p.dir)
+        .map((p) => ({ name: p.name, dir: p.dir }));
+      const registry = buildProfileRegistry(profiles, tool);
+
+      if (opts.json) {
+        console.log(
+          JSON.stringify(opts.contradictions ? registry.contradictions : registry, null, 2),
+        );
+        return;
+      }
+
+      if (!opts.contradictions) {
+        console.log(chalk.dim(`method: ${registry.method}`));
+        for (const entry of registry.entries) {
+          const name = chalk.cyan((entry.profileName ?? "(unregistered)").padEnd(18));
+          const own = entry.own.email ?? entry.own.accountUuid ?? chalk.dim("(none)");
+          let state: string;
+          switch (entry.binding) {
+            case "consistent":
+              state = chalk.green("consistent");
+              break;
+            case "displaced":
+              state = chalk.yellow(`displaced by ${entry.occupant.email ?? entry.occupant.accountUuid}`);
+              break;
+            case "occupied":
+              state = chalk.red(`occupied by ${entry.occupant.email ?? entry.occupant.accountUuid} (no switch recorded)`);
+              break;
+            case "unbound":
+              state = chalk.yellow("no own identity recorded");
+              break;
+            default:
+              state = chalk.dim("vacant");
+          }
+          const key = credentialKeyForEntry(entry);
+          const keyNote = key ? chalk.dim(` cred:${key.slice(0, 10)}`) : chalk.dim(" cred:none");
+          console.log(`${name} ${String(own).padEnd(30)} ${state}${keyNote}`);
+        }
+        console.log();
+      }
+
+      const groups = opts.contradictions ? registry.contradictions : registry.groups;
+      if (groups.length === 0) {
+        console.log(
+          opts.contradictions
+            ? "no credential is claimed by more than one account"
+            : "no credential appears in more than one place",
+        );
+        return;
+      }
+      for (const group of groups) {
+        const colour =
+          group.inference.cause === "contamination"
+            ? chalk.red
+            : group.inference.cause === "displacement"
+              ? chalk.yellow
+              : chalk.dim;
+        console.log(
+          `${colour(group.inference.cause)} ${chalk.dim(group.fingerprint.slice(0, 10))} — ${group.members.length} copies, ${group.distinctAccountUuids.length} identities (confidence: ${group.inference.confidence})`,
+        );
+        console.log(`  ${group.inference.why}`);
+        for (const member of group.members) {
+          const where = member.dir ?? "central store";
+          console.log(
+            chalk.dim(`    ${member.layer.padEnd(7)} ${member.profileName ?? member.accountUuid ?? "?"} ${member.email ?? ""} ${where}`),
+          );
+        }
+      }
+      if (registry.contradictions.length > 0) {
+        console.log();
+        console.log(chalk.red(`${registry.contradictions.length} credential(s) claimed by more than one account.`));
+        console.log(
+          chalk.dim(
+            "One credential cannot belong to several accounts, so all but at most one binding is a cross-write. " +
+              "Do NOT delete a copy: for a displaced profile the parked copy is the only surviving one. " +
+              `Confirm by: ${registry.contradictions[0]!.inference.verificationPath}.`,
+          ),
+        );
       }
     }),
   );
