@@ -332,6 +332,42 @@ test("launch runs configs apply by default before spawning", () => {
   expect(readLogEntries()[0]?.tool).toBe("claude");
 });
 
+test("launch still PROCEEDS when a profile has no instruction sources, leaving its home alone", () => {
+  // The live invocation is bare `accounts launch accountNNN --tool claude
+  // --permissions dangerous` — no --allow-configs-failure, no --skip-configs,
+  // ~15 concurrent on the fleet. So the no-sources path has to be proven at the
+  // CLI boundary, not just through an injected runner: if prelaunch throws here
+  // the process exits non-zero and every pooled agent stops starting, which is
+  // the 0.2.9 breakage. Emptying the home instead is the defect this whole
+  // change exists to remove. Neither is acceptable, so: exit 0, home untouched.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs-no-sources.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
+  expect(profile).toBeTruthy();
+  expect(profile!.identity ?? "").toBe("");
+
+  // A home already carrying rules from an earlier render. Stale-but-present has
+  // to survive: it is strictly better than the empty home that replaced it.
+  const indexPath = join(profile!.dir, "CLAUDE.md");
+  const existing = "# claude session instructions\n\nPR-first landing is the default.\n";
+  writeFileSync(indexPath, existing);
+
+  const result = runCliWith(["launch", "acct", "--tool", "claude", "--", "--version"], {
+    env: { FAKE_CONFIGS_LOG: configsLog },
+  });
+
+  expect(result.status).toBe(0);
+  expect(readFileSync(indexPath, "utf8")).toBe(existing);
+  // The renderer is never invoked, so it cannot have written an empty home.
+  expect(existsSync(configsLog)).toBe(false);
+  // The launch actually happened.
+  expect(readLogEntries()[0]?.tool).toBe("claude");
+  // And it said so, rather than failing silently.
+  expect(`${result.stderr}${result.stdout}`).toContain("no instruction sources resolved");
+});
+
 test("switch --launch runs configs apply by default before spawning", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
   writeFakeConfigs();
