@@ -68,6 +68,10 @@ function identityJson(uuid: string, label: string): string {
   return JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: `${label}@example.com` } });
 }
 
+function emailIdentityJson(label: string): string {
+  return JSON.stringify({ oauthAccount: { emailAddress: `${label}@example.com` } });
+}
+
 /** Backdate a file so mtime-based freshness comparisons see it as old. */
 function backdate(path: string, secondsAgo: number): void {
   const t = new Date(Date.now() - secondsAgo * 1000);
@@ -117,6 +121,7 @@ test("an in-session login to another account does not replace the profile's park
   // with the guest's credential, and a replaced file still exists.
   expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parked);
 });
+
 
 test("an in-session login to another account does not overwrite the profile's parked identity", () => {
   const dir = makeHostProfile("hostident");
@@ -179,6 +184,29 @@ test("a foreign credential cannot replace an unattributed parked credential", ()
   expect(existsSync(centralCredentialsSnapshot(UUID_GUEST))).toBe(false);
 });
 
+test("an in-session login cannot replace an email-only profile's parked identity or credential", () => {
+  // Some Claude versions omit accountUuid. The original gate treated that as
+  // no identity at all, so it was inert for these profiles even though both
+  // records carried distinct, attributable email addresses.
+  const dir = mkdtempSync(join(tmpdir(), "foreign-email-only-"));
+  writeFileSync(join(dir, ".claude.json"), emailIdentityJson("host"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("host"));
+  addProfile({ name: "emailonly", dir });
+  ensureProfileAuthSnapshot(dir, tool());
+  const parkedIdentity = readFileSync(profileOAuthSnapshot(dir));
+  const parkedCredential = readFileSync(profileCredentialsSnapshot(dir));
+
+  backdate(profileOAuthSnapshot(dir), 3600);
+  backdate(profileCredentialsSnapshot(dir), 3600);
+  writeFileSync(join(dir, ".claude.json"), emailIdentityJson("guest"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("guest"));
+
+  ensureProfileAuthSnapshot(dir, tool());
+
+  expect(readFileSync(profileOAuthSnapshot(dir))).toEqual(parkedIdentity);
+  expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(parkedCredential);
+});
+
 // --- positive controls: the guard must not freeze the legitimate paths -------
 // Each of these must survive the fix. A mutant that satisfies the tests above
 // by refusing every snapshot refresh has to break at least one of them.
@@ -196,6 +224,22 @@ test("POSITIVE CONTROL: the same account rotating its token still refreshes the 
   const after = readFileSync(profileCredentialsSnapshot(dir));
   expect(after).not.toEqual(before);
   expect(JSON.parse(after.toString()).claudeAiOauth.accessToken).toBe("host-rotated-access");
+});
+
+test("POSITIVE CONTROL: an email-only account can still refresh its parked credential", () => {
+  const dir = mkdtempSync(join(tmpdir(), "foreign-email-rotate-"));
+  writeFileSync(join(dir, ".claude.json"), emailIdentityJson("host"));
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("host"));
+  addProfile({ name: "emailrotate", dir });
+  ensureProfileAuthSnapshot(dir, tool());
+
+  backdate(profileCredentialsSnapshot(dir), 3600);
+  writeFileSync(join(dir, ".credentials.json"), credentialJson("host-rotated"));
+  ensureProfileAuthSnapshot(dir, tool());
+
+  expect(JSON.parse(readFileSync(profileCredentialsSnapshot(dir), "utf8")).claudeAiOauth.accessToken).toBe(
+    "host-rotated-access",
+  );
 });
 
 test("POSITIVE CONTROL: a profile with no parked identity or credential captures its first snapshot", () => {
@@ -273,13 +317,12 @@ test("a case-variant uuid is the SAME account, so the refresh still happens", ()
   );
 });
 
-test("an UNKNOWN live identity cannot prove a conflict, so the refresh still happens", () => {
+test("a missing live uuid falls back to the matching email, so the refresh still happens", () => {
   const dir = makeHostProfile("liveunknown");
   backdate(profileCredentialsSnapshot(dir), 3600);
   backdate(centralCredentialsSnapshot(UUID_HOST), 3600);
-  // Empty-string uuid: present but carrying no identity. `own` is known, `live`
-  // is not. Deliberately permissive, matching `recoverParkedCredential` — `own`
-  // is what gets written, `live` only detects conflict.
+  // Empty-string uuid carries no identity, but the matching email still proves
+  // that this is the same account and permits its token rotation.
   writeFileSync(join(dir, ".claude.json"), identityJson("", "host"));
   writeFileSync(join(dir, ".credentials.json"), credentialJson("host-rotated"));
 
