@@ -292,11 +292,32 @@ test("launch syncs Claude profile credentials into keychain before spawning", ()
   expect(keychainPayload).toContain("acct@example.com-access-token");
 });
 
+/**
+ * Prelaunch renders only when it has an instruction source to render FROM.
+ * These tests are about the render being WIRED UP, so they have to supply one;
+ * the no-sources path (skip, home untouched, launch still succeeds) is covered
+ * in src/empty-instruction-render.test.ts.
+ */
+function giveInstructionSource(name: string, tool: string): void {
+  const path = join(home, `${name}-${tool}.configs.json`);
+  writeFileSync(
+    path,
+    JSON.stringify({
+      contract: "hasna.identities.configs-instructions/v1",
+      // Same id the fake configs binary writes into the manifest, so this
+      // exercises the wiring rather than the shortfall guard.
+      sources: [{ id: "global-codewith", layer: "global", content: "rules" }],
+    }) + "\n",
+  );
+  expect(runCli("set", name, "--tool", tool, "--identity", path).status).toBe(0);
+}
+
 test("launch runs configs apply by default before spawning", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
   writeFakeConfigs();
   const configsLog = join(home, "fake-configs.log");
   expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
   const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
   expect(profile).toBeTruthy();
 
@@ -316,6 +337,7 @@ test("switch --launch runs configs apply by default before spawning", () => {
   writeFakeConfigs();
   const configsLog = join(home, "fake-configs.log");
   expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
   const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
   expect(profile).toBeTruthy();
 

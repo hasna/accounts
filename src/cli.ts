@@ -374,6 +374,7 @@ interface ConfigsCliOptions {
   configsDryRun?: boolean;
   skipConfigs?: boolean;
   allowConfigsFailure?: boolean;
+  allowEmptyInstructions?: boolean;
   configsBin?: string;
   identitiesBin?: string;
   identityExport?: string[];
@@ -388,6 +389,7 @@ function configsPrelaunchOptions(opts: ConfigsCliOptions): ConfigsPrelaunchOptio
     configsBin: opts.configsBin,
     identitiesBin: opts.identitiesBin,
     identityExports: opts.identityExport,
+    allowEmptySources: opts.allowEmptyInstructions,
     skipReason: opts.skipConfigs ? "--skip-configs" : mode === "skip" ? "--configs skip" : undefined,
   };
 }
@@ -398,6 +400,7 @@ function addConfigsOptions(command: Command): Command {
     .option("--configs-dry-run", "run the configs prelaunch render plan without applying")
     .option("--skip-configs", "skip configs prelaunch")
     .option("--allow-configs-failure", "continue launch/run even if configs prelaunch fails")
+    .option("--allow-empty-instructions", "render a home with no operating rules on purpose (fails closed otherwise)")
     .option("--configs-bin <path>", "configs CLI binary", "configs")
     .option("--identities-bin <path>", "identities CLI binary used for profile identity exports", "identities")
     .option("--identity-export <path>", "OpenIdentities configs instruction export JSON; repeatable", collectRepeated, []);
