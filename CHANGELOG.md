@@ -6,7 +6,40 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
-## [0.2.25] - 2026-07-30
+## [0.2.26] - 2026-07-30
+
+`0.2.25` was prepared (#91) but never published to npm: #93 landed on `main`
+after the release commit, so the tree carrying `version: 0.2.25` contained
+behaviour that the `0.2.25` entry below does not describe. Rather than amend a
+released version's notes to cover code it never announced, `0.2.25` is retired
+unpublished and this entry ships that tree plus #93. `0.2.26` therefore contains
+everything listed under `0.2.25` as well as the fix below.
+
+### Fixed
+
+- **An occupied profile dir no longer reports `ok`** (`src/lib/readiness.ts`,
+  `src/cli.ts`). `#63` already detected in-place account switches and emitted
+  `dirOccupiedByAnotherAccount: true`, but it left `status` alone — so the same
+  payload said the dir was occupied *and* said `status: "ok"`, and every
+  consumer that reads a verdict rather than a flag was told the profile was
+  fine. Measured on station01: five profiles reporting `ok` that
+  `accounts launch` refused **by name**. A health check that disagrees with the
+  launch path is worse than no health check, because the disagreement is
+  invisible until a launch fails. An occupied dir now grades `degraded` — not
+  `unavailable`, because the profile's own credential is parked and intact, so
+  it is one reconcile away from usable rather than broken.
+
+- **`accounts show` now displays the reason a launch would be refused**
+  (`src/cli.ts`). `accounts launch account031` refused with "its config dir
+  currently carries the account of account029" while
+  `accounts show account031 --json` displayed the correct dir, the correct
+  email, and no mention of `account029` anywhere — the CLI refused for a reason
+  its own inspection command would not show, which made the state
+  undiagnosable from outside. `show` now carries a `switchedAway` field (JSON)
+  and a `switched:` line (human output) naming the occupying profile and the
+  exact reconcile command.
+
+## [0.2.25] - 2026-07-30 [unpublished — superseded by 0.2.26]
 
 ### Fixed
 
