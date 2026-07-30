@@ -6,6 +6,49 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.27] - 2026-07-30
+
+### Fixed
+
+- **A credential is no longer selected from a directory occupied by a different
+  account** (`src/lib/credential-broker.ts`). `fanOut` re-checked every write
+  *target* against the account it was about to write, but `rankedCopies` never
+  applied that predicate to *candidates* at all. A directory holding another
+  account's credential was therefore admitted as a source, won the ranking on
+  `mtime`, and was written into the central store under the incoming account's
+  uuid — with no throw and no warning. `switch-account` reached this on every
+  run, because it passes the target uuid but also passes the live config dir in
+  `extraDirs` while that dir still holds the outgoing identity.
+
+  The central copy made it worse in both directions: its gate was hardcoded to
+  `() => true`, so it accepted foreign bytes as a target *and*, as a source,
+  could win the ranking and be fanned back out over an account's own correct
+  credential. The damage was not confined to the central store.
+
+  The predicate (renamed `identityStillMatches` → `carriesThisAccount`, since it
+  no longer asserts only a write-time recheck) is now applied **symmetrically**
+  to candidate admission and to write targets, and a refusal is recorded in
+  `ConvergeReport.skipped` rather than dropped silently. The gate is enforced in
+  the broker rather than at the call site, so every caller of
+  `convergeIdentityCredential` and `convergeDirCredential` is covered.
+
+- **The live default config dir donates its own credential again**
+  (`src/lib/claude-layout.ts`). `dirAccountUuid` read only the first candidate
+  identity path, but `profileAccountJsonPaths` appends the *parent*
+  `~/.claude.json` precisely when `profileDir === tool.defaultDir` — the
+  standard Claude Code layout. The predicate therefore disagreed with
+  `buildIdentityIndex` on exactly that layout. Latent while it gated only
+  writes; load-bearing once it gated sources, where it made the default dir
+  unable to donate at all and let a stale sibling copy durably outrank the live
+  one through `betterCredential`'s `mtime` tie-break. It now iterates every
+  candidate path with the same order and first-match-wins precedence as the
+  enumerator.
+
+This release changes the **write and selection** path only. Central-store
+entries already cross-written by earlier versions are deliberately left
+untouched; deduplicating them is a separate decision, and the authentic copy
+among them cannot be identified from the store alone.
+
 ## [0.2.26] - 2026-07-30
 
 `0.2.25` was prepared (#91) but never published to npm: #93 landed on `main`
