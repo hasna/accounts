@@ -142,13 +142,20 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
     // across a custody boundary the squatted dir's real owner never consented
     // to — the class of write the bb267228 gate exists to prevent, which
     // `src/repair-auth-gates.test.ts` ("a blanket launch cannot create the
-    // second copy") asserts a launch must not perform. So a single guest door
-    // anywhere in the live set stops the heal; `liveElsewhereAllOwnDoors` is
-    // `every` over a non-empty list and is consulted with an explicit `=== true`
-    // so an absent field can never be read as permission.
+    // second copy") asserts a launch must not perform.
+    //
+    // THE GATE MUST RANGE OVER THE SAME DOORS THE WRITE DOES. An earlier form of
+    // this check asked whether every door in `accountLiveDoorsElsewhere` owned
+    // the account — but that set is filtered to RESTORABLE credentials, while
+    // the broker's fan-out targets every `current-occupant` door regardless of
+    // state. A guest dir holding a husk therefore sat outside the gate and
+    // inside the write set, and was written through while the gate reported no
+    // guests present. `noGuestOccupantDoorsElsewhere` is computed over the
+    // unfiltered occupant set for exactly that reason, and is consulted with an
+    // explicit `=== true` so an absent field can never be read as permission.
     //
     // Best-effort: a launch must never fail on a heal.
-    if (recovery.outcome === "account-live-elsewhere" && recovery.liveElsewhereAllOwnDoors === true) {
+    if (recovery.outcome === "account-live-elsewhere" && recovery.noGuestOccupantDoorsElsewhere === true) {
       try {
         convergeDirCredential(profile.dir, { tool });
       } catch {

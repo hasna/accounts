@@ -158,6 +158,56 @@ test("launch does NOT heal when the account is live in a GUEST dir (bb267228 bou
   expect(readFileSync(join(guest.dir, ".credentials.json")).equals(guestBefore)).toBe(true);
 });
 
+test("launch does NOT heal when the guest dir's own credential is a HUSK (gate/write-set domain match)", async () => {
+  const store = resolveStore();
+
+  // The case a credential-state-FILTERED gate is blind to, and the reason the
+  // ownership check ranges over the unfiltered occupant set.
+  //
+  // `accountLiveDoorsElsewhere` drops doors holding nothing restorable, because
+  // a husk cannot be revoked by a rotation — correct for the refusal it serves.
+  // But the broker's `enumerateCopies` adds a `dir-live` write target for EVERY
+  // current-occupant door with no state filter, so a GUEST dir whose own
+  // credential is a husk is outside the filtered set and inside the write set.
+  // A gate built on the filtered set reports "no guests" and the fan-out then
+  // writes one account's credential into a dir another account owns.
+  const primary = await store.addProfile({ name: "husk-primary", tool: "claude", description: "b29f5b6c" });
+  const dir = primary.dir;
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(join(dir, ".credentials.json"), huskCred());
+  writeFileSync(join(dir, ".claude.json"), accountFile(OWN_UUID, "own@example.test"));
+  writeFileSync(join(dir, ".accounts-auth", "oauth-account.json"), accountFile(OWN_UUID, "own@example.test"));
+  const parked = realCred("own");
+  writeFileSync(join(dir, ".accounts-auth", "credentials.json"), parked);
+  seedCentral(OWN_UUID, "own@example.test", parked);
+
+  // A legitimate duplicate door keeps the outcome at `account-live-elsewhere`
+  // (something restorable must be live elsewhere for that refusal to fire).
+  const sibling = await store.addProfile({ name: "husk-sibling", tool: "claude", description: "b29f5b6c" });
+  mkdirSync(sibling.dir, { recursive: true });
+  writeFileSync(join(sibling.dir, ".credentials.json"), parked);
+  writeFileSync(join(sibling.dir, ".claude.json"), accountFile(OWN_UUID, "own@example.test"));
+
+  // The guest: owned by the DECOY account, presenting OWN_UUID, and its own live
+  // credential is a husk — so it is invisible to the credential-state filter.
+  const guest = await store.addProfile({ name: "husk-guest", tool: "claude", description: "b29f5b6c" });
+  mkdirSync(join(guest.dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(join(guest.dir, ".accounts-auth", "oauth-account.json"), accountFile(DECOY_UUID, "decoy@example.test"));
+  writeFileSync(join(guest.dir, ".claude.json"), accountFile(OWN_UUID, "own@example.test"));
+  writeFileSync(join(guest.dir, ".credentials.json"), huskCred());
+
+  const guestBefore = readFileSync(join(guest.dir, ".credentials.json"));
+
+  profileEnv(primary, getTool("claude"));
+
+  // The guest dir — owned by another account — must not be written through.
+  expect(readFileSync(join(guest.dir, ".credentials.json")).equals(guestBefore)).toBe(true);
+  expect(credentialHealth(join(guest.dir, ".credentials.json")).exists).toBe(true);
+  expect((credentialHealth(join(guest.dir, ".credentials.json")) as { refreshTokenLength: number }).refreshTokenLength).toBe(0);
+  // And with a guest present the heal is refused outright, so the husk survives.
+  expect(credentialHealth(join(dir, ".credentials.json"))).toMatchObject({ refreshTokenLength: 0 });
+});
+
 test("launch does NOT heal a MIS-BOUND dir whose live identity is a different account (discriminating)", async () => {
   const store = resolveStore();
 

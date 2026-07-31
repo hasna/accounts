@@ -426,23 +426,6 @@ export interface LiveAccountDoor {
   profileName?: string;
   /** State of that dir's live `.credentials.json` — never a token value. */
   state: CredentialState;
-  /**
-   * Does this dir OWN the account it is currently running, or is it merely
-   * carrying it?
-   *
-   * Every door here is a `current-occupant` by construction, and that role alone
-   * cannot tell the two apart: a dir legitimately running its own account and a
-   * dir holding someone else's after an in-place switch are both "occupied by
-   * this account". `true` means the dir also has an `own-identity` door for this
-   * same account — a legitimate duplicate door. `false` means the dir's own
-   * identity is a DIFFERENT account and this one is a guest in it.
-   *
-   * The distinction matters to any caller deciding whether a write is safe:
-   * fanning an account's credential through a guest dir crosses a custody
-   * boundary that the dir's own owner never consented to, which is a different
-   * hazard from two legitimate copies of one account converging.
-   */
-  ownsAccount: boolean;
 }
 
 /**
@@ -496,20 +479,66 @@ export function accountLiveDoorsElsewhere(
     seen.add(canonical);
     const state = classifyCredentialFile(dirCredentialsFile(door.dir)).state;
     if (!isRestorableState(state)) continue;
-    // Does this same dir also OWN this account? `identity` is this account's
-    // entry, so an `own-identity` door on the same dir means the dir's own
-    // binding is this account and it is legitimately running it.
-    const ownsAccount = identity.doors.some(
-      (other) => other.role === "own-identity" && sameConfigDir(other.dir, door.dir),
-    );
     live.push({
       dir: door.dir,
       ...(door.profileName ? { profileName: door.profileName } : {}),
       state,
-      ownsAccount,
     });
   }
   return live;
+}
+
+/**
+ * Other dirs currently PRESENTING this account that do not OWN it — guests
+ * carrying it after an in-place switch, or dirs whose own binding is unreadable.
+ *
+ * DELIBERATELY UNFILTERED BY CREDENTIAL STATE, unlike `accountLiveDoorsElsewhere`
+ * above, and that difference is the entire point of this function existing
+ * separately rather than being a flag on that one.
+ *
+ * The two answer different questions over different domains:
+ *
+ *   - `accountLiveDoorsElsewhere` asks "could a token rotation revoke a WORKING
+ *     copy somewhere else", so it rightly drops doors holding nothing
+ *     restorable — a husk cannot be revoked.
+ *   - this asks "would a write REACH a dir that another account owns", and the
+ *     broker's `enumerateCopies` adds a `dir-live` write target for EVERY
+ *     `current-occupant` door with no state filter whatsoever
+ *     (`credential-broker.ts`, the `dirLiveCopy` branch). A guest dir whose own
+ *     credential happens to be a husk is therefore still a write target.
+ *
+ * A gate built on the FILTERED set is blind to exactly those dirs while the
+ * write set still contains them — measured: a guest dir holding a husk was
+ * written through while the gate reported no guests present. The gate and the
+ * write set must range over the same doors, so this one ranges over all of them.
+ *
+ * Ownership is decided the same way the index builds roles: a dir OWNS this
+ * account when it also carries an `own-identity` door for it. A dir with no
+ * such door is not this account's — fail closed and report it as a guest.
+ */
+export function accountGuestOccupantDoorsElsewhere(
+  index: ReadonlyArray<AccountIdentity>,
+  accountUuid: string,
+  excludeDir: string,
+): string[] {
+  const wanted = accountUuid.toLowerCase();
+  const identity = index.find((entry) => entry.accountUuid.toLowerCase() === wanted);
+  if (!identity) return [];
+
+  const seen = new Set<string>();
+  const guests: string[] = [];
+  for (const door of identity.doors) {
+    if (door.role !== "current-occupant") continue;
+    if (sameConfigDir(door.dir, excludeDir)) continue;
+    const canonical = canonicalConfigDir(door.dir);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    const owns = identity.doors.some(
+      (other) => other.role === "own-identity" && sameConfigDir(other.dir, door.dir),
+    );
+    if (!owns) guests.push(door.dir);
+  }
+  return guests;
 }
 
 /**
