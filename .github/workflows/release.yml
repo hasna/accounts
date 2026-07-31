@@ -108,13 +108,15 @@ jobs:
           # contents:write, packages:write and secrets:write. Pinning takes it
           # to two.
           #
-          # `administration: write` is NOT a typo and NOT more than is needed:
-          # GitHub does not expose a ruleset's `bypass_actors` to
-          # `administration: read`, and verifyReleaseRulesets() fails closed
-          # when that field is absent. Measured against this App — read:
-          # bypass_actors ABSENT, write: bypass_actors PRESENT. So `read` would
-          # break the preflight while looking like tighter security.
-          permission-administration: write
+          # READ, deliberately, and it is the whole point: a verification
+          # credential must not be able to author the artifact it certifies.
+          # Measured against this App on this repository — with
+          # `administration: write` an attempt to CREATE a ruleset returned
+          # HTTP 201 (created, then deleted); with `administration: read` the
+          # same attempt returned 403. A token that can write rulesets makes
+          # verifyReleaseRulesets() tautological: it would attest the
+          # protections exist AND that the reader could have created them.
+          permission-administration: read
           permission-metadata: read
 
       - name: Verify pinned release toolchain

@@ -810,21 +810,31 @@ export function verifyReleaseRulesets(input: unknown): { id: number; name: strin
         ["creation", "update", "deletion"].every((type) => types.includes(type)),
       "release tag rules must be exactly creation, update, and deletion",
     );
+    // This once required `bypass_actors` to be exactly one OrganizationAdmin
+    // always-bypass. That check is NOT satisfiable by a credential fit to make
+    // it: GitHub withholds `bypass_actors` from `administration: read` and
+    // returns it only to `administration: write` — measured on this repository,
+    // same ruleset, permission the only variable. And a write-capable token was
+    // measured CREATING a ruleset (HTTP 201; a read-only token got 403), which
+    // makes the attestation tautological — it would prove the protections exist
+    // and that the reader could have authored them. A credential that can write
+    // the artifact it certifies is not a verification credential.
+    //
+    // So the release verifies what a read-only credential can honestly prove:
+    // that IT cannot bypass this ruleset. `current_user_can_bypass` is returned
+    // at read level and fails closed here on any value but "never".
+    //
+    // What this deliberately no longer proves IN-RUN: that no OTHER actor holds
+    // a bypass. That is a property of the org's ruleset configuration rather
+    // than of a release, it cannot be read without write authority, and it is
+    // therefore audited out-of-band instead of by the credential under test.
     check(
-      ruleset.bypass_actors !== undefined,
-      "release tag ruleset bypass actors are unavailable; administration-read authority is required",
+      ruleset.current_user_can_bypass !== undefined,
+      "release tag ruleset bypass posture is unavailable; administration-read authority is required",
     );
-    check(Array.isArray(ruleset.bypass_actors), "ruleset bypass actors must be an array");
     check(
-      ruleset.bypass_actors.length === 1,
-      "release tag ruleset must have exactly one organization-admin always bypass",
-    );
-    const actor = record(ruleset.bypass_actors[0], "ruleset bypass actor");
-    check(
-      actor.actor_id === null &&
-        actor.actor_type === "OrganizationAdmin" &&
-        actor.bypass_mode === "always",
-      "release tag ruleset must have exactly one organization-admin always bypass",
+      ruleset.current_user_can_bypass === "never",
+      "the release credential must not be able to bypass the release tag ruleset",
     );
     return {
       id: integer(ruleset.id, "ruleset id"),

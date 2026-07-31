@@ -224,11 +224,11 @@ function ruleset(ruleTypes = ["creation", "update", "deletion"]) {
     name: "protect-npm-accounts-release-tags",
     target: "tag",
     enforcement: "active",
-    bypass_actors: [{
-      actor_id: null,
-      actor_type: "OrganizationAdmin",
-      bypass_mode: "always",
-    }],
+    // Shaped as `administration: read` actually returns it — measured on the
+    // live ruleset: `current_user_can_bypass` present, `bypass_actors` absent.
+    // The fixture must match the credential the release actually uses, or it
+    // asserts a response the workflow can never receive.
+    current_user_can_bypass: "never",
     conditions: {
       ref_name: {
         include: ["refs/tags/npm/accounts/v*"],
@@ -398,8 +398,17 @@ test("requires a live active release-tag ruleset with immutable restricted autho
     id: 19_812_295,
     name: "protect-npm-accounts-release-tags",
   });
-  const { bypass_actors: _hiddenByGitHub, ...readOnlyRuleset } = ruleset();
-  expect(() => verifyReleaseRulesets([readOnlyRuleset])).toThrow("bypass actors are unavailable");
+  // GitHub withholds the bypass posture without administration-read authority.
+  const { current_user_can_bypass: _withheld, ...withoutPosture } = ruleset();
+  expect(() => verifyReleaseRulesets([withoutPosture]))
+    .toThrow("bypass posture is unavailable");
+  // A credential that CAN bypass the ruleset it is certifying is rejected —
+  // this is the check that replaced the bypass_actors enumeration, and it is
+  // the one a read-only credential can honestly make.
+  expect(() => verifyReleaseRulesets([{ ...ruleset(), current_user_can_bypass: "always" }]))
+    .toThrow("must not be able to bypass");
+  expect(() => verifyReleaseRulesets([{ ...ruleset(), current_user_can_bypass: "pull_request" }]))
+    .toThrow("must not be able to bypass");
   expect(() => verifyReleaseRulesets([{ ...ruleset(), enforcement: "evaluate" }]))
     .toThrow("no active tag ruleset");
   expect(() => verifyReleaseRulesets([{
@@ -430,27 +439,13 @@ test("requires a live active release-tag ruleset with immutable restricted autho
     .toThrow("exactly creation, update, and deletion");
   expect(() => verifyReleaseRulesets([ruleset(["creation", "update"])]))
     .toThrow("exactly creation, update, and deletion");
-  expect(() => verifyReleaseRulesets([{ ...ruleset(), bypass_actors: [] }]))
-    .toThrow("exactly one organization-admin");
-  expect(() => verifyReleaseRulesets([{
+  // A stray `bypass_actors` in the payload must not resurrect the old
+  // enumeration or change the verdict: the release no longer decides on it,
+  // and an extra field is not a reason to pass or fail.
+  expect(verifyReleaseRulesets([{
     ...ruleset(),
-    bypass_actors: [{
-      actor_id: 123,
-      actor_type: "Team",
-      bypass_mode: "always",
-    }],
-  }])).toThrow("exactly one organization-admin");
-  expect(() => verifyReleaseRulesets([{
-    ...ruleset(),
-    bypass_actors: [
-      ...ruleset().bypass_actors,
-      {
-        actor_id: 123,
-        actor_type: "Team",
-        bypass_mode: "always",
-      },
-    ],
-  }])).toThrow("exactly one organization-admin");
+    bypass_actors: [{ actor_id: 123, actor_type: "Team", bypass_mode: "always" }],
+  }])).toEqual({ id: 19_812_295, name: "protect-npm-accounts-release-tags" });
   expect(() => verifyReleaseRulesets([{
     ...ruleset(),
     rules: [...ruleset().rules, { type: "required_signatures" }],

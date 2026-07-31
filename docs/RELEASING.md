@@ -76,23 +76,37 @@ person can reach, for as long as the token lives, whereas this one carries a
 single repository for roughly an hour. The release actor is still independently
 required to be a live repository administrator, read with the workflow token.
 
-**Permissions are pinned on the mint step, and the pin is `administration:
-write` — which is not a mistake.** Left unpinned, the minted token inherits
-every permission the installation holds on this repository, measured at roughly
-35 scopes including `contents: write`, `packages: write` and `secrets: write`.
-Pinning takes it to two: `permission-administration: write` and
-`permission-metadata: read`.
+**Permissions are pinned on the mint step to `administration: read` and
+`metadata: read`.** Left unpinned the minted token inherits every permission the
+installation holds on this repository — measured at roughly 35 scopes including
+`contents: write`, `packages: write` and `secrets: write`. Pinning takes it to
+two.
 
-The counter-intuitive half is worth stating plainly, because this document
-specified `Administration read` for months and that specification was never
-sufficient: **GitHub does not expose a ruleset's `bypass_actors` to
-`administration: read`**, and `verifyReleaseRulesets()` fails closed when that
-field is absent. Measured against this App on the same ruleset — with
-`administration: read` the detail read returns HTTP 200 and no `bypass_actors`;
-with `administration: write` the same read returns them. So `read` would break
-the preflight while looking like tighter security. A negative control confirms
-the pinned credential still cannot write: an attempted repository-variable
-create returns HTTP 403.
+**`read` rather than `write`, and the reason is a property of verification
+rather than of exposure.** Measured against this App on this repository: a token
+minted with `administration: write` successfully **created** a repository
+ruleset (HTTP 201, deleted immediately afterwards); the same request from an
+`administration: read` token returned HTTP 403. A credential that can author
+rulesets cannot honestly certify them — `verifyReleaseRulesets()` would attest
+that the protections exist *and* that the reader could have created them, which
+is no attestation at all. Short life and single-repository scope bound the
+exposure; they do not repair the validity.
+
+**What that costs, stated rather than glossed.** GitHub returns a ruleset's
+`bypass_actors` only to `administration: write` — measured on the same ruleset
+with permission as the only variable: `read` omits the field, `write` returns
+it. The preflight therefore no longer enumerates bypass actors. It verifies
+instead what a read-only credential can honestly prove, using
+`current_user_can_bypass`, which **is** returned at read level: that the release
+credential itself cannot bypass the ruleset, failing closed on any value other
+than `never`.
+
+So the in-run guarantee is now "this credential can neither author nor bypass
+the protection", and the property that no *other* actor holds a bypass is
+audited **out of band**. That property belongs to the organization's ruleset
+configuration rather than to any single release, and it cannot be read by a
+credential fit to verify it — so verifying it from inside the release was
+always going to force the choice between a tautological attestation and none.
 
 The normal workflow token remains read-only and is used for the environment,
 deployment-policy, and triggering-actor reads. The administration-read token is
