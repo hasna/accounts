@@ -130,12 +130,25 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
     // which includes the still-valid copy that is live elsewhere — into every
     // copy, so all dirs end holding the SAME token. It never introduces a second,
     // superseded token, so it cannot cause the double-refresh revocation the
-    // refusal guards against, and it re-checks each dir's occupant identity at
-    // write time so only THIS account's copies are touched. We only reach it when
-    // `recoverParkedCredential` has already passed its identity gates and refused
-    // solely on `account-live-elsewhere`, so the dir is provably its own account.
+    // restore refusal guards against, and it re-checks each dir's occupant
+    // identity (and, since #99, its content binding) at write time.
+    //
+    // NARROWED TO LEGITIMATE DUPLICATE DOORS ONLY, and this condition is
+    // load-bearing rather than defensive. `account-live-elsewhere` covers two
+    // shapes that "the account is running somewhere else" does not distinguish:
+    // another dir that OWNS this account and is running it, and a dir owned by a
+    // DIFFERENT account that is merely carrying this one after an in-place
+    // switch. Converging through the second one sources and fans a credential
+    // across a custody boundary the squatted dir's real owner never consented
+    // to — the class of write the bb267228 gate exists to prevent, which
+    // `src/repair-auth-gates.test.ts` ("a blanket launch cannot create the
+    // second copy") asserts a launch must not perform. So a single guest door
+    // anywhere in the live set stops the heal; `liveElsewhereAllOwnDoors` is
+    // `every` over a non-empty list and is consulted with an explicit `=== true`
+    // so an absent field can never be read as permission.
+    //
     // Best-effort: a launch must never fail on a heal.
-    if (recovery.outcome === "account-live-elsewhere") {
+    if (recovery.outcome === "account-live-elsewhere" && recovery.liveElsewhereAllOwnDoors === true) {
       try {
         convergeDirCredential(profile.dir, { tool });
       } catch {

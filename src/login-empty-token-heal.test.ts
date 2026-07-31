@@ -118,6 +118,46 @@ test("launch heals a rotated-away root when the account is live in a second prof
   expect(rootBytes.equals(readFileSync(join(centralDir(DECOY_UUID), "credentials.json")))).toBe(false);
 });
 
+test("launch does NOT heal when the account is live in a GUEST dir (bb267228 boundary)", async () => {
+  const store = resolveStore();
+
+  // The shape src/repair-auth-gates.test.ts guards: this profile's parked copy is
+  // a SUPERSEDED predecessor, and the account's CURRENT credential is live in a
+  // dir owned by a DIFFERENT account that is merely carrying it after an in-place
+  // switch. Converging here would source and fan a credential through that guest
+  // dir — across a custody boundary its real owner never consented to — which is
+  // exactly the write bb267228 refuses. The husk must survive the launch.
+  const primary = await store.addProfile({ name: "guest-primary", tool: "claude", description: "b29f5b6c" });
+  const dir = primary.dir;
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(join(dir, ".credentials.json"), huskCred());
+  writeFileSync(join(dir, ".claude.json"), accountFile(OWN_UUID, "own@example.test"));
+  writeFileSync(join(dir, ".accounts-auth", "oauth-account.json"), accountFile(OWN_UUID, "own@example.test"));
+  const superseded = realCred("own-old");
+  writeFileSync(join(dir, ".accounts-auth", "credentials.json"), superseded);
+  seedCentral(OWN_UUID, "own@example.test", superseded);
+
+  // A dir whose OWN identity is the decoy account, currently carrying OWN_UUID's
+  // CURRENT credential (the in-place switch).
+  const guest = await store.addProfile({ name: "guest-squatted", tool: "claude", description: "b29f5b6c" });
+  mkdirSync(join(guest.dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(join(guest.dir, ".accounts-auth", "oauth-account.json"), accountFile(DECOY_UUID, "decoy@example.test"));
+  writeFileSync(join(guest.dir, ".claude.json"), accountFile(OWN_UUID, "own@example.test"));
+  writeFileSync(join(guest.dir, ".credentials.json"), realCred("own-current"));
+
+  const rootPath = join(dir, ".credentials.json");
+  const guestBefore = readFileSync(join(guest.dir, ".credentials.json"));
+
+  profileEnv(primary, getTool("claude"));
+
+  // The husk survives: no converge fired.
+  const after = credentialHealth(rootPath);
+  expect(after.exists).toBe(true);
+  expect(after.refreshTokenLength).toBe(0);
+  // And the guest dir was not written through on the way.
+  expect(readFileSync(join(guest.dir, ".credentials.json")).equals(guestBefore)).toBe(true);
+});
+
 test("launch does NOT heal a MIS-BOUND dir whose live identity is a different account (discriminating)", async () => {
   const store = resolveStore();
 

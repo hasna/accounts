@@ -426,6 +426,23 @@ export interface LiveAccountDoor {
   profileName?: string;
   /** State of that dir's live `.credentials.json` — never a token value. */
   state: CredentialState;
+  /**
+   * Does this dir OWN the account it is currently running, or is it merely
+   * carrying it?
+   *
+   * Every door here is a `current-occupant` by construction, and that role alone
+   * cannot tell the two apart: a dir legitimately running its own account and a
+   * dir holding someone else's after an in-place switch are both "occupied by
+   * this account". `true` means the dir also has an `own-identity` door for this
+   * same account — a legitimate duplicate door. `false` means the dir's own
+   * identity is a DIFFERENT account and this one is a guest in it.
+   *
+   * The distinction matters to any caller deciding whether a write is safe:
+   * fanning an account's credential through a guest dir crosses a custody
+   * boundary that the dir's own owner never consented to, which is a different
+   * hazard from two legitimate copies of one account converging.
+   */
+  ownsAccount: boolean;
 }
 
 /**
@@ -479,10 +496,17 @@ export function accountLiveDoorsElsewhere(
     seen.add(canonical);
     const state = classifyCredentialFile(dirCredentialsFile(door.dir)).state;
     if (!isRestorableState(state)) continue;
+    // Does this same dir also OWN this account? `identity` is this account's
+    // entry, so an `own-identity` door on the same dir means the dir's own
+    // binding is this account and it is legitimately running it.
+    const ownsAccount = identity.doors.some(
+      (other) => other.role === "own-identity" && sameConfigDir(other.dir, door.dir),
+    );
     live.push({
       dir: door.dir,
       ...(door.profileName ? { profileName: door.profileName } : {}),
       state,
+      ownsAccount,
     });
   }
   return live;
