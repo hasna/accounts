@@ -826,39 +826,46 @@ export function verifyReleaseRulesets(input: unknown): { id: number; name: strin
   );
 }
 
+// The administration credential is a GitHub App installation token minted for
+// this run, so it has no user identity: `GET /user` answers 403 "Resource not
+// accessible by integration" for any installation token. The binding this
+// asserts instead is the credential's SCOPE — it must reach exactly this one
+// repository and nothing else. That is narrower than the personal token it
+// replaces, which necessarily carried everything its owner could reach.
+//
+// Administration-read authority is proven separately and already fails closed:
+// GitHub omits `bypass_actors` from a ruleset read without it, and
+// verifyReleaseRulesets() rejects a ruleset whose bypass actors are absent.
 export function verifyReleaseEnvironment(
   environmentInput: unknown,
   policiesInput: unknown,
   actorPermissionInput: unknown,
-  administrationIdentityInput: unknown,
-  administrationPermissionInput: unknown,
+  administrationScopeInput: unknown,
+  repositoryInput: unknown,
 ): void {
   const environment = record(environmentInput, "GitHub release environment");
   const actorPermission = record(actorPermissionInput, "GitHub release actor permission");
   const actor = record(actorPermission.user, "GitHub release actor");
-  const administrationIdentity = record(
-    administrationIdentityInput,
-    "GitHub administration credential identity",
-  );
-  const administrationPermission = record(
-    administrationPermissionInput,
-    "GitHub administration credential permission",
-  );
-  const administrationUser = record(
-    administrationPermission.user,
-    "GitHub administration credential permission user",
+  const repository = text(repositoryInput, "release repository");
+  const administrationScope = record(
+    administrationScopeInput,
+    "GitHub administration credential scope",
   );
   check(actorPermission.permission === "admin", "release actor must have repository admin permission");
   check(
-    administrationPermission.permission === "admin",
-    "administration credential needs repository admin read authority",
+    Array.isArray(administrationScope.repositories),
+    "administration credential scope must list its repositories",
   );
   check(
-    administrationIdentity.id === actor.id &&
-      administrationIdentity.login === actor.login &&
-      administrationUser.id === actor.id &&
-      administrationUser.login === actor.login,
-    "administration credential must belong to the release actor",
+    administrationScope.total_count === 1 && administrationScope.repositories.length === 1,
+    "administration credential must be scoped to exactly one repository",
+  );
+  check(
+    text(
+      record(administrationScope.repositories[0], "administration credential repository").full_name,
+      "administration credential repository full name",
+    ) === repository,
+    "administration credential must be scoped to the release repository",
   );
   check(environment.name === RELEASE_ENVIRONMENT, `release environment must be ${RELEASE_ENVIRONMENT}`);
   check(Array.isArray(environment.protection_rules), "release environment protection rules must be an array");
@@ -988,7 +995,7 @@ async function assertLiveReleaseControls(
     environment,
     policies,
     actorPermission,
-    administrationIdentity,
+    administrationScope,
   ] = await Promise.all([
     fetchJson(
       githubUrl(`/repos/${repository}/rulesets?includes_parents=true&targets=tag&per_page=100`),
@@ -1012,7 +1019,11 @@ async function assertLiveReleaseControls(
       MAX_JSON_BYTES,
       headers,
     ),
-    fetchJson(githubUrl("/user"), MAX_JSON_BYTES, administrationHeaders),
+    fetchJson(
+      githubUrl("/installation/repositories?per_page=100"),
+      MAX_JSON_BYTES,
+      administrationHeaders,
+    ),
   ]);
   check(Array.isArray(summaries), "GitHub rulesets response must be an array");
   const details = await Promise.all(summaries.map(async (entry, index) => {
@@ -1024,24 +1035,16 @@ async function assertLiveReleaseControls(
       administrationHeaders,
     );
   }));
-  const administration = record(administrationIdentity, "GitHub administration credential identity");
-  const administrationName = encodeURIComponent(
-    text(administration.login, "GitHub administration credential login"),
-  );
-  const administrationPermission = await fetchJson(
-    githubUrl(`/repos/${repository}/collaborators/${administrationName}/permission`),
-    MAX_JSON_BYTES,
-    administrationHeaders,
-  );
   const ruleset = verifyReleaseRulesets(details);
   verifyReleaseEnvironment(
     environment,
     policies,
     actorPermission,
-    administrationIdentity,
-    administrationPermission,
+    administrationScope,
+    repository,
   );
   console.log(`verified active release tag ruleset ${ruleset.name} (${ruleset.id})`);
+  console.log(`verified administration credential scoped to ${repository} alone`);
   console.log(`verified protected ${RELEASE_ENVIRONMENT} environment and tag policy`);
 }
 

@@ -87,19 +87,23 @@ jobs:
         with:
           bun-version: "1.3.14"
 
-
       # Mint a short-lived, installation-scoped token for the preflight's live
       # ruleset and environment reads. Short-lived and scoped beats a long-lived
       # PAT: nothing durable exists to leak, and the credential cannot outlive
       # the run that used it.
+      #
+      # `repositories: accounts` is load-bearing, not tidiness: the preflight
+      # asserts this credential reaches exactly one repository, so widening it
+      # here fails the release rather than silently granting more.
       - name: Mint release admin token
         id: release-admin-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: accounts
+
       - name: Verify pinned release toolchain
         run: node scripts/assert-toolchain.mjs
 

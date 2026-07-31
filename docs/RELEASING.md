@@ -53,14 +53,28 @@ an active semantic match for only this tag pattern, all three protections, and
 
 GitHub omits `bypass_actors` from a ruleset response unless the API caller can
 administer that ruleset. The preflight therefore fails closed when the field is
-missing. Store a fine-grained token named `RELEASE_GITHUB_ADMIN_TOKEN` in the
-protected environment with only repository Metadata read and Administration
-read access for `hasna/accounts`. Do not grant Contents write, Actions write, or
-any organization-wide mutation permission. The token must belong to the same
-user who triggered the release. The preflight uses it only to read the live
-ruleset, requires the visible bypass list to contain exactly one
-`OrganizationAdmin` entry in `always` mode, and verifies that its owner and the
-release actor are the same live repository administrator.
+missing. The credential that performs that read, `RELEASE_GITHUB_ADMIN_TOKEN`,
+is **minted per run** from the `hasna-identity` GitHub App and is never stored —
+see the secrets table below for why. The preflight uses it only to read the live
+ruleset, and requires the visible bypass list to contain exactly one
+`OrganizationAdmin` entry in `always` mode.
+
+**How the credential is bound.** This originally specified a fine-grained
+personal token that had to belong to the release actor, and the preflight
+checked that by calling `GET /user`. **An App installation token cannot satisfy
+that check, in principle rather than by configuration**: `GET /user` answers
+`403 Resource not accessible by integration` for every installation token, and an
+installation token has no user identity to compare against the actor in the first
+place. So the binding is now the credential's *scope* — the preflight asserts via
+`GET /installation/repositories` that the token reaches **exactly one repository,
+and that it is `hasna/accounts`**. A release whose credential can reach a second
+repository fails closed.
+
+That is a narrower guarantee than the one it replaces, not a weaker one: a
+personal token bound to the release actor necessarily carries everything that
+person can reach, for as long as the token lives, whereas this one carries a
+single repository for roughly an hour. The release actor is still independently
+required to be a live repository administrator, read with the workflow token.
 
 The normal workflow token remains read-only and is used for the environment,
 deployment-policy, and triggering-actor reads. The administration-read token is
@@ -75,8 +89,8 @@ Create a protected `npm-release` environment:
 - allow deployments only from tags matching `npm/accounts/v*`;
 - require exactly one user reviewer matching the release actor;
 - allow that reviewer to approve their own deployment;
-- store only `RELEASE_GITHUB_ADMIN_TOKEN` and the `NPM_DIST_TAG_TOKEN` described
-  below.
+- store only `RELEASE_APP_ID`, `RELEASE_APP_PRIVATE_KEY`, and the
+  `NPM_DIST_TAG_TOKEN` described below.
 
 The npm trusted publisher must include the same environment name. A mismatch
 causes npm OIDC publication to fail. This repository currently has one

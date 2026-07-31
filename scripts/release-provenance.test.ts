@@ -477,21 +477,25 @@ test("requires protected release-environment reviewers and an exact tag deployme
     role_name: "admin",
     user: { id: 123, login: "release-owner" },
   };
-  const administrationCredential = {
-    identity: { id: 123, login: "release-owner" },
-    permission: actor,
+  // The administration credential is an App installation token minted per run.
+  // It has no user identity — `GET /user` is 403 for any installation token —
+  // so the binding asserted is its SCOPE: exactly this one repository.
+  const repository = "hasna/accounts";
+  const administrationScope = {
+    total_count: 1,
+    repositories: [{ id: 1, full_name: "hasna/accounts" }],
   };
   expect(() => verifyReleaseEnvironment(
     environment,
     policies,
     actor,
-    administrationCredential.identity,
-    administrationCredential.permission,
+    administrationScope,
+    repository,
   )).not.toThrow();
   expect(() => verifyReleaseEnvironment({
     ...environment,
     protection_rules: [{ type: "branch_policy" }],
-  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+  }, policies, actor, administrationScope, repository))
     .toThrow("require reviewers");
   expect(() => verifyReleaseEnvironment({
     ...environment,
@@ -503,7 +507,7 @@ test("requires protected release-environment reviewers and an exact tag deployme
       },
       { type: "branch_policy" },
     ],
-  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+  }, policies, actor, administrationScope, repository))
     .toThrow("allow the authorized reviewer");
   expect(() => verifyReleaseEnvironment({
     ...environment,
@@ -515,22 +519,22 @@ test("requires protected release-environment reviewers and an exact tag deployme
       },
       { type: "branch_policy" },
     ],
-  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+  }, policies, actor, administrationScope, repository))
     .toThrow("exactly match the live release actor");
   expect(() => verifyReleaseEnvironment(environment, policies, {
     ...actor,
     permission: "write",
-  }, administrationCredential.identity, administrationCredential.permission))
+  }, administrationScope, repository))
     .toThrow("repository admin permission");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
     branch_policies: [{ id: 456, name: "npm/accounts/v*", type: "branch" }],
-  }, actor, administrationCredential.identity, administrationCredential.permission))
+  }, actor, administrationScope, repository))
     .toThrow("exact npm/accounts/v* tag policy");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
     branch_policies: [{ id: 456, name: "npm/accounts/*", type: "tag" }],
-  }, actor, administrationCredential.identity, administrationCredential.permission))
+  }, actor, administrationScope, repository))
     .toThrow("exact npm/accounts/v* tag policy");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
@@ -539,22 +543,46 @@ test("requires protected release-environment reviewers and an exact tag deployme
       { id: 456, name: "npm/accounts/v*", type: "tag" },
       { id: 789, name: "main", type: "branch" },
     ],
-  }, actor, administrationCredential.identity, administrationCredential.permission))
+  }, actor, administrationScope, repository))
     .toThrow("exactly one deployment tag policy");
+  // A credential that reaches a second repository is rejected: the whole point
+  // of the scope binding is that it cannot be a broad, reusable credential.
   expect(() => verifyReleaseEnvironment(
     environment,
     policies,
     actor,
-    { id: 999, login: "other-admin" },
-    { permission: "admin", user: { id: 999, login: "other-admin" } },
-  )).toThrow("administration credential must belong to the release actor");
+    {
+      total_count: 2,
+      repositories: [
+        { id: 1, full_name: "hasna/accounts" },
+        { id: 2, full_name: "hasna/todos" },
+      ],
+    },
+    repository,
+  )).toThrow("scoped to exactly one repository");
+  // Correctly narrow, but narrowed to the WRONG repository.
   expect(() => verifyReleaseEnvironment(
     environment,
     policies,
     actor,
-    administrationCredential.identity,
-    { ...administrationCredential.permission, permission: "write" },
-  )).toThrow("administration credential needs repository admin read authority");
+    { total_count: 1, repositories: [{ id: 2, full_name: "hasna/todos" }] },
+    repository,
+  )).toThrow("scoped to the release repository");
+  // total_count and the array must agree; a truncated page must not read as narrow.
+  expect(() => verifyReleaseEnvironment(
+    environment,
+    policies,
+    actor,
+    { total_count: 7, repositories: [{ id: 1, full_name: "hasna/accounts" }] },
+    repository,
+  )).toThrow("scoped to exactly one repository");
+  expect(() => verifyReleaseEnvironment(
+    environment,
+    policies,
+    actor,
+    { total_count: 1 },
+    repository,
+  )).toThrow("must list its repositories");
 });
 
 test("allows only advancing or exact-idempotent semantic promotion", () => {
@@ -1973,11 +2001,27 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(workflow).toContain("group: hasna-accounts-npm-release");
   expect(workflow).not.toContain("group: release-${{ github.ref }}");
   expect(workflow).toContain("id-token: write");
-  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED");
-  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}");
+  // The admin credential is minted per run from the App, never stored, so the
+  // presence gate gets the App credentials and the preflight steps get the
+  // minted token. Asserting the secret form is ABSENT keeps a stored
+  // installation token — which would expire mid-life and fail as an
+  // authorization error — from creeping back in.
+  expect(workflow).toContain("RELEASE_APP_ID_CONFIGURED");
+  expect(workflow).toContain("RELEASE_APP_PRIVATE_KEY_CONFIGURED");
+  expect(workflow).not.toContain("secrets.RELEASE_GITHUB_ADMIN_TOKEN");
+  expect(workflow).toContain("uses: actions/create-github-app-token");
+  expect(workflow).toContain("repositories: accounts");
+  expect(workflow).toContain(
+    "RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}",
+  );
   expect(
-    workflow.match(/RELEASE_GITHUB_ADMIN_TOKEN: \$\{\{ secrets\.RELEASE_GITHUB_ADMIN_TOKEN \}\}/g),
+    workflow.match(
+      /RELEASE_GITHUB_ADMIN_TOKEN: \$\{\{ steps\.release-admin-token\.outputs\.token \}\}/g,
+    ),
   ).toHaveLength(3);
+  // The token must be minted before the first step that consumes it.
+  expect(workflow.indexOf("id: release-admin-token"))
+    .toBeLessThan(workflow.indexOf("release-provenance.ts preflight"));
   expect(workflow).toContain("bun run test:provenance-crypto");
   expect(workflow).toContain(`node-version: "${RELEASE_NODE_VERSION}"`);
   expect(workflow).toContain(`bun-version: "${RELEASE_BUN_VERSION}"`);
@@ -2147,7 +2191,11 @@ test("release workflow names its missing environment secrets before doing any wo
   const secretsStep = workflow.indexOf("NPM_DIST_TAG_TOKEN is not configured");
   expect(secretsStep).toBeGreaterThan(-1);
   expect(secretsStep).toBeLessThan(preflightStep);
-  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN is not configured");
+  // Each credential the release actually depends on must still fail BY NAME.
+  // The admin token is minted rather than stored, so the names that can be
+  // missing are the App's, not the token's.
+  expect(workflow).toContain("RELEASE_APP_ID is not configured");
+  expect(workflow).toContain("RELEASE_APP_PRIVATE_KEY is not configured");
   expect(workflow.indexOf("uses: actions/checkout")).toBeGreaterThan(secretsStep);
 });
 
