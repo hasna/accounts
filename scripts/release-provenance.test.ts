@@ -294,7 +294,8 @@ test("accepts only the exact tokenless protected GitHub OIDC workflow and pinned
     GITHUB_WORKFLOW_REF: `${candidate.repository}/${RELEASE_WORKFLOW}@refs/tags/${candidate.tag}`,
     GITHUB_SHA: candidate.commit,
     NPM_DIST_TAG_TOKEN_CONFIGURED: "true",
-    RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: "true",
+    RELEASE_APP_ID_CONFIGURED: "true",
+    RELEASE_APP_PRIVATE_KEY_CONFIGURED: "true",
     ACTIONS_ID_TOKEN_REQUEST_URL: "https://example.invalid/oidc",
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "present",
   };
@@ -322,8 +323,12 @@ test("accepts only the exact tokenless protected GitHub OIDC workflow and pinned
   }, tools)).toThrow("NPM_DIST_TAG_TOKEN is not configured");
   expect(() => assertTrustedPublishEnvironment(manifest, {
     ...env,
-    RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: "false",
-  }, tools)).toThrow("RELEASE_GITHUB_ADMIN_TOKEN is not configured");
+    RELEASE_APP_ID_CONFIGURED: "false",
+  }, tools)).toThrow("RELEASE_APP_ID is not configured");
+  expect(() => assertTrustedPublishEnvironment(manifest, {
+    ...env,
+    RELEASE_APP_PRIVATE_KEY_CONFIGURED: "false",
+  }, tools)).toThrow("RELEASE_APP_PRIVATE_KEY is not configured");
   expect(() => assertTrustedPublishEnvironment(manifest, {
     ...env,
     "NPM_CONFIG_//REGISTRY.NPMJS.ORG/:_AUTHTOKEN": "forbidden",
@@ -2197,6 +2202,39 @@ test("release workflow names its missing environment secrets before doing any wo
   expect(workflow).toContain("RELEASE_APP_ID is not configured");
   expect(workflow).toContain("RELEASE_APP_PRIVATE_KEY is not configured");
   expect(workflow.indexOf("uses: actions/checkout")).toBeGreaterThan(secretsStep);
+});
+
+// This test exists because the fixture-based tests above CANNOT catch env drift
+// between the workflow and the script: they hand-write the environment, so they
+// assert a state the workflow may no longer produce. That is exactly how a
+// release-blocking defect shipped — the workflow stopped exporting
+// RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED while workflowIdentity() still required
+// it, and every test stayed green because every fixture supplied it by hand.
+//
+// So derive the contract from the two artefacts instead of restating it: what
+// the script REQUIRES must be exactly what the workflow PROVIDES. Equality is
+// deliberate rather than subset — a presence flag the workflow exports and
+// nothing reads is dead configuration that reads as a live guard.
+test("every *_CONFIGURED flag the script requires is exactly the set the workflow exports", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  const script = readFileSync(
+    new URL("./release-provenance.ts", import.meta.url),
+    "utf8",
+  );
+  const provided = new Set(
+    [...workflow.matchAll(/^\s+([A-Z][A-Z0-9_]*_CONFIGURED):/gm)].map((m) => m[1]),
+  );
+  const required = new Set(
+    [...script.matchAll(/env\.([A-Z][A-Z0-9_]*_CONFIGURED)/g)].map((m) => m[1]),
+  );
+  // Positive control on the extractors themselves: an empty set on either side
+  // would make the comparison vacuously pass in the direction that loses.
+  expect(provided.size).toBeGreaterThan(0);
+  expect(required.size).toBeGreaterThan(0);
+  expect([...required].sort()).toEqual([...provided].sort());
 });
 
 // `test` is a required status check on main and a separate job would not be, so

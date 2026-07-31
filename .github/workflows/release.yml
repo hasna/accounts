@@ -103,6 +103,19 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: accounts
+          # Without these the token inherits every permission the installation
+          # holds on this repository — measured as ~35 scopes including
+          # contents:write, packages:write and secrets:write. Pinning takes it
+          # to two.
+          #
+          # `administration: write` is NOT a typo and NOT more than is needed:
+          # GitHub does not expose a ruleset's `bypass_actors` to
+          # `administration: read`, and verifyReleaseRulesets() fails closed
+          # when that field is absent. Measured against this App — read:
+          # bypass_actors ABSENT, write: bypass_actors PRESENT. So `read` would
+          # break the preflight while looking like tighter security.
+          permission-administration: write
+          permission-metadata: read
 
       - name: Verify pinned release toolchain
         run: node scripts/assert-toolchain.mjs

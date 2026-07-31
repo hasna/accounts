@@ -675,9 +675,19 @@ function workflowIdentity(
     env.NPM_DIST_TAG_TOKEN_CONFIGURED === "true",
     "NPM_DIST_TAG_TOKEN is not configured in the protected release environment",
   );
+  // The preflight's administration credential is MINTED per run from a GitHub
+  // App, so the thing that can be missing from the environment is the App's
+  // credentials — not a token. Asserting the old
+  // RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED here would fail every run with a
+  // message naming a secret the design deliberately no longer stores, which is
+  // a false report of the cause rather than an honest one.
   check(
-    env.RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED === "true",
-    "RELEASE_GITHUB_ADMIN_TOKEN is not configured in the protected release environment",
+    env.RELEASE_APP_ID_CONFIGURED === "true",
+    "RELEASE_APP_ID is not configured in the protected release environment",
+  );
+  check(
+    env.RELEASE_APP_PRIVATE_KEY_CONFIGURED === "true",
+    "RELEASE_APP_PRIVATE_KEY is not configured in the protected release environment",
   );
   check(manifest.publishConfig?.registry === REGISTRY, `publish registry must be ${REGISTRY}`);
   check(manifest.publishConfig?.access === "public", "publish access must be public");

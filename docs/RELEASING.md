@@ -76,6 +76,24 @@ person can reach, for as long as the token lives, whereas this one carries a
 single repository for roughly an hour. The release actor is still independently
 required to be a live repository administrator, read with the workflow token.
 
+**Permissions are pinned on the mint step, and the pin is `administration:
+write` — which is not a mistake.** Left unpinned, the minted token inherits
+every permission the installation holds on this repository, measured at roughly
+35 scopes including `contents: write`, `packages: write` and `secrets: write`.
+Pinning takes it to two: `permission-administration: write` and
+`permission-metadata: read`.
+
+The counter-intuitive half is worth stating plainly, because this document
+specified `Administration read` for months and that specification was never
+sufficient: **GitHub does not expose a ruleset's `bypass_actors` to
+`administration: read`**, and `verifyReleaseRulesets()` fails closed when that
+field is absent. Measured against this App on the same ruleset — with
+`administration: read` the detail read returns HTTP 200 and no `bypass_actors`;
+with `administration: write` the same read returns them. So `read` would break
+the preflight while looking like tighter security. A negative control confirms
+the pinned credential still cannot write: an attempted repository-variable
+create returns HTTP 403.
+
 The normal workflow token remains read-only and is used for the environment,
 deployment-policy, and triggering-actor reads. The administration-read token is
 not passed to build, test, pack, npm publication, registry verification, or npm
