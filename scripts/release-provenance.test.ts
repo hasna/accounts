@@ -2011,6 +2011,16 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(workflow).not.toContain("secrets.RELEASE_GITHUB_ADMIN_TOKEN");
   expect(workflow).toContain("uses: actions/create-github-app-token");
   expect(workflow).toContain("repositories: accounts");
+  // The permission pin is the whole of the P1-1 remedy and it is ONE YAML line.
+  // Nothing at runtime can defend it: current_user_can_bypass has no
+  // discriminating power over the permission level — a token minted with
+  // administration:write returns "never" too, while also being able to author
+  // the ruleset it certifies. Measured: write -> POST /rulesets 201 CREATED,
+  // read -> 403. So a silent regression from read back to write is invisible
+  // everywhere except here.
+  expect(workflow).toContain("permission-administration: read");
+  expect(workflow).toContain("permission-metadata: read");
+  expect(workflow).not.toContain("permission-administration: write");
   expect(workflow).toContain(
     "RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}",
   );
