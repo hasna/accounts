@@ -6,6 +6,59 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.29] - 2026-07-31
+
+The first release intended to go through the release workflow rather than
+around it. Every version since `0.2.22` reached npm by break-glass, because the
+workflow had **never succeeded** — three runs (`0.2.24`, `0.2.25`, `0.2.28`) all
+died at the provisioning gate for a credential that could not be provisioned in
+the form the contract asked for.
+
+### Fixed
+
+- **The release lane could not complete, and each of its three blockers hid the
+  next.** `RELEASE_GITHUB_ADMIN_TOKEN` was specified as a stored personal token.
+  Substituting a GitHub App installation token is not a drop-in: a stored one
+  expires in about an hour, so it would pass a presence check forever and then
+  fail as an authorization error. It is now **minted per run** and the presence
+  gate moved to `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY`, which still fails
+  by name.
+
+  Minting alone was not sufficient. The preflight identified that credential by
+  calling `GET /user` and asserting the identity equalled the release actor —
+  unsatisfiable in principle, because an installation token has no user identity
+  and that endpoint answers `403 Resource not accessible by integration` for
+  every one. The credential is now bound by **scope** instead:
+  `GET /installation/repositories` must return exactly one repository and it must
+  be the release repository. Narrower than the token it replaces — a personal
+  token carries everything its owner can reach for as long as it lives; this
+  carries one repository for about an hour.
+
+  And `workflowIdentity()` still required an environment variable the workflow
+  had stopped exporting, so the run aborted before any of that executed, with an
+  error naming a credential the design deliberately no longer stores.
+
+- **The tag ruleset is now verified by a credential that cannot author it.** The
+  minted token is pinned to `administration: read` + `metadata: read` — down from
+  the roughly 35 scopes an unpinned token inherits. `administration: write` was
+  measured creating a repository ruleset, which would have made the attestation
+  tautological: proof that the protections exist *and* that the reader could have
+  created them. Because GitHub returns `bypass_actors` only to `write`, the
+  release no longer enumerates bypass actors; it asserts via
+  `current_user_can_bypass` that it cannot itself bypass the ruleset, and the
+  "no other actor holds a bypass" property is audited out of band.
+
+### Changed
+
+- `docs/RELEASING.md` now describes what the release verifies **and what it
+  deliberately does not**, rather than implying full coverage. Its long-standing
+  "Administration read" specification was measured insufficient for the check it
+  was written for.
+- Regression coverage for the class that let all of this ship: a test derives the
+  set of `*_CONFIGURED` flags from `release.yml` and from `release-provenance.ts`
+  and requires them to be equal, so workflow/script drift cannot pass a green
+  suite again.
+
 ## [0.2.28] - 2026-07-31
 
 `0.2.27` was published break-glass from a tree that was never merged, so `main`
