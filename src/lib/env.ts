@@ -6,6 +6,7 @@ import {
   recoverParkedCredential,
   sanitizeClaudeProfileApiSettings,
 } from "./claude-auth.js";
+import { convergeDirCredential } from "./credential-broker.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
@@ -110,7 +111,37 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
     // launch, so the session starts with a working credential instead of a
     // blank one. Runs BEFORE the switched-away heal because it refuses the
     // identity-changing case outright, leaving that to the function below.
-    recoverParkedCredential(profile.dir, tool, profile.name);
+    const recovery = recoverParkedCredential(profile.dir, tool, profile.name);
+    // b29f5b6c: the launched session reads an EMPTY (logged-out) root while
+    // `login`/`usage` report logged-in. The empty root is Claude Code's own
+    // `rotated-away` blank, written in place after a DUPLICATE live copy of this
+    // same account rotated the refresh token out. `recoverParkedCredential`
+    // above then REFUSES to restore the intact parked copy with
+    // `account-live-elsewhere` — because a blind restore of a possibly-superseded
+    // PREDECESSOR credential, while the account is live in another dir, would put
+    // two DIFFERENT tokens on disk and the next refresh would revoke one
+    // (defect bb267228). That refusal is correct for a restore, but it leaves the
+    // dir logged-out.
+    //
+    // The safe heal for a dir that legitimately holds its OWN account is
+    // CONVERGENCE, not restore. `convergeDirCredential` is pure file I/O (no
+    // token exchange) that fans the CURRENT WINNING credential — the freshest
+    // copy across the central store, the profile snapshots, and every live dir,
+    // which includes the still-valid copy that is live elsewhere — into every
+    // copy, so all dirs end holding the SAME token. It never introduces a second,
+    // superseded token, so it cannot cause the double-refresh revocation the
+    // refusal guards against, and it re-checks each dir's occupant identity at
+    // write time so only THIS account's copies are touched. We only reach it when
+    // `recoverParkedCredential` has already passed its identity gates and refused
+    // solely on `account-live-elsewhere`, so the dir is provably its own account.
+    // Best-effort: a launch must never fail on a heal.
+    if (recovery.outcome === "account-live-elsewhere") {
+      try {
+        convergeDirCredential(profile.dir, { tool });
+      } catch {
+        // The session still launches and reaches its own auth error.
+      }
+    }
     // A dir left switched to another account by `switch-account` must not
     // launch as that other account: restore the profile's own auth (or refuse
     // loudly while live sessions still use the dir).
