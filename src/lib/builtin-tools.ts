@@ -52,14 +52,41 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     // one — on a machine whose config is templated it can carry unsubstituted
     // `{{PLACEHOLDER}}` commands. Rendered files are listed first so their
     // definitions win, and placeholder-bearing members are dropped entirely.
-    sharedConfig: {
-      target: ".claude.json",
-      sources: ["settings.json", "mcp.json", "../.claude.json"],
-      keys: ["mcpServers"],
-      // A vault-retrieval server is the closest thing to sharing tokens without
-      // literally doing so; the user drew the line at "only tokens should not".
-      exclude: ["secrets"],
-    },
+    sharedConfig: [
+      {
+        target: ".claude.json",
+        sources: ["settings.json", "mcp.json", "../.claude.json"],
+        keys: ["mcpServers"],
+        // A vault-retrieval server is the closest thing to sharing tokens without
+        // literally doing so; the user drew the line at "only tokens should not".
+        exclude: ["secrets"],
+      },
+      // Hooks are the other half, and they are NOT interchangeable with the
+      // above: Claude Code reads hooks from `<CLAUDE_CONFIG_DIR>/settings.json`,
+      // never from `.claude.json`. Because `accounts` points CLAUDE_CONFIG_DIR at
+      // the profile dir, a hook registered only in the machine's shared home
+      // reaches the shared home and nothing else — it looks installed and is
+      // inert in every profile. Seeding it here is what makes a guard survive
+      // profile creation; a sweep over existing profiles cannot, because it is a
+      // snapshot and `accounts add` keeps minting new ones after it passes.
+      //
+      // Members are hook EVENT names (`PreToolUse`, `SessionStart`, …), so the
+      // union-by-member rule means a profile that has configured an event keeps
+      // its own list for that event and still gains events it has never set.
+      //
+      // No hook path is named here. What gets seeded is whatever the machine's
+      // own settings.json declares, so this stays a mechanism and the fleet
+      // supplies the policy.
+      {
+        target: "settings.json",
+        sources: ["settings.json"],
+        keys: ["hooks"],
+        // Seeding alone would still decay silently if the write ever failed, and
+        // a missing hook has no symptom. `required` turns that silence into a
+        // refused launch.
+        required: true,
+      },
+    ],
     // Measured on this machine: transcripts live at
     // `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<sessionId>.jsonl`, with
     // subagent transcripts and per-project memory nested beneath the same root,

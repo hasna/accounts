@@ -8,7 +8,7 @@ import {
 } from "./claude-auth.js";
 import { convergeDirCredential } from "./credential-broker.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
-import { ensureSharedCapabilities } from "./shared-capabilities.js";
+import { assertProfileGuarded, ensureSharedCapabilities } from "./shared-capabilities.js";
 
 /**
  * Runtime request diagnostics that can print provider request headers or
@@ -105,6 +105,11 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
   // Every launch surface goes through here, so profiles created before shared
   // capabilities existed are repaired the next time they are used.
   ensureSharedCapabilities(profile.dir, tool);
+  // ...and then verified, because "the repair ran" is not "the profile is
+  // correct". Seeding is best-effort by design (it must not stop a tool from
+  // starting), so without this the failure mode of a failed seed is a profile
+  // that launches happily with its guards missing.
+  assertProfileGuarded(profile.dir, tool);
   if (tool.id === "claude") {
     // A dir whose own credential was rotated away by another copy of the same
     // account has parked material nothing else reaches — put it back before the

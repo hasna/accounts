@@ -52,6 +52,7 @@ import {
   findProfile as localFind,
   getProfile as localGet,
   listProfiles as localList,
+  purgeProfileDir,
   redetectEmail as localRedetect,
   removeProfile as localRemove,
   renameProfile as localRename,
@@ -283,10 +284,10 @@ class ApiStore implements AccountsStore {
   async removeProfile(name: string, opts: RemoveOptions = {}): Promise<RemoveResult> {
     const profile = await this.api.remove(name, opts.tool);
     reconcileMachineProfileRemove(profile.tool, profile.name);
-    const purgeNote = opts.purge
-      ? "--purge is a local-only operation; the config dir (if any) was not touched in self_hosted mode"
-      : undefined;
-    return { profile, purged: false, ...(purgeNote ? { purgeNote } : {}) };
+    // The row lives in the API; the DIRECTORY has always lived on this machine.
+    // Skipping it here is what turned `--purge` into a silent orphan generator.
+    const { purged, purgeNote } = opts.purge ? purgeProfileDir(profile) : { purged: false, purgeNote: undefined };
+    return { profile, purged, ...(purgeNote ? { purgeNote } : {}) };
   }
 
   async redetectEmail(name: string, tool?: string): Promise<Profile> {
