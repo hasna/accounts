@@ -19,7 +19,14 @@ jobs:
     environment: npm-release
     env:
       NPM_DIST_TAG_TOKEN_CONFIGURED: ${{ secrets.NPM_DIST_TAG_TOKEN != '' }}
-      RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN != '' }}
+      # The preflight's admin credential is MINTED PER RUN from a GitHub App
+      # rather than stored. A stored installation token would expire about an
+      # hour after it was created and then fail the preflight as an
+      # authorization error — strictly worse than the honest "not configured"
+      # failure this gate exists to give. So presence is checked on the App
+      # credentials, which do not expire on that timescale.
+      RELEASE_APP_ID_CONFIGURED: ${{ secrets.RELEASE_APP_ID != '' }}
+      RELEASE_APP_PRIVATE_KEY_CONFIGURED: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
     timeout-minutes: 30
     permissions:
       actions: read
@@ -51,8 +58,12 @@ jobs:
             echo "::error::NPM_DIST_TAG_TOKEN is not configured in the npm-release environment of this repository"
             missing=1
           fi
-          if [[ "$RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED" != "true" ]]; then
-            echo "::error::RELEASE_GITHUB_ADMIN_TOKEN is not configured in the npm-release environment of this repository"
+          if [[ "$RELEASE_APP_ID_CONFIGURED" != "true" ]]; then
+            echo "::error::RELEASE_APP_ID is not configured in the npm-release environment of this repository"
+            missing=1
+          fi
+          if [[ "$RELEASE_APP_PRIVATE_KEY_CONFIGURED" != "true" ]]; then
+            echo "::error::RELEASE_APP_PRIVATE_KEY is not configured in the npm-release environment of this repository"
             missing=1
           fi
           if [[ "$missing" != "0" ]]; then
@@ -76,6 +87,19 @@ jobs:
         with:
           bun-version: "1.3.14"
 
+
+      # Mint a short-lived, installation-scoped token for the preflight's live
+      # ruleset and environment reads. Short-lived and scoped beats a long-lived
+      # PAT: nothing durable exists to leak, and the credential cannot outlive
+      # the run that used it.
+      - name: Mint release admin token
+        id: release-admin-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: accounts
       - name: Verify pinned release toolchain
         run: node scripts/assert-toolchain.mjs
 
@@ -88,7 +112,7 @@ jobs:
       - name: Verify protected release identity and live tag ruleset
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}
         run: bun run scripts/release-provenance.ts preflight
 
       - name: Verify release
@@ -122,7 +146,7 @@ jobs:
       - name: Reverify live controls immediately before publication
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}
         run: bun run scripts/release-provenance.ts preflight
 
       - name: Publish preserved candidate under version quarantine
@@ -139,7 +163,7 @@ jobs:
       - name: Reverify live controls immediately before promotion
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}
         run: bun run scripts/release-provenance.ts preflight
 
       - name: Promote the verified version to its intended dist-tag

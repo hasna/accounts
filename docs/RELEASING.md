@@ -141,7 +141,15 @@ Both secrets live in the `npm-release` environment of `hasna/accounts`:
 | Secret | Purpose | Created by |
 | --- | --- | --- |
 | `NPM_DIST_TAG_TOKEN` | granular npm token scoped to `@hasna/accounts`, used only by the dist-tag promotion step | an npm owner of the package |
-| `RELEASE_GITHUB_ADMIN_TOKEN` | reads the live release-tag ruleset and environment configuration during preflight | a `hasna` organization administrator |
+| `RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY` | GitHub App credentials; the workflow MINTS a short-lived installation token from them per run and exposes it to the preflight as `RELEASE_GITHUB_ADMIN_TOKEN`, which reads the live release-tag ruleset and environment configuration | any holder of the `hasna-identity` App credentials |
+
+`RELEASE_GITHUB_ADMIN_TOKEN` is deliberately **not** stored. A GitHub App
+installation token expires roughly an hour after it is minted, so storing one
+would turn this gate's honest "not configured" failure into a confusing
+authorization failure the first time a release ran more than an hour after
+provisioning. Minting per run is also better security than the PAT this
+originally called for: the credential is installation-scoped, repository-scoped,
+short-lived, and nothing durable exists to leak.
 
 Verify presence without reading either value:
 
