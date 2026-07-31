@@ -60,6 +60,14 @@ trigger the tool's own uncoordinated refresh).
   and `planParkedRecovery`, which both remain in force.
 - A husk (no refresh token) never propagates; with no restorable copy anywhere,
   nothing is written.
+- **A credential another account already claims is neither adopted nor
+  written.** The identity checks above are all *containment* checks — they ask
+  what the directory claims — and the central copy's is `() => true`, which
+  proves the slot is right and never that the bytes in it were legitimately
+  filed. Content binding (`sha256` of the refresh token; see
+  `docs/auth-store.md`) asks the question containment cannot, and it gates
+  sources and targets alike. Refused copies appear in `skipped` with the
+  conflicting uuid named — never silently.
 - Symlinked paths are refused; every write is atomic (temp + rename, mode 0600).
 - A failed exchange writes nothing.
 

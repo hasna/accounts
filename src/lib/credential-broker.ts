@@ -10,6 +10,13 @@ import {
   profileAccountUuid,
   type CredentialHealthPresent,
 } from "./auth-store.js";
+import {
+  buildCredentialClaimIndex,
+  credentialBindingRefusal,
+  credentialFingerprintFromBytes,
+  recordCredentialBinding,
+  type CredentialClaimIndex,
+} from "./credential-binding.js";
 import { dirCredentialsFile, liveClaudePaths, profileCredentialsSnapshot } from "./claude-layout.js";
 import { buildIdentityIndex, dirAccountUuid } from "./identity-index.js";
 import { withIdentityLock, withIdentityLockSync, type IdentityLockOptions } from "./identity-lock.js";
@@ -302,8 +309,23 @@ interface RankedCopy extends BrokerCopy {
  * `oauthAccount` is UNATTRIBUTABLE, and an unattributable credential is
  * exactly the thing that must not be adopted as an identity's record. Such a
  * dir could already never RECEIVE; it can now no longer DONATE either.
+ *
+ * CONTAINMENT IS NOT ENOUGH, AND THE COMMENT ABOVE ON THE CENTRAL COPY SAYS SO:
+ * `carriesThisAccount: () => true` proves the SLOT is right, never that the
+ * BYTES in it were legitimately filed. So each admitted candidate is checked a
+ * second time against its own CONTENT — the refresh token's fingerprint — and
+ * refused when some other account's central slot already claims it. That is the
+ * only question containment cannot ask, and it is the one that matters: a
+ * profile whose `oauth-account.json` says A while its `credentials.json` holds
+ * B's material passes every check above, and its file is the freshest on disk,
+ * which is precisely what ranking crowns.
  */
-function rankedCopies(copies: BrokerCopy[], report: { skipped: BrokerSkip[] }): RankedCopy[] {
+function rankedCopies(
+  accountUuid: string,
+  copies: BrokerCopy[],
+  claimIndex: CredentialClaimIndex,
+  report: { skipped: BrokerSkip[] },
+): RankedCopy[] {
   const out: RankedCopy[] = [];
   for (const copy of copies) {
     if (!existsNotSymlink(copy.path)) continue;
@@ -319,7 +341,13 @@ function rankedCopies(copies: BrokerCopy[], report: { skipped: BrokerSkip[] }): 
       });
       continue;
     }
-    out.push({ ...copy, health, bytes: readFileSync(copy.path) });
+    const bytes = readFileSync(copy.path);
+    const refusal = credentialBindingRefusal(accountUuid, bytes, claimIndex);
+    if (refusal) {
+      report.skipped.push({ path: copy.path, kind: copy.kind, reason: refusal.reason });
+      continue;
+    }
+    out.push({ ...copy, health, bytes });
   }
   return out;
 }
@@ -331,15 +359,37 @@ function rankedCopies(copies: BrokerCopy[], report: { skipped: BrokerSkip[] }): 
  *  - live/snapshot files are update-only (never created),
  *  - a dir whose occupant is no longer this account is skipped,
  *  - byte-identical copies are left alone,
- *  - symlinked paths are refused by `writeFileAtomic` and recorded as skips.
+ *  - symlinked paths are refused by `writeFileAtomic` and recorded as skips,
+ *  - a payload another account already claims reaches NO target, central
+ *    included (see `credential-binding.ts`).
  */
 function fanOut(
+  accountUuid: string,
   copies: BrokerCopy[],
   payload: Buffer,
   payloadHealth: CredentialHealthPresent,
+  claimIndex: CredentialClaimIndex,
   report: { writes: BrokerWrite[]; skipped: BrokerSkip[] },
   excludePath?: string,
 ): void {
+  // Defence in depth, not belt-and-braces theatre: the source gate should have
+  // stopped a foreign payload before it could be crowned, but the central slot
+  // is the ONE target whose containment check is vacuously true, so it is the
+  // one target that would accept anything the ranking handed it. That asymmetry
+  // is what made the original corruption one-directional INTO central.
+  const payloadRefusal = credentialBindingRefusal(accountUuid, payload, claimIndex);
+  if (payloadRefusal) {
+    for (const copy of copies) {
+      if (excludePath && resolve(copy.path) === resolve(excludePath)) continue;
+      // Only paths that would actually have been written: a copy that does not
+      // exist and may not be created was never a target, and reporting it as
+      // "refused" would inflate the skip list with non-events — the shape that
+      // teaches operators to stop reading it.
+      if (!existsNotSymlink(copy.path) && !copy.mayCreate) continue;
+      report.skipped.push({ path: copy.path, kind: copy.kind, reason: payloadRefusal.reason });
+    }
+    return;
+  }
   for (const copy of copies) {
     if (excludePath && resolve(copy.path) === resolve(excludePath)) continue;
     const exists = existsNotSymlink(copy.path);
@@ -365,6 +415,18 @@ function fanOut(
     try {
       writeFileAtomic(copy.path, payload, { mode: 0o600, mustStayUnder: copy.stayUnder });
       report.writes.push({ path: copy.path, kind: copy.kind, action: exists ? "updated" : "created" });
+      // The central slot accepting a payload IS the account taking ownership of
+      // it; record that so the claim survives the next in-place rotation of a
+      // sibling copy, and so a later cross-write has something to collide with.
+      if (copy.kind === "central") {
+        const fingerprint = credentialFingerprintFromBytes(payload);
+        if (fingerprint) {
+          recordCredentialBinding(accountUuid, fingerprint, {
+            evidence: "central-write",
+            sourceKind: "central",
+          });
+        }
+      }
     } catch (error) {
       report.skipped.push({
         path: copy.path,
@@ -379,7 +441,12 @@ function convergeLocked(accountUuid: string, tool: ToolDef, opts: BrokerOptions)
   const now = opts.now ?? Date.now;
   const report: ConvergeReport = { accountUuid, writes: [], skipped: [] };
   const copies = enumerateCopies(accountUuid, tool, opts);
-  const ranked = rankedCopies(copies, report);
+  // Built ONCE, under the lock, and reused for both the source and the target
+  // gate: a per-candidate rebuild would read the central store N times and —
+  // worse — could see it change mid-decision, so two candidates would be judged
+  // against two different worlds.
+  const claimIndex = buildCredentialClaimIndex();
+  const ranked = rankedCopies(accountUuid, copies, claimIndex, report);
   if (ranked.length === 0) return report;
 
   const winner = ranked.reduce((a, b) => (betterCredential(a.health, b.health) === a.health ? a : b));
@@ -392,7 +459,7 @@ function convergeLocked(accountUuid: string, tool: ToolDef, opts: BrokerOptions)
 
   report.winner = { path: winner.path, kind: winner.kind };
   report.expiresInMs = winner.health.expiresAt - now();
-  fanOut(copies, winner.bytes, winner.health, report, winner.path);
+  fanOut(accountUuid, copies, winner.bytes, winner.health, claimIndex, report, winner.path);
   return report;
 }
 
@@ -531,6 +598,15 @@ function normalizedUuid(accountUuid: string): string {
  *
  * A failed exchange writes NOTHING. The copies stay as they were; the old
  * access token keeps whatever validity it had.
+ *
+ * A CONTESTED CREDENTIAL IS NEVER EXCHANGED, and that falls out of the order
+ * rather than needing its own gate: converge runs first, the binding check
+ * refuses every copy of a credential two accounts claim, so there is no winner
+ * and this returns before reaching the token endpoint. That is the right
+ * outcome and worth naming — exchanging a credential whose true owner is
+ * another account would ROTATE THAT OWNER'S REFRESH TOKEN and revoke them,
+ * server-side and irreversibly, which is the exact harm the broker exists to
+ * prevent, delivered by the broker itself.
  */
 export async function ensureFreshIdentityCredential(
   accountUuid: string,
@@ -586,9 +662,30 @@ export async function ensureFreshIdentityCredential(
       writeFileAtomic(centralPath, payload, { mode: 0o600, mustStayUnder: accountsHome() });
       report.writes.push({ path: centralPath, kind: "central", action: centralExisted ? "updated" : "created" });
 
+      // This rotation is THIS account's by construction — the server minted it
+      // in exchange for this account's refresh token, which is a stronger proof
+      // of ownership than any file on disk can offer. Recording it here is what
+      // keeps the binding current across rotation: without it, the account's own
+      // freshly rotated credential would look unclaimed on the next converge.
+      const rotatedFingerprint = credentialFingerprintFromBytes(payload);
+      if (rotatedFingerprint) {
+        recordCredentialBinding(uuid, rotatedFingerprint, { evidence: "rotation", sourceKind: "exchange" });
+      }
+
       const payloadHealth = credentialHealth(centralPath);
       if (payloadHealth.exists) {
-        fanOut(enumerateCopies(uuid, tool, opts), payload, payloadHealth, report, centralPath);
+        // Index rebuilt AFTER the central write and the rebinding, so the
+        // fan-out is judged against the world the rotation just created rather
+        // than the one that preceded it.
+        fanOut(
+          uuid,
+          enumerateCopies(uuid, tool, opts),
+          payload,
+          payloadHealth,
+          buildCredentialClaimIndex(),
+          report,
+          centralPath,
+        );
       }
       report.winner = { path: centralPath, kind: "central" };
       report.expiresInMs = exchanged.expiresInS * 1000;
