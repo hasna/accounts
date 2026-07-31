@@ -103,6 +103,13 @@ with links after verification.
 | `accounts auth bindings` | `--json`, `--conflicts`; which credential each account claims. **Exits 1** when one credential is claimed by more than one account — see `docs/auth-store.md` |
 | `accounts health` | Alias `readiness`; `--json`; exits nonzero only when status is `unavailable` |
 | `accounts doctor` | `--accept-capability-baseline`; errors on missing dirs, stale pointers, or broken shared capabilities |
+| `accounts registry` | `-t, --tool`, `--json`, `--contradictions`; reconcile name, dir, identity and credential |
+| `accounts registry --invariant` | Report names held by more than one provider, over the merged universe |
+| `accounts registry --backfill-uuid` | Plan each profile's `accountUuid` from its parked identity; `--apply` to write (local transport only) |
+| `accounts registry --write-manifest` | Record today's `(name, provider)` pairs as the grandfather manifest; `--apply` to write |
+
+See [One name, one provider](name-invariant.md) for what the invariant checks,
+why it currently warns instead of refusing, and what flips it.
 
 See [Central auth snapshot store](auth-store.md) for sweep safeguards and
 compatibility behavior.

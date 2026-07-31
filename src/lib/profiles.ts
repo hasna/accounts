@@ -7,6 +7,7 @@ import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
 import { sameConfigDir } from "./safe-path.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
+import { isAccountUuid } from "./auth-store.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
 export type ProfileMetadata = Record<string, ProfileMetadataValue>;
@@ -184,6 +185,11 @@ export function addProfile(opts: AddOptions): Profile {
   const profile: Profile = {
     name,
     tool: toolId,
+    // Written alongside `tool`, not instead of it: every existing reader keeps
+    // working off `tool` for one release while new records already carry the
+    // canonical field, so the later flip has no backfill to do for anything
+    // created from here on.
+    provider: toolId,
     ...(email ? { email } : {}),
     ...(displayName !== undefined ? { displayName } : {}),
     ...(identity !== undefined ? { identity } : {}),
@@ -289,6 +295,12 @@ export interface UpdateOptions {
   metadata?: ProfileMetadata;
   description?: string;
   dir?: string;
+  /**
+   * The account uuid this profile belongs to, as backfilled from the dir's
+   * parked identity. Set only by the reconcile backfill, which refuses to
+   * overwrite a disagreeing value — see src/lib/uuid-backfill.ts.
+   */
+  accountUuid?: string;
 }
 
 export function updateProfile(name: string, opts: UpdateOptions): Profile {
@@ -316,6 +328,12 @@ export function updateProfile(name: string, opts: UpdateOptions): Profile {
     profile.metadata = { ...(profile.metadata ?? {}), ...(metadata ?? {}) };
   }
   if (opts.description !== undefined) profile.description = opts.description;
+  if (opts.accountUuid !== undefined) {
+    if (!isAccountUuid(opts.accountUuid)) {
+      throw new AccountsError(`accountUuid must be a uuid; got ${JSON.stringify(opts.accountUuid)}`);
+    }
+    profile.accountUuid = opts.accountUuid.toLowerCase();
+  }
   if (opts.dir !== undefined) {
     const dir = expandPath(opts.dir);
     if (store.profiles.some((p) => p !== profile && sameConfigDir(p.dir, dir))) {

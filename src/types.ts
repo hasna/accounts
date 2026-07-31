@@ -120,6 +120,18 @@ export const toolDefSchema = z.object({
   accountFile: z.string().optional(),
   emailPath: z.array(z.string()).optional(),
   /**
+   * A subdirectory of `defaultDir` in which the TOOL ITSELF keeps its profile
+   * directories, when it has its own profile mechanism (codewith:
+   * `~/.codewith/auth_profiles/<name>`).
+   *
+   * Declared here rather than mapped tool-by-tool in the enumerator because
+   * those directories hold real registry rows — 22 of the merged view's records
+   * are codewith — and an enumerator that hardcodes one tool's layout silently
+   * omits the next tool that grows one. Absent means the tool has no native
+   * profiles root and only the managed layout applies.
+   */
+  nativeProfilesDir: pathSegmentSchema.optional(),
+  /**
    * Capability directories (skills, subagents, …) that belong to the human, not
    * to the account: linked from the tool's shared home into every profile so one
    * corpus serves all of them. Credentials are never listed here.
@@ -234,9 +246,32 @@ function nonBlankStringSchema(label: string) {
   return z.string().refine((value) => value.trim().length > 0, `${label} must not be empty`);
 }
 
-export const profileSchema = z.object({
+/**
+ * The account uuid that owns this profile, as recorded in the central auth
+ * store at `<accountsHome>/auth/<uuid>/`. Optional because it is backfilled —
+ * a profile whose parked identity is unrecoverable keeps it absent and earns a
+ * health finding rather than a guessed binding.
+ */
+const accountUuidSchema = z
+  .string()
+  .regex(
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/,
+    "accountUuid must be a uuid",
+  );
+
+const profileObjectSchema = z.object({
   name: profileNameSchema,
   tool: slugSchema,
+  /**
+   * The canonical name for the field `tool` has always held. PR-1 introduces it
+   * as a MIRROR, not a replacement: `tool` stays the persisted key for one
+   * release so every existing reader keeps working, and new code reads through
+   * {@link profileProvider}. When the two disagree the record is refused rather
+   * than one being silently preferred — a record whose provider and tool point
+   * at different apps has no correct interpretation.
+   */
+  provider: slugSchema.optional(),
+  accountUuid: accountUuidSchema.optional(),
   email: z.string().email().optional(),
   displayName: nonBlankStringSchema("display name").optional(),
   identity: nonBlankStringSchema("identity").optional(),
@@ -248,7 +283,28 @@ export const profileSchema = z.object({
   lastUsedAt: z.string().optional(),
 });
 
+export const profileSchema = profileObjectSchema.superRefine((profile, ctx) => {
+  if (profile.provider !== undefined && profile.provider !== profile.tool) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["provider"],
+      message: `provider "${profile.provider}" disagrees with tool "${profile.tool}" for profile "${profile.name}"`,
+    });
+  }
+});
+
 export type Profile = z.infer<typeof profileSchema>;
+
+/**
+ * The provider a profile belongs to, read through the alias.
+ *
+ * The single accessor every new caller uses, so that flipping the persisted key
+ * from `tool` to `provider` in a later release is a change to this function
+ * rather than to every call site.
+ */
+export function profileProvider(profile: Pick<Profile, "tool"> & { provider?: string }): string {
+  return profile.provider ?? profile.tool;
+}
 
 export const storeSchema = z.object({
   version: z.literal(1),
