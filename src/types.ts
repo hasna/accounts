@@ -98,6 +98,35 @@ const sharedConfigSourceSchema = z
     return parts.every((part, index) => part !== ".." || index === 0);
   }, "may only ascend one level above the tool's shared home");
 
+/** One (target file, source files, keys) merge rule for a tool's shared config. */
+const sharedConfigSpecSchema = z.object({
+  /** Profile-relative JSON file the keys are merged into. */
+  target: pathSegmentSchema,
+  /**
+   * Shared-home-relative JSON files read for those keys, in priority order.
+   * Members are unioned across all of them and the first definition of a
+   * given member name wins, so put rendered files ahead of raw ones.
+   */
+  sources: z.array(sharedConfigSourceSchema).min(1).max(8),
+  keys: z.array(sharedConfigKeySchema).min(1).max(16),
+  /** Member names never shared into a profile, whatever a source says. */
+  exclude: z.array(sharedConfigMemberSchema).max(64).optional(),
+  /**
+   * Refuse to launch the profile when the machine declares these keys and the
+   * profile still lacks them after seeding. For safety configuration whose
+   * absence has no symptom — a hook that is not registered simply never fires,
+   * so a profile missing it is indistinguishable from a guarded one until the
+   * incident it was built to prevent.
+   *
+   * Deliberately opt-in per spec rather than applied to every shared key: a
+   * missing MCP server is a degraded session, while a missing guard is a silent
+   * one, and only the second is worth refusing to start over.
+   */
+  required: z.boolean().optional(),
+});
+
+export type SharedConfigSpec = z.infer<typeof sharedConfigSpecSchema>;
+
 const portableEnvNameSchema = z
   .string()
   .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "must be a portable environment variable name");
@@ -141,21 +170,17 @@ export const toolDefSchema = z.object({
    * Capability configuration that cannot be linked because the profile's own
    * file is rewritten in place (Claude Code stores MCP servers alongside OAuth
    * state). The listed keys are merged member-by-member instead.
+   *
+   * A LIST, because one tool can keep shared capability in more than one file
+   * and the two are not interchangeable: Claude Code reads MCP servers from
+   * `.claude.json` and hooks from `settings.json`. A single spec forced one
+   * target, so whichever file lost the argument could never be seeded — which
+   * is how every profile minted after a hook sweep was born without the hook
+   * while looking completely normal. A bare object stays valid and means one
+   * spec, so custom tools already in the registry keep working.
    */
   sharedConfig: z
-    .object({
-      /** Profile-relative JSON file the keys are merged into. */
-      target: pathSegmentSchema,
-      /**
-       * Shared-home-relative JSON files read for those keys, in priority order.
-       * Members are unioned across all of them and the first definition of a
-       * given member name wins, so put rendered files ahead of raw ones.
-       */
-      sources: z.array(sharedConfigSourceSchema).min(1).max(8),
-      keys: z.array(sharedConfigKeySchema).min(1).max(16),
-      /** Member names never shared into a profile, whatever a source says. */
-      exclude: z.array(sharedConfigMemberSchema).max(64).optional(),
-    })
+    .union([sharedConfigSpecSchema, z.array(sharedConfigSpecSchema).min(1).max(8)])
     .optional(),
   /**
    * Where the tool keeps conversation history, so a session started under one

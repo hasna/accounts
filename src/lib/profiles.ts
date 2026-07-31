@@ -94,6 +94,15 @@ function resolveProfileFromStore(store: Store, name: string, toolId?: string): P
   return matches[0]!;
 }
 
+/** A tool's default dir, or undefined when the tool is not resolvable here. */
+function safeToolDefaultDir(toolId: string): string | undefined {
+  try {
+    return getTool(toolId).defaultDir;
+  } catch {
+    return undefined;
+  }
+}
+
 function isManagedProfileDir(dir: string): boolean {
   const rel = relative(resolve(profilesDir()), resolve(dir));
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
@@ -237,19 +246,42 @@ export function removeProfile(
   if (store.toolLocks[profile.name] === profile.tool) delete store.toolLocks[profile.name];
   saveStore(store);
 
-  let purged = false;
-  let purgeNote: string | undefined;
-  if (options.purge) {
-    const managed = isManagedProfileDir(profile.dir);
-    const isDefault = profile.dir === getTool(profile.tool).defaultDir;
-    if (managed && !isDefault && existsSync(profile.dir)) {
-      rmSync(profile.dir, { recursive: true, force: true });
-      purged = true;
-    } else {
-      purgeNote = `refused to delete ${profile.dir} (not a managed profile dir); remove it manually if intended`;
-    }
-  }
+  const { purged, purgeNote } = options.purge ? purgeProfileDir(profile) : { purged: false, purgeNote: undefined };
   return { profile, purged, purgeNote };
+}
+
+/**
+ * Delete a profile's managed config dir. Shared by the local and hosted stores
+ * because a PROFILE DIR IS ALWAYS MACHINE-LOCAL — which store holds the row says
+ * nothing about where the bytes are. The hosted path used to skip this and
+ * report it as "a local-only operation", which left the directory behind after
+ * the row that named it was gone: an orphan no `accounts` command can list,
+ * still holding whatever the profile accumulated, including `.credentials.json`.
+ * A dir invisible to the tool that made it is exactly the population an audit
+ * cannot see.
+ *
+ * The guards are unchanged: never a dir outside the managed profile root, never
+ * the tool's own default dir, and a refusal is reported rather than performed.
+ */
+export function purgeProfileDir(profile: Profile): { purged: boolean; purgeNote?: string } {
+  const managed = isManagedProfileDir(profile.dir);
+  // `isManagedProfileDir` is the guard that matters: it admits only paths
+  // strictly under the managed profiles root, which no tool's default dir is.
+  // The default-dir comparison is a second belt for a tool configured to live
+  // inside that root — so a tool the local registry cannot resolve (a custom
+  // tool that exists only in the hosted registry) means "no default dir to
+  // protect", not "refuse". Letting `getTool` throw here would turn the purge of
+  // a cloud-registered custom tool's profile back into the orphan this fixes.
+  const isDefault = profile.dir === safeToolDefaultDir(profile.tool);
+  if (managed && !isDefault && existsSync(profile.dir)) {
+    rmSync(profile.dir, { recursive: true, force: true });
+    return { purged: true };
+  }
+  if (!existsSync(profile.dir)) return { purged: false };
+  return {
+    purged: false,
+    purgeNote: `refused to delete ${profile.dir} (not a managed profile dir); remove it manually if intended`,
+  };
 }
 
 export function renameProfile(oldName: string, newName: string, toolId?: string): Profile {

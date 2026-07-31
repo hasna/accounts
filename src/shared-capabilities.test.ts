@@ -25,6 +25,7 @@ import {
   ensureSharedCapabilities,
   resetCapabilityBaseline,
   sharedCapabilityHealth,
+  sharedConfigsFor,
   sharedHomeFor,
 } from "./lib/shared-capabilities.js";
 
@@ -431,7 +432,8 @@ test("excluded members are never shared into a profile", () => {
   const p = addProfile({ name: "excluded" });
   const servers = readJson(join(p.dir, ".claude.json")).mcpServers as Record<string, unknown>;
   expect(Object.keys(servers)).toEqual(["todos"]);
-  expect(getTool("claude").sharedConfig!.exclude).toContain("secrets");
+  const accountSpec = sharedConfigsFor(getTool("claude")).find((c) => c.target === ".claude.json");
+  expect(accountSpec!.exclude).toContain("secrets");
 });
 
 test("switchProfile materializes shared capabilities even when it applies live auth", async () => {
@@ -526,4 +528,154 @@ test("tool definitions may not contain NUL bytes in shared paths", () => {
       sharedConfig: { target: "config.json", sources: ["set\u0000tings.json"], keys: ["mcpServers"] },
     }),
   ).toThrow(AccountsError);
+});
+
+// --- hooks reach the profile's own settings.json (70d05ea6 / 189da2d6) -------
+//
+// Claude Code loads hooks from $CLAUDE_CONFIG_DIR/settings.json, and `accounts`
+// sets CLAUDE_CONFIG_DIR to the profile dir. Before this test existed, the only
+// key the creation path propagated was `mcpServers`, and it wrote it to
+// `.claude.json` — so a hook configured on the machine could not reach a new
+// profile by any route, and every profile minted after a guard sweep was born
+// unguarded while looking completely normal (measured 2026-07-31: guard coverage
+// brought to 30/30, next profile created minutes later was 0/2).
+
+/** Shape Claude Code actually reads: event -> matcher groups -> command hooks. */
+function seedSharedHooks(root: string, command: string): void {
+  writeFileSync(
+    join(root, "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command, timeout: 10 }] }],
+      },
+    }),
+  );
+}
+
+test("a profile is BORN with the machine's hooks in its own settings.json", () => {
+  seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
+
+  const p = addProfile({ name: "guarded-at-birth" });
+
+  const settingsPath = join(p.dir, "settings.json");
+  expect(existsSync(settingsPath)).toBe(true);
+  const hooks = readJson(settingsPath).hooks as Record<string, unknown[]>;
+  expect(JSON.stringify(hooks)).toContain("/opt/guards/env-dump-guard.sh");
+  expect(hooks.PreToolUse).toHaveLength(1);
+});
+
+test("seeding hooks does not disturb the profile's own settings or the mcp merge", () => {
+  seedSharedHooks(sharedHome, "/opt/guards/layout-guard.sh");
+  const p = addProfile({ name: "coexist" });
+
+  // The account file merge is unchanged: mcpServers still lands in .claude.json.
+  const servers = readJson(join(p.dir, ".claude.json")).mcpServers as Record<string, unknown>;
+  expect(Object.keys(servers).sort()).toEqual(["notes", "todos"]);
+  // ...and hooks did NOT leak into the account file.
+  expect(readJson(join(p.dir, ".claude.json")).hooks).toBeUndefined();
+
+  // A key the profile owns survives a re-run that seeds nothing new.
+  const settingsPath = join(p.dir, "settings.json");
+  const settings = readJson(settingsPath);
+  writeFileSync(settingsPath, JSON.stringify({ ...settings, theme: "dark" }));
+  ensureSharedCapabilities(p.dir, getTool("claude"));
+  const after = readJson(settingsPath);
+  expect(after.theme).toBe("dark");
+  expect(JSON.stringify(after.hooks)).toContain("/opt/guards/layout-guard.sh");
+});
+
+test("a profile's own hook event wins, and unseen events are still seeded", () => {
+  writeFileSync(
+    join(sharedHome, "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "/shared/pre.sh" }] }],
+        SessionStart: [{ hooks: [{ type: "command", command: "/shared/start.sh" }] }],
+      },
+    }),
+  );
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "own-hooks" });
+  writeFileSync(
+    join(p.dir, "settings.json"),
+    JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "/profile/pre.sh" }] }] } }),
+  );
+
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+  ensureSharedCapabilities(p.dir, getTool("claude"));
+
+  const hooks = readJson(join(p.dir, "settings.json")).hooks as Record<string, unknown>;
+  // union by member name, profile always wins — the documented merge semantics
+  expect(JSON.stringify(hooks.PreToolUse)).toContain("/profile/pre.sh");
+  expect(JSON.stringify(hooks.PreToolUse)).not.toContain("/shared/pre.sh");
+  expect(JSON.stringify(hooks.SessionStart)).toContain("/shared/start.sh");
+});
+
+test("sharedCapabilityHealth reports an unguarded profile as a problem", () => {
+  seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "unhealthy" });
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+
+  const health = sharedCapabilityHealth(p.dir, getTool("claude"));
+  const hooksRow = health.config.find((c) => c.key === "hooks");
+  expect(hooksRow).toBeDefined();
+  expect(hooksRow!.status).toBe("missing");
+  expect(hooksRow!.target).toBe(join(p.dir, "settings.json"));
+});
+
+// --- the startup assertion (70d05ea6 step 5) --------------------------------
+//
+// Seeding fixes the creation path; this is what stops the fix decaying again.
+// Both directions are asserted, because an assertion that cannot refuse is
+// decoration and one that cannot pass bricks every launch on the machine.
+
+test("profileEnv REFUSES a profile missing required shared config", () => {
+  seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "bare" });
+  expect(existsSync(join(p.dir, "settings.json"))).toBe(false);
+
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+  // Make the seed that profileEnv attempts fail, so the profile is still bare
+  // when the assertion runs — the real-world case is an unwritable dir.
+  writeFileSync(join(p.dir, "settings.json"), "{ not json");
+
+  expect(() => profileEnv(p, getTool("claude"))).toThrow(AccountsError);
+  expect(() => profileEnv(p, getTool("claude"))).toThrow(/refusing to launch/);
+});
+
+test("the refusal names its own override, and the override works", () => {
+  seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
+  const p = addProfile({ name: "override" });
+  writeFileSync(join(p.dir, "settings.json"), "{ not json");
+
+  let message = "";
+  try {
+    profileEnv(p, getTool("claude"));
+  } catch (err) {
+    message = (err as Error).message;
+  }
+  expect(message).toContain("ACCOUNTS_ALLOW_UNGUARDED_PROFILE");
+
+  process.env.ACCOUNTS_ALLOW_UNGUARDED_PROFILE = "1";
+  try {
+    expect(profileEnv(p, getTool("claude")).CLAUDE_CONFIG_DIR).toBe(p.dir);
+  } finally {
+    delete process.env.ACCOUNTS_ALLOW_UNGUARDED_PROFILE;
+  }
+});
+
+test("the assertion PASSES for a normally created profile, and on a machine with no hooks", () => {
+  // (a) machine declares hooks -> profile is seeded -> launch proceeds.
+  seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
+  const guarded = addProfile({ name: "normal" });
+  expect(profileEnv(guarded, getTool("claude")).CLAUDE_CONFIG_DIR).toBe(guarded.dir);
+
+  // (b) machine declares NO hooks -> nothing to enforce -> launch proceeds.
+  // Without this the check would refuse every launch on every machine that does
+  // not use hooks, which is the same defect pointed the other way.
+  rmSync(join(sharedHome, "settings.json"), { force: true });
+  const plain = addProfile({ name: "no-hooks-machine" });
+  expect(profileEnv(plain, getTool("claude")).CLAUDE_CONFIG_DIR).toBe(plain.dir);
 });

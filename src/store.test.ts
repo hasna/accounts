@@ -354,6 +354,45 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(loadMachineStore().applied).toEqual({});
     });
 
+    // dd52424e: the hosted path reported `--purge` as "a local-only operation"
+    // and left the directory behind. The row went, the dir stayed — an orphan no
+    // `accounts` command can list, still holding `.credentials.json`. A profile
+    // dir is machine-local regardless of which store holds the row.
+    test("API removeProfile --purge deletes the machine-local config dir", async () => {
+      const dir = join(home, "profiles", "acme", "doomed");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "settings.json"), JSON.stringify({ theme: "light" }));
+      // Positive control: the detector sees the dir while it is genuinely there,
+      // so a later `false` is an observation and not a broken check.
+      expect(existsSync(dir)).toBe(true);
+
+      const { fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        if (c.method === "DELETE") return { status: 204, body: null };
+        return { status: 200, body: { tool: "acme", name: "doomed", dir, createdAt: "2020-01-01T00:00:00Z" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const result = await store.removeProfile("doomed", { tool: "acme", purge: true });
+
+      expect(result.purged).toBe(true);
+      expect(result.purgeNote).toBeUndefined();
+      expect(existsSync(dir)).toBe(false);
+    });
+
+    test("API removeProfile without --purge leaves the dir alone", async () => {
+      const dir = join(home, "profiles", "acme", "kept");
+      mkdirSync(dir, { recursive: true });
+      const { fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        if (c.method === "DELETE") return { status: 204, body: null };
+        return { status: 200, body: { tool: "acme", name: "kept", dir, createdAt: "2020-01-01T00:00:00Z" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const result = await store.removeProfile("kept", { tool: "acme" });
+      expect(result.purged).toBe(false);
+      expect(existsSync(dir)).toBe(true);
+    });
+
     test("switching from cloud to explicit local mode clears remote tool state", async () => {
       const { fetchImpl } = mockFetch(() => ({
         status: 200,
