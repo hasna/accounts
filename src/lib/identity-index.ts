@@ -513,8 +513,22 @@ export function accountLiveDoorsElsewhere(
  * write set must range over the same doors, so this one ranges over all of them.
  *
  * Ownership is decided the same way the index builds roles: a dir OWNS this
- * account when it also carries an `own-identity` door for it. A dir with no
- * such door is not this account's — fail closed and report it as a guest.
+ * account when it also carries an `own-identity` door for it, and a dir with no
+ * such door is reported as a guest.
+ *
+ * KNOWN GAP — this does NOT fail closed on an unreadable own-binding, and an
+ * earlier version of this comment claimed that it did. `buildIdentityIndex`
+ * computes `own = snapshotOwn ?? (occupant && profileAccountUuid(...) === occupant ...)`,
+ * and when the parked snapshot is missing OR CORRUPT, `profileAccountUuid`
+ * falls through to the dir's LIVE account file — the very file that makes the
+ * dir a guest candidate. A guest whose `oauth-account.json` is unparseable
+ * therefore mints an `own-identity` door and is classified here as an owner.
+ * Measured at the time of writing: unreachable on this fleet (no registered
+ * profile has a corrupt own-binding snapshot) and doubly guarded in practice,
+ * because every real guest dir also carries a `switched-account.json` marker and
+ * `profileAccountUuid` DOES fail closed on an existing marker. Closing it
+ * properly belongs to the index's ownership rule rather than to this predicate;
+ * do not read this function as a fail-closed guard until that lands.
  */
 export function accountGuestOccupantDoorsElsewhere(
   index: ReadonlyArray<AccountIdentity>,
