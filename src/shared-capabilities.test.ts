@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addProfile, removeProfile } from "./lib/profiles.js";
+import { addProfile, purgeProfileDir, removeProfile } from "./lib/profiles.js";
 import { addCustomTool, getTool } from "./lib/tools.js";
 import { profileEnv } from "./lib/env.js";
 import { switchProfile } from "./lib/switch.js";
@@ -25,6 +25,7 @@ import {
   ensureSharedCapabilities,
   resetCapabilityBaseline,
   sharedCapabilityHealth,
+  assertProfileGuarded,
   sharedConfigsFor,
   sharedHomeFor,
 } from "./lib/shared-capabilities.js";
@@ -678,4 +679,119 @@ test("the assertion PASSES for a normally created profile, and on a machine with
   rmSync(join(sharedHome, "settings.json"), { force: true });
   const plain = addProfile({ name: "no-hooks-machine" });
   expect(profileEnv(plain, getTool("claude")).CLAUDE_CONFIG_DIR).toBe(plain.dir);
+});
+
+// --- P1 from adversarial review (Seneca, PR #105): partial coverage ---------
+//
+// specHealth compared member COUNTS, so any one hook event made a profile pass.
+// Measured live on station01 during that review: the shared home declared
+// PreToolUse AND SessionStart, and 30 of 30 profiles held only PreToolUse — all
+// 30 would have reported "shared" and launched. The comparison has to be over
+// the declared member NAMES.
+
+test("a profile holding only SOME of the machine's hook events is NOT healthy", () => {
+  writeFileSync(
+    join(sharedHome, "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "/shared/pre.sh" }] }],
+        SessionStart: [{ hooks: [{ type: "command", command: "/shared/start.sh" }] }],
+      },
+    }),
+  );
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "partial" });
+  writeFileSync(
+    join(p.dir, "settings.json"),
+    JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "/own/pre.sh" }] }] } }),
+  );
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+
+  const row = sharedCapabilityHealth(p.dir, getTool("claude")).config.find((c) => c.key === "hooks");
+  expect(row!.status).toBe("missing");
+  expect(row!.reason).toContain("SessionStart");
+  // ...and the launch assertion must act on it, not just report it.
+  expect(() => assertProfileGuarded(p.dir, getTool("claude"))).toThrow(/refusing to launch/);
+});
+
+test("a hook event present but EMPTY counts as absent, not as covered", () => {
+  seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "hollow" });
+  // The permanently-unguarded shape: union-by-member never fills an existing
+  // member, so this profile would never be seeded AND never be refused.
+  writeFileSync(join(p.dir, "settings.json"), JSON.stringify({ hooks: { PreToolUse: [] } }));
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+
+  expect(readFileSync(join(p.dir, "settings.json"), "utf8")).not.toContain("env-dump-guard");
+  const row = sharedCapabilityHealth(p.dir, getTool("claude")).config.find((c) => c.key === "hooks");
+  expect(row!.status).toBe("missing");
+  expect(() => assertProfileGuarded(p.dir, getTool("claude"))).toThrow(/refusing to launch/);
+});
+
+test("a profile with every declared event, under its own commands, stays healthy", () => {
+  // The passing state, so the stricter check is not one that can only refuse.
+  writeFileSync(
+    join(sharedHome, "settings.json"),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "/shared/pre.sh" }] }],
+        SessionStart: [{ hooks: [{ type: "command", command: "/shared/start.sh" }] }],
+      },
+    }),
+  );
+  const p = addProfile({ name: "complete" });
+  const row = sharedCapabilityHealth(p.dir, getTool("claude")).config.find((c) => c.key === "hooks");
+  expect(row!.status).toBe("shared");
+  expect(() => assertProfileGuarded(p.dir, getTool("claude"))).not.toThrow();
+});
+
+// --- P1 from adversarial review: the purge deleted a path it was HANDED -----
+//
+// `isManagedProfileDir` is lexical, so a symlink under the profiles root
+// satisfied it while pointing anywhere. On the hosted path `profile.dir` comes
+// from an API response, which made the delete target remote-controlled. The
+// reviewer walked past the guard and deleted a different live profile's dir,
+// `.credentials.json` and all.
+
+test("purge REFUSES a symlink under the profiles root that points elsewhere", () => {
+  const victim = join(home, "precious");
+  mkdirSync(victim, { recursive: true });
+  writeFileSync(join(victim, ".credentials.json"), JSON.stringify({ token: "PLACEHOLDER" }));
+
+  const real = addProfile({ name: "decoy" });
+  const evilName = "evil";
+  const evilDir = join(home, "profiles", "claude", evilName);
+  symlinkSync(victim, evilDir);
+
+  // Positive control: the victim is genuinely there before the attempt, so a
+  // later `true` is an observation rather than a check that cannot fail.
+  expect(existsSync(join(victim, ".credentials.json"))).toBe(true);
+
+  const result = purgeProfileDir({ ...real, name: evilName, dir: evilDir });
+  expect(result.purged).toBe(false);
+  expect(result.purgeNote).toContain("not the managed dir");
+  expect(existsSync(join(victim, ".credentials.json"))).toBe(true);
+});
+
+test("purge REFUSES a dir that is managed but belongs to a different profile", () => {
+  const mine = addProfile({ name: "mine" });
+  const theirs = addProfile({ name: "theirs" });
+  writeFileSync(join(theirs.dir, ".credentials.json"), JSON.stringify({ token: "PLACEHOLDER" }));
+  expect(existsSync(join(theirs.dir, ".credentials.json"))).toBe(true);
+
+  // The hosted store hands us a row whose `dir` disagrees with its own name.
+  const result = purgeProfileDir({ ...mine, dir: theirs.dir });
+  expect(result.purged).toBe(false);
+  expect(existsSync(join(theirs.dir, ".credentials.json"))).toBe(true);
+});
+
+test("purge still deletes the profile's OWN managed dir", () => {
+  // The passing state — a guard that refuses everything is not a fix.
+  const p = addProfile({ name: "genuine" });
+  expect(existsSync(p.dir)).toBe(true);
+  const result = purgeProfileDir(p);
+  expect(result.purged).toBe(true);
+  expect(result.purgeNote).toBeUndefined();
+  expect(existsSync(p.dir)).toBe(false);
 });

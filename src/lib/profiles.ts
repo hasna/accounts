@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { type Profile, type Store, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
@@ -94,17 +94,31 @@ function resolveProfileFromStore(store: Store, name: string, toolId?: string): P
   return matches[0]!;
 }
 
-/** A tool's default dir, or undefined when the tool is not resolvable here. */
-function safeToolDefaultDir(toolId: string): string | undefined {
+/**
+ * Containment decided on REAL paths, for the one caller that deletes.
+ *
+ * This replaces a purely lexical predicate that resolved neither side. The
+ * lexical form was the only containment check the purge had, and it is the one
+ * a reviewer walked past with a symlink.
+ *
+ * `isManagedProfileDir` is purely lexical, so a symlink sitting under the
+ * profiles root satisfies it while pointing anywhere on the machine. That is
+ * harmless for the read-only callers, and not harmless for `rmSync`: a reviewer
+ * walked past the lexical guard with a symlink and deleted a different live
+ * profile's dir, `.credentials.json` and all. Resolving both sides first closes
+ * it, and refusing when the path does not resolve keeps the failure a refusal
+ * rather than a delete of whatever the parent happens to be.
+ */
+function isRealManagedProfileDir(dir: string): boolean {
+  let realRoot: string;
+  let realDir: string;
   try {
-    return getTool(toolId).defaultDir;
+    realRoot = realpathSync(profilesDir());
+    realDir = realpathSync(dir);
   } catch {
-    return undefined;
+    return false;
   }
-}
-
-function isManagedProfileDir(dir: string): boolean {
-  const rel = relative(resolve(profilesDir()), resolve(dir));
+  const rel = relative(realRoot, realDir);
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
@@ -264,24 +278,35 @@ export function removeProfile(
  * the tool's own default dir, and a refusal is reported rather than performed.
  */
 export function purgeProfileDir(profile: Profile): { purged: boolean; purgeNote?: string } {
-  const managed = isManagedProfileDir(profile.dir);
-  // `isManagedProfileDir` is the guard that matters: it admits only paths
-  // strictly under the managed profiles root, which no tool's default dir is.
-  // The default-dir comparison is a second belt for a tool configured to live
-  // inside that root — so a tool the local registry cannot resolve (a custom
-  // tool that exists only in the hosted registry) means "no default dir to
-  // protect", not "refuse". Letting `getTool` throw here would turn the purge of
-  // a cloud-registered custom tool's profile back into the orphan this fixes.
-  const isDefault = profile.dir === safeToolDefaultDir(profile.tool);
-  if (managed && !isDefault && existsSync(profile.dir)) {
-    rmSync(profile.dir, { recursive: true, force: true });
-    return { purged: true };
+  if (!profile.dir || !existsSync(profile.dir)) return { purged: false };
+
+  // DERIVE the path to delete; never delete the one we were handed. On the
+  // hosted path `profile.dir` arrives in an API response, so trusting it makes
+  // the delete target remote-controlled. The canonical managed location is a
+  // pure function of (profiles root, tool, name), so the supplied dir only has
+  // to AGREE with it — and a supplied path that disagrees is refused and
+  // reported rather than deleted.
+  const expected = join(profilesDir(), profile.tool, profile.name);
+  if (!isRealManagedProfileDir(profile.dir) || !samePathOnDisk(profile.dir, expected)) {
+    return {
+      purged: false,
+      purgeNote:
+        `refused to delete ${profile.dir}: it is not the managed dir for ${profile.tool}/${profile.name} ` +
+        `(expected ${expected}). Remove it manually if that is genuinely intended.`,
+    };
   }
-  if (!existsSync(profile.dir)) return { purged: false };
-  return {
-    purged: false,
-    purgeNote: `refused to delete ${profile.dir} (not a managed profile dir); remove it manually if intended`,
-  };
+
+  rmSync(expected, { recursive: true, force: true });
+  return { purged: true };
+}
+
+/** Both paths resolved, so a symlink cannot make two different dirs compare equal. */
+function samePathOnDisk(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
 }
 
 export function renameProfile(oldName: string, newName: string, toolId?: string): Profile {

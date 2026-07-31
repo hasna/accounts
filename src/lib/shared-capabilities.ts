@@ -598,10 +598,40 @@ function specHealth(sharedHome: string, profileDir: string, config: SharedConfig
       return { key, status: "unreadable" as const, target: targetPath, shared: sharedCount, profile: 0, reason: doc.reason };
     }
     const value = doc.state === "object" ? doc.value[key] : undefined;
-    const profileCount = isPlainObject(value) ? Object.keys(value).length : 0;
-    const status = sharedCount === 0 ? "unavailable" : profileCount === 0 ? "missing" : "shared";
-    return { key, status, target: targetPath, shared: sharedCount, profile: profileCount };
+    const profileValue = isPlainObject(value) ? value : undefined;
+    const profileCount = profileValue ? Object.keys(profileValue).length : 0;
+    if (sharedCount === 0) {
+      return { key, status: "unavailable" as const, target: targetPath, shared: 0, profile: profileCount };
+    }
+    // Compare the declared member NAMES, never the counts. A count answers "does
+    // the profile have any hooks at all", which is not the question: a profile
+    // carrying `PreToolUse` while the machine also declares `SessionStart` has a
+    // real, missing guard and a count of 1. Measured on this box by the reviewer:
+    // 30 of 30 live profiles are in exactly that state, and every one of them
+    // would have reported "shared". A member present but EMPTY is also absent —
+    // union-by-member never fills it, so it would be permanently unguarded while
+    // reporting healthy, which is the check-that-cannot-fail this exists to stop.
+    const absent = Object.keys(shared[key] ?? {}).filter((member) => {
+      const held = profileValue?.[member];
+      return held === undefined || isVacuous(held);
+    });
+    const status = absent.length > 0 ? ("missing" as const) : ("shared" as const);
+    return {
+      key,
+      status,
+      target: targetPath,
+      shared: sharedCount,
+      profile: profileCount,
+      ...(absent.length > 0 ? { reason: `missing or empty: ${absent.join(", ")}` } : {}),
+    };
   });
+}
+
+/** Present in name only: an empty array or object carries no configuration. */
+function isVacuous(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length === 0;
+  if (isPlainObject(value)) return Object.keys(value).length === 0;
+  return false;
 }
 
 /**
