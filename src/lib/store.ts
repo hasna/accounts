@@ -64,6 +64,13 @@ import {
 import { loadStore } from "../storage.js";
 import { resolveAccountsCloud, type AccountsCloudApi } from "./cloud-accounts.js";
 import { assertSafeWritePath } from "./safe-path.js";
+import { assertNameFree, type NameInvariantVerdict } from "./name-invariant.js";
+import { grandfatheredPairs } from "./grandfather-manifest.js";
+import {
+  enumerateProfileDirs,
+  mergedNameUniverse,
+  type DiscoveredProfileDir,
+} from "./profile-namespaces.js";
 
 export interface CurrentEntry {
   tool: string;
@@ -98,6 +105,39 @@ export interface AccountsStore {
   addTool(def: ToolDef): Promise<ToolDef>;
   /** Remove a custom tool from the active registry. */
   removeTool(id: string): Promise<void>;
+  /**
+   * Evaluate one-name-one-provider for a prospective binding, against the
+   * MERGED universe this transport can see.
+   *
+   * Part of the contract rather than a helper each caller assembles, because
+   * the enforcement point is the thing the design's first review cycle got
+   * wrong: a check built from `loadStore()` sees 14 of 23 colliding records and
+   * cannot see two of the named fixtures at all. Putting it here means both
+   * transports answer from their own authoritative view.
+   *
+   * PR-1 semantics are WARN: this RETURNS a verdict and does not throw. The
+   * existing per-store hard rejections (`nameConflict` in profiles.ts and in
+   * AccountsRepo) are untouched and still refuse a duplicate — this adds
+   * coverage over the merged universe, it does not relax anything.
+   */
+  assertNameFree(name: string, provider: string): Promise<NameInvariantVerdict>;
+}
+
+/**
+ * The universe + grandfather set a store evaluates the invariant against.
+ *
+ * Shared by both transports so "what counts as the universe" is written once;
+ * only the record source differs.
+ */
+async function evaluateAgainstUniverse(
+  records: readonly Profile[],
+  discovered: readonly DiscoveredProfileDir[],
+  name: string,
+  provider: string,
+): Promise<NameInvariantVerdict> {
+  return assertNameFree(name, provider, mergedNameUniverse(records, discovered), {
+    grandfathered: grandfatheredPairs(),
+  });
 }
 
 /** On-box JSON registry. Delegates to the core profile library. */
@@ -149,6 +189,12 @@ class LocalStore implements AccountsStore {
   }
   async removeTool(id: string): Promise<void> {
     localRemoveCustomTool(id);
+  }
+  async assertNameFree(name: string, provider: string): Promise<NameInvariantVerdict> {
+    // Registry rows PLUS on-disk dirs: in local mode the registry file is known
+    // to describe a fraction of the machine (8 of 28 claude dirs measured), so
+    // the file alone would under-report.
+    return evaluateAgainstUniverse(await this.listProfiles(), enumerateProfileDirs(await this.listTools()), name, provider);
   }
 }
 
@@ -297,6 +343,19 @@ class ApiStore implements AccountsStore {
     if (isBuiltinTool(id)) throw new AccountsError(`"${id}" is a built-in tool and cannot be removed`);
     await this.api.removeTool(id);
     await this.refreshToolCache();
+  }
+
+  /**
+   * Client-side PRE-FLIGHT only. The server's own write path is authoritative:
+   * `AccountsRepo.create`/`rename` refuse a duplicate whatever this returns, so
+   * a client that skipped this check still cannot create one. This exists to
+   * give the operator the provider and email of the holder before they spend a
+   * login on a name that will be refused.
+   */
+  async assertNameFree(name: string, provider: string): Promise<NameInvariantVerdict> {
+    // Server rows are the primary universe (they ARE what `accounts list`
+    // returns); local dirs are supplementary and catch unregistered drift.
+    return evaluateAgainstUniverse(await this.listProfiles(), enumerateProfileDirs(await this.listTools()), name, provider);
   }
 
   /** Pull the cloud custom-tool set into the process-local resolution cache. */
