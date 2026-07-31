@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
 import chalk from "chalk";
-import { AccountsError, type Profile } from "./types.js";
+import { AccountsError, profileProvider, type Profile, type ToolDef } from "./types.js";
 import {
   DEFAULT_TOOL,
   getTool,
@@ -85,6 +85,10 @@ import {
   statusNeedsOperator,
 } from "./lib/identity-index.js";
 import { buildProfileRegistry, credentialKeyForEntry } from "./lib/profile-registry.js";
+import { applyAccountUuidBackfill, planAccountUuidBackfill, summarizeBackfill } from "./lib/uuid-backfill.js";
+import { crossProviderCollisions, NAME_INVARIANT_MODE } from "./lib/name-invariant.js";
+import { enumerateProfileDirs, mergedNameUniverse } from "./lib/profile-namespaces.js";
+import { grandfatherManifestPath, writeGrandfatherManifest } from "./lib/grandfather-manifest.js";
 import {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_MIN_HEADROOM,
@@ -1756,15 +1760,158 @@ program
     }),
   );
 
+/**
+ * The PR-1 reconcile modes: the merged-universe invariant report, the
+ * accountUuid backfill, and the grandfather manifest.
+ *
+ * All three read ONE enumeration — store records (primary) plus every on-disk
+ * provider namespace including tool-native roots (supplementary). The design's
+ * first review cycle failed precisely because the gate and the enumerator read
+ * different stores, so they are wired to the same source here rather than each
+ * assembling its own.
+ */
+async function runRegistryInvariantModes(
+  tool: ToolDef,
+  opts: { json?: boolean; invariant?: boolean; backfillUuid?: boolean; apply?: boolean; writeManifest?: boolean },
+): Promise<void> {
+  const store = resolveStore();
+  const records = await store.listProfiles();
+  const discovered = enumerateProfileDirs(await store.listTools());
+  const universe = mergedNameUniverse(records, discovered);
+  const collisions = crossProviderCollisions(universe);
+
+  const result: Record<string, unknown> = {
+    transport: store.transport,
+    mode: NAME_INVARIANT_MODE,
+    universe: { records: records.length, discoveredDirs: discovered.length, bindings: universe.length },
+  };
+
+  if (opts.invariant || opts.writeManifest) {
+    result.collisions = collisions;
+  }
+
+  if (opts.writeManifest) {
+    const manifest = opts.apply
+      ? writeGrandfatherManifest(universe, `registry --write-manifest (${store.transport})`)
+      : { version: 1 as const, createdAt: "(dry run)", source: "(dry run)", pairs: universe };
+    result.manifest = { applied: Boolean(opts.apply), path: grandfatherManifestPath(), pairs: manifest.pairs.length };
+  }
+
+  if (opts.backfillUuid) {
+    // Backfill reads DIRECTORIES, so it is scoped to the dirs of the selected
+    // provider; a record whose dir lives on another machine has nothing here to
+    // read and is absent by construction rather than guessed at.
+    const dirs = records
+      .filter((p) => profileProvider(p) === tool.id && p.dir)
+      .map((p) => ({ name: p.name, dir: p.dir }));
+    const registry = buildProfileRegistry(dirs, tool);
+    const existing = new Map(
+      records.filter((p) => p.accountUuid).map((p) => [p.name, p.accountUuid!] as const),
+    );
+    const plan = planAccountUuidBackfill(registry, existing);
+    const summary = summarizeBackfill(plan);
+    const applied: string[] = [];
+    if (opts.apply) {
+      if (store.transport !== "local") {
+        // The server has no account_uuid column yet; that lands with migration
+        // 0006 in PR-2. Refusing loudly beats writing nowhere and reporting
+        // success.
+        throw new AccountsError(
+          "--apply is local-transport only in this release: the hosted accounts table has no accountUuid " +
+            "column until migration 0006 (PR-2). Re-run without --apply to record the plan.",
+        );
+      }
+      applied.push(...(await applyAccountUuidBackfill(store, plan)));
+    }
+    result.backfill = { provider: tool.id, summary, applied: applied.length, plan };
+  }
+
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(chalk.dim(`transport: ${store.transport} · invariant mode: ${NAME_INVARIANT_MODE}`));
+  console.log(
+    chalk.dim(
+      `universe: ${universe.length} bindings (${records.length} store records, ${discovered.length} on-disk dirs)`,
+    ),
+  );
+  if (opts.invariant || opts.writeManifest) {
+    if (collisions.length === 0) {
+      console.log(chalk.green("no name is held by more than one provider"));
+    } else {
+      console.log(chalk.yellow(`${collisions.length} name(s) held by more than one provider:`));
+      for (const collision of collisions) {
+        console.log(`  ${chalk.cyan(collision.name.padEnd(18))} ${collision.providers.join(", ")}`);
+      }
+      console.log(
+        chalk.dim(
+          "Reported, not refused: names become provider-unique in a later release, after the rename migration.",
+        ),
+      );
+    }
+  }
+  if (opts.writeManifest) {
+    const manifest = result.manifest as { applied: boolean; path: string; pairs: number };
+    console.log(
+      manifest.applied
+        ? chalk.green(`grandfather manifest written: ${manifest.pairs} pairs -> ${manifest.path}`)
+        : chalk.dim(`dry run: ${manifest.pairs} pairs would be written to ${manifest.path} (pass --apply)`),
+    );
+  }
+  if (opts.backfillUuid) {
+    const { summary, applied, plan } = result.backfill as {
+      summary: ReturnType<typeof summarizeBackfill>;
+      applied: number;
+      plan: ReturnType<typeof planAccountUuidBackfill>;
+    };
+    console.log();
+    console.log(
+      `accountUuid backfill (${tool.id}): ${summary.backfilled} resolvable, ${summary.alreadySet} already set, ` +
+        `${summary.conflict} conflict, ${summary.unverified} unverified, ${summary.unresolved} unresolved`,
+    );
+    for (const row of plan) {
+      if (row.outcome === "already-set") continue;
+      const colour =
+        row.outcome === "backfilled" ? chalk.green : row.outcome === "conflict" ? chalk.red : chalk.yellow;
+      console.log(
+        `  ${chalk.cyan((row.profileName ?? "(unregistered)").padEnd(18))} ${colour(row.outcome.padEnd(11))} ${chalk.dim(row.reason)}`,
+      );
+    }
+    console.log(
+      applied > 0
+        ? chalk.green(`applied to ${applied} profile record(s)`)
+        : chalk.dim(opts.apply ? "nothing to apply" : "dry run — pass --apply to write"),
+    );
+  }
+}
+
 program
   .command("registry")
   .description("reconcile every profile's name, directory, identity and credential across all three stores")
   .option("--tool <tool>", "tool id (default: claude)", "claude")
   .option("--json", "output JSON")
   .option("--contradictions", "only show credentials claimed by more than one account")
+  .option("--invariant", "report names held by more than one provider, over the merged universe")
+  .option("--backfill-uuid", "plan the accountUuid backfill from each dir's parked identity")
+  .option("--apply", "with --backfill-uuid or --write-manifest, write the result (default: dry run)")
+  .option("--write-manifest", "record today's (name, provider) pairs as the grandfather manifest")
   .action(
-    action(async (opts: { tool?: string; json?: boolean; contradictions?: boolean }) => {
+    action(async (opts: {
+      tool?: string;
+      json?: boolean;
+      contradictions?: boolean;
+      invariant?: boolean;
+      backfillUuid?: boolean;
+      apply?: boolean;
+      writeManifest?: boolean;
+    }) => {
       const tool = getTool(opts.tool ?? "claude");
+      if (opts.invariant || opts.backfillUuid || opts.writeManifest) {
+        await runRegistryInvariantModes(tool, opts);
+        return;
+      }
       // resolveStore(), not loadStore(): the local-file store this CLI's `auth`
       // verbs read holds a fraction of the registry (8 of 29 claude profiles on
       // station01), so building the registry from it would silently omit two

@@ -112,6 +112,9 @@ export const BUILTIN_TOOLS: ToolDef[] = [
       dangerous: ["--dangerously-bypass-approvals-and-sandbox"],
     },
     accountFile: "auth.json",
+    // Codewith owns its own profile directories; the accounts registry records
+    // them where they already live rather than moving them.
+    nativeProfilesDir: "auth_profiles",
   },
   {
     id: "takumi",
