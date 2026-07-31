@@ -37,6 +37,17 @@ import {
   profileSwitchedAccountMarker,
 } from "./claude-layout.js";
 import { assertSafeWritePath, writeFileAtomic } from "./safe-path.js";
+// Cyclic by design and safe: `credential-binding.ts` uses this module's central
+// PATH helpers, all of which are hoisted `export function` declarations reached
+// only from inside function bodies. Nothing here runs at module-evaluation time,
+// so neither half can observe the other half-initialised. The alternative —
+// re-deriving `<home>/auth/<uuid>/…` in a second place — is the hardcoded
+// duplicate this repo's rules forbid, and would drift the day the layout moves.
+import {
+  credentialBindingRefusalForFile,
+  credentialFingerprintFromBytes,
+  recordCredentialBinding,
+} from "./credential-binding.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -305,7 +316,15 @@ export function centralCredentialsPathForProfile(profileDir: string, tool?: Tool
 
 // --- write path: mirror per-profile snapshots into the central store ---------
 
-export type SyncFileAction = "created" | "updated" | "kept" | "none";
+/**
+ * `refused` is not a failure to write — it is a REFUSAL to file bytes that
+ * provably belong to another account (see `credential-binding.ts`). It is
+ * spelled apart from `none`/`kept` because those two mean "nothing to do" and
+ * this one means "something is wrong with the estate": collapsing it into
+ * either is how the original corruption stayed invisible while every surface
+ * read green.
+ */
+export type SyncFileAction = "created" | "updated" | "kept" | "none" | "refused";
 
 export interface SyncResult {
   synced: boolean;
@@ -314,6 +333,8 @@ export interface SyncResult {
   email?: string;
   centralDir?: string;
   credentials?: SyncFileAction;
+  /** Present exactly when `credentials === "refused"` — safe to print, never a token. */
+  credentialsReason?: string;
   oauth?: SyncFileAction;
 }
 
@@ -333,7 +354,12 @@ function syncOAuthFile(uuid: string, source: JsonRecord): SyncFileAction {
   return action;
 }
 
-function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): SyncFileAction {
+interface CredentialSyncOutcome {
+  action: SyncFileAction;
+  reason?: string;
+}
+
+function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): CredentialSyncOutcome {
   // Candidates: the per-profile snapshot, plus the dir's live credential file
   // when no switch-marker FILE claims it for another account (fail closed —
   // see switchMarkerFilePresent) AND the dir's live identity does not itself
@@ -350,20 +376,43 @@ function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): 
     .filter((path) => existsSync(path) && !lstatSync(path).isSymbolicLink())
     .map((path) => ({ path, health: credentialHealth(path) }))
     .filter((c): c is { path: string; health: CredentialHealthPresent } => c.health.exists);
-  if (candidates.length === 0) return "none";
+  if (candidates.length === 0) return { action: "none" };
   const best = candidates.reduce((a, b) => (betterCredential(a.health, b.health) === a.health ? a : b));
+
+  // CONTENT binding, checked before anything is compared or written. The gates
+  // above are all CONTAINMENT gates — they ask what the directory claims, and a
+  // directory's claim is only as good as the last thing that wrote it. When a
+  // profile's `oauth-account.json` says A while its `credentials.json` holds B's
+  // material, every check above passes and B's credential is filed under A. That
+  // is the measured P0 (one credential under eight uuids), and only the payload
+  // itself can answer it.
+  //
+  // Placed BEFORE the `kept` comparisons on purpose: an already-contaminated
+  // slot then reports `refused` on every sync instead of a reassuring `kept`.
+  // A wrong state that reports "nothing to do" is exactly what let this run for
+  // weeks with every health surface green.
+  const refusal = credentialBindingRefusalForFile(uuid, best.path);
+  if (refusal) return { action: "refused", reason: refusal.reason };
 
   const centralPath = centralCredentialsSnapshot(uuid);
   const centralHealth = credentialHealth(centralPath);
   const bytes = readFileSync(best.path);
+  const bind = () => {
+    const fingerprint = credentialFingerprintFromBytes(bytes);
+    if (fingerprint) {
+      recordCredentialBinding(uuid, fingerprint, { evidence: "central-write", sourceKind: "profile-snapshot" });
+    }
+  };
   if (!centralHealth.exists) {
     writeCentralFile(centralPath, bytes);
-    return "created";
+    bind();
+    return { action: "created" };
   }
-  if (betterCredential(best.health, centralHealth) !== best.health) return "kept";
-  if (readFileSync(centralPath).equals(bytes)) return "kept";
+  if (betterCredential(best.health, centralHealth) !== best.health) return { action: "kept" };
+  if (readFileSync(centralPath).equals(bytes)) return { action: "kept" };
   writeCentralFile(centralPath, bytes);
-  return "updated";
+  bind();
+  return { action: "updated" };
 }
 
 /**
@@ -388,7 +437,8 @@ export function syncProfileSnapshotToCentral(profileDir: string, tool?: ToolDef)
     uuid,
     ...(email ? { email } : {}),
     centralDir: centralAuthDir(uuid),
-    credentials,
+    credentials: credentials.action,
+    ...(credentials.reason ? { credentialsReason: credentials.reason } : {}),
     oauth,
   };
 }

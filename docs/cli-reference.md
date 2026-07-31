@@ -100,6 +100,7 @@ with links after verification.
 | `accounts auth status` | `--json`; list the UUID-keyed identity index |
 | `accounts auth migrate` | `--json`; mirror every Claude profile snapshot into the central store |
 | `accounts auth sweep` | `--json`, `--delete`; dry-run by default, and deletion moves bytes to `auth-trash` |
+| `accounts auth bindings` | `--json`, `--conflicts`; which credential each account claims. **Exits 1** when one credential is claimed by more than one account — see `docs/auth-store.md` |
 | `accounts health` | Alias `readiness`; `--json`; exits nonzero only when status is `unavailable` |
 | `accounts doctor` | `--accept-capability-baseline`; errors on missing dirs, stale pointers, or broken shared capabilities |
 

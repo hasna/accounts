@@ -41,6 +41,11 @@ import {
   type SyncResult,
 } from "./lib/auth-store.js";
 import {
+  CREDENTIAL_BINDING_METHOD,
+  credentialBindingConflicts,
+  listCredentialBindings,
+} from "./lib/credential-binding.js";
+import {
   assertRegisteredConfigDir,
   convergeDirCredential,
   convergeIdentityCredential,
@@ -1927,12 +1932,24 @@ auth
           });
         }
       }
+      // A refused credential is an estate defect, not a no-op: exiting 0 here
+      // would let a caller read "the command ran" as "the estate is fine",
+      // which is the exact shape this whole change exists to remove.
+      if (rows.some((row) => row.credentials === "refused")) failures += 1;
       if (opts.json) console.log(JSON.stringify(rows, null, 2));
       else {
         for (const row of rows) {
           if (row.error) console.log(`${chalk.red("FAIL")} ${row.profile}: ${row.error}`);
           else if (row.skipped) console.log(`${chalk.yellow("skip")} ${row.profile}: ${row.skipped}`);
           else if (!row.synced) console.log(`${chalk.yellow("skip")} ${row.profile}: ${row.reason}`);
+          else if (row.credentials === "refused")
+            // Loud, and on its own line. A refusal folded into the `ok` line
+            // reads as a successful migrate with an unusual word in it, which
+            // is how the estate stayed green while eight accounts shared one
+            // credential.
+            console.log(
+              `${chalk.red("REFUSED")} ${row.profile} → ${row.uuid}${row.email ? chalk.dim(" (" + row.email + ")") : ""}: ${row.credentialsReason}`,
+            );
           else
             console.log(
               `${chalk.green("ok")}   ${row.profile} → ${row.uuid}${row.email ? chalk.dim(" (" + row.email + ")") : ""} credentials=${row.credentials} oauth=${row.oauth}`,
@@ -1970,6 +1987,77 @@ auth
       if (result.unresolved.length > 0 && !result.deleted) {
         console.log(chalk.yellow("note: unresolved profile bindings above will block --delete"));
       }
+    }),
+  );
+
+auth
+  .command("bindings")
+  .description("which credential each account claims, and any credential claimed by more than one")
+  .option("--json", "output JSON")
+  .option("--conflicts", "only show credentials claimed by more than one account")
+  .action(
+    action((opts: { json?: boolean; conflicts?: boolean }) => {
+      const conflicts = credentialBindingConflicts();
+      if (opts.json) {
+        console.log(
+          JSON.stringify(
+            opts.conflicts
+              ? { method: CREDENTIAL_BINDING_METHOD, conflicts }
+              : { method: CREDENTIAL_BINDING_METHOD, bindings: listCredentialBindings(), conflicts },
+            null,
+            2,
+          ),
+        );
+        // A conflict is a corrupt estate, not a report: exit non-zero so a
+        // scripted caller cannot read "the command ran" as "the estate is fine".
+        if (conflicts.length > 0) process.exitCode = 1;
+        return;
+      }
+
+      // Fingerprints are digests of a refresh token, never the token — but they
+      // are still secret-DERIVED, and an operator only needs enough to tell two
+      // apart. Twelve hex characters does that; the full value stays in the
+      // 0600 record.
+      const short = (fingerprint: string) => fingerprint.replace(/^sha256:/, "").slice(0, 12);
+
+      if (!opts.conflicts) {
+        console.log(chalk.dim(`method: ${CREDENTIAL_BINDING_METHOD}`));
+        const rows = listCredentialBindings();
+        if (rows.length === 0) {
+          console.log("no central auth entries — run `accounts auth migrate` to populate the store");
+        }
+        for (const row of rows) {
+          const who = chalk.cyan(row.accountUuid) + " " + (row.email ?? chalk.dim("(no email)"));
+          if (!row.fingerprint) {
+            console.log(`${who} ${chalk.yellow("no credential in the central slot")}`);
+            continue;
+          }
+          const recorded = row.recorded
+            ? row.drifted
+              ? chalk.yellow(` (recorded ${short(row.recorded.fingerprint)} — slot has drifted)`)
+              : chalk.dim(` (recorded ${row.recorded.boundAt})`)
+            : chalk.dim(" (no record yet — predates binding, or never re-filed)");
+          console.log(`${who} ${short(row.fingerprint)}${recorded}`);
+        }
+      }
+
+      if (conflicts.length === 0) {
+        console.log(chalk.green("no credential is claimed by more than one account"));
+        return;
+      }
+      for (const conflict of conflicts) {
+        console.log(
+          `${chalk.red("conflict")} ${short(conflict.fingerprint)} claimed by ${conflict.accountUuids.length}: ` +
+            `${conflict.accountUuids.join(", ")}${conflict.emails.length ? chalk.dim(` (${conflict.emails.join(", ")})`) : ""}`,
+        );
+      }
+      console.log(
+        chalk.yellow(
+          "at most one claim per credential can be true; the others have no credential of their own left — " +
+            "`accounts login <profile>` is the only repair, and nothing here chooses for you",
+        ),
+      );
+      process.exitCode = 1;
     }),
   );
 
