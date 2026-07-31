@@ -6,6 +6,51 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.28] - 2026-07-31
+
+`0.2.27` was published break-glass from a tree that was never merged, so `main`
+carried `version: 0.2.26` while npm served `0.2.27`. This release reconciles the
+two and ships the b29f5b6c fix.
+
+### Fixed
+
+- **A launched Claude session could read a logged-out profile while `accounts login`
+  reported it logged-in** (b29f5b6c). The profile-root `.credentials.json` — the file
+  a launched session reads via `CLAUDE_CONFIG_DIR` — held Claude Code's own
+  `rotated-away` husk (empty tokens, scopes intact), written in place after a
+  DUPLICATE live copy of the same account rotated the refresh token out from under
+  it, while the profile's snapshot and the central store still held the real
+  credential. `profileEnv`'s heal refused to restore it with `account-live-elsewhere`
+  (defect bb267228) — correct for a blind restore of a possibly-superseded
+  predecessor token, but it left the directory logged-out.
+
+  The launch path now heals by **convergence** instead: `convergeDirCredential`
+  performs no token exchange and fans the current winning credential into every
+  copy, so all directories end holding the SAME token rather than a second,
+  superseded one.
+
+  The heal is **narrowed to legitimate duplicate doors**. `account-live-elsewhere`
+  conflates a directory that OWNS the account and is running it with one owned by a
+  DIFFERENT account that is merely carrying it after an in-place switch; converging
+  through the latter would cross a custody boundary its real owner never consented
+  to. `accountGuestOccupantDoorsElsewhere` ranges over the UNFILTERED
+  current-occupant set — the same doors the broker's fan-out targets — so a guest
+  directory holding a husk cannot hide from the gate, and a single guest anywhere in
+  that set stops the heal. The bb267228 launch gate is preserved, not worked around.
+
+### Known limitations
+
+- A profile whose directory currently presents a DIFFERENT account
+  (`identity-would-change`) is deliberately not healed: restoring there would change
+  which account the directory presents. Tracked as `6824d0b3`.
+- `convergeDirCredential` itself still writes through a guest directory with no
+  ownership gate, and the usage hook calls it unconditionally. Pre-existing and not
+  widened by this release; tracked as `96e80483`.
+- A guest directory whose own binding snapshot is CORRUPT is classified as an owner
+  by the identity index, so it is not reported as a guest. Unreachable on the
+  measured fleet and independently guarded by the switch marker; tracked as
+  `67163aa4`.
+
 ## [0.2.26] - 2026-07-30
 
 `0.2.25` was prepared (#91) but never published to npm: #93 landed on `main`
