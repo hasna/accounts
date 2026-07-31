@@ -795,3 +795,48 @@ test("purge still deletes the profile's OWN managed dir", () => {
   expect(result.purgeNote).toBeUndefined();
   expect(existsSync(p.dir)).toBe(false);
 });
+
+// --- P1 from re-review (Seneca @ 9b56b82): the DERIVATION took untrusted input
+//
+// Deriving join(profilesDir(), tool, name) removed the trust from `dir` and
+// silently moved it to `name`, which is just as remote-supplied: HostedStore
+// returns the server's body and cloud-accounts' toProfile is a plain field copy
+// that never applies profileSchema. A response naming "../claude/victim"
+// normalises back inside the managed root, so both containment checks agree and
+// the delete lands on a different profile's dir.
+
+test("purge REFUSES a profile identity that is not a slug", () => {
+  const victim = addProfile({ name: "victimprofile" });
+  writeFileSync(join(victim.dir, ".credentials.json"), JSON.stringify({ token: "PLACEHOLDER" }));
+  const decoy = addProfile({ name: "throwaway" });
+  // Positive control: the victim is genuinely present before the attempt.
+  expect(existsSync(join(victim.dir, ".credentials.json"))).toBe(true);
+
+  // Exactly the reviewer's RR-B3b: a traversing `name` whose join() normalises
+  // back inside the root, paired with the matching `dir` so both checks agree.
+  const result = purgeProfileDir({ ...decoy, name: "../claude/victimprofile", dir: victim.dir });
+
+  expect(result.purged).toBe(false);
+  expect(result.purgeNote).toContain("not a valid profile identity");
+  expect(existsSync(join(victim.dir, ".credentials.json"))).toBe(true);
+  expect(existsSync(victim.dir)).toBe(true);
+});
+
+test("purge REFUSES a tool id that is not a slug", () => {
+  const victim = addProfile({ name: "othervictim" });
+  expect(existsSync(victim.dir)).toBe(true);
+  const result = purgeProfileDir({ ...victim, tool: "../claude" });
+  expect(result.purged).toBe(false);
+  expect(result.purgeNote).toContain("not a valid profile identity");
+  expect(existsSync(victim.dir)).toBe(true);
+});
+
+test("a valid identity still purges — the identity check refuses only bad input", () => {
+  // The passing state, so the new gate is not one that refuses everything.
+  const p = addProfile({ name: "legitimate" });
+  expect(existsSync(p.dir)).toBe(true);
+  const result = purgeProfileDir(p);
+  expect(result.purged).toBe(true);
+  expect(result.purgeNote).toBeUndefined();
+  expect(existsSync(p.dir)).toBe(false);
+});

@@ -280,6 +280,21 @@ export function removeProfile(
 export function purgeProfileDir(profile: Profile): { purged: boolean; purgeNote?: string } {
   if (!profile.dir || !existsSync(profile.dir)) return { purged: false };
 
+  // The identity the path is derived FROM is remote-supplied too, so validate it
+  // before deriving. `HostedStore.removeProfile` returns the server's body, and
+  // `toProfile` in cloud-accounts.ts is a plain field copy that never applies
+  // `profileSchema` — so a response naming `../claude/victim` normalises back
+  // inside the managed root, both checks below agree, and the delete lands on a
+  // different profile. Deriving from unvalidated input just moves the trust from
+  // `dir` to `name` rather than removing it. Slugs cannot contain a separator or
+  // a dot segment, which is exactly the property the derivation needs.
+  if (!profileNameSchema.safeParse(profile.name).success || !profileNameSchema.safeParse(profile.tool).success) {
+    return {
+      purged: false,
+      purgeNote: `refused to delete ${profile.dir}: "${profile.tool}/${profile.name}" is not a valid profile identity`,
+    };
+  }
+
   // DERIVE the path to delete; never delete the one we were handed. On the
   // hosted path `profile.dir` arrives in an API response, so trusting it makes
   // the delete target remote-controlled. The canonical managed location is a
