@@ -489,6 +489,59 @@ export function accountLiveDoorsElsewhere(
 }
 
 /**
+ * Other dirs currently PRESENTING this account that do not OWN it — guests
+ * carrying it after an in-place switch, or dirs whose own binding is unreadable.
+ *
+ * DELIBERATELY UNFILTERED BY CREDENTIAL STATE, unlike `accountLiveDoorsElsewhere`
+ * above, and that difference is the entire point of this function existing
+ * separately rather than being a flag on that one.
+ *
+ * The two answer different questions over different domains:
+ *
+ *   - `accountLiveDoorsElsewhere` asks "could a token rotation revoke a WORKING
+ *     copy somewhere else", so it rightly drops doors holding nothing
+ *     restorable — a husk cannot be revoked.
+ *   - this asks "would a write REACH a dir that another account owns", and the
+ *     broker's `enumerateCopies` adds a `dir-live` write target for EVERY
+ *     `current-occupant` door with no state filter whatsoever
+ *     (`credential-broker.ts`, the `dirLiveCopy` branch). A guest dir whose own
+ *     credential happens to be a husk is therefore still a write target.
+ *
+ * A gate built on the FILTERED set is blind to exactly those dirs while the
+ * write set still contains them — measured: a guest dir holding a husk was
+ * written through while the gate reported no guests present. The gate and the
+ * write set must range over the same doors, so this one ranges over all of them.
+ *
+ * Ownership is decided the same way the index builds roles: a dir OWNS this
+ * account when it also carries an `own-identity` door for it. A dir with no
+ * such door is not this account's — fail closed and report it as a guest.
+ */
+export function accountGuestOccupantDoorsElsewhere(
+  index: ReadonlyArray<AccountIdentity>,
+  accountUuid: string,
+  excludeDir: string,
+): string[] {
+  const wanted = accountUuid.toLowerCase();
+  const identity = index.find((entry) => entry.accountUuid.toLowerCase() === wanted);
+  if (!identity) return [];
+
+  const seen = new Set<string>();
+  const guests: string[] = [];
+  for (const door of identity.doors) {
+    if (door.role !== "current-occupant") continue;
+    if (sameConfigDir(door.dir, excludeDir)) continue;
+    const canonical = canonicalConfigDir(door.dir);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    const owns = identity.doors.some(
+      (other) => other.role === "own-identity" && sameConfigDir(other.dir, door.dir),
+    );
+    if (!owns) guests.push(door.dir);
+  }
+  return guests;
+}
+
+/**
  * The accountUuid currently occupying a config dir's live account file.
  *
  * ITERATES EVERY CANDIDATE PATH, exactly as `buildIdentityIndex`'s layer A

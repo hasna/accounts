@@ -6,6 +6,7 @@ import {
   recoverParkedCredential,
   sanitizeClaudeProfileApiSettings,
 } from "./claude-auth.js";
+import { convergeDirCredential } from "./credential-broker.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 
@@ -110,7 +111,57 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
     // launch, so the session starts with a working credential instead of a
     // blank one. Runs BEFORE the switched-away heal because it refuses the
     // identity-changing case outright, leaving that to the function below.
-    recoverParkedCredential(profile.dir, tool, profile.name);
+    const recovery = recoverParkedCredential(profile.dir, tool, profile.name);
+    // b29f5b6c: the launched session reads an EMPTY (logged-out) root while
+    // `login`/`usage` report logged-in. The empty root is Claude Code's own
+    // `rotated-away` blank, written in place after a DUPLICATE live copy of this
+    // same account rotated the refresh token out. `recoverParkedCredential`
+    // above then REFUSES to restore the intact parked copy with
+    // `account-live-elsewhere` — because a blind restore of a possibly-superseded
+    // PREDECESSOR credential, while the account is live in another dir, would put
+    // two DIFFERENT tokens on disk and the next refresh would revoke one
+    // (defect bb267228). That refusal is correct for a restore, but it leaves the
+    // dir logged-out.
+    //
+    // The safe heal for a dir that legitimately holds its OWN account is
+    // CONVERGENCE, not restore. `convergeDirCredential` is pure file I/O (no
+    // token exchange) that fans the CURRENT WINNING credential — the freshest
+    // copy across the central store, the profile snapshots, and every live dir,
+    // which includes the still-valid copy that is live elsewhere — into every
+    // copy, so all dirs end holding the SAME token. It never introduces a second,
+    // superseded token, so it cannot cause the double-refresh revocation the
+    // restore refusal guards against, and it re-checks each dir's occupant
+    // identity (and, since #99, its content binding) at write time.
+    //
+    // NARROWED TO LEGITIMATE DUPLICATE DOORS ONLY, and this condition is
+    // load-bearing rather than defensive. `account-live-elsewhere` covers two
+    // shapes that "the account is running somewhere else" does not distinguish:
+    // another dir that OWNS this account and is running it, and a dir owned by a
+    // DIFFERENT account that is merely carrying this one after an in-place
+    // switch. Converging through the second one sources and fans a credential
+    // across a custody boundary the squatted dir's real owner never consented
+    // to — the class of write the bb267228 gate exists to prevent, which
+    // `src/repair-auth-gates.test.ts` ("a blanket launch cannot create the
+    // second copy") asserts a launch must not perform.
+    //
+    // THE GATE MUST RANGE OVER THE SAME DOORS THE WRITE DOES. An earlier form of
+    // this check asked whether every door in `accountLiveDoorsElsewhere` owned
+    // the account — but that set is filtered to RESTORABLE credentials, while
+    // the broker's fan-out targets every `current-occupant` door regardless of
+    // state. A guest dir holding a husk therefore sat outside the gate and
+    // inside the write set, and was written through while the gate reported no
+    // guests present. `noGuestOccupantDoorsElsewhere` is computed over the
+    // unfiltered occupant set for exactly that reason, and is consulted with an
+    // explicit `=== true` so an absent field can never be read as permission.
+    //
+    // Best-effort: a launch must never fail on a heal.
+    if (recovery.outcome === "account-live-elsewhere" && recovery.noGuestOccupantDoorsElsewhere === true) {
+      try {
+        convergeDirCredential(profile.dir, { tool });
+      } catch {
+        // The session still launches and reaches its own auth error.
+      }
+    }
     // A dir left switched to another account by `switch-account` must not
     // launch as that other account: restore the profile's own auth (or refuse
     // loudly while live sessions still use the dir).
