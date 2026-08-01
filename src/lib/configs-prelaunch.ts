@@ -1,5 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
@@ -245,6 +245,40 @@ type IncumbentFloor =
   | { ids: string[]; origin: "manifest" | "audit" | "fresh" | "waived" }
   | { ids: never[]; origin: "destroyed"; detail: string };
 
+type RenderedInstructionEvidence =
+  | { state: "absent"; count: 0 }
+  | { state: "ok"; count: number }
+  | { state: "unreadable"; count: 0 };
+
+/**
+ * Count the package-owned per-source instruction files left by configs.
+ *
+ * This is deliberately independent of both records whose staleness it checks:
+ * the render manifest and accounts' prelaunch audit. A missing directory is the
+ * expected first-render shape; an unreadable directory is not evidence of an
+ * empty home.
+ */
+function readRenderedInstructionEvidence(profile: Profile): RenderedInstructionEvidence {
+  const root = join(profile.dir, ".hasna", "instructions");
+  if (!existsSync(root)) return { state: "absent", count: 0 };
+
+  let count = 0;
+  const pending = [root];
+  try {
+    while (pending.length > 0) {
+      const dir = pending.pop();
+      if (!dir) continue;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) pending.push(join(dir, entry.name));
+        else count += 1;
+      }
+    }
+    return { state: "ok", count };
+  } catch {
+    return { state: "unreadable", count: 0 };
+  }
+}
+
 /**
  * The set of instruction sources this home must not lose, read from the most
  * trustworthy record still standing.
@@ -266,12 +300,50 @@ function resolveIncumbentFloor(profile: Profile, tool: ToolDef): IncumbentFloor 
 
   const audit = readConfigsPrelaunchAudit(profile, tool);
   const recorded = audit?.preservationFloor ?? audit?.manifest;
-  if (recorded && recorded.sourceIds.length > 0) return { ids: [...recorded.sourceIds], origin: "audit" };
+  const rendered = readRenderedInstructionEvidence(profile);
 
   const manifestDetail =
     read.state === "unreadable"
       ? "the session render manifest exists but could not be parsed"
       : "the session render manifest is absent";
+
+  if (rendered.state === "unreadable") {
+    return {
+      ids: [],
+      origin: "destroyed",
+      detail: `${manifestDetail}, and the rendered instruction files cannot be read`,
+    };
+  }
+
+  // The bounded legacy summary is not a preservation floor when it admits that
+  // it omitted ids. Likewise, a count that disagrees with the ids cannot name
+  // the set it claims to protect. New preservationFloor records are uncapped,
+  // but the count check still guards malformed or partially written audits.
+  if (recorded) {
+    const legacyWasTruncated = !audit?.preservationFloor && audit?.manifest.sourceIdsTruncated === true;
+    if (legacyWasTruncated) {
+      return {
+        ids: [],
+        origin: "destroyed",
+        detail: `${manifestDetail}, and the prelaunch audit truncated its previous source ids`,
+      };
+    }
+    if (recorded.sourceIds.length !== recorded.sourceCount) {
+      return {
+        ids: [],
+        origin: "destroyed",
+        detail: `${manifestDetail}, and the prelaunch audit names ${recorded.sourceIds.length} of ${recorded.sourceCount} previous sources`,
+      };
+    }
+    if (rendered.count > recorded.sourceCount) {
+      return {
+        ids: [],
+        origin: "destroyed",
+        detail: `${manifestDetail}, ${rendered.count} rendered instruction files remain on disk, and the prelaunch audit records only ${recorded.sourceCount} previous sources`,
+      };
+    }
+    if (recorded.sourceIds.length > 0) return { ids: [...recorded.sourceIds], origin: "audit" };
+  }
 
   // The audit remembers a non-empty set but cannot name it, so a comparison is
   // impossible while the home is known to have something to lose.
@@ -280,6 +352,18 @@ function resolveIncumbentFloor(profile: Profile, tool: ToolDef): IncumbentFloor 
       ids: [],
       origin: "destroyed",
       detail: `${manifestDetail}, and the prelaunch audit records ${recorded.sourceCount} previous sources without usable ids`,
+    };
+  }
+
+  // A genuinely fresh account (for example account042) has no manifest, no
+  // audit floor, and no rendered per-source files. Disk evidence makes the
+  // otherwise identical stale-zero shape fail closed without blocking that
+  // first-render path.
+  if (rendered.count > 0) {
+    return {
+      ids: [],
+      origin: "destroyed",
+      detail: `${manifestDetail}, no usable prelaunch floor remains, and ${rendered.count} rendered instruction files remain on disk`,
     };
   }
 

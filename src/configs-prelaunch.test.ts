@@ -1545,6 +1545,28 @@ describe("configs prelaunch floor integrity", () => {
     );
   }
 
+  function writeRenderedInstructionFiles(p: Profile, ids: string[]) {
+    const dir = join(p.dir, ".hasna", "instructions");
+    mkdirSync(dir, { recursive: true });
+    for (const id of ids) {
+      writeFileSync(join(dir, `${id}.md`), `# ${id}\n`);
+    }
+  }
+
+  function rewritePriorAudit(
+    p: Profile,
+    update: (audit: {
+      manifest: { sourceCount: number; sourceIds: string[]; sourceIdsTruncated: boolean };
+    }) => void,
+  ) {
+    const path = join(p.dir, ".hasna", "accounts", "prelaunch-status.json");
+    const audit = JSON.parse(readFileSync(path, "utf8")) as {
+      manifest: { sourceCount: number; sourceIds: string[]; sourceIdsTruncated: boolean };
+    };
+    update(audit);
+    writeFileSync(path, JSON.stringify(audit, null, 2) + "\n");
+  }
+
   function sabotage(p: Profile, how: "corrupt" | "remove") {
     const path = join(p.dir, ".hasna", "session-render-manifest.json");
     if (how === "corrupt") writeFileSync(path, "{ not json");
@@ -1647,6 +1669,154 @@ describe("configs prelaunch floor integrity", () => {
     }
   });
 
+  test("REGRESSION 328064bc: stale account005 audit cannot call a 20-to-4 render safe", () => {
+    resetHome();
+    try {
+      const incumbentIds = Array.from({ length: 20 }, (_, index) =>
+        `account005-rule-${String(index + 1).padStart(2, "0")}`,
+      );
+      const suppliedIds = incumbentIds.slice(0, 4);
+      const exportPath = join(home, "account005.configs.json");
+      writeExport(exportPath, suppliedIds);
+      const p = profileInHome("claude", { identity: exportPath });
+
+      writeManifest(p, "claude", incumbentIds.map((id) => ({ id })));
+      writePriorAudit(p, "claude", incumbentIds.slice(0, 3));
+      writeRenderedInstructionFiles(p, incumbentIds);
+      sabotage(p, "remove");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", suppliedIds, calls),
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.skipped).toBe(true);
+      expect(result.result).not.toBe("applied");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("REGRESSION 328064bc: rendered files distinguish a stale-zero audit from a fresh home", () => {
+    resetHome();
+    try {
+      const incumbentIds = Array.from({ length: 20 }, (_, index) => `stale-zero-rule-${index + 1}`);
+      const suppliedIds = incumbentIds.slice(0, 4);
+      const exportPath = join(home, "stale-zero.configs.json");
+      writeExport(exportPath, suppliedIds);
+      const p = profileInHome("claude", { identity: exportPath });
+
+      writeManifest(p, "claude", incumbentIds.map((id) => ({ id })));
+      writePriorAudit(p, "claude", []);
+      writeRenderedInstructionFiles(p, incumbentIds);
+      sabotage(p, "remove");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", suppliedIds, calls),
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toContain("20 rendered instruction files");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("CONTROL 328064bc: an accurate account005 floor refuses and names dropped sources", () => {
+    resetHome();
+    try {
+      const incumbentIds = Array.from({ length: 20 }, (_, index) =>
+        `account005-rule-${String(index + 1).padStart(2, "0")}`,
+      );
+      const suppliedIds = incumbentIds.slice(0, 4);
+      const exportPath = join(home, "account005-accurate.configs.json");
+      writeExport(exportPath, suppliedIds);
+      const p = profileInHome("claude", { identity: exportPath });
+
+      writeManifest(p, "claude", incumbentIds.map((id) => ({ id })));
+      writePriorAudit(p, "claude", incumbentIds);
+      writeRenderedInstructionFiles(p, incumbentIds);
+      sabotage(p, "remove");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", suppliedIds, calls),
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.skipped).toBe(true);
+      expect(result.result).not.toBe("applied");
+      expect(result.reason).toContain("would remove 16 of them");
+      for (const id of incumbentIds.slice(4, 9)) expect(result.reason).toContain(id);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("REGRESSION 328064bc: a truncated legacy audit is not a preservation floor", () => {
+    resetHome();
+    try {
+      const incumbentIds = Array.from({ length: 25 }, (_, index) => `legacy-rule-${index + 1}`);
+      const recordedIds = incumbentIds.slice(0, 20);
+      const exportPath = join(home, "truncated.configs.json");
+      writeExport(exportPath, recordedIds);
+      const p = profileInHome("claude", { identity: exportPath });
+
+      writeManifest(p, "claude", incumbentIds.map((id) => ({ id })));
+      writePriorAudit(p, "claude", recordedIds);
+      rewritePriorAudit(p, (audit) => {
+        audit.manifest.sourceCount = incumbentIds.length;
+        audit.manifest.sourceIdsTruncated = true;
+      });
+      writeRenderedInstructionFiles(p, incumbentIds);
+      sabotage(p, "remove");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", recordedIds, calls),
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toContain("truncated");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("REGRESSION 328064bc: an audit count that exceeds its ids is not a preservation floor", () => {
+    resetHome();
+    try {
+      const incumbentIds = Array.from({ length: 20 }, (_, index) => `partial-rule-${index + 1}`);
+      const recordedIds = incumbentIds.slice(0, 3);
+      const exportPath = join(home, "partial.configs.json");
+      writeExport(exportPath, incumbentIds.slice(0, 4));
+      const p = profileInHome("claude", { identity: exportPath });
+
+      writeManifest(p, "claude", incumbentIds.map((id) => ({ id })));
+      writePriorAudit(p, "claude", recordedIds);
+      rewritePriorAudit(p, (audit) => {
+        audit.manifest.sourceCount = incumbentIds.length;
+      });
+      writeRenderedInstructionFiles(p, incumbentIds);
+      sabotage(p, "remove");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", incumbentIds.slice(0, 4), calls),
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toContain("names 3 of 20");
+    } finally {
+      cleanup();
+    }
+  });
+
   // ---- must-not-over-block controls -------------------------------------
   // A guard that refuses everything is its own outage, and it would satisfy
   // every assertion above. Each control below has to pass in the same run.
@@ -1682,6 +1852,12 @@ describe("configs prelaunch floor integrity", () => {
       const exportPath = join(home, "first.configs.json");
       writeExport(exportPath, SUPPLIED_IDS);
       const p = profileInHome("claude", { identity: exportPath });
+      mkdirSync(join(p.dir, "sessions"), { recursive: true });
+      mkdirSync(join(p.dir, "skills", "example"), { recursive: true });
+      writeFileSync(join(p.dir, "history.jsonl"), '{"display":"operating home"}\n');
+      writeFileSync(join(p.dir, "skills", "example", "SKILL.md"), "# Existing skill\n");
+      expect(existsSync(join(p.dir, ".hasna", "instructions"))).toBe(false);
+      expect(existsSync(join(p.dir, "CLAUDE.md"))).toBe(false);
 
       const calls: string[][] = [];
       const result = runConfigsPrelaunch(p, getTool("claude"), {
