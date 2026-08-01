@@ -79,6 +79,17 @@ export const updateAccountSchema = z
     dir: profileDirSchema.nullable().optional(),
     description: z.string().nullable().optional(),
     lastUsedAt: z.string().datetime().optional(),
+    /**
+     * R-P1-4 (2026-07-31-accounts-debloat-design.md): the tool-native/on-disk
+     * name, when it differs from the registry `name`. Last-write-wins.
+     */
+    nativeName: profileNameSchema.nullable().optional(),
+    /**
+     * R-P1-4: former registry name(s). APPENDED (deduped) to the record's
+     * existing aliases by `AccountsRepo.update` — this array is the increment
+     * being recorded, not a replacement of the full history.
+     */
+    aliases: z.array(profileNameSchema).max(64).optional(),
   })
   .refine((v) => Object.keys(v).length > 0, "update requires at least one field");
 export type UpdateAccountInput = z.infer<typeof updateAccountSchema>;

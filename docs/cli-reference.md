@@ -12,8 +12,8 @@ command. Arguments after a variadic `[args...]` are passed to the target tool.
 | `accounts import [name]` | Name defaults to `main`; `-t, --tool` (default `claude`), `-d, --dir`, `-e, --email`, `--description`, `--copy` |
 | `accounts login <name>` | `-t, --tool`; without it, Accounts uses the profile’s locked tool or an interactive tool chooser |
 | `accounts list` | Alias `ls`; `-t, --tool`, `--json` |
-| `accounts show <name>` | `-t, --tool`, `--json` |
-| `accounts set <name>` | `-t, --tool`, `-e, --email`, `--display-name`, `--identity`, `--card-last4`, repeatable `--metadata`, `--description`, `-d, --dir`; at least one update is required |
+| `accounts show <name>` | `-t, --tool`, `--json`; also prints an `alias note:` line per OTHER profile whose `aliases` record `<name>` as a former name of theirs (R-P1-4) |
+| `accounts set <name>` | `-t, --tool`, `-e, --email`, `--display-name`, `--identity`, `--card-last4`, repeatable `--metadata`, `--description`, `-d, --dir`, `--native-name`, repeatable `--alias` (appends, never replaces); at least one update is required |
 | `accounts detect <name>` | `-t, --tool`; re-detects email from the tool’s account file |
 | `accounts rename <name> <new-name>` | `-t, --tool` |
 | `accounts remove <name>` | Alias `rm`; `-t, --tool`, `--purge` to delete a managed config directory |

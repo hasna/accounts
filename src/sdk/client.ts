@@ -12,13 +12,13 @@ export interface VersionResponse { "version": string }
 
 export interface ErrorResponse { "error": string; "reason"?: string }
 
-export interface Account { "tool": string; "name": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata": Record<string, unknown>; "dir"?: string; "description"?: string; "createdAt": string; "lastUsedAt"?: string }
+export interface Account { "tool": string; "name": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata": Record<string, unknown>; "dir"?: string; "description"?: string; "createdAt": string; "lastUsedAt"?: string; "nativeName"?: string; "aliases"?: Array<string> }
 
 export interface AccountList { "accounts": Array<Account> }
 
 export interface CreateAccountInput { "name": string; "tool": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string }
 
-export interface UpdateAccountInput { "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string; "lastUsedAt"?: string }
+export interface UpdateAccountInput { "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string; "lastUsedAt"?: string; "nativeName"?: string; "aliases"?: Array<string> }
 
 export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string }
 

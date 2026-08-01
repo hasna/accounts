@@ -41,6 +41,10 @@ export interface CloudAccount {
   description?: string;
   createdAt: string;
   lastUsedAt?: string;
+  /** R-P1-4: the tool-native/on-disk name, when it differs from `name`. */
+  nativeName?: string;
+  /** R-P1-4: former registry name(s) this profile has answered to. */
+  aliases?: string[];
 }
 
 export interface CloudCurrentSelection {
@@ -71,6 +75,10 @@ export interface CloudUpdateInput {
   dir?: string;
   description?: string;
   lastUsedAt?: string;
+  /** R-P1-4: last-write-wins (a single fixed on-disk identifier). */
+  nativeName?: string;
+  /** R-P1-4: APPENDED (deduped) to the record's existing aliases server-side — never a replace. */
+  aliases?: string[];
 }
 
 /**
@@ -113,6 +121,8 @@ function toProfile(account: CloudAccount): Profile {
     ...(account.description ? { description: account.description } : {}),
     createdAt: account.createdAt,
     ...(account.lastUsedAt ? { lastUsedAt: account.lastUsedAt } : {}),
+    ...(account.nativeName ? { nativeName: account.nativeName } : {}),
+    ...(account.aliases && account.aliases.length > 0 ? { aliases: account.aliases } : {}),
   };
 }
 
@@ -264,6 +274,8 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       if (input.dir !== undefined) body.dir = input.dir;
       if (input.description !== undefined) body.description = input.description;
       if (input.lastUsedAt !== undefined) body.lastUsedAt = input.lastUsedAt;
+      if (input.nativeName !== undefined) body.nativeName = input.nativeName;
+      if (input.aliases !== undefined) body.aliases = input.aliases;
       const updated = await t.patch<CloudAccount>(
         `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}`,
         body,

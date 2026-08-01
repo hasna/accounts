@@ -596,6 +596,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0004_current_selection_account_fk",
       "accounts_0005_custom_tool_tombstones",
       "accounts_0006_purge_test_tool_fixtures",
+      "accounts_0007_alias_records",
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,

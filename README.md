@@ -588,6 +588,15 @@ keys may use letters, digits, `_`, `.`, `:`, and `-`; object prototype keys such
 as `__proto__`, `prototype`, and `constructor` are rejected. Do not store
 secrets, tokens, full card numbers, or billing addresses in profile metadata.
 
+A registry rename can be recorded, not just performed: `accounts set <name>
+--native-name <tool-native-name>` records the identifier the tool itself still
+uses on disk, and `accounts set <name> --alias <old-name>` (repeatable) records
+a former registry name — appended to the profile's alias history, never
+replacing it. `accounts show <old-name>` then resolves the exact-name match as
+before AND prints a disambiguation line for any OTHER profile whose aliases
+record `<old-name>` as one of its former names, so an old name never silently
+answers "no such profile" for something that was only renamed.
+
 ## Agent / MCP Switching
 
 `accounts` ships a stdio MCP server:
