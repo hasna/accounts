@@ -78,7 +78,7 @@ export function planAccountUuidBackfill(
 ): BackfillPlanEntry[] {
   const centralUuids = new Set(registry.central.map((entry) => entry.accountUuid.toLowerCase()));
   const plan = registry.entries.map((entry) => planOne(entry, centralUuids, existing));
-  return resolveDuplicateClaims(plan);
+  return resolveDuplicateClaims(plan, existing);
 }
 
 /**
@@ -110,33 +110,77 @@ export function planAccountUuidBackfill(
  * data is dirty. The narrower, per-row refusal already closes the actual
  * hazard: `--apply` will never write a uuid this function cannot say is
  * uniquely claimed.
+ *
+ * CYCLE 1 REMEDIATION (independent review, Seneca). The first pass at this
+ * only compared freshly PROPOSED (`backfilled`) rows against each other. It
+ * missed the same defect reached a different way: a uuid already RECORDED on
+ * one profile (an `already-set` row — the store's existing binding, which
+ * `planOne` only ever reaches by confirming it agrees with that profile's own
+ * parked identity) is a real, standing claim regardless of what this plan
+ * proposes elsewhere. A different profile whose OWN parked identity
+ * independently resolves to that same uuid still looked `backfilled`, because
+ * its row-level check only ever compares against ITS OWN existing entry (which
+ * is empty), never another profile's. `existing` is therefore seeded into the
+ * same claimant map as every freshly proposed uuid: an `already-set` profile
+ * never itself reaches `backfilled` (`planOne` returns `already-set` or
+ * `conflict` whenever `existing` has an entry for it), so seeding cannot cause
+ * a row to collide with itself — only a genuinely different profile's proposal
+ * against an already-recorded uuid. This is reachable through the tool's own
+ * dry-run -> apply -> re-run workflow: the moment any profile has been
+ * backfilled once, this gap is live for every subsequent invocation, which is
+ * exactly the state the fleet is in after `--apply` first runs.
  */
-function resolveDuplicateClaims(plan: BackfillPlanEntry[]): BackfillPlanEntry[] {
-  const claimants = new Map<string, BackfillPlanEntry[]>();
-  for (const row of plan) {
-    if (row.outcome !== "backfilled" || !row.accountUuid) continue;
-    const rows = claimants.get(row.accountUuid) ?? [];
-    rows.push(row);
-    claimants.set(row.accountUuid, rows);
+function resolveDuplicateClaims(
+  plan: BackfillPlanEntry[],
+  existing: ReadonlyMap<string, string>,
+): BackfillPlanEntry[] {
+  interface Claimant {
+    label: string;
+    kind: "existing" | "proposed";
+    row?: BackfillPlanEntry;
   }
 
-  const duplicated = new Map([...claimants.entries()].filter(([, rows]) => rows.length > 1));
-  if (duplicated.size === 0) return plan;
+  const claimants = new Map<string, Claimant[]>();
+
+  // Seed with what the store ALREADY records. Real regardless of what this
+  // plan proposes elsewhere, and never redundant with a `backfilled` row for
+  // the SAME profile: `planOne` only reaches `backfilled` when `existing` has
+  // no entry for that profile name.
+  for (const [name, uuid] of existing) {
+    const lower = uuid.toLowerCase();
+    const list = claimants.get(lower) ?? [];
+    list.push({ label: name, kind: "existing" });
+    claimants.set(lower, list);
+  }
+
+  // Add every freshly proposed backfill.
+  for (const row of plan) {
+    if (row.outcome !== "backfilled" || !row.accountUuid) continue;
+    const list = claimants.get(row.accountUuid) ?? [];
+    list.push({ label: row.profileName ?? "(unregistered)", kind: "proposed", row });
+    claimants.set(row.accountUuid, list);
+  }
+
+  const disputed = new Map([...claimants.entries()].filter(([, rows]) => rows.length > 1));
+  if (disputed.size === 0) return plan;
 
   return plan.map((row) => {
     const uuid = row.accountUuid;
-    if (row.outcome !== "backfilled" || !uuid || !duplicated.has(uuid)) return row;
-    const selfLabel = row.profileName ?? "(unregistered)";
-    const siblings = duplicated
+    if (row.outcome !== "backfilled" || !uuid || !disputed.has(uuid)) return row;
+    // Excluded by object identity, not by label — labels are not unique
+    // (multiple unregistered dirs all read "(unregistered)").
+    const siblings = disputed
       .get(uuid)!
-      .map((r) => r.profileName ?? "(unregistered)")
-      .filter((label) => label !== selfLabel);
+      .filter((claimant) => claimant.row !== row)
+      .map((claimant) =>
+        claimant.kind === "existing" ? `already recorded on ${claimant.label}` : `also proposed for ${claimant.label}`,
+      );
     const { accountUuid: _drop, ...withoutUuid } = row;
     return {
       ...withoutUuid,
       outcome: "conflict",
       reason:
-        `${uuid} is also the parked identity resolved for ${siblings.join(", ")}; refusing to apply — ` +
+        `${uuid} is ${siblings.join("; ")}; refusing to apply — ` +
         "a uuid claimed by more than one profile means at most one binding is correct and this cannot say which",
     };
   });

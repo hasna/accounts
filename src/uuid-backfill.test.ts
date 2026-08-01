@@ -310,4 +310,79 @@ describe("a uuid claimed by more than one profile — CRITICAL, task 2b15400e", 
     expect(plan[0]!.outcome).toBe("backfilled");
     expect(plan[0]!.accountUuid).toBe(OWN_UUID);
   });
+
+  // CYCLE 1 REMEDIATION. Independent reviewer (Seneca) reproduced this against
+  // the fix above: `resolveDuplicateClaims` only cross-checked rows whose OWN
+  // outcome was `backfilled`. It never compared a freshly proposed uuid against
+  // a uuid ALREADY recorded on a different profile — an `already-set` row. That
+  // is the identical defect this PR claims to fix, reached through
+  // `already-set` x `backfilled` instead of `backfilled` x `backfilled`, and it
+  // is reachable through the tool's own dry-run -> apply -> re-run workflow:
+  // the moment any profile has been backfilled once, this gap is live for
+  // every subsequent invocation.
+  test("REGRESSION (cycle 1): a uuid already recorded on one profile blocks a fresh backfill proposing it for another", () => {
+    makeCentral(OWN_UUID, "shared@example.com");
+    // account-a already holds OWN_UUID (already-set: its existing record agrees
+    // with its own parked identity). account-b has NO existing record, but its
+    // parked identity independently resolves to the SAME uuid.
+    const plan = planFor(
+      [
+        makeProfileDir("account-a", { own: OWN_UUID }),
+        makeProfileDir("account-b", { own: OWN_UUID }),
+      ],
+      new Map([["account-a", OWN_UUID]]),
+    );
+    const byName = new Map(plan.map((p) => [p.profileName, p]));
+
+    // The exact defect: on the cycle-0 fix this reads already-set + backfilled,
+    // conflict=0, and applyAccountUuidBackfill would write OWN_UUID onto
+    // account-b even though account-a already holds it.
+    expect(byName.get("account-a")!.outcome).toBe("already-set");
+    expect(byName.get("account-b")!.outcome).toBe("conflict");
+    expect(byName.get("account-b")!.accountUuid).toBeUndefined();
+    expect(byName.get("account-b")!.reason).toMatch(/already recorded|more than one|also.*profile/i);
+  });
+
+  test("REGRESSION (cycle 1): applyAccountUuidBackfill never writes a uuid another profile already holds", async () => {
+    makeCentral(OWN_UUID, "shared@example.com");
+    const plan = planFor(
+      [
+        makeProfileDir("account-a", { own: OWN_UUID }),
+        makeProfileDir("account-b", { own: OWN_UUID }),
+      ],
+      new Map([["account-a", OWN_UUID]]),
+    );
+    const touched: string[] = [];
+    const applied = await applyAccountUuidBackfill(
+      {
+        async updateProfile(name: string) {
+          touched.push(name);
+          return {};
+        },
+      },
+      plan,
+    );
+    // account-a is already-set (never applied by construction); account-b must
+    // now ALSO never be applied, because OWN_UUID is already claimed.
+    expect(applied).toEqual([]);
+    expect(touched).toEqual([]);
+  });
+
+  test("an already-set collision does not swallow an UNRELATED, unambiguous profile in the same plan", () => {
+    makeCentral(OWN_UUID, "shared@example.com");
+    makeCentral(SECOND_UUID, "clean@example.com");
+    const plan = planFor(
+      [
+        makeProfileDir("account-a", { own: OWN_UUID }),
+        makeProfileDir("account-b", { own: OWN_UUID }),
+        makeProfileDir("account-clean", { own: SECOND_UUID }),
+      ],
+      new Map([["account-a", OWN_UUID]]),
+    );
+    const byName = new Map(plan.map((p) => [p.profileName, p]));
+    expect(byName.get("account-a")!.outcome).toBe("already-set");
+    expect(byName.get("account-b")!.outcome).toBe("conflict");
+    expect(byName.get("account-clean")!.outcome).toBe("backfilled");
+    expect(byName.get("account-clean")!.accountUuid).toBe(SECOND_UUID);
+  });
 });
