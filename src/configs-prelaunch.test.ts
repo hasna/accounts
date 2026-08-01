@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Profile } from "./types.js";
@@ -1235,6 +1235,224 @@ describe("configs prelaunch", () => {
       const result = runConfigsPrelaunch(p, getTool("fakeagent"));
       expect(result.skipped).toBe(true);
       expect(result.reason).toBe("unsupported tool fakeagent");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/**
+ * A prelaunch render must never REDUCE what a home already carries.
+ *
+ * Measured on station01 2026-08-01 (todos c461ce8a): 25 of 30 claude profile
+ * homes held a canonical 19-source render and a 12-source identity export.
+ * Prelaunch renders from the export, and `configs session apply` then DELETES
+ * the seven unmatched managed files as "stale managed file removed" — so a
+ * single launch silently strips seven doctrine rules from a governed home, at
+ * rc=0, recorded as `result: applied`.
+ *
+ * The shortfall guard that should have caught it could not: left unarmed its
+ * expected set is derived from the same export it is validating, so the
+ * comparison is tautological. These tests pin the floor to the home's OWN prior
+ * manifest, which is independent of the export by construction and needs no
+ * hardcoded rule list — accounts still does not own the canonical set.
+ */
+describe("configs prelaunch instruction preservation", () => {
+  const INCUMBENT_IDS = [
+    "global-adversarial-review-proportionality-system-prompt",
+    "global-fix-on-sight",
+    "global-credential-exposure-hygiene",
+    "hasna-agent-operating-rules",
+    "global-dispatch-survivability",
+    "global-report-taxonomy",
+    "global-mementos-discipline",
+  ];
+  // What the stale export declares: a strict subset, exactly the real shape.
+  const SUPPLIED_IDS = INCUMBENT_IDS.slice(0, 4);
+  const DROPPED_IDS = INCUMBENT_IDS.slice(4);
+
+  function writeExport(path: string, ids: string[]) {
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        contract: "hasna.identities.configs-instructions/v1",
+        sources: ids.map((id) => ({ id, layer: "global", content: `rules for ${id}` })),
+      }) + "\n",
+    );
+  }
+
+  /**
+   * Stands in for `configs session apply`: renders exactly the ids it was
+   * handed and prunes everything else, which is what the real command does.
+   */
+  function renderingRunner(p: Profile, toolId: string, ids: string[], calls: string[][]) {
+    return (bin: string, args: string[]) => {
+      calls.push([bin, ...args]);
+      writeManifest(p, toolId, ids.map((id) => ({ id })));
+      return { status: 0, stdout: Buffer.from("ok"), stderr: Buffer.from("") };
+    };
+  }
+
+  test("REGRESSION c461ce8a: refuses to render when the export would drop sources the home already carries", () => {
+    resetHome();
+    try {
+      const exportPath = join(home, "stale-export.configs.json");
+      writeExport(exportPath, SUPPLIED_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+      // The home as the canonical render left it.
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, calls),
+      });
+
+      // The renderer must never have run: detecting the loss after writing it
+      // leaves the home already corrupted.
+      expect(calls).toHaveLength(0);
+      expect(result.result).not.toBe("applied");
+      expect(result.skipped).toBe(true);
+      // The operator has to be told WHICH rules were about to go.
+      for (const id of DROPPED_IDS) expect(result.reason).toContain(id);
+
+      // And the home still carries everything it started with.
+      const manifest = JSON.parse(
+        readFileSync(join(p.dir, ".hasna", "session-render-manifest.json"), "utf8"),
+      ) as { sources: Array<{ id: string }> };
+      expect(manifest.sources.map((s) => s.id).sort()).toEqual([...INCUMBENT_IDS].sort());
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("records EVERY dropped id in the audit, not just what fits in the prose reason", () => {
+    // The prose `reason` is capped at MAX_REASON_LENGTH (220). Measured on the
+    // real station01 fixture, an eight-id refusal produced a reason of exactly
+    // 220 characters naming two of them and cutting off mid-list — so the audit
+    // was least informative precisely where the most was being removed, while
+    // the changelog claimed the ids were named there. Bound by count, not by
+    // slicing the middle out of the payload.
+    resetHome();
+    try {
+      const longIncumbent = Array.from({ length: 9 }, (_, i) => `global-a-deliberately-long-instruction-source-id-number-${i}`);
+      const exportPath = join(home, "short-export.configs.json");
+      writeExport(exportPath, longIncumbent.slice(0, 2));
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", longIncumbent.map((id) => ({ id })));
+
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", longIncumbent.slice(0, 2), []),
+      });
+      expect(result.result).toBe("skipped");
+
+      const audit = JSON.parse(
+        readFileSync(join(p.dir, ".hasna", "accounts", "prelaunch-status.json"), "utf8"),
+      ) as { reason?: string; droppedSourceIds?: string[]; droppedSourceCount?: number };
+
+      // The prose really is truncated — this is the condition being defended
+      // against, so assert it rather than assume it.
+      expect(audit.reason!.length).toBe(220);
+      expect(audit.reason).not.toContain(longIncumbent[8]);
+
+      // …and the structured field carries all seven regardless.
+      expect(audit.droppedSourceCount).toBe(7);
+      expect(audit.droppedSourceIds).toEqual(longIncumbent.slice(2));
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("still renders when the export covers everything the home carries", () => {
+    // The must-not-over-block control. A guard that blocks every launch is its
+    // own outage, so the ordinary case has to be shown passing in the same run
+    // as the blocked one — otherwise the test above is satisfied by a function
+    // that always refuses.
+    resetHome();
+    try {
+      const grown = [...INCUMBENT_IDS, "global-corpus-coverage-bounded-by-axes"];
+      const exportPath = join(home, "current-export.configs.json");
+      writeExport(exportPath, grown);
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", grown, calls),
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(result.result).toBe("applied");
+      expect(result.skipped).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("renders freely into a home that has no manifest yet", () => {
+    // A fresh home has no incumbent set, so there is nothing to preserve and
+    // the floor must not be invented. Without this the first render of every
+    // new profile would be refused.
+    resetHome();
+    try {
+      const exportPath = join(home, "first-export.configs.json");
+      writeExport(exportPath, SUPPLIED_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, calls),
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(result.result).toBe("applied");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("allows a deliberate reduction when the operator asks for one", () => {
+    // Rules do get retired. Without an escape hatch the incumbent floor would
+    // pin a home to a superseded set forever.
+    resetHome();
+    try {
+      const exportPath = join(home, "reduced-export.configs.json");
+      writeExport(exportPath, SUPPLIED_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        allowSourceReduction: true,
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, calls),
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(result.result).toBe("applied");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("records that the preservation floor was available, so silence is never read as coverage", () => {
+    resetHome();
+    try {
+      const exportPath = join(home, "audited-export.configs.json");
+      writeExport(exportPath, INCUMBENT_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", INCUMBENT_IDS, []),
+      });
+
+      expect(result.result).toBe("applied");
+      const audit = JSON.parse(
+        readFileSync(join(p.dir, ".hasna", "accounts", "prelaunch-status.json"), "utf8"),
+      ) as { shortfallGuard?: string };
+      // Unarmed no longer means unchecked: the prior manifest supplied a real,
+      // independent floor.
+      expect(audit.shortfallGuard).toBe("incumbent");
     } finally {
       cleanup();
     }

@@ -39,8 +39,41 @@ export interface ConfigsPrelaunchManifestStatus {
  * an export that was already short — the case that ran undetected for weeks.
  * Recorded explicitly so a surface can distinguish "checked and fine" from
  * "could not check", which is the distinction the whole incident turned on.
+ *
+ * `incumbent` is the floor taken from the home's OWN prior manifest. It is
+ * independent of the export by construction — the manifest was written by a
+ * previous render, not by the artefact under test — and it needs no configured
+ * rule list, so it arms itself on every home that has ever been rendered. It
+ * proves only that the render did not REDUCE the home; it says nothing about
+ * whether the incumbent set was itself complete. `armed` remains the stronger
+ * claim and takes precedence when both are available.
  */
-export type ConfigsShortfallGuardState = "armed" | "unarmed";
+export type ConfigsShortfallGuardState = "armed" | "incumbent" | "unarmed";
+
+/**
+ * Every instruction source id the manifest declares, uncapped.
+ *
+ * Deliberately NOT `assessConfigsManifest().sourceIds`, which truncates at
+ * MAX_SOURCE_IDS because it feeds a bounded audit record. A safety check built
+ * on a display cap disarms itself the moment the canonical set grows past that
+ * cap, silently and in the direction that loses — the vacuous-check shape this
+ * whole module exists to avoid. Reporting is bounded; comparison is not.
+ */
+export function readManifestSourceIds(profile: Profile): string[] {
+  const path = configsManifestPath(profile);
+  if (!existsSync(path)) return [];
+  try {
+    const parsed = asRecord(JSON.parse(readFileSync(path, "utf8")));
+    const sources = parsed?.["sources"];
+    if (!Array.isArray(sources)) return [];
+    return sources.flatMap((source) => {
+      const id = stringValue(asRecord(source)?.["id"]);
+      return id ? [id] : [];
+    });
+  } catch {
+    return [];
+  }
+}
 
 export interface ConfigsPrelaunchAudit {
   schema: "hasna.accounts.configs-prelaunch/v1";
@@ -53,6 +86,18 @@ export interface ConfigsPrelaunchAudit {
   statusCode?: number | null;
   identityExportCount: number;
   shortfallGuard?: ConfigsShortfallGuardState;
+  /**
+   * Instruction source ids a refused render would have removed.
+   *
+   * Structured rather than left to `reason`, which is prose and is capped at
+   * MAX_REASON_LENGTH. Measured on the real fixture: an eight-id refusal
+   * produced a reason of exactly 220 characters that named two of them and cut
+   * off mid-list, so "the audit names the dropped ids" was false for precisely
+   * the cases with the most to say. Bound the record by COUNT, like sourceIds,
+   * never by truncating the middle of the payload.
+   */
+  droppedSourceIds?: string[];
+  droppedSourceCount?: number;
   updatedAt: string;
   manifest: {
     path: string;
@@ -82,6 +127,7 @@ export interface RecordConfigsPrelaunchAuditInput {
   statusCode?: number | null;
   identityExportCount?: number;
   shortfallGuard?: ConfigsShortfallGuardState;
+  droppedSourceIds?: string[];
 }
 
 const STATUS_SCHEMA = "hasna.accounts.configs-prelaunch/v1" as const;
@@ -312,6 +358,12 @@ export function recordConfigsPrelaunchAudit(
     ...(input.statusCode !== undefined ? { statusCode: input.statusCode } : {}),
     identityExportCount: input.identityExportCount ?? 0,
     ...(input.shortfallGuard ? { shortfallGuard: input.shortfallGuard } : {}),
+    ...(input.droppedSourceIds && input.droppedSourceIds.length > 0
+      ? {
+          droppedSourceIds: input.droppedSourceIds.slice(0, MAX_SOURCE_IDS),
+          droppedSourceCount: input.droppedSourceIds.length,
+        }
+      : {}),
     updatedAt: new Date().toISOString(),
     manifest: {
       path: manifest.path,

@@ -9,6 +9,7 @@ import { redactText } from "./redaction.js";
 import {
   assessConfigsManifest,
   getConfigsPrelaunchSummary,
+  readManifestSourceIds,
   recordConfigsPrelaunchAudit,
   type ConfigsPrelaunchAuditResult,
   type ConfigsPrelaunchSummary,
@@ -51,6 +52,21 @@ export interface ConfigsPrelaunchOptions {
    * which still catches a renderer silently dropping sources.
    */
   requiredSourceIds?: string[];
+  /**
+   * Let this render REMOVE instruction sources the home already carries.
+   *
+   * Off by default. A prelaunch render is the wrong place to retire a rule: it
+   * fires on an ordinary `accounts launch`, from whatever export happens to be
+   * on disk, and `configs session apply` deletes the unmatched managed files
+   * outright ("stale managed file removed"). Measured 2026-08-01 on station01,
+   * that is how a governed home went from 19 sources to 12 at rc=0, recorded as
+   * `applied`, with no surface reporting a loss.
+   *
+   * Retiring a rule is a deliberate act performed by the canonical render, which
+   * resets the floor for every home. This flag exists so that act is expressible
+   * here too, not so it can happen by accident.
+   */
+  allowSourceReduction?: boolean;
   skipReason?: string;
   runner?: ConfigsRunner;
 }
@@ -361,10 +377,80 @@ export function runConfigsPrelaunch(
   //           short — which is the case that ran for weeks. Recorded by name so
   //           its silence is never read as coverage.
   const independentRequiredSourceIds = resolveRequiredInstructionSourceIds({ explicit: opts.requiredSourceIds });
+
+  // What the home ALREADY carries, read before anything is written.
+  //
+  // This is the floor that was missing. The configured expectation above is the
+  // stronger check but nobody sets it, so in practice the guard fell back to the
+  // export's own ids and compared the render against the artefact that produced
+  // it — a comparison that cannot fail. The prior manifest is independent of the
+  // export by construction, costs one file read, and needs no rule list, so it
+  // arms on every home that has ever been rendered instead of on the homes
+  // someone remembered to configure.
+  // Not consulted at all once the operator has authorised a reduction: the floor
+  // and the permission to go below it cannot both apply, and leaving it in place
+  // made the post-render check reject the very reduction that was just allowed.
+  const incumbentSourceIds =
+    mode === "apply" && opts.allowSourceReduction !== true ? readManifestSourceIds(profile) : [];
+
   const shortfallGuard: ConfigsShortfallGuardState =
-    independentRequiredSourceIds.length > 0 ? "armed" : "unarmed";
+    independentRequiredSourceIds.length > 0 ? "armed" : incumbentSourceIds.length > 0 ? "incumbent" : "unarmed";
+  const suppliedSourceIds = identityExports.flatMap(readIdentityExportSourceIds);
   const requiredSourceIds =
-    shortfallGuard === "armed" ? independentRequiredSourceIds : identityExports.flatMap(readIdentityExportSourceIds);
+    shortfallGuard === "armed"
+      ? independentRequiredSourceIds
+      : // Union, not either/or: the incumbent set catches an export that is
+        // already short, and the supplied set catches the renderer dropping
+        // something it WAS handed. Neither subsumes the other.
+        [...new Set([...incumbentSourceIds, ...suppliedSourceIds])];
+
+  // REFUSE BEFORE WRITING, not after.
+  //
+  // The post-render check below already rejects a shortfall, but by then the
+  // home is corrupted — the render has run and configs has deleted the files.
+  // Failing closed at that point buys both the damage and a dead launch. If the
+  // inputs to this render cannot possibly produce what the home already has,
+  // the render is simply not worth running: the home keeps its rules and the
+  // launch proceeds. Loud, non-destructive, and no outage.
+  const wouldDropSourceIds =
+    mode === "apply" && opts.allowSourceReduction !== true && identityExports.length > 0
+      ? incumbentSourceIds.filter((id) => !suppliedSourceIds.includes(id))
+      : [];
+  if (wouldDropSourceIds.length > 0) {
+    const shown = wouldDropSourceIds.slice(0, 5).join(", ");
+    const reason =
+      `session render inputs for ${tool.id}/${profile.name} declare ${suppliedSourceIds.length} instruction ` +
+      `sources but the home already carries ${incumbentSourceIds.length}; rendering would remove ` +
+      `${wouldDropSourceIds.length} of them (${shown}${wouldDropSourceIds.length > 5 ? ", …" : ""}). ` +
+      `Kept the existing instruction home and skipped the render. ` +
+      `Refresh the identity export, re-run the canonical render, ` +
+      `or pass --allow-instruction-reduction to remove them on purpose.`;
+    process.stderr.write(`accounts: ${reason}\n`);
+    const prelaunch = recordConfigsPrelaunchAudit(profile, tool, configsTool, {
+      mode,
+      result: "skipped",
+      allowFailure,
+      reason,
+      identityExportCount: identityExports.length,
+      shortfallGuard,
+      // The full list, structured. `reason` is prose and is capped at
+      // MAX_REASON_LENGTH; an eight-id refusal measured 220 characters and named
+      // two of them before cutting off mid-list, so the audit would have been
+      // least informative exactly where most was being removed.
+      droppedSourceIds: wouldDropSourceIds,
+    });
+    return {
+      skipped: true,
+      mode,
+      result: "skipped",
+      reason,
+      command: [],
+      status: undefined,
+      identityExports,
+      allowFailure,
+      prelaunch,
+    };
+  }
 
   const command = configsPrelaunchCommand(profile, tool, { ...opts, identityExports });
   const [bin, ...args] = command;
@@ -421,10 +507,14 @@ export function runConfigsPrelaunch(
     // the failure mode that survived undetected longest, precisely because it
     // looks identical to success everywhere else. Only trustworthy when the
     // manifest listed its ids in full; a truncated list cannot prove absence.
+    // Compare against the UNCAPPED id list. `manifest.sourceIds` is truncated at
+    // MAX_SOURCE_IDS for the audit record, and reading the check off it meant the
+    // guard stopped checking — reporting nothing missing — as soon as a home
+    // carried more sources than the display cap. The canonical set is 19 against
+    // a cap of 20, so that cliff was one rule away.
+    const renderedSourceIds = readManifestSourceIds(profile);
     const missingSources =
-      manifest.drift === "ok" && !manifest.sourceIdsTruncated
-        ? requiredSourceIds.filter((id) => !manifest.sourceIds.includes(id))
-        : [];
+      manifest.drift === "ok" ? requiredSourceIds.filter((id) => !renderedSourceIds.includes(id)) : [];
     if (manifest.drift !== "ok" || emptyRender || missingSources.length > 0) {
       const reason = emptyRender
         ? `session render produced no instruction sources for ${tool.id}/${profile.name}; the home would carry no operating rules`

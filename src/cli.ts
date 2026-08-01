@@ -411,6 +411,7 @@ interface ConfigsCliOptions {
   skipConfigs?: boolean;
   allowConfigsFailure?: boolean;
   allowEmptyInstructions?: boolean;
+  allowInstructionReduction?: boolean;
   requiredInstructionSource?: string[];
   configsBin?: string;
   identitiesBin?: string;
@@ -433,6 +434,7 @@ function configsPrelaunchOptions(opts: ConfigsCliOptions): ConfigsPrelaunchOptio
     // inert. Empty here means "not configured", and prelaunch records that as
     // `unarmed` rather than passing quietly.
     requiredSourceIds: resolveRequiredInstructionSourceIds({ explicit: opts.requiredInstructionSource }),
+    allowSourceReduction: opts.allowInstructionReduction,
     skipReason: opts.skipConfigs ? "--skip-configs" : mode === "skip" ? "--configs skip" : undefined,
   };
 }
@@ -444,6 +446,10 @@ function addConfigsOptions(command: Command): Command {
     .option("--skip-configs", "skip configs prelaunch")
     .option("--allow-configs-failure", "continue launch/run even if configs prelaunch fails")
     .option("--allow-empty-instructions", "render a home with no operating rules on purpose (fails closed otherwise)")
+    .option(
+      "--allow-instruction-reduction",
+      "let the render remove instruction sources the home already carries (skipped and kept otherwise)",
+    )
     .option(
       "--required-instruction-source <id>",
       `instruction source id the rendered home must carry; repeatable. Defaults to ${REQUIRED_INSTRUCTION_SOURCES_ENV}`,
