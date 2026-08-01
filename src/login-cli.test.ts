@@ -368,6 +368,57 @@ test("launch still PROCEEDS when a profile has no instruction sources, leaving i
   expect(`${result.stderr}${result.stdout}`).toContain("no instruction sources resolved");
 });
 
+test("the shortfall guard is ARMED in production, not just reachable from a library call", () => {
+  // The guard shipped inert: it existed, had tests, and nothing in the CLI ever
+  // passed it an expectation, so in production it compared a render against the
+  // export that produced it. A library-level test cannot catch that — only
+  // driving the real binary can. This asserts the wiring, not the algorithm.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs-shortfall.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
+
+  // Asserted through the FLAG, not the environment variable. The library reads
+  // the env itself, so an env-based assertion passes even with cli.ts reverted —
+  // measured, not assumed: removing the wiring left that version of this test
+  // green, which would have shipped a second inert guard behind a green test.
+  // `--required-instruction-source` exists only if cli.ts threads it through.
+  const result = runCliWith(
+    [
+      "launch",
+      "acct",
+      "--tool",
+      "claude",
+      "--required-instruction-source",
+      "hasna-agent-operating-rules",
+      "--",
+      "--version",
+    ],
+    { env: { FAKE_CONFIGS_LOG: configsLog } },
+  );
+
+  expect(result.status).not.toBe(0);
+  expect(`${result.stderr}${result.stdout}`).toContain("missing 1 of 1 required instruction sources");
+  expect(`${result.stderr}${result.stdout}`).toContain("hasna-agent-operating-rules");
+});
+
+test("the same launch succeeds when the required rule IS rendered", () => {
+  // Positive control: without it the test above would pass on any launch failure.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs-shortfall-ok.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
+
+  const result = runCliWith(
+    ["launch", "acct", "--tool", "claude", "--required-instruction-source", "global-codewith", "--", "--version"],
+    { env: { FAKE_CONFIGS_LOG: configsLog } },
+  );
+
+  expect(result.status).toBe(0);
+});
+
 test("switch --launch runs configs apply by default before spawning", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
   writeFakeConfigs();

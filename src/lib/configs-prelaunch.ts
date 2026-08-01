@@ -12,6 +12,7 @@ import {
   recordConfigsPrelaunchAudit,
   type ConfigsPrelaunchAuditResult,
   type ConfigsPrelaunchSummary,
+  type ConfigsShortfallGuardState,
 } from "./configs-prelaunch-status.js";
 
 export type ConfigsPrelaunchMode = "plan" | "apply" | "skip";
@@ -178,6 +179,39 @@ function readIdentityExportSourceIds(path: string): string[] {
   }
 }
 
+/**
+ * Environment key carrying the canonical instruction sources a governed home
+ * must end up with. Comma-separated ids.
+ *
+ * Configuration rather than a constant in this file on purpose: accounts does
+ * not own the rule set and must not encode it. It only needs to be told, by
+ * something that is NOT the artefact under test, what to expect.
+ */
+export const REQUIRED_INSTRUCTION_SOURCES_ENV = "HASNA_ACCOUNTS_REQUIRED_INSTRUCTION_SOURCES";
+
+/**
+ * The instruction sources a render must produce, from a source INDEPENDENT of
+ * the render being checked.
+ *
+ * This independence is the whole point. The guard shipped inert because its
+ * expected value was derived from the same export it was validating, which
+ * cannot fail: a stale export declaring three rules renders three, and the
+ * comparison passes while the home is missing seven. Returns an empty list when
+ * nothing is configured, and callers must treat that as "cannot check" rather
+ * than "checked and fine".
+ */
+export function resolveRequiredInstructionSourceIds(
+  opts: { env?: NodeJS.ProcessEnv; explicit?: string[] } = {},
+): string[] {
+  if (opts.explicit && opts.explicit.length > 0) return [...opts.explicit];
+  const raw = (opts.env ?? process.env)[REQUIRED_INSTRUCTION_SOURCES_ENV];
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+}
+
 function defaultRunner(command: string, args: string[]) {
   return spawnSync(command, args, {
     encoding: "buffer",
@@ -316,10 +350,21 @@ export function runConfigsPrelaunch(
     };
   }
 
-  // What this render is REQUIRED to end up carrying. An explicit list from the
-  // caller wins; otherwise every source the supplied exports declare, so a
-  // renderer that quietly drops one is still caught.
-  const requiredSourceIds = opts.requiredSourceIds ?? identityExports.flatMap(readIdentityExportSourceIds);
+  // What this render is REQUIRED to end up carrying, and — just as important —
+  // whether that expectation is INDEPENDENT of the thing being checked.
+  //
+  //   armed   an expectation supplied from outside: a caller literal, or the
+  //           configured canonical set. This can actually fail.
+  //   unarmed nothing configured, so the only available expectation is the
+  //           export itself. That comparison catches a renderer DROPPING a
+  //           source it was handed, and cannot catch an export that was already
+  //           short — which is the case that ran for weeks. Recorded by name so
+  //           its silence is never read as coverage.
+  const independentRequiredSourceIds = resolveRequiredInstructionSourceIds({ explicit: opts.requiredSourceIds });
+  const shortfallGuard: ConfigsShortfallGuardState =
+    independentRequiredSourceIds.length > 0 ? "armed" : "unarmed";
+  const requiredSourceIds =
+    shortfallGuard === "armed" ? independentRequiredSourceIds : identityExports.flatMap(readIdentityExportSourceIds);
 
   const command = configsPrelaunchCommand(profile, tool, { ...opts, identityExports });
   const [bin, ...args] = command;
@@ -335,6 +380,7 @@ export function runConfigsPrelaunch(
       reason: `configs prelaunch ${mode} failed`,
       statusCode: result.status,
       identityExportCount: identityExports.length,
+      shortfallGuard,
     });
     throw new AccountsError(`configs prelaunch ${mode} failed for ${tool.id}/${profile.name}${detail}`);
   }
@@ -347,6 +393,7 @@ export function runConfigsPrelaunch(
       reason,
       statusCode: result.status,
       identityExportCount: identityExports.length,
+      shortfallGuard,
     });
     return {
       skipped: false,
@@ -394,6 +441,7 @@ export function runConfigsPrelaunch(
         reason: allowFailure ? `${reason}; --allow-configs-failure` : reason,
         statusCode: result.status,
         identityExportCount: identityExports.length,
+        shortfallGuard,
       });
       if (!allowFailure) throw new AccountsError(`configs prelaunch ${mode} failed for ${tool.id}/${profile.name}: ${reason}`);
       return {
@@ -418,6 +466,7 @@ export function runConfigsPrelaunch(
     reason: identityBypass,
     statusCode: result.status,
     identityExportCount: identityExports.length,
+    shortfallGuard,
   });
   return {
     skipped: false,
