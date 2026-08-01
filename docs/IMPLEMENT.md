@@ -71,11 +71,14 @@ Generated handoffs target POSIX sh/bash/zsh syntax. `src/lib/env.ts` rejects
 non-portable variable names, quotes every value as a non-expanding POSIX word,
 and inserts `env --` before assignments so a leading-hyphen provider binary
 cannot be parsed as an `env` option. Embedded quotes, newlines, backslashes,
-dollars, and backticks remain literal. Tool schemas validate `extraEnv` keys
-at registration/load time, while the renderer validates again at the execution
-boundary for defense in depth. fish, nushell, and PowerShell output is not
-claimed; use an Accounts-owned launch there (or `accounts shell` for
-fish/nushell when `SHELL` identifies that shell).
+dollars, and backticks remain literal. A public restart command renders a
+non-empty credential-named environment value as `env -u NAME` instead of a
+runnable `[REDACTED]` assignment; deliberately empty credential values remain
+empty assignments. Tool schemas validate `extraEnv` keys at registration/load
+time, while the renderer validates again at the execution boundary for defense
+in depth. fish, nushell, and PowerShell output is not claimed; use an
+Accounts-owned launch there (or `accounts shell` for fish/nushell when `SHELL`
+identifies that shell).
 
 Do not broaden that list without evidence that another control dumps provider
 requests. `PATH`, proxy/TLS configuration, Bedrock/Vertex selection, and
