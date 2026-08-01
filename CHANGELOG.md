@@ -6,6 +6,19 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.30] - 2026-08-01
+
+Ships the alias capability, which was merged after `0.2.29` had already been
+published and so had never reached an installed binary. Release span measured
+against the bytes `0.2.29` actually shipped rather than against its tag: the
+`npm/accounts/v0.2.29` tag points at `0791af29`, but the published `0.2.29`
+artifact was cut from `3e5a7791`, two commits later — verified by finding
+`purgeProfileDir` (from `c3798bcd`) and `claimed by more than one profile`
+(from `3e5a7791`) in the published `dist/cli.js`, not merely in its packaged
+`CHANGELOG.md`. The eight commits new in `0.2.30` are therefore `0944c23e`,
+`8f62e684`, `28e319d5`, `613450c7`, `5ac06e44`, `ce2215b8`, `9f00b7db` and
+`e0303603`.
+
 ### Added
 
 - **Alias records: a rename is recorded, not just performed (R-P1-4).**
@@ -38,6 +51,12 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   also independently resolves to — the second is reachable the moment any
   profile has been backfilled once, through the tool's own
   dry-run → apply → re-run workflow. (task `2b15400e`)
+
+  **This code already shipped inside the `0.2.29` artifact** and is logged here
+  only because `0.2.29` was a manual publish cut from `3e5a7791`, a head two
+  commits ahead of the tag it was released under, so its own changelog section
+  never described it. Recorded rather than silently relocated: an entry that
+  moves between versions is otherwise indistinguishable from a regression.
 
 ## [0.2.29] - 2026-07-31
 
