@@ -39,8 +39,41 @@ export interface ConfigsPrelaunchManifestStatus {
  * an export that was already short — the case that ran undetected for weeks.
  * Recorded explicitly so a surface can distinguish "checked and fine" from
  * "could not check", which is the distinction the whole incident turned on.
+ *
+ * `incumbent` is the floor taken from the home's OWN prior manifest. It is
+ * independent of the export by construction — the manifest was written by a
+ * previous render, not by the artefact under test — and it needs no configured
+ * rule list, so it arms itself on every home that has ever been rendered. It
+ * proves only that the render did not REDUCE the home; it says nothing about
+ * whether the incumbent set was itself complete. `armed` remains the stronger
+ * claim and takes precedence when both are available.
  */
-export type ConfigsShortfallGuardState = "armed" | "unarmed";
+export type ConfigsShortfallGuardState = "armed" | "incumbent" | "unarmed";
+
+/**
+ * Every instruction source id the manifest declares, uncapped.
+ *
+ * Deliberately NOT `assessConfigsManifest().sourceIds`, which truncates at
+ * MAX_SOURCE_IDS because it feeds a bounded audit record. A safety check built
+ * on a display cap disarms itself the moment the canonical set grows past that
+ * cap, silently and in the direction that loses — the vacuous-check shape this
+ * whole module exists to avoid. Reporting is bounded; comparison is not.
+ */
+export function readManifestSourceIds(profile: Profile): string[] {
+  const path = configsManifestPath(profile);
+  if (!existsSync(path)) return [];
+  try {
+    const parsed = asRecord(JSON.parse(readFileSync(path, "utf8")));
+    const sources = parsed?.["sources"];
+    if (!Array.isArray(sources)) return [];
+    return sources.flatMap((source) => {
+      const id = stringValue(asRecord(source)?.["id"]);
+      return id ? [id] : [];
+    });
+  } catch {
+    return [];
+  }
+}
 
 export interface ConfigsPrelaunchAudit {
   schema: "hasna.accounts.configs-prelaunch/v1";
