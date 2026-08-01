@@ -113,11 +113,13 @@ test("resolveSupervisorLaunch treats a known target as a tool and uses the activ
   expect(plan.profile.name).toBe("one");
 });
 
-test("accounts run/supervisor prelaunch passes --allow-empty-sources for identity-less profiles", async () => {
-  // Regression for the live-bridge dead-letter: `accounts run codewith -p accountNNN`
-  // (supervisor path) must render an explicit EMPTY session for a profile with no
-  // identity/instruction sources instead of failing closed with
-  // "Session render has no instruction sources".
+test("accounts run/supervisor prelaunch renders an empty session only when explicitly asked", async () => {
+  // This once asserted that a profile with no identity sources gets an EMPTY
+  // render automatically, to stop `accounts run codewith -p accountNNN` failing
+  // closed. That unblocked the dead-letter and silently shipped agent homes
+  // with zero operating rules. The empty render is now opt-in, and this test
+  // pins the opt-in path; the fail-closed default is covered in
+  // src/empty-instruction-render.test.ts.
   const scriptPath = join(home, "codewith-exec-once.mjs");
   writeFileSync(scriptPath, "process.exit(0);\n");
 
@@ -130,6 +132,7 @@ test("accounts run/supervisor prelaunch passes --allow-empty-sources for identit
     restartDelayMs: 25,
     configsPrelaunch: {
       mode: "apply",
+      allowEmptySources: true,
       runner: (bin, args) => {
         calls.push([bin, ...args]);
         // configs writes a valid sourceCount:0 manifest for an explicit empty render.
@@ -813,12 +816,38 @@ test("supervisor refuses to unlink a non-socket control path", async () => {
   expect(readFileSync(socketPath, "utf8")).toBe("not-a-socket");
 });
 
+/**
+ * Prelaunch only renders when it has an instruction source to render FROM; with
+ * none it skips without invoking the renderer. Tests that exercise the RENDER
+ * path therefore have to give the profile one, or they silently stop testing
+ * the thing they were written for.
+ */
+function instructionSourceFor(name: string): string {
+  const path = join(home, `${name}.configs.json`);
+  writeFileSync(
+    path,
+    JSON.stringify({
+      contract: "hasna.identities.configs-instructions/v1",
+      sources: [{ id: "global-codewith", layer: "global", content: "rules" }],
+    }) + "\n",
+  );
+  return path;
+}
+
+/**
+ * The supervisor re-reads profiles from the store when it switches, so the
+ * identity has to be persisted, not just present on the in-memory copy.
+ */
+function addProfileWithInstructions(name: string, tool: string): Profile {
+  return addProfile({ name, tool, identity: instructionSourceFor(name) });
+}
+
 test("supervisor revalidates its filesystem boundary after prelaunch", async () => {
   if (process.platform === "win32") return;
 
   const scriptPath = join(home, "boundary-swap-child.mjs");
   writeFileSync(scriptPath, "process.exit(0);\n");
-  const profile = addProfile({ name: "one", tool: "codewith" });
+  const profile = addProfileWithInstructions("one", "codewith");
   const tool = { ...getTool("codewith"), bin: process.execPath };
   const supervisors = dirname(supervisorSocketPath("codewith"));
   const held = join(home, "held-supervisors");
@@ -943,9 +972,9 @@ test("supervisor switch preflights configs before queueing or stopping the curre
     ].join("\n"),
   );
 
-  const one = addProfile({ name: "one", tool: "codewith" });
-  const two = addProfile({ name: "two", tool: "codewith" });
-  const bad = addProfile({ name: "bad", tool: "codewith" });
+  const one = addProfileWithInstructions("one", "codewith");
+  const two = addProfileWithInstructions("two", "codewith");
+  const bad = addProfileWithInstructions("bad", "codewith");
   const tool = { ...getTool("codewith"), bin: process.execPath, resumeArgs: [scriptPath] };
   const calls: string[][] = [];
 

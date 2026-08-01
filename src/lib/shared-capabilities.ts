@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { platform } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { ToolDef } from "../types.js";
+import { AccountsError, type SharedConfigSpec, type ToolDef } from "../types.js";
 import { accountsHome } from "../storage.js";
 import { writeFileAtomic } from "./safe-path.js";
 
@@ -128,8 +128,19 @@ export function sharedEntriesFor(tool: ToolDef): string[] {
   return [...new Set([...(tool.sharedEntries ?? []), ...sessions])];
 }
 
+/**
+ * Every shared-config merge rule for a tool, as a list. `sharedConfig` accepts a
+ * bare object for the single-rule case (and for tools already in the registry),
+ * so every consumer normalizes here rather than each one re-deciding.
+ */
+export function sharedConfigsFor(tool: ToolDef): SharedConfigSpec[] {
+  const config = tool.sharedConfig;
+  if (!config) return [];
+  return Array.isArray(config) ? config : [config];
+}
+
 export function toolSharesCapabilities(tool: ToolDef): boolean {
-  return sharedEntriesFor(tool).length > 0 || tool.sharedConfig !== undefined;
+  return sharedEntriesFor(tool).length > 0 || sharedConfigsFor(tool).length > 0;
 }
 
 function lstatIfExists(path: string) {
@@ -280,10 +291,8 @@ function hasUnrenderedPlaceholder(value: unknown): boolean {
  * carries an unsubstituted placeholder is dropped: shipping it would put a
  * server into every profile that cannot start.
  */
-function readSharedConfig(sharedHome: string, tool: ToolDef): Record<string, JsonRecord> {
-  const config = tool.sharedConfig;
+function readSharedConfig(sharedHome: string, config: SharedConfigSpec): Record<string, JsonRecord> {
   const found: Record<string, JsonRecord> = {};
-  if (!config) return found;
   const excluded = new Set(config.exclude ?? []);
   for (const rel of config.sources) {
     const path = resolveSharedSource(sharedHome, rel);
@@ -307,10 +316,8 @@ function readSharedConfig(sharedHome: string, tool: ToolDef): Record<string, Jso
   return found;
 }
 
-function mergeSharedConfig(ctx: SharedContext, tool: ToolDef, result: SharedCapabilitiesResult): void {
-  const config = tool.sharedConfig;
-  if (!config) return;
-  const shared = readSharedConfig(ctx.sharedHome, tool);
+function mergeSharedConfig(ctx: SharedContext, config: SharedConfigSpec, result: SharedCapabilitiesResult): void {
+  const shared = readSharedConfig(ctx.sharedHome, config);
   if (Object.keys(shared).length === 0) return;
 
   const targetPath = join(ctx.profileDir, config.target);
@@ -507,8 +514,54 @@ export function ensureSharedCapabilities(profileDir: string, tool: ToolDef): Sha
       recordCorpusFloor(join(ctx.sharedHome, entry), corpusIsRecursive(tool, entry));
     }
   }
-  mergeSharedConfig(ctx, tool, result);
+  for (const config of sharedConfigsFor(tool)) mergeSharedConfig(ctx, config, result);
   return result;
+}
+
+/** Break-glass for the assertion below. Named in the refusal so it is discoverable. */
+export const UNGUARDED_LAUNCH_OVERRIDE = "ACCOUNTS_ALLOW_UNGUARDED_PROFILE";
+
+/**
+ * Refuse to hand out launch env for a profile that is missing shared config a
+ * spec marks `required`. Runs AFTER `ensureSharedCapabilities` has had its go,
+ * so it can only fire when seeding was attempted and did not take — an
+ * unwritable profile dir, an unparseable `settings.json`, or a profile created
+ * out-of-band by something that never called us.
+ *
+ * The two states, stated so the check is falsifiable rather than decorative:
+ *   passes  — the machine declares no such keys (nothing to enforce), or the
+ *             profile has them.
+ *   refuses — the machine declares them, seeding ran, the profile still lacks
+ *             them.
+ * A machine that configures no hooks is therefore never blocked by this, which
+ * is what keeps it from becoming a check that cannot fail in the other
+ * direction: one that refuses every launch everywhere.
+ */
+export function assertProfileGuarded(profileDir: string, tool: ToolDef): void {
+  const required = sharedConfigsFor(tool).filter((c) => c.required);
+  if (required.length === 0) return;
+  if (process.env[UNGUARDED_LAUNCH_OVERRIDE] === "1") return;
+
+  const sharedHome = sharedHomeFor(tool);
+  if (!existsSync(sharedHome) || samePath(sharedHome, profileDir)) return;
+
+  const faults: string[] = [];
+  for (const config of required) {
+    for (const row of specHealth(sharedHome, profileDir, config)) {
+      if (row.status === "missing") {
+        faults.push(`"${row.key}" is declared on this machine but absent from ${row.target}`);
+      } else if (row.status === "unreadable") {
+        faults.push(`${row.target} could not be parsed (${row.reason}), so "${row.key}" cannot be verified`);
+      }
+    }
+  }
+  if (faults.length === 0) return;
+
+  throw new AccountsError(
+    `refusing to launch ${tool.label} profile at ${profileDir}: ${faults.join("; ")}. ` +
+      `This is safety configuration whose absence is silent — the profile would run and look normal. ` +
+      `Run \`accounts doctor\` to see the full report, or set ${UNGUARDED_LAUNCH_OVERRIDE}=1 to launch anyway.`,
+  );
 }
 
 function entryHealth(sharedHome: string, profileDir: string, entry: string): SharedCapabilityEntryHealth {
@@ -530,9 +583,11 @@ function entryHealth(sharedHome: string, profileDir: string, entry: string): Sha
 }
 
 function configHealth(sharedHome: string, profileDir: string, tool: ToolDef): SharedCapabilityConfigHealth[] {
-  const config = tool.sharedConfig;
-  if (!config) return [];
-  const shared = readSharedConfig(sharedHome, tool);
+  return sharedConfigsFor(tool).flatMap((config) => specHealth(sharedHome, profileDir, config));
+}
+
+function specHealth(sharedHome: string, profileDir: string, config: SharedConfigSpec): SharedCapabilityConfigHealth[] {
+  const shared = readSharedConfig(sharedHome, config);
   const targetPath = join(profileDir, config.target);
   const doc = readJsonDocument(targetPath);
   return config.keys.map((key) => {
@@ -543,10 +598,40 @@ function configHealth(sharedHome: string, profileDir: string, tool: ToolDef): Sh
       return { key, status: "unreadable" as const, target: targetPath, shared: sharedCount, profile: 0, reason: doc.reason };
     }
     const value = doc.state === "object" ? doc.value[key] : undefined;
-    const profileCount = isPlainObject(value) ? Object.keys(value).length : 0;
-    const status = sharedCount === 0 ? "unavailable" : profileCount === 0 ? "missing" : "shared";
-    return { key, status, target: targetPath, shared: sharedCount, profile: profileCount };
+    const profileValue = isPlainObject(value) ? value : undefined;
+    const profileCount = profileValue ? Object.keys(profileValue).length : 0;
+    if (sharedCount === 0) {
+      return { key, status: "unavailable" as const, target: targetPath, shared: 0, profile: profileCount };
+    }
+    // Compare the declared member NAMES, never the counts. A count answers "does
+    // the profile have any hooks at all", which is not the question: a profile
+    // carrying `PreToolUse` while the machine also declares `SessionStart` has a
+    // real, missing guard and a count of 1. Measured on this box by the reviewer:
+    // 30 of 30 live profiles are in exactly that state, and every one of them
+    // would have reported "shared". A member present but EMPTY is also absent —
+    // union-by-member never fills it, so it would be permanently unguarded while
+    // reporting healthy, which is the check-that-cannot-fail this exists to stop.
+    const absent = Object.keys(shared[key] ?? {}).filter((member) => {
+      const held = profileValue?.[member];
+      return held === undefined || isVacuous(held);
+    });
+    const status = absent.length > 0 ? ("missing" as const) : ("shared" as const);
+    return {
+      key,
+      status,
+      target: targetPath,
+      shared: sharedCount,
+      profile: profileCount,
+      ...(absent.length > 0 ? { reason: `missing or empty: ${absent.join(", ")}` } : {}),
+    };
   });
+}
+
+/** Present in name only: an empty array or object carries no configuration. */
+function isVacuous(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length === 0;
+  if (isPlainObject(value)) return Object.keys(value).length === 0;
+  return false;
 }
 
 /**

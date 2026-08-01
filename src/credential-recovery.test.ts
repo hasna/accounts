@@ -1,5 +1,16 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile } from "./lib/profiles.js";
@@ -9,7 +20,7 @@ import {
   recoverParkedCredential,
   writeSwitchedAccountMarker,
 } from "./lib/claude-auth.js";
-import { profileCredentialsSnapshot } from "./lib/claude-layout.js";
+import { profileCredentialsSnapshot, profileUnreadableCredentialsDir } from "./lib/claude-layout.js";
 import {
   classifyCredentialFile,
   parkedCredentialVerdict,
@@ -246,6 +257,40 @@ test("recoverParkedCredential restores the parked credential into a rotated-away
   // ARCHIVE-NEVER-DELETE: the parked copy is the only source of this material
   // and must survive the restore byte-for-byte.
   expect(readFileSync(profileCredentialsSnapshot(dir))).toEqual(snapshotBefore);
+  expect(existsSync(profileUnreadableCredentialsDir(dir))).toBe(false);
+});
+
+test("recovery preserves an unreadable live credential byte-for-byte before replacing it", () => {
+  const dir = makeProfile("alpha", UUID_A, "alpha");
+  const unreadable = Buffer.from([0x7b, 0x22, 0x66, 0x75, 0x74, 0x75, 0x72, 0x65, 0x22, 0x3a, 0xff, 0x7d]);
+  writeFileSync(join(dir, ".credentials.json"), unreadable);
+  expect(classifyCredentialFile(join(dir, ".credentials.json")).state).toBe("unreadable");
+
+  const result = recoverParkedCredential(dir, tool(), "alpha");
+
+  expect(result.outcome).toBe("recovered");
+  expect(classifyCredentialFile(join(dir, ".credentials.json")).state).toBe("usable");
+  const archives = readdirSync(profileUnreadableCredentialsDir(dir));
+  expect(archives).toHaveLength(1);
+  const archive = join(profileUnreadableCredentialsDir(dir), archives[0]!);
+  expect(readFileSync(archive)).toEqual(unreadable);
+  expect(statSync(archive).mode & 0o777).toBe(0o600);
+  expect(result.detail).toContain(archive);
+});
+
+test("recovery refuses to overwrite an unreadable live credential when it cannot preserve it", () => {
+  const dir = makeProfile("alpha", UUID_A, "alpha");
+  const unreadable = Buffer.from("foreign credential schema\n");
+  writeFileSync(join(dir, ".credentials.json"), unreadable);
+  const outside = mkdtempSync(join(tmpdir(), "recov-archive-outside-"));
+  symlinkSync(outside, profileUnreadableCredentialsDir(dir));
+
+  const result = recoverParkedCredential(dir, tool(), "alpha");
+
+  expect(result.outcome).toBe("failed");
+  expect(readFileSync(join(dir, ".credentials.json"))).toEqual(unreadable);
+  expect(readdirSync(outside)).toEqual([]);
+  rmSync(outside, { recursive: true, force: true });
 });
 
 test("recovery works even with live sessions attached — there is no identity to yank", () => {
