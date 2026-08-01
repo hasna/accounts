@@ -15,8 +15,8 @@ Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** 
 - **Multi-tool** — first-class built-ins for Claude, Takumi, Codex CLI, Codex
   App, Codewith, Gemini, opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build;
   custom tools via `accounts tools add`.
-- **Tool lock-in** — first login/use chooses the tool for a profile name, so
-  later bare commands like `accounts launch work` keep using that tool.
+- **Tool-specific profiles** — each profile belongs to one tool, and older
+  duplicate names must pass `--tool` on bare commands.
 - **Local-first** — the registry defaults to `~/.hasna/accounts/`; network access is opt-in
   for API storage and usage refreshes. No telemetry is sent by default.
 - **Open source** — source, docs, and contribution guidelines live in this repository.

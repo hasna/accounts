@@ -964,6 +964,28 @@ test("login requires an explicit choice for shared profile names when non-intera
   expect(readLogEntries()).toHaveLength(0);
 });
 
+test("login requires an explicit choice for shared profile names even when locked", () => {
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  writeFakeTool("fake-variant-tool", "FAKE_VARIANT_HOME", "fake-variant");
+  addFakeLoginTool("fake-login", "Fake Login", "FAKE_LOGIN_HOME", "fake-login-tool");
+  addFakeLoginTool("fake-variant", "Fake Variant", "FAKE_VARIANT_HOME", "fake-variant-tool");
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+  seedProfileRow("acct", "fake-variant");
+  const path = join(home, "accounts.json");
+  const store = readStore();
+  store.toolLocks = { ...(store.toolLocks ?? {}), acct: "fake-login" };
+  writeFileSync(path, JSON.stringify(store, null, 2));
+
+  const result = runCli("login", "acct");
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('profile "acct" is not locked to a tool');
+  expect(result.stderr).toContain("accounts login acct --tool fake-login");
+  expect(result.stderr).toContain("accounts login acct --tool fake-variant");
+  expect(readLogEntries()).toHaveLength(0);
+  expect(readStore().toolLocks?.acct).toBe("fake-login");
+});
+
 test("login refuses to create a profile whose name is already held by another tool", () => {
   writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
   writeFakeTool("fake-variant-tool", "FAKE_VARIANT_HOME", "fake-variant");
