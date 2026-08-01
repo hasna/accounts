@@ -11,7 +11,7 @@ import {
   configsSessionToolFor,
   runConfigsPrelaunch,
 } from "./lib/configs-prelaunch.js";
-import { getConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
+import { getConfigsPrelaunchSummary, readManifestSourceIds } from "./lib/configs-prelaunch-status.js";
 
 let home = "";
 
@@ -1453,6 +1453,295 @@ describe("configs prelaunch instruction preservation", () => {
       // Unarmed no longer means unchecked: the prior manifest supplied a real,
       // independent floor.
       expect(audit.shortfallGuard).toBe("incumbent");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/**
+ * REGRESSION 8776dba9 — the floor's own input can be destroyed, and until this
+ * block existed that disarmed the floor silently.
+ *
+ * `readManifestSourceIds` returned a bare `string[]` and answered `[]` for four
+ * different conditions: no manifest, unparseable manifest, malformed `sources`,
+ * and a manifest legitimately declaring none. Only the last is a trustworthy
+ * zero. The caller read `[]` as "this home has nothing to protect", so ONE
+ * deleted or corrupted file re-armed the exact failure the preservation floor
+ * above was written to stop.
+ *
+ * Measured on station01 2026-08-01 against published 0.2.31, on a scratch
+ * profile: with the manifest corrupted, `renderIssued=1`, `result=applied`, and
+ * the home went from 7 sources to 4 with drift `ok` and every gate green.
+ * Identical outcome with the manifest deleted instead.
+ *
+ * These tests are written against the OUTCOME — was the render issued — rather
+ * than against the audit fields, because the audit was green in the failing case
+ * and would have been satisfied by the broken code.
+ */
+describe("configs prelaunch floor integrity", () => {
+  const INCUMBENT_IDS = [
+    "global-adversarial-review-proportionality-system-prompt",
+    "global-fix-on-sight",
+    "global-credential-exposure-hygiene",
+    "hasna-agent-operating-rules",
+    "global-dispatch-survivability",
+    "global-report-taxonomy",
+    "global-mementos-discipline",
+  ];
+  const SUPPLIED_IDS = INCUMBENT_IDS.slice(0, 4);
+  const DROPPED_IDS = INCUMBENT_IDS.slice(4);
+
+  function writeExport(path: string, ids: string[]) {
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        contract: "hasna.identities.configs-instructions/v1",
+        sources: ids.map((id) => ({ id, layer: "global", content: `rules for ${id}` })),
+      }) + "\n",
+    );
+  }
+
+  function renderingRunner(p: Profile, toolId: string, ids: string[], calls: string[][]) {
+    return (bin: string, args: string[]) => {
+      calls.push([bin, ...args]);
+      writeManifest(p, toolId, ids.map((id) => ({ id })));
+      return { status: 0, stdout: Buffer.from("ok"), stderr: Buffer.from("") };
+    };
+  }
+
+  /**
+   * The record accounts itself writes on every prelaunch run. Any home that has
+   * ever been launched has one, which is what makes it usable as a fallback
+   * floor when the manifest is gone.
+   */
+  function writePriorAudit(p: Profile, toolId: string, ids: string[]) {
+    const dir = join(p.dir, ".hasna", "accounts");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "prelaunch-status.json"),
+      JSON.stringify(
+        {
+          schema: "hasna.accounts.configs-prelaunch/v1",
+          tool: toolId,
+          profile: p.name,
+          mode: "apply",
+          result: "applied",
+          allowFailure: false,
+          identityExportCount: 1,
+          updatedAt: "2026-07-01T00:00:00.000Z",
+          manifest: {
+            path: join(p.dir, ".hasna", "session-render-manifest.json"),
+            drift: "ok",
+            sourceCount: ids.length,
+            sourceIds: ids,
+            sourceIdsTruncated: false,
+          },
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+  }
+
+  function sabotage(p: Profile, how: "corrupt" | "remove") {
+    const path = join(p.dir, ".hasna", "session-render-manifest.json");
+    if (how === "corrupt") writeFileSync(path, "{ not json");
+    else rmSync(path);
+  }
+
+  for (const how of ["corrupt", "remove"] as const) {
+    test(`REGRESSION 8776dba9: a ${how === "corrupt" ? "corrupted" : "removed"} manifest does not disarm the preservation floor`, () => {
+      resetHome();
+      try {
+        const exportPath = join(home, `stale-${how}.configs.json`);
+        writeExport(exportPath, SUPPLIED_IDS);
+        const p = profileInHome("claude", { identity: exportPath });
+        writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+        writePriorAudit(p, "claude", INCUMBENT_IDS);
+
+        sabotage(p, how);
+
+        const calls: string[][] = [];
+        const result = runConfigsPrelaunch(p, getTool("claude"), {
+          runner: renderingRunner(p, "claude", SUPPLIED_IDS, calls),
+        });
+
+        // Before the fix this was calls=1 / result="applied" for both variants.
+        expect(calls).toHaveLength(0);
+        expect(result.skipped).toBe(true);
+        expect(result.result).not.toBe("applied");
+        // The audit still remembers the set, so the operator gets the real
+        // message naming what was about to go — not a generic refusal.
+        for (const id of DROPPED_IDS) expect(result.reason).toContain(id);
+      } finally {
+        cleanup();
+      }
+    });
+  }
+
+  test("REGRESSION 8776dba9: refuses when BOTH records of the floor are gone", () => {
+    // No audit to fall back on. The manifest exists and cannot be read, which a
+    // never-rendered home can never look like — so this is a destroyed input,
+    // not an absent one, and guessing "absent" is what loses the rules.
+    resetHome();
+    try {
+      const exportPath = join(home, "no-audit.configs.json");
+      writeExport(exportPath, SUPPLIED_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+      sabotage(p, "corrupt");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, calls),
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.skipped).toBe(true);
+      expect(result.reason).toContain("cannot be read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("REGRESSION review: a skipped run cannot erase the audit fallback before the next render", () => {
+    resetHome();
+    try {
+      const staleExport = join(home, "stale-after-skip.configs.json");
+      const p = profileInHome("claude");
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+      writePriorAudit(p, "claude", INCUMBENT_IDS);
+
+      rmSync(join(p.dir, ".hasna", "session-render-manifest.json"));
+
+      // The first run has no readable identity input. It correctly skips, but
+      // recording that skip must not replace the only surviving copy of the
+      // incumbent floor with the currently missing manifest's empty summary.
+      const firstCalls: string[][] = [];
+      const first = runConfigsPrelaunch(p, getTool("claude"), {
+        identityExports: [join(home, "missing.configs.json")],
+        runner: renderingRunner(p, "claude", [], firstCalls),
+      });
+      expect(firstCalls).toHaveLength(0);
+      expect(first.result).toBe("skipped");
+      expect(first.prelaunch.lastRun?.manifest.drift).toBe("missing");
+      expect(first.prelaunch.lastRun?.preservationFloor?.sourceIds).toEqual(INCUMBENT_IDS);
+
+      writeExport(staleExport, SUPPLIED_IDS);
+      const secondCalls: string[][] = [];
+      const second = runConfigsPrelaunch(p, getTool("claude"), {
+        identityExports: [staleExport],
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, secondCalls),
+      });
+
+      // Before the review fix this was calls=1 / result="applied": the first
+      // skip had rewritten the audit to sourceCount=0, so this run called the
+      // missing manifest a fresh home and removed the three dropped sources.
+      expect(secondCalls).toHaveLength(0);
+      expect(second.result).toBe("skipped");
+      for (const id of DROPPED_IDS) expect(second.reason).toContain(id);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // ---- must-not-over-block controls -------------------------------------
+  // A guard that refuses everything is its own outage, and it would satisfy
+  // every assertion above. Each control below has to pass in the same run.
+
+  test("CONTROL: a destroyed manifest still renders when the export covers the recorded floor", () => {
+    resetHome();
+    try {
+      const exportPath = join(home, "complete.configs.json");
+      writeExport(exportPath, INCUMBENT_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+      writePriorAudit(p, "claude", INCUMBENT_IDS);
+      sabotage(p, "corrupt");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", INCUMBENT_IDS, calls),
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(result.result).toBe("applied");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("CONTROL: a first-ever render into a home with no manifest and no audit is not blocked", () => {
+    // The bootstrap path. `missing` manifest plus `missing` audit is the only
+    // state in which an empty floor is a true answer, and it must stay open or
+    // no new profile can ever be rendered.
+    resetHome();
+    try {
+      const exportPath = join(home, "first.configs.json");
+      writeExport(exportPath, SUPPLIED_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, calls),
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(result.result).toBe("applied");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("CONTROL: --allow-instruction-reduction still renders through a destroyed manifest", () => {
+    // The escape hatch has to survive the new refusal, or an operator with a
+    // corrupt manifest is wedged out of their own launch with no way through.
+    resetHome();
+    try {
+      const exportPath = join(home, "reduce.configs.json");
+      writeExport(exportPath, SUPPLIED_IDS);
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+      writePriorAudit(p, "claude", INCUMBENT_IDS);
+      sabotage(p, "corrupt");
+
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        allowSourceReduction: true,
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, calls),
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(result.result).toBe("applied");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("readManifestSourceIds reports WHY it returned nothing", () => {
+    // The unit-level statement of the defect: three of these used to be the
+    // same value, and the one that is a real zero is the only one that may
+    // disarm anything.
+    resetHome();
+    try {
+      const p = profileInHome("claude");
+
+      expect(readManifestSourceIds(p)).toEqual({ state: "missing", ids: [] });
+
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+      expect(readManifestSourceIds(p)).toEqual({ state: "ok", ids: INCUMBENT_IDS });
+
+      writeManifest(p, "claude", []);
+      expect(readManifestSourceIds(p)).toEqual({ state: "ok", ids: [] });
+
+      const path = join(p.dir, ".hasna", "session-render-manifest.json");
+      writeFileSync(path, "{ not json");
+      expect(readManifestSourceIds(p)).toEqual({ state: "unreadable", ids: [] });
+
+      writeFileSync(path, JSON.stringify({ schema: "x", sources: "not-an-array" }));
+      expect(readManifestSourceIds(p)).toEqual({ state: "unreadable", ids: [] });
     } finally {
       cleanup();
     }

@@ -49,6 +49,40 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   rule away from silently reporting nothing missing, forever. Comparison now
   uses a new uncapped `readManifestSourceIds()`; the audit record stays bounded.
 
+- **Deleting or corrupting one file no longer disarms the preservation floor
+  (todos `8776dba9`).** The floor above reads exactly one input —
+  `<profile.dir>/.hasna/session-render-manifest.json` — and
+  `readManifestSourceIds()` returned a bare `string[]`, answering `[]` for four
+  different conditions: no manifest, unparseable JSON, a malformed `sources`
+  field, and a manifest legitimately declaring none. Only the last is a
+  trustworthy zero, and the caller treated all four as "this home has nothing to
+  protect". A bare `catch { return [] }` on the sole input to a safety control
+  is the defect.
+
+  Reproduced on station01 2026-08-01 against published `0.2.31`, on a scratch
+  profile carrying 7 sources against a stale 4-source export: with the manifest
+  corrupted **or** deleted, the render was issued, the audit recorded
+  `result: applied`, manifest drift read `ok`, and the home dropped to 4
+  sources. Every gate green. That is the failure `c461ce8a` had just closed,
+  re-armed by one missing file.
+
+  `readManifestSourceIds()` now returns `{ state, ids }` with
+  `state: "ok" | "missing" | "unreadable"`, so a caller can no longer fail to
+  notice that its input was destroyed. The guard resolves the floor in order:
+  the manifest; failing that, the **prelaunch audit** at
+  `.hasna/accounts/prelaunch-status.json`, which `accounts` writes on every run
+  and is a second, independently produced record of the same set; failing both,
+  it **refuses the render** and says so, unless nothing on disk claims the home
+  has ever carried sources — the first-ever render of a new profile stays open.
+
+  The audit now carries an uncapped `preservationFloor` independently of its
+  bounded manifest summary, and carries that floor forward when a skipped or
+  failed run observes the manifest missing. That prevents an intermediate run
+  from erasing the fallback before the next render. Legacy audit records remain
+  capped until one successful render refreshes the durable floor.
+  `--allow-instruction-reduction` bypasses the new refusal, so an operator with
+  a corrupt manifest is never wedged out of their own launch.
+
 ## [0.2.30] - 2026-08-01
 
 Ships the alias capability, which was merged after `0.2.29` had already been

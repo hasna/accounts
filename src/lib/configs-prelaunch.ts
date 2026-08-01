@@ -9,6 +9,7 @@ import { redactText } from "./redaction.js";
 import {
   assessConfigsManifest,
   getConfigsPrelaunchSummary,
+  readConfigsPrelaunchAudit,
   readManifestSourceIds,
   recordConfigsPrelaunchAudit,
   type ConfigsPrelaunchAuditResult,
@@ -228,6 +229,68 @@ export function resolveRequiredInstructionSourceIds(
     .filter((id) => id.length > 0);
 }
 
+/**
+ * Where the preservation floor came from, or why there is none.
+ *
+ * `manifest`  read from the home's own session render manifest — the normal case.
+ * `audit`     the manifest is gone or corrupt, so the floor came from the
+ *             prelaunch audit accounts wrote on the previous run.
+ * `fresh`     nothing on disk claims this home has ever carried sources. The
+ *             only state in which rendering into an unprotected home is correct.
+ * `waived`    the operator authorised a reduction; no floor applies.
+ * `destroyed` something says this home HAS carried sources and nothing can say
+ *             which. Not the same as `fresh`, and the whole point of this type.
+ */
+type IncumbentFloor =
+  | { ids: string[]; origin: "manifest" | "audit" | "fresh" | "waived" }
+  | { ids: never[]; origin: "destroyed"; detail: string };
+
+/**
+ * The set of instruction sources this home must not lose, read from the most
+ * trustworthy record still standing.
+ *
+ * Two records exist and accounts writes the second one itself: every prelaunch
+ * run stores the manifest's source ids into `.hasna/accounts/prelaunch-status.json`.
+ * That file is independent of the manifest and of the export, so consulting it
+ * turns "the floor file was deleted" from a silent disarm into an ordinary
+ * drop-check — which is what probe B on todos `8776dba9` demonstrated was
+ * missing.
+ *
+ * New audits carry an uncapped `preservationFloor` separately from the bounded
+ * manifest summary. Older audits have only the capped summary, so their fallback
+ * remains partial until one successful render refreshes the durable floor.
+ */
+function resolveIncumbentFloor(profile: Profile, tool: ToolDef): IncumbentFloor {
+  const read = readManifestSourceIds(profile);
+  if (read.state === "ok") return { ids: read.ids, origin: "manifest" };
+
+  const audit = readConfigsPrelaunchAudit(profile, tool);
+  const recorded = audit?.preservationFloor ?? audit?.manifest;
+  if (recorded && recorded.sourceIds.length > 0) return { ids: [...recorded.sourceIds], origin: "audit" };
+
+  const manifestDetail =
+    read.state === "unreadable"
+      ? "the session render manifest exists but could not be parsed"
+      : "the session render manifest is absent";
+
+  // The audit remembers a non-empty set but cannot name it, so a comparison is
+  // impossible while the home is known to have something to lose.
+  if (recorded && recorded.sourceCount > 0) {
+    return {
+      ids: [],
+      origin: "destroyed",
+      detail: `${manifestDetail}, and the prelaunch audit records ${recorded.sourceCount} previous sources without usable ids`,
+    };
+  }
+
+  // A corrupt manifest with nothing corroborating it is still a destroyed input,
+  // not an empty one: a home that has never been rendered has NO manifest, so a
+  // manifest that exists and cannot be read is an anomaly either way.
+  if (read.state === "unreadable") return { ids: [], origin: "destroyed", detail: manifestDetail };
+
+  return { ids: [], origin: "fresh" };
+}
+
 function defaultRunner(command: string, args: string[]) {
   return spawnSync(command, args, {
     encoding: "buffer",
@@ -390,8 +453,53 @@ export function runConfigsPrelaunch(
   // Not consulted at all once the operator has authorised a reduction: the floor
   // and the permission to go below it cannot both apply, and leaving it in place
   // made the post-render check reject the very reduction that was just allowed.
-  const incumbentSourceIds =
-    mode === "apply" && opts.allowSourceReduction !== true ? readManifestSourceIds(profile) : [];
+  const floorApplies = mode === "apply" && opts.allowSourceReduction !== true;
+  const incumbent = floorApplies ? resolveIncumbentFloor(profile, tool) : { ids: [], origin: "waived" as const };
+  const incumbentSourceIds = incumbent.ids;
+
+  // FAIL CLOSED WHEN THE FLOOR ITSELF IS DESTROYED.
+  //
+  // todos `8776dba9`. The floor above is read from one file, and until this
+  // branch existed an unreadable file produced an empty list that was
+  // indistinguishable from a home with nothing to protect — so deleting or
+  // corrupting `.hasna/session-render-manifest.json` re-armed the exact failure
+  // this module was written to stop. Measured on station01 2026-08-01 against
+  // 0.2.31: one corrupt file, guard passes, render issues, 19 sources become 12,
+  // every gate green. `resolveIncumbentFloor` first falls back to the prelaunch
+  // audit, which is a second, independently written record of the same set; this
+  // branch is what happens when BOTH are gone.
+  //
+  // Refusing costs a launch that keeps its rules. Proceeding costs the rules.
+  // `--allow-instruction-reduction` remains the way to say the loss is intended,
+  // and it bypasses this whole block, so an operator is never wedged.
+  if (incumbent.origin === "destroyed") {
+    const reason =
+      `the instruction floor for ${tool.id}/${profile.name} cannot be read: ` +
+      `${incumbent.detail}. Refusing to render, because a render that cannot see ` +
+      `what the home already carries cannot be shown not to remove it. ` +
+      `Re-run the canonical render to rebuild the manifest, ` +
+      `or pass --allow-instruction-reduction to render anyway.`;
+    process.stderr.write(`accounts: ${reason}\n`);
+    const prelaunch = recordConfigsPrelaunchAudit(profile, tool, configsTool, {
+      mode,
+      result: "skipped",
+      allowFailure,
+      reason,
+      identityExportCount: identityExports.length,
+      shortfallGuard: "unarmed",
+    });
+    return {
+      skipped: true,
+      mode,
+      result: "skipped",
+      reason,
+      command: [],
+      status: undefined,
+      identityExports,
+      allowFailure,
+      prelaunch,
+    };
+  }
 
   const shortfallGuard: ConfigsShortfallGuardState =
     independentRequiredSourceIds.length > 0 ? "armed" : incumbentSourceIds.length > 0 ? "incumbent" : "unarmed";
@@ -512,7 +620,11 @@ export function runConfigsPrelaunch(
     // guard stopped checking — reporting nothing missing — as soon as a home
     // carried more sources than the display cap. The canonical set is 19 against
     // a cap of 20, so that cliff was one rule away.
-    const renderedSourceIds = readManifestSourceIds(profile);
+    // `.ids` alone is safe HERE only because the branch below is gated on
+    // `manifest.drift === "ok"`, which independently proves the manifest just
+    // written is present and parseable. A `missing`/`unreadable` read cannot
+    // reach the comparison.
+    const renderedSourceIds = readManifestSourceIds(profile).ids;
     const missingSources =
       manifest.drift === "ok" ? requiredSourceIds.filter((id) => !renderedSourceIds.includes(id)) : [];
     if (manifest.drift !== "ok" || emptyRender || missingSources.length > 0) {

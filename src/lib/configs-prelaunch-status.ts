@@ -51,27 +51,61 @@ export interface ConfigsPrelaunchManifestStatus {
 export type ConfigsShortfallGuardState = "armed" | "incumbent" | "unarmed";
 
 /**
- * Every instruction source id the manifest declares, uncapped.
+ * Why a manifest read produced the ids it produced.
+ *
+ * `ok`         the manifest parsed and its `sources` array was read. An empty
+ *              `ids` here is a real, trustworthy answer: the home carries none.
+ * `missing`    no manifest on disk. Either a home that has never been rendered,
+ *              or one whose floor has been deleted — this read cannot tell them
+ *              apart, so the caller must look elsewhere before concluding.
+ * `unreadable` a manifest EXISTS and could not be understood: unparseable JSON,
+ *              a non-object document, or no `sources` array. The safety input is
+ *              destroyed, which is never the same as "there is nothing to
+ *              protect".
+ */
+export type ConfigsManifestSourcesState = "ok" | "missing" | "unreadable";
+
+export interface ConfigsManifestSourcesRead {
+  state: ConfigsManifestSourcesState;
+  ids: string[];
+}
+
+/**
+ * Every instruction source id the manifest declares, uncapped, WITH the reason
+ * behind an empty answer.
  *
  * Deliberately NOT `assessConfigsManifest().sourceIds`, which truncates at
  * MAX_SOURCE_IDS because it feeds a bounded audit record. A safety check built
  * on a display cap disarms itself the moment the canonical set grows past that
  * cap, silently and in the direction that loses — the vacuous-check shape this
  * whole module exists to avoid. Reporting is bounded; comparison is not.
+ *
+ * The `state` is the fix for todos `8776dba9`. This used to return a bare
+ * `string[]`, and a bare `catch { return [] }` on the ONLY input to a safety
+ * control collapsed four distinct conditions — missing file, unparseable JSON,
+ * malformed `sources`, and a genuine zero — into the single answer that disarms
+ * the control. Measured on station01 2026-08-01 against 0.2.31: deleting or
+ * corrupting this one file made the prelaunch source-reduction guard pass, the
+ * render issue, and a governed home drop 19 sources to 12 while every gate
+ * reported `applied` / drift `ok`. The caller cannot fail closed on a condition
+ * it is never told about, so the condition is now part of the return value.
  */
-export function readManifestSourceIds(profile: Profile): string[] {
+export function readManifestSourceIds(profile: Profile): ConfigsManifestSourcesRead {
   const path = configsManifestPath(profile);
-  if (!existsSync(path)) return [];
+  if (!existsSync(path)) return { state: "missing", ids: [] };
   try {
     const parsed = asRecord(JSON.parse(readFileSync(path, "utf8")));
     const sources = parsed?.["sources"];
-    if (!Array.isArray(sources)) return [];
-    return sources.flatMap((source) => {
-      const id = stringValue(asRecord(source)?.["id"]);
-      return id ? [id] : [];
-    });
+    if (!Array.isArray(sources)) return { state: "unreadable", ids: [] };
+    return {
+      state: "ok",
+      ids: sources.flatMap((source) => {
+        const id = stringValue(asRecord(source)?.["id"]);
+        return id ? [id] : [];
+      }),
+    };
   } catch {
-    return [];
+    return { state: "unreadable", ids: [] };
   }
 }
 
@@ -98,6 +132,21 @@ export interface ConfigsPrelaunchAudit {
    */
   droppedSourceIds?: string[];
   droppedSourceCount?: number;
+  /**
+   * Last trustworthy instruction floor, kept independently of the CURRENT
+   * manifest status below.
+   *
+   * A skipped or failed run still records the current manifest. If that file
+   * has just disappeared, replacing the previous audit with `sourceCount: 0`
+   * would erase the only surviving floor and make the next run look fresh.
+   * This snapshot is therefore carried forward while the manifest is missing
+   * or unreadable. It is uncapped because it feeds a safety comparison rather
+   * than a display surface.
+   */
+  preservationFloor?: {
+    sourceCount: number;
+    sourceIds: string[];
+  };
   updatedAt: string;
   manifest: {
     path: string;
@@ -346,7 +395,24 @@ export function recordConfigsPrelaunchAudit(
   configsTool: string | undefined,
   input: RecordConfigsPrelaunchAuditInput,
 ): ConfigsPrelaunchSummary {
+  const previous = readConfigsPrelaunchAudit(profile, tool);
   const manifest = assessConfigsManifest(profile, tool, configsTool);
+  const manifestSources = readManifestSourceIds(profile);
+  const previousFloor =
+    previous?.preservationFloor ??
+    (previous && previous.manifest.sourceCount > 0
+      ? {
+          sourceCount: previous.manifest.sourceCount,
+          sourceIds: [...previous.manifest.sourceIds],
+        }
+      : undefined);
+  const preservationFloor =
+    manifestSources.state === "ok"
+      ? {
+          sourceCount: manifest.sourceCount,
+          sourceIds: [...manifestSources.ids],
+        }
+      : previousFloor;
   const audit: ConfigsPrelaunchAudit = {
     schema: STATUS_SCHEMA,
     tool: tool.id,
@@ -364,6 +430,7 @@ export function recordConfigsPrelaunchAudit(
           droppedSourceCount: input.droppedSourceIds.length,
         }
       : {}),
+    ...(preservationFloor ? { preservationFloor } : {}),
     updatedAt: new Date().toISOString(),
     manifest: {
       path: manifest.path,
