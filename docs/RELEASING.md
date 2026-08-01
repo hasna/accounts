@@ -53,14 +53,60 @@ an active semantic match for only this tag pattern, all three protections, and
 
 GitHub omits `bypass_actors` from a ruleset response unless the API caller can
 administer that ruleset. The preflight therefore fails closed when the field is
-missing. Store a fine-grained token named `RELEASE_GITHUB_ADMIN_TOKEN` in the
-protected environment with only repository Metadata read and Administration
-read access for `hasna/accounts`. Do not grant Contents write, Actions write, or
-any organization-wide mutation permission. The token must belong to the same
-user who triggered the release. The preflight uses it only to read the live
-ruleset, requires the visible bypass list to contain exactly one
-`OrganizationAdmin` entry in `always` mode, and verifies that its owner and the
-release actor are the same live repository administrator.
+missing. The credential that performs that read, `RELEASE_GITHUB_ADMIN_TOKEN`,
+is **minted per run** from the `hasna-identity` GitHub App and is never stored —
+see the secrets table below for why. The preflight uses it only to read the live
+ruleset, and requires the visible bypass list to contain exactly one
+`OrganizationAdmin` entry in `always` mode.
+
+**How the credential is bound.** This originally specified a fine-grained
+personal token that had to belong to the release actor, and the preflight
+checked that by calling `GET /user`. **An App installation token cannot satisfy
+that check, in principle rather than by configuration**: `GET /user` answers
+`403 Resource not accessible by integration` for every installation token, and an
+installation token has no user identity to compare against the actor in the first
+place. So the binding is now the credential's *scope* — the preflight asserts via
+`GET /installation/repositories` that the token reaches **exactly one repository,
+and that it is `hasna/accounts`**. A release whose credential can reach a second
+repository fails closed.
+
+That is a narrower guarantee than the one it replaces, not a weaker one: a
+personal token bound to the release actor necessarily carries everything that
+person can reach, for as long as the token lives, whereas this one carries a
+single repository for roughly an hour. The release actor is still independently
+required to be a live repository administrator, read with the workflow token.
+
+**Permissions are pinned on the mint step to `administration: read` and
+`metadata: read`.** Left unpinned the minted token inherits every permission the
+installation holds on this repository — measured at roughly 35 scopes including
+`contents: write`, `packages: write` and `secrets: write`. Pinning takes it to
+two.
+
+**`read` rather than `write`, and the reason is a property of verification
+rather than of exposure.** Measured against this App on this repository: a token
+minted with `administration: write` successfully **created** a repository
+ruleset (HTTP 201, deleted immediately afterwards); the same request from an
+`administration: read` token returned HTTP 403. A credential that can author
+rulesets cannot honestly certify them — `verifyReleaseRulesets()` would attest
+that the protections exist *and* that the reader could have created them, which
+is no attestation at all. Short life and single-repository scope bound the
+exposure; they do not repair the validity.
+
+**What that costs, stated rather than glossed.** GitHub returns a ruleset's
+`bypass_actors` only to `administration: write` — measured on the same ruleset
+with permission as the only variable: `read` omits the field, `write` returns
+it. The preflight therefore no longer enumerates bypass actors. It verifies
+instead what a read-only credential can honestly prove, using
+`current_user_can_bypass`, which **is** returned at read level: that the release
+credential itself cannot bypass the ruleset, failing closed on any value other
+than `never`.
+
+So the in-run guarantee is now "this credential can neither author nor bypass
+the protection", and the property that no *other* actor holds a bypass is
+audited **out of band**. That property belongs to the organization's ruleset
+configuration rather than to any single release, and it cannot be read by a
+credential fit to verify it — so verifying it from inside the release was
+always going to force the choice between a tautological attestation and none.
 
 The normal workflow token remains read-only and is used for the environment,
 deployment-policy, and triggering-actor reads. The administration-read token is
@@ -75,8 +121,8 @@ Create a protected `npm-release` environment:
 - allow deployments only from tags matching `npm/accounts/v*`;
 - require exactly one user reviewer matching the release actor;
 - allow that reviewer to approve their own deployment;
-- store only `RELEASE_GITHUB_ADMIN_TOKEN` and the `NPM_DIST_TAG_TOKEN` described
-  below.
+- store only `RELEASE_APP_ID`, `RELEASE_APP_PRIVATE_KEY`, and the
+  `NPM_DIST_TAG_TOKEN` described below.
 
 The npm trusted publisher must include the same environment name. A mismatch
 causes npm OIDC publication to fail. This repository currently has one
@@ -141,7 +187,15 @@ Both secrets live in the `npm-release` environment of `hasna/accounts`:
 | Secret | Purpose | Created by |
 | --- | --- | --- |
 | `NPM_DIST_TAG_TOKEN` | granular npm token scoped to `@hasna/accounts`, used only by the dist-tag promotion step | an npm owner of the package |
-| `RELEASE_GITHUB_ADMIN_TOKEN` | reads the live release-tag ruleset and environment configuration during preflight | a `hasna` organization administrator |
+| `RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY` | GitHub App credentials; the workflow MINTS a short-lived installation token from them per run and exposes it to the preflight as `RELEASE_GITHUB_ADMIN_TOKEN`, which reads the live release-tag ruleset and environment configuration | any holder of the `hasna-identity` App credentials |
+
+`RELEASE_GITHUB_ADMIN_TOKEN` is deliberately **not** stored. A GitHub App
+installation token expires roughly an hour after it is minted, so storing one
+would turn this gate's honest "not configured" failure into a confusing
+authorization failure the first time a release ran more than an hour after
+provisioning. Minting per run is also better security than the PAT this
+originally called for: the credential is installation-scoped, repository-scoped,
+short-lived, and nothing durable exists to leak.
 
 Verify presence without reading either value:
 
@@ -199,6 +253,8 @@ next version to the workflow.
 | Date (UTC) | Version | Operator | Reason | Follow-up |
 | --- | --- | --- | --- | --- |
 | 2026-07-30 11:31 | 0.2.24 | ops agent (station02, npm user andreihasna2) | Release run 30533148549 for tag `npm/accounts/v0.2.24` failed at the provisioning gate: the `npm-release` environment held zero secrets, and 0.2.22/0.2.23 carry no attestations so the npm trusted publisher was never configured. Both `RELEASE_GITHUB_ADMIN_TOKEN` (fine-grained PAT) and the trusted publisher require owner web-UI provisioning; 0.2.24 ships the #87 subscription broker fix needed fleet-wide. Published from a clean checkout of d4820677 after `typecheck` rc=0 and `bun test` 1265 pass / 0 fail. Declared in git-publishing (msg 607121) before acting. | Provision `NPM_DIST_TAG_TOKEN` + `RELEASE_GITHUB_ADMIN_TOKEN` in the `npm-release` environment and configure the npm trusted publisher, then return 0.2.25 to the workflow. |
+| 2026-07-30 16:45 | 0.2.26 | ops agent Augustus (station01, npm user andreihasna2) | Owner escalation: agents were failing to launch fleet-wide. The provisioning gate from the 0.2.24 row is still open and was re-verified rather than assumed — `gh api repos/hasna/accounts/environments/npm-release/secrets` returns `total_count: 0`, and release run 30551828667 for tag `npm/accounts/v0.2.25` had already failed there. **0.2.25 was never published and is retired superseded**: #93 landed on `main` after the `prepare 0.2.25` commit, so the tree carrying `version: 0.2.25` contained readiness/CLI behaviour its changelog did not describe; 0.2.26 ships that tree plus #93 with its own entry. Published from a clean detached checkout of `f552a68` (`git status --porcelain` empty before packing) after `typecheck` rc=0, `bun test` 1313 pass / 1 skip / 0 fail rc=0, `build` rc=0. Positive control run before publishing: reverting #93's one-line `status` change in `src/lib/readiness.ts` fails 2 of 6 `src/health-launch-agreement.test.ts` tests (rc=1), so the suite discriminates the fix from its absence. Declared in git-publishing (msg 609253) before acting, confirmed after (msg 609287); `[BREAKING]`-style verdict-change heads-up in announcements (msg 609249). | Same as the 0.2.24 row — provision `NPM_DIST_TAG_TOKEN` + `RELEASE_GITHUB_ADMIN_TOKEN` and configure the npm trusted publisher, then return the next release to the workflow. Additionally: **verify a rollout by the binary's own `--version` resolved through `PATH`, never by the installer's exit code.** On station01 `bun install -g` had been a silent no-op because `~/.local/bin/accounts` precedes `~/.bun/bin` on `PATH` and symlinked into `~/.hasna/accounts-selfhost/`, which pinned `@hasna/accounts` to an exact old version; every prior rollout to that host changed nothing. |
+| 2026-07-31 15:0x | 0.2.28 | agent Augustus (station01, npm user andreihasna2) | Release run 30640431787 for tag `npm/accounts/v0.2.28` failed at the provisioning gate, re-verified rather than assumed: `gh api repos/hasna/accounts/environments/npm-release/secrets --jq '[.secrets[].name]'` returns `[]`, so both `NPM_DIST_TAG_TOKEN` and `RELEASE_GITHUB_ADMIN_TOKEN` are still absent — the same gate as the 0.2.24 and 0.2.26 rows, now three releases old. Neither credential exists in the secrets vault in the form this contract requires: the vault holds a broader `@hasna`-scope publish token and a `hasnaxyz`-scoped GitHub PAT, and **neither was substituted**, because this contract deliberately specifies a package-scoped dist-tag token and widening that scope to unblock a release would make the control decorative. 0.2.28 ships the b29f5b6c fix: a launched Claude session could read a logged-out profile root while `accounts login` reported it logged-in. Published from a clean checkout of `93c1221` (`git status --porcelain` empty), `typecheck` rc=0, and CI green on `0dbc2de` whose tree I verified byte-identical to the merged commit — so the workflow's own `test` job covered exactly these bytes. Adversarial review returned NO_GO on a constructed P1 (the narrowing gate and the broker's write set ranged over different door sets, so a guest dir holding a husk was written through), which was remediated and then reviewed GO. Declared in git-publishing (msg 615305) before acting, confirmed after (msg 615465). | Unchanged and now urgent: provision `NPM_DIST_TAG_TOKEN` + `RELEASE_GITHUB_ADMIN_TOKEN` in the `npm-release` environment and configure the npm trusted publisher, then return the next release to the workflow. Three consecutive releases have now bypassed deterministic packing, provenance attestation, Sigstore identity policy and the dist-tag quarantine. Separately: the **hosted** accounts service at accounts.hasna.xyz reports `version 0.2.21` against npm 0.2.28 — publishing does not deploy it, and nothing was measuring that gap. |
 
 ## Pinned release substrate
 

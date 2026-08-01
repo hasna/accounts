@@ -219,8 +219,21 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
   // token on the next request — so it is `degraded`: usable, wants attention.
   // Collapsing it to `unavailable` is what let a downstream pool manager
   // quarantine ten live Claude accounts as dead.
-  const status: AccountsReadinessStatus =
+  // An occupied dir CANNOT launch — `healSwitchedProfileDir` refuses it outright
+  // while a live session holds the guest's account. So it must never read `ok`,
+  // whatever the profile's own parked credential looks like.
+  //
+  // #63 detected occupancy and offered the reconcile action but left `status`
+  // alone, so the same payload said `dirOccupiedByAnotherAccount: true` and
+  // `status: "ok"` — and everything that reads a verdict rather than a flag was
+  // told the profile was fine. Measured on station01: five profiles reporting
+  // `ok` that `accounts launch` refused by name. `degraded`, not `unavailable`:
+  // the profile's own credential is parked and intact, so this is one
+  // reconcile away from usable rather than broken.
+  const credentialStatus: AccountsReadinessStatus =
     health.status === "ok" ? "ok" : health.status === "unknown" || health.renewable ? "degraded" : "unavailable";
+  const status: AccountsReadinessStatus =
+    health.dirOccupiedByAnotherAccount && credentialStatus === "ok" ? "degraded" : credentialStatus;
   // An occupied dir needs reconciling, not re-authenticating: the profile's own
   // credential is parked and intact, and telling an operator to re-login would
   // send them through a browser flow that fixes nothing. Named first so it is

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
 import chalk from "chalk";
-import { AccountsError, type Profile } from "./types.js";
+import { AccountsError, profileProvider, type Profile, type ToolDef } from "./types.js";
 import {
   DEFAULT_TOOL,
   getTool,
@@ -41,6 +41,11 @@ import {
   type SyncResult,
 } from "./lib/auth-store.js";
 import {
+  CREDENTIAL_BINDING_METHOD,
+  credentialBindingConflicts,
+  listCredentialBindings,
+} from "./lib/credential-binding.js";
+import {
   assertRegisteredConfigDir,
   convergeDirCredential,
   convergeIdentityCredential,
@@ -55,6 +60,7 @@ import {
   parkedRecoveryDisposition,
   planParkedRecovery,
   recoverParkedCredential,
+  readSwitchedAccountMarker,
 } from "./lib/claude-auth.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
@@ -78,6 +84,11 @@ import {
   dirAccountUuid,
   statusNeedsOperator,
 } from "./lib/identity-index.js";
+import { buildProfileRegistry, credentialKeyForEntry } from "./lib/profile-registry.js";
+import { applyAccountUuidBackfill, planAccountUuidBackfill, summarizeBackfill } from "./lib/uuid-backfill.js";
+import { crossProviderCollisions, NAME_INVARIANT_MODE } from "./lib/name-invariant.js";
+import { enumerateProfileDirs, mergedNameUniverse } from "./lib/profile-namespaces.js";
+import { grandfatherManifestPath, writeGrandfatherManifest } from "./lib/grandfather-manifest.js";
 import {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_MIN_HEADROOM,
@@ -257,14 +268,38 @@ function prelaunchSummaryFor(p: Profile): ConfigsPrelaunchSummary {
   return getConfigsPrelaunchSummary(p, tool, configsSessionToolFor(tool));
 }
 
+/**
+ * Why a launch would be refused, when the reason lives in the dir rather than in
+ * the registry row.
+ *
+ * `accounts launch account031` refused with "its config dir currently carries
+ * the account of account029", while `accounts show account031 --json` displayed
+ * the correct dir, the correct email, and no mention of account029 anywhere in
+ * its output. The CLI refused for a reason its own inspection command would not
+ * display, which makes the state undiagnosable from outside — the operator sees
+ * a healthy-looking profile and an error that contradicts it.
+ */
+function switchedAwayDetails(p: Profile): { switchedAway?: { profile: string; email?: string } } {
+  if (p.tool !== "claude") return {};
+  const marker = readSwitchedAccountMarker(p.dir);
+  if (!marker) return {};
+  return { switchedAway: { profile: marker.profile, ...(marker.email ? { email: marker.email } : {}) } };
+}
+
 function profileDetails(
   p: Profile,
   active: boolean,
-): Profile & { active: boolean; applied: boolean; prelaunch: ConfigsPrelaunchSummary } {
+): Profile & {
+  active: boolean;
+  applied: boolean;
+  prelaunch: ConfigsPrelaunchSummary;
+  switchedAway?: { profile: string; email?: string };
+} {
   return {
     ...p,
     active,
     applied: appliedProfileName(p.tool) === p.name,
+    ...switchedAwayDetails(p),
     prelaunch: prelaunchSummaryFor(p),
   };
 }
@@ -597,6 +632,13 @@ program
       }
       console.log(`  created:    ${p.createdAt}`);
       if (p.lastUsedAt) console.log(`  last used:  ${p.lastUsedAt}`);
+      if (details.switchedAway) {
+        console.log(
+          `  ${chalk.yellow("switched:")}   this dir currently carries the account of ` +
+            `${chalk.bold(details.switchedAway.profile)} (in-place switch) — ` +
+            `${p.name} cannot launch until it is reconciled: accounts switch-account ${p.name} --dir ${p.dir}`,
+        );
+      }
       printPrelaunchDetails(details.prelaunch);
     }),
   );
@@ -1730,6 +1772,245 @@ program
     }),
   );
 
+/**
+ * The PR-1 reconcile modes: the merged-universe invariant report, the
+ * accountUuid backfill, and the grandfather manifest.
+ *
+ * All three read ONE enumeration — store records (primary) plus every on-disk
+ * provider namespace including tool-native roots (supplementary). The design's
+ * first review cycle failed precisely because the gate and the enumerator read
+ * different stores, so they are wired to the same source here rather than each
+ * assembling its own.
+ */
+async function runRegistryInvariantModes(
+  tool: ToolDef,
+  opts: { json?: boolean; invariant?: boolean; backfillUuid?: boolean; apply?: boolean; writeManifest?: boolean },
+): Promise<void> {
+  const store = resolveStore();
+  const records = await store.listProfiles();
+  const discovered = enumerateProfileDirs(await store.listTools());
+  const universe = mergedNameUniverse(records, discovered);
+  const collisions = crossProviderCollisions(universe);
+
+  const result: Record<string, unknown> = {
+    transport: store.transport,
+    mode: NAME_INVARIANT_MODE,
+    universe: { records: records.length, discoveredDirs: discovered.length, bindings: universe.length },
+  };
+
+  if (opts.invariant || opts.writeManifest) {
+    result.collisions = collisions;
+  }
+
+  if (opts.writeManifest) {
+    const manifest = opts.apply
+      ? writeGrandfatherManifest(universe, `registry --write-manifest (${store.transport})`)
+      : { version: 1 as const, createdAt: "(dry run)", source: "(dry run)", pairs: universe };
+    result.manifest = { applied: Boolean(opts.apply), path: grandfatherManifestPath(), pairs: manifest.pairs.length };
+  }
+
+  if (opts.backfillUuid) {
+    // Backfill reads DIRECTORIES, so it is scoped to the dirs of the selected
+    // provider; a record whose dir lives on another machine has nothing here to
+    // read and is absent by construction rather than guessed at.
+    const dirs = records
+      .filter((p) => profileProvider(p) === tool.id && p.dir)
+      .map((p) => ({ name: p.name, dir: p.dir }));
+    const registry = buildProfileRegistry(dirs, tool);
+    const existing = new Map(
+      records.filter((p) => p.accountUuid).map((p) => [p.name, p.accountUuid!] as const),
+    );
+    const plan = planAccountUuidBackfill(registry, existing);
+    const summary = summarizeBackfill(plan);
+    const applied: string[] = [];
+    if (opts.apply) {
+      if (store.transport !== "local") {
+        // The server has no account_uuid column yet; that lands with migration
+        // 0006 in PR-2. Refusing loudly beats writing nowhere and reporting
+        // success.
+        throw new AccountsError(
+          "--apply is local-transport only in this release: the hosted accounts table has no accountUuid " +
+            "column until migration 0006 (PR-2). Re-run without --apply to record the plan.",
+        );
+      }
+      applied.push(...(await applyAccountUuidBackfill(store, plan)));
+    }
+    result.backfill = { provider: tool.id, summary, applied: applied.length, plan };
+  }
+
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(chalk.dim(`transport: ${store.transport} · invariant mode: ${NAME_INVARIANT_MODE}`));
+  console.log(
+    chalk.dim(
+      `universe: ${universe.length} bindings (${records.length} store records, ${discovered.length} on-disk dirs)`,
+    ),
+  );
+  if (opts.invariant || opts.writeManifest) {
+    if (collisions.length === 0) {
+      console.log(chalk.green("no name is held by more than one provider"));
+    } else {
+      console.log(chalk.yellow(`${collisions.length} name(s) held by more than one provider:`));
+      for (const collision of collisions) {
+        console.log(`  ${chalk.cyan(collision.name.padEnd(18))} ${collision.providers.join(", ")}`);
+      }
+      console.log(
+        chalk.dim(
+          "Reported, not refused: names become provider-unique in a later release, after the rename migration.",
+        ),
+      );
+    }
+  }
+  if (opts.writeManifest) {
+    const manifest = result.manifest as { applied: boolean; path: string; pairs: number };
+    console.log(
+      manifest.applied
+        ? chalk.green(`grandfather manifest written: ${manifest.pairs} pairs -> ${manifest.path}`)
+        : chalk.dim(`dry run: ${manifest.pairs} pairs would be written to ${manifest.path} (pass --apply)`),
+    );
+  }
+  if (opts.backfillUuid) {
+    const { summary, applied, plan } = result.backfill as {
+      summary: ReturnType<typeof summarizeBackfill>;
+      applied: number;
+      plan: ReturnType<typeof planAccountUuidBackfill>;
+    };
+    console.log();
+    console.log(
+      `accountUuid backfill (${tool.id}): ${summary.backfilled} resolvable, ${summary.alreadySet} already set, ` +
+        `${summary.conflict} conflict, ${summary.unverified} unverified, ${summary.unresolved} unresolved`,
+    );
+    for (const row of plan) {
+      if (row.outcome === "already-set") continue;
+      const colour =
+        row.outcome === "backfilled" ? chalk.green : row.outcome === "conflict" ? chalk.red : chalk.yellow;
+      console.log(
+        `  ${chalk.cyan((row.profileName ?? "(unregistered)").padEnd(18))} ${colour(row.outcome.padEnd(11))} ${chalk.dim(row.reason)}`,
+      );
+    }
+    console.log(
+      applied > 0
+        ? chalk.green(`applied to ${applied} profile record(s)`)
+        : chalk.dim(opts.apply ? "nothing to apply" : "dry run — pass --apply to write"),
+    );
+  }
+}
+
+program
+  .command("registry")
+  .description("reconcile every profile's name, directory, identity and credential across all three stores")
+  .option("--tool <tool>", "tool id (default: claude)", "claude")
+  .option("--json", "output JSON")
+  .option("--contradictions", "only show credentials claimed by more than one account")
+  .option("--invariant", "report names held by more than one provider, over the merged universe")
+  .option("--backfill-uuid", "plan the accountUuid backfill from each dir's parked identity")
+  .option("--apply", "with --backfill-uuid or --write-manifest, write the result (default: dry run)")
+  .option("--write-manifest", "record today's (name, provider) pairs as the grandfather manifest")
+  .action(
+    action(async (opts: {
+      tool?: string;
+      json?: boolean;
+      contradictions?: boolean;
+      invariant?: boolean;
+      backfillUuid?: boolean;
+      apply?: boolean;
+      writeManifest?: boolean;
+    }) => {
+      const tool = getTool(opts.tool ?? "claude");
+      if (opts.invariant || opts.backfillUuid || opts.writeManifest) {
+        await runRegistryInvariantModes(tool, opts);
+        return;
+      }
+      // resolveStore(), not loadStore(): the local-file store this CLI's `auth`
+      // verbs read holds a fraction of the registry (8 of 29 claude profiles on
+      // station01), so building the registry from it would silently omit two
+      // thirds of the machine's profiles and under-report every group.
+      const store = resolveStore();
+      const profiles = (await store.listProfiles(tool.id))
+        .filter((p) => p.dir)
+        .map((p) => ({ name: p.name, dir: p.dir }));
+      const registry = buildProfileRegistry(profiles, tool);
+
+      if (opts.json) {
+        console.log(
+          JSON.stringify(opts.contradictions ? registry.contradictions : registry, null, 2),
+        );
+        return;
+      }
+
+      if (!opts.contradictions) {
+        console.log(chalk.dim(`method: ${registry.method}`));
+        for (const entry of registry.entries) {
+          const name = chalk.cyan((entry.profileName ?? "(unregistered)").padEnd(18));
+          const own = entry.own.email ?? entry.own.accountUuid ?? chalk.dim("(none)");
+          let state: string;
+          switch (entry.binding) {
+            case "consistent":
+              state = chalk.green("consistent");
+              break;
+            case "displaced":
+              state = chalk.yellow(`displaced by ${entry.occupant.email ?? entry.occupant.accountUuid}`);
+              break;
+            case "occupied":
+              state = chalk.red(`occupied by ${entry.occupant.email ?? entry.occupant.accountUuid} (no switch recorded)`);
+              break;
+            case "unbound":
+              state = chalk.yellow("no own identity recorded");
+              break;
+            default:
+              state = chalk.dim("vacant");
+          }
+          const key = credentialKeyForEntry(entry);
+          const keyNote = key ? chalk.dim(` cred:${key.slice(0, 10)}`) : chalk.dim(" cred:none");
+          console.log(`${name} ${String(own).padEnd(30)} ${state}${keyNote}`);
+        }
+        console.log();
+      }
+
+      const groups = opts.contradictions ? registry.contradictions : registry.groups;
+      if (groups.length === 0) {
+        console.log(
+          opts.contradictions
+            ? "no credential is claimed by more than one account"
+            : "no credential appears in more than one place",
+        );
+        return;
+      }
+      for (const group of groups) {
+        const colour =
+          group.inference.cause === "contamination"
+            ? chalk.red
+            : group.inference.cause === "displacement"
+              ? chalk.yellow
+              : chalk.dim;
+        console.log(
+          `${colour(group.inference.cause)} ${chalk.dim(group.fingerprint.slice(0, 10))} — ${group.members.length} copies, ${group.distinctAccountUuids.length} identities (confidence: ${group.inference.confidence})`,
+        );
+        console.log(`  ${group.inference.why}`);
+        for (const member of group.members) {
+          const where = member.dir ?? "central store";
+          console.log(
+            chalk.dim(`    ${member.layer.padEnd(7)} ${member.profileName ?? member.accountUuid ?? "?"} ${member.email ?? ""} ${where}`),
+          );
+        }
+      }
+      if (registry.contradictions.length > 0) {
+        console.log();
+        console.log(chalk.red(`${registry.contradictions.length} credential(s) claimed by more than one account.`));
+        console.log(
+          chalk.dim(
+            "One credential cannot belong to several accounts, so all but at most one binding is a cross-write. " +
+              "Do NOT delete a copy: for a displaced profile the parked copy is the only surviving one. " +
+              `Confirm by: ${registry.contradictions[0]!.inference.verificationPath}.`,
+          ),
+        );
+      }
+    }),
+  );
+
 const auth = program
   .command("auth")
   .description(`central identity-keyed auth snapshot store (${join(accountsHome(), "auth")})`);
@@ -1810,12 +2091,24 @@ auth
           });
         }
       }
+      // A refused credential is an estate defect, not a no-op: exiting 0 here
+      // would let a caller read "the command ran" as "the estate is fine",
+      // which is the exact shape this whole change exists to remove.
+      if (rows.some((row) => row.credentials === "refused")) failures += 1;
       if (opts.json) console.log(JSON.stringify(rows, null, 2));
       else {
         for (const row of rows) {
           if (row.error) console.log(`${chalk.red("FAIL")} ${row.profile}: ${row.error}`);
           else if (row.skipped) console.log(`${chalk.yellow("skip")} ${row.profile}: ${row.skipped}`);
           else if (!row.synced) console.log(`${chalk.yellow("skip")} ${row.profile}: ${row.reason}`);
+          else if (row.credentials === "refused")
+            // Loud, and on its own line. A refusal folded into the `ok` line
+            // reads as a successful migrate with an unusual word in it, which
+            // is how the estate stayed green while eight accounts shared one
+            // credential.
+            console.log(
+              `${chalk.red("REFUSED")} ${row.profile} → ${row.uuid}${row.email ? chalk.dim(" (" + row.email + ")") : ""}: ${row.credentialsReason}`,
+            );
           else
             console.log(
               `${chalk.green("ok")}   ${row.profile} → ${row.uuid}${row.email ? chalk.dim(" (" + row.email + ")") : ""} credentials=${row.credentials} oauth=${row.oauth}`,
@@ -1853,6 +2146,77 @@ auth
       if (result.unresolved.length > 0 && !result.deleted) {
         console.log(chalk.yellow("note: unresolved profile bindings above will block --delete"));
       }
+    }),
+  );
+
+auth
+  .command("bindings")
+  .description("which credential each account claims, and any credential claimed by more than one")
+  .option("--json", "output JSON")
+  .option("--conflicts", "only show credentials claimed by more than one account")
+  .action(
+    action((opts: { json?: boolean; conflicts?: boolean }) => {
+      const conflicts = credentialBindingConflicts();
+      if (opts.json) {
+        console.log(
+          JSON.stringify(
+            opts.conflicts
+              ? { method: CREDENTIAL_BINDING_METHOD, conflicts }
+              : { method: CREDENTIAL_BINDING_METHOD, bindings: listCredentialBindings(), conflicts },
+            null,
+            2,
+          ),
+        );
+        // A conflict is a corrupt estate, not a report: exit non-zero so a
+        // scripted caller cannot read "the command ran" as "the estate is fine".
+        if (conflicts.length > 0) process.exitCode = 1;
+        return;
+      }
+
+      // Fingerprints are digests of a refresh token, never the token — but they
+      // are still secret-DERIVED, and an operator only needs enough to tell two
+      // apart. Twelve hex characters does that; the full value stays in the
+      // 0600 record.
+      const short = (fingerprint: string) => fingerprint.replace(/^sha256:/, "").slice(0, 12);
+
+      if (!opts.conflicts) {
+        console.log(chalk.dim(`method: ${CREDENTIAL_BINDING_METHOD}`));
+        const rows = listCredentialBindings();
+        if (rows.length === 0) {
+          console.log("no central auth entries — run `accounts auth migrate` to populate the store");
+        }
+        for (const row of rows) {
+          const who = chalk.cyan(row.accountUuid) + " " + (row.email ?? chalk.dim("(no email)"));
+          if (!row.fingerprint) {
+            console.log(`${who} ${chalk.yellow("no credential in the central slot")}`);
+            continue;
+          }
+          const recorded = row.recorded
+            ? row.drifted
+              ? chalk.yellow(` (recorded ${short(row.recorded.fingerprint)} — slot has drifted)`)
+              : chalk.dim(` (recorded ${row.recorded.boundAt})`)
+            : chalk.dim(" (no record yet — predates binding, or never re-filed)");
+          console.log(`${who} ${short(row.fingerprint)}${recorded}`);
+        }
+      }
+
+      if (conflicts.length === 0) {
+        console.log(chalk.green("no credential is claimed by more than one account"));
+        return;
+      }
+      for (const conflict of conflicts) {
+        console.log(
+          `${chalk.red("conflict")} ${short(conflict.fingerprint)} claimed by ${conflict.accountUuids.length}: ` +
+            `${conflict.accountUuids.join(", ")}${conflict.emails.length ? chalk.dim(` (${conflict.emails.join(", ")})`) : ""}`,
+        );
+      }
+      console.log(
+        chalk.yellow(
+          "at most one claim per credential can be true; the others have no credential of their own left — " +
+            "`accounts login <profile>` is the only repair, and nothing here chooses for you",
+        ),
+      );
+      process.exitCode = 1;
     }),
   );
 

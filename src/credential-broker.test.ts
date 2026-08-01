@@ -211,6 +211,157 @@ test("converge never writes this account's tokens into a dir occupied by ANOTHER
   });
 });
 
+/**
+ * THE CROSS-WRITE. `switch-account` calls
+ * `convergeIdentityCredential(targetUuid, { extraDirs: [configDir] })`, where
+ * `configDir` is the dir the OUTGOING account is still sitting in. That dir
+ * enters `enumerateCopies` as a `dir-live` candidate, and — before the read
+ * gate — was READ and RANKED with no identity check at all. The outgoing
+ * account has just been in use, so its file is the newest on disk and the
+ * mtime-ordered, identity-blind ranking crowns it. Fan-out then wrote it into
+ * `central/<INCOMING uuid>/.credentials.json`, whose write gate is the
+ * hardcoded `() => true`.
+ *
+ * One-directional by construction: every OTHER write target re-checks its
+ * dir's occupant, so the poison could only ever flow INTO central. Measured
+ * store state on this fleet: 18 uuid entries, 18 distinct identity files, but
+ * only 8 distinct credential blobs — one blob filed under eight uuids.
+ */
+test("CROSS-WRITE GATE: an extraDir occupied by ANOTHER account is not an eligible source", () => {
+  withHome((home) => {
+    const old = new Date(Date.now() - 2 * HOUR);
+    // The INCOMING account — the switch target. Its own copy is older, which
+    // is the ordinary case: the session has not been using it.
+    const incoming: Cred = { accessToken: "at-incoming", refreshToken: "rt-incoming", expiresAt: Date.now() + 6 * HOUR };
+    const targetDir = makeDir(home, "incoming", UUID, incoming, { mtime: old });
+
+    // The OUTGOING account, still occupying the session's config dir. It was
+    // refreshed moments ago, so it is the NEWEST credential file on disk —
+    // precisely what an identity-blind mtime ranking selects.
+    const outgoing: Cred = { accessToken: "at-outgoing", refreshToken: "rt-outgoing", expiresAt: Date.now() + 7 * HOUR };
+    const sessionDir = makeDir(home, "outgoing", OTHER_UUID, outgoing);
+
+    // Exactly switchAccount's call shape.
+    const report = convergeIdentityCredential(UUID, {
+      tool,
+      profiles: [
+        { name: "incoming", dir: targetDir },
+        { name: "outgoing", dir: sessionDir },
+      ],
+      extraDirs: [sessionDir],
+    });
+
+    // THE LOAD-BEARING ASSERTION: the incoming account's credential of record
+    // is its OWN credential, never the outgoing account's. This is the exact
+    // byte-level claim behind "18 uuids, 8 credential blobs".
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-incoming");
+
+    // The outgoing account's file must never be crowned for the incoming uuid.
+    expect(report.winner?.path).not.toBe(join(sessionDir, ".credentials.json"));
+    expect(report.winner?.path).toBe(join(targetDir, ".credentials.json"));
+
+    // And the outgoing account keeps its own material, untouched.
+    expect(readCred(join(sessionDir, ".credentials.json")).refreshToken).toBe("rt-outgoing");
+
+    // The refusal is REPORTED, not silent — the absence of any signal is how
+    // this survived to 0.2.26.
+    expect(
+      report.skipped.some((s) => s.path === join(sessionDir, ".credentials.json") && /does not carry this account/.test(s.reason)),
+    ).toBe(true);
+  });
+});
+
+test("CROSS-WRITE GATE, positive control: the SAME extraDir, carrying the target account, is used", () => {
+  withHome((home) => {
+    const old = new Date(Date.now() - 2 * HOUR);
+    // Same shape as above, except the session dir carries the TARGET account.
+    // If the gate were over-broad this would go dead and convergence would
+    // stop doing its job.
+    const parked: Cred = { accessToken: "at-parked", refreshToken: "rt-parked", expiresAt: Date.now() + 6 * HOUR };
+    const targetDir = makeDir(home, "incoming", UUID, parked, { mtime: old });
+    const live: Cred = { accessToken: "at-live", refreshToken: "rt-live", expiresAt: Date.now() + 7 * HOUR };
+    const sessionDir = makeDir(home, "session", UUID, live);
+
+    const report = convergeIdentityCredential(UUID, {
+      tool,
+      profiles: [{ name: "incoming", dir: targetDir }],
+      extraDirs: [sessionDir],
+    });
+
+    expect(report.winner?.path).toBe(join(sessionDir, ".credentials.json"));
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-live");
+    expect(readCred(join(targetDir, ".credentials.json")).refreshToken).toBe("rt-live");
+  });
+});
+
+/**
+ * THE DEFAULT-DIR LAYOUT. Claude Code's real default config dir keeps its
+ * `oauthAccount` in the PARENT `~/.claude.json`, not inside `~/.claude/`.
+ * `profileAccountJsonPaths` models that by returning a SECOND path — and only
+ * when `profileDir === tool.defaultDir` (claude-layout.ts:48).
+ *
+ * `buildIdentityIndex` loops every one of those paths, so the dir is still
+ * enumerated as a door. Any identity predicate that reads `paths[0]` alone
+ * therefore DISAGREES WITH THE ENUMERATOR on exactly the standard layout.
+ *
+ * Every fixture in this file until now put `.claude.json` INSIDE the profile
+ * dir (see `makeDir`), so the second path was never exercised — which is how a
+ * fully green suite could miss this.
+ */
+function makeDefaultDir(home: string, uuid: string, cred: Cred, opts: { mtime?: Date } = {}): { dir: string; tool: typeof tool } {
+  const fakeHome = join(home, "userhome");
+  const dir = join(fakeHome, ".claude");
+  mkdirSync(dir, { recursive: true });
+  // Identity lives in the PARENT only — the real default layout.
+  writeFileSync(join(fakeHome, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: "live@example.com" } }));
+  writeFileSync(join(dir, ".credentials.json"), credBytes(cred));
+  if (opts.mtime) utimesSync(join(dir, ".credentials.json"), opts.mtime, opts.mtime);
+  return { dir, tool: { ...tool, defaultDir: dir } };
+}
+
+test("DEFAULT-DIR SOURCE: the live default config dir donates for its own account", () => {
+  withHome((home) => {
+    const live: Cred = { accessToken: "at-live", refreshToken: "rt-live", expiresAt: Date.now() + 7 * HOUR };
+    const { dir, tool: defaultTool } = makeDefaultDir(home, UUID, live);
+
+    const report = convergeIdentityCredential(UUID, {
+      tool: defaultTool,
+      profiles: [{ name: "live", dir }],
+    });
+
+    // The account's ONLY credential is in this dir. Refusing it as a source
+    // makes convergence a no-op that reports "no restorable credential copy".
+    expect(report.winner?.path).toBe(join(dir, ".credentials.json"));
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-live");
+  });
+});
+
+test("DEFAULT-DIR SOURCE: a STALE sibling never outranks the live default dir", () => {
+  withHome((home) => {
+    // Worse than a no-op. If the default dir cannot donate, the only remaining
+    // candidate is the stale sibling — which is then crowned AND written to
+    // central with a FRESH mtime. `betterCredential` tie-breaks on mtime, so
+    // the stale copy would durably outrank the genuinely fresher live one.
+    const live: Cred = { accessToken: "at-live", refreshToken: "rt-live", expiresAt: Date.now() + 7 * HOUR };
+    const { dir, tool: defaultTool } = makeDefaultDir(home, UUID, live);
+    const old = new Date(Date.now() - 2 * HOUR);
+    const staleDir = makeDir(home, "stale-sibling", UUID, { accessToken: "at-stale", refreshToken: "rt-stale", expiresAt: Date.now() - HOUR }, { mtime: old });
+
+    const report = convergeIdentityCredential(UUID, {
+      tool: defaultTool,
+      profiles: [
+        { name: "live", dir },
+        { name: "stale", dir: staleDir },
+      ],
+    });
+
+    expect(report.winner?.path).toBe(join(dir, ".credentials.json"));
+    expect(readCred(centralCredentialsSnapshot(UUID)).refreshToken).toBe("rt-live");
+    // The stale sibling converged UP to the live rotation, not the reverse.
+    expect(readCred(join(staleDir, ".credentials.json")).refreshToken).toBe("rt-live");
+  });
+});
+
 test("EXFILTRATION GATE: converging an UNREGISTERED dir is refused outright", () => {
   withHome((home) => {
     const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };

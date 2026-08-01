@@ -6,7 +6,155 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
-## [0.2.25] - 2026-07-30
+### Fixed
+
+- **CRITICAL: `registry --backfill-uuid` could silently write one `accountUuid`
+  onto multiple profiles.** `planAccountUuidBackfill` planned each profile in
+  isolation, so two directories that independently resolved the SAME parked
+  identity both read as clean, confirmed `backfilled` rows and
+  `summary.conflict` reported `0` throughout. Measured live: one uuid proposed
+  for three profiles, a second for two more, with no conflict surfaced. A uuid
+  now claimed by more than one profile in the same plan is downgraded to the
+  existing `conflict` outcome for every row involved (never applied); unrelated,
+  unambiguous rows in the same plan are unaffected. Fixed in two passes: a
+  uuid proposed by more than one FRESH backfill, and (found in review) a uuid
+  already RECORDED on one profile that a different profile's fresh backfill
+  also independently resolves to — the second is reachable the moment any
+  profile has been backfilled once, through the tool's own
+  dry-run → apply → re-run workflow. (task `2b15400e`)
+
+## [0.2.29] - 2026-07-31
+
+The first release intended to go through the release workflow rather than
+around it. Every version since `0.2.22` reached npm by break-glass, because the
+workflow had **never succeeded** — three runs (`0.2.24`, `0.2.25`, `0.2.28`) all
+died at the provisioning gate for a credential that could not be provisioned in
+the form the contract asked for.
+
+### Fixed
+
+- **The release lane could not complete, and each of its three blockers hid the
+  next.** `RELEASE_GITHUB_ADMIN_TOKEN` was specified as a stored personal token.
+  Substituting a GitHub App installation token is not a drop-in: a stored one
+  expires in about an hour, so it would pass a presence check forever and then
+  fail as an authorization error. It is now **minted per run** and the presence
+  gate moved to `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY`, which still fails
+  by name.
+
+  Minting alone was not sufficient. The preflight identified that credential by
+  calling `GET /user` and asserting the identity equalled the release actor —
+  unsatisfiable in principle, because an installation token has no user identity
+  and that endpoint answers `403 Resource not accessible by integration` for
+  every one. The credential is now bound by **scope** instead:
+  `GET /installation/repositories` must return exactly one repository and it must
+  be the release repository. Narrower than the token it replaces — a personal
+  token carries everything its owner can reach for as long as it lives; this
+  carries one repository for about an hour.
+
+  And `workflowIdentity()` still required an environment variable the workflow
+  had stopped exporting, so the run aborted before any of that executed, with an
+  error naming a credential the design deliberately no longer stores.
+
+- **The tag ruleset is now verified by a credential that cannot author it.** The
+  minted token is pinned to `administration: read` + `metadata: read` — down from
+  the roughly 35 scopes an unpinned token inherits. `administration: write` was
+  measured creating a repository ruleset, which would have made the attestation
+  tautological: proof that the protections exist *and* that the reader could have
+  created them. Because GitHub returns `bypass_actors` only to `write`, the
+  release no longer enumerates bypass actors; it asserts via
+  `current_user_can_bypass` that it cannot itself bypass the ruleset, and the
+  "no other actor holds a bypass" property is audited out of band.
+
+### Changed
+
+- `docs/RELEASING.md` now describes what the release verifies **and what it
+  deliberately does not**, rather than implying full coverage. Its long-standing
+  "Administration read" specification was measured insufficient for the check it
+  was written for.
+- Regression coverage for the class that let all of this ship: a test derives the
+  set of `*_CONFIGURED` flags from `release.yml` and from `release-provenance.ts`
+  and requires them to be equal, so workflow/script drift cannot pass a green
+  suite again.
+
+## [0.2.28] - 2026-07-31
+
+`0.2.27` was published break-glass from a tree that was never merged, so `main`
+carried `version: 0.2.26` while npm served `0.2.27`. This release reconciles the
+two and ships the b29f5b6c fix.
+
+### Fixed
+
+- **A launched Claude session could read a logged-out profile while `accounts login`
+  reported it logged-in** (b29f5b6c). The profile-root `.credentials.json` — the file
+  a launched session reads via `CLAUDE_CONFIG_DIR` — held Claude Code's own
+  `rotated-away` husk (empty tokens, scopes intact), written in place after a
+  DUPLICATE live copy of the same account rotated the refresh token out from under
+  it, while the profile's snapshot and the central store still held the real
+  credential. `profileEnv`'s heal refused to restore it with `account-live-elsewhere`
+  (defect bb267228) — correct for a blind restore of a possibly-superseded
+  predecessor token, but it left the directory logged-out.
+
+  The launch path now heals by **convergence** instead: `convergeDirCredential`
+  performs no token exchange and fans the current winning credential into every
+  copy, so all directories end holding the SAME token rather than a second,
+  superseded one.
+
+  The heal is **narrowed to legitimate duplicate doors**. `account-live-elsewhere`
+  conflates a directory that OWNS the account and is running it with one owned by a
+  DIFFERENT account that is merely carrying it after an in-place switch; converging
+  through the latter would cross a custody boundary its real owner never consented
+  to. `accountGuestOccupantDoorsElsewhere` ranges over the UNFILTERED
+  current-occupant set — the same doors the broker's fan-out targets — so a guest
+  directory holding a husk cannot hide from the gate, and a single guest anywhere in
+  that set stops the heal. The bb267228 launch gate is preserved, not worked around.
+
+### Known limitations
+
+- A profile whose directory currently presents a DIFFERENT account
+  (`identity-would-change`) is deliberately not healed: restoring there would change
+  which account the directory presents. Tracked as `6824d0b3`.
+- `convergeDirCredential` itself still writes through a guest directory with no
+  ownership gate, and the usage hook calls it unconditionally. Pre-existing and not
+  widened by this release; tracked as `96e80483`.
+- A guest directory whose own binding snapshot is CORRUPT is classified as an owner
+  by the identity index, so it is not reported as a guest. Unreachable on the
+  measured fleet and independently guarded by the switch marker; tracked as
+  `67163aa4`.
+
+## [0.2.26] - 2026-07-30
+
+`0.2.25` was prepared (#91) but never published to npm: #93 landed on `main`
+after the release commit, so the tree carrying `version: 0.2.25` contained
+behaviour that the `0.2.25` entry below does not describe. Rather than amend a
+released version's notes to cover code it never announced, `0.2.25` is retired
+unpublished and this entry ships that tree plus #93. `0.2.26` therefore contains
+everything listed under `0.2.25` as well as the fix below.
+
+### Fixed
+
+- **An occupied profile dir no longer reports `ok`** (`src/lib/readiness.ts`,
+  `src/cli.ts`). `#63` already detected in-place account switches and emitted
+  `dirOccupiedByAnotherAccount: true`, but it left `status` alone — so the same
+  payload said the dir was occupied *and* said `status: "ok"`, and every
+  consumer that reads a verdict rather than a flag was told the profile was
+  fine. Measured on station01: five profiles reporting `ok` that
+  `accounts launch` refused **by name**. A health check that disagrees with the
+  launch path is worse than no health check, because the disagreement is
+  invisible until a launch fails. An occupied dir now grades `degraded` — not
+  `unavailable`, because the profile's own credential is parked and intact, so
+  it is one reconcile away from usable rather than broken.
+
+- **`accounts show` now displays the reason a launch would be refused**
+  (`src/cli.ts`). `accounts launch account031` refused with "its config dir
+  currently carries the account of account029" while
+  `accounts show account031 --json` displayed the correct dir, the correct
+  email, and no mention of `account029` anywhere — the CLI refused for a reason
+  its own inspection command would not show, which made the state
+  undiagnosable from outside. `show` now carries a `switchedAway` field (JSON)
+  and a `switched:` line (human output) naming the occupying profile and the
+  exact reconcile command.
+
+## [0.2.25] - 2026-07-30 [unpublished — superseded by 0.2.26]
 
 ### Fixed
 
@@ -238,6 +386,11 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   existing `apply` semantics.
 
 ### Fixed
+
+- Purge the leaked `fake-login`, `fake-variant`, `missing-review`, and
+  `review-state-shape` test tools (and their dependent fixture profiles) from
+  the production PostgreSQL registry. Migration `0006` tombstones the ids so
+  legacy account writers cannot recreate them implicitly.
 
 - Share capabilities across profiles instead of isolating them. A profile is an
   isolated config dir, so pointing Claude Code at a freshly created one gave it

@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { type Store, storeSchema, AccountsError, profileNameSchema } from "./types.js";
 import { writeFileAtomic } from "./lib/safe-path.js";
+import { crossProviderCollisions } from "./lib/name-invariant.js";
 
 function validateEnvPath(value: string, label: string): string {
   const trimmed = value.trim();
@@ -157,7 +158,58 @@ export function loadStore(): Store {
     if (!profileNameSchema.safeParse(name).success || !toolId) delete store.toolLocks[name];
     else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.toolLocks[name];
   }
+  reportCrossProviderCollisions(store);
   return store;
+}
+
+/** Suppress the load-time integrity warning (scripted consumers, test rigs). */
+export const INVARIANT_QUIET_ENV = "HASNA_ACCOUNTS_INVARIANT_QUIET";
+
+/**
+ * Collision signatures already reported by this process.
+ *
+ * `loadStore()` runs many times per command, so an un-deduped warning would
+ * print the same line a dozen times and train every reader to ignore it. Keyed
+ * on the signature rather than a boolean so a store that changes mid-process
+ * still reports its NEW collisions.
+ */
+const reportedCollisionSignatures = new Set<string>();
+
+/** Exposed for tests, which need a fresh process-level state per case. */
+export function resetCollisionReportState(): void {
+  reportedCollisionSignatures.clear();
+}
+
+/**
+ * WARN MODE (PR-1). Report names held by more than one provider; never throw.
+ *
+ * A hard failure here would brick every `accounts` command on today's data —
+ * 23 records currently violate this — so the failing state must only become
+ * reachable after PR-2's migration cleans the data. That is the whole reason
+ * this is a report and not a refusal, and PR-2 flips it by raising
+ * `NAME_INVARIANT_MODE`, not by editing this function's callers.
+ *
+ * Scope note, stated so nobody reads more into a clean run than it supports:
+ * this sees only THIS FILE. accounts.json holds 14 of the 23 colliding records
+ * and cannot see `account01` or `account024` at all, which live solely as
+ * server rows. Silence here is not evidence that the merged view is clean —
+ * `accounts registry --invariant` reads the merged universe and is the gate.
+ */
+function reportCrossProviderCollisions(store: Store): void {
+  if (process.env[INVARIANT_QUIET_ENV] === "1") return;
+  const collisions = crossProviderCollisions(
+    store.profiles.map((p) => ({ name: p.name, provider: p.tool })),
+  );
+  if (collisions.length === 0) return;
+  const signature = collisions.map((c) => `${c.name}:${c.providers.join("+")}`).join(",");
+  if (reportedCollisionSignatures.has(signature)) return;
+  reportedCollisionSignatures.add(signature);
+  const detail = collisions.map((c) => `${c.name} (${c.providers.join(", ")})`).join("; ");
+  process.stderr.write(
+    `accounts: name-invariant warning: ${collisions.length} name(s) held by more than one provider ` +
+      `in ${storePath()}: ${detail}. Names become provider-unique in a later release; ` +
+      `run \`accounts registry --invariant\` for the merged view.\n`,
+  );
 }
 
 export function saveStore(store: Store): void {

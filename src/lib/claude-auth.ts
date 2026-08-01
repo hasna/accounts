@@ -44,7 +44,12 @@ import {
   type SyncResult,
   syncProfileSnapshotToCentral,
 } from "./auth-store.js";
-import { accountLiveDoorsElsewhere, buildIdentityIndex, type AccountIdentity } from "./identity-index.js";
+import {
+  accountGuestOccupantDoorsElsewhere,
+  accountLiveDoorsElsewhere,
+  buildIdentityIndex,
+  type AccountIdentity,
+} from "./identity-index.js";
 import { listProfiles } from "./profiles.js";
 import { accountsHome } from "../storage.js";
 
@@ -579,6 +584,23 @@ export type ParkedRecoveryPlan =
       outcome: Exclude<ParkedRecoveryPlanOutcome, "would-recover">;
       detail: string;
       layers?: ProfileCredentialLayers;
+      /**
+       * `account-live-elsewhere` ONLY: NO other dir that currently presents this
+       * account is a guest — every one of them also owns it. Computed over the
+       * UNFILTERED occupant-door set, which is the set the credential broker
+       * actually writes to; see {@link accountGuestOccupantDoorsElsewhere} for
+       * why the credential-state-filtered set is the wrong domain for a
+       * write-safety gate.
+       *
+       * This does NOT soften the refusal — restoring a parked PREDECESSOR
+       * credential stays refused either way, because the hazard it guards
+       * (two DIFFERENT tokens, one revoked on the next rotation) is identical
+       * for legitimate doors. It is published for callers deciding whether a
+       * CONVERGENCE — which makes every copy hold the SAME token rather than a
+       * second one — is safe here, and that question does turn on whether a
+       * guest dir would be written through.
+       */
+      noGuestOccupantDoorsElsewhere?: boolean;
     };
 
 export interface ParkedRecoveryResult {
@@ -586,6 +608,8 @@ export interface ParkedRecoveryResult {
   /** Operator-facing explanation, safe to print. */
   detail: string;
   layers?: ProfileCredentialLayers;
+  /** See the identically named field on {@link ParkedRecoveryPlan}. */
+  noGuestOccupantDoorsElsewhere?: boolean;
 }
 
 /** A config dir this machine knows about, from whichever registry the caller uses. */
@@ -774,6 +798,13 @@ export function planParkedRecovery(
       .join(", ");
     return {
       outcome: "account-live-elsewhere",
+      // Default-deny, and computed over the UNFILTERED occupant set rather
+      // than `liveElsewhere`: the broker writes to every occupant door
+      // regardless of its credential state, so a gate reading only the
+      // restorable ones is blind to a guest dir holding a husk. Consumed only
+      // by callers weighing a CONVERGENCE; the refusal itself is unconditional.
+      noGuestOccupantDoorsElsewhere:
+        accountGuestOccupantDoorsElsewhere(cross.index, ownUuid, profileDir).length === 0,
       detail:
         `this profile's parked credential belongs to an account that is ALREADY live in another config dir ` +
         `(${where}), so the parked copy is a superseded predecessor rather than the account's current credential. ` +
@@ -850,7 +881,14 @@ export function recoverParkedCredential(
     // Every refusal outcome is identical between plan and execution BECAUSE the
     // decision was made in one place. That identity is what `--dry-run` relies
     // on; duplicating the gates into the preview is what let them drift.
-    return { outcome: plan.outcome, detail: plan.detail, ...(plan.layers ? { layers: plan.layers } : {}) };
+    return {
+      outcome: plan.outcome,
+      detail: plan.detail,
+      ...(plan.layers ? { layers: plan.layers } : {}),
+      ...(plan.noGuestOccupantDoorsElsewhere !== undefined
+        ? { noGuestOccupantDoorsElsewhere: plan.noGuestOccupantDoorsElsewhere }
+        : {}),
+    };
   }
 
   // NEVER THROWS. This runs inside `profileEnv`, which every launch surface goes
