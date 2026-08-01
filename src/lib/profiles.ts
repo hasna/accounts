@@ -1,12 +1,13 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { type Profile, type Store, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
 import { sameConfigDir } from "./safe-path.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
+import { isAccountUuid } from "./auth-store.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
 export type ProfileMetadata = Record<string, ProfileMetadataValue>;
@@ -93,8 +94,31 @@ function resolveProfileFromStore(store: Store, name: string, toolId?: string): P
   return matches[0]!;
 }
 
-function isManagedProfileDir(dir: string): boolean {
-  const rel = relative(resolve(profilesDir()), resolve(dir));
+/**
+ * Containment decided on REAL paths, for the one caller that deletes.
+ *
+ * This replaces a purely lexical predicate that resolved neither side. The
+ * lexical form was the only containment check the purge had, and it is the one
+ * a reviewer walked past with a symlink.
+ *
+ * `isManagedProfileDir` is purely lexical, so a symlink sitting under the
+ * profiles root satisfies it while pointing anywhere on the machine. That is
+ * harmless for the read-only callers, and not harmless for `rmSync`: a reviewer
+ * walked past the lexical guard with a symlink and deleted a different live
+ * profile's dir, `.credentials.json` and all. Resolving both sides first closes
+ * it, and refusing when the path does not resolve keeps the failure a refusal
+ * rather than a delete of whatever the parent happens to be.
+ */
+function isRealManagedProfileDir(dir: string): boolean {
+  let realRoot: string;
+  let realDir: string;
+  try {
+    realRoot = realpathSync(profilesDir());
+    realDir = realpathSync(dir);
+  } catch {
+    return false;
+  }
+  const rel = relative(realRoot, realDir);
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
@@ -184,6 +208,11 @@ export function addProfile(opts: AddOptions): Profile {
   const profile: Profile = {
     name,
     tool: toolId,
+    // Written alongside `tool`, not instead of it: every existing reader keeps
+    // working off `tool` for one release while new records already carry the
+    // canonical field, so the later flip has no backfill to do for anything
+    // created from here on.
+    provider: toolId,
     ...(email ? { email } : {}),
     ...(displayName !== undefined ? { displayName } : {}),
     ...(identity !== undefined ? { identity } : {}),
@@ -231,19 +260,68 @@ export function removeProfile(
   if (store.toolLocks[profile.name] === profile.tool) delete store.toolLocks[profile.name];
   saveStore(store);
 
-  let purged = false;
-  let purgeNote: string | undefined;
-  if (options.purge) {
-    const managed = isManagedProfileDir(profile.dir);
-    const isDefault = profile.dir === getTool(profile.tool).defaultDir;
-    if (managed && !isDefault && existsSync(profile.dir)) {
-      rmSync(profile.dir, { recursive: true, force: true });
-      purged = true;
-    } else {
-      purgeNote = `refused to delete ${profile.dir} (not a managed profile dir); remove it manually if intended`;
-    }
-  }
+  const { purged, purgeNote } = options.purge ? purgeProfileDir(profile) : { purged: false, purgeNote: undefined };
   return { profile, purged, purgeNote };
+}
+
+/**
+ * Delete a profile's managed config dir. Shared by the local and hosted stores
+ * because a PROFILE DIR IS ALWAYS MACHINE-LOCAL — which store holds the row says
+ * nothing about where the bytes are. The hosted path used to skip this and
+ * report it as "a local-only operation", which left the directory behind after
+ * the row that named it was gone: an orphan no `accounts` command can list,
+ * still holding whatever the profile accumulated, including `.credentials.json`.
+ * A dir invisible to the tool that made it is exactly the population an audit
+ * cannot see.
+ *
+ * The guards are unchanged: never a dir outside the managed profile root, never
+ * the tool's own default dir, and a refusal is reported rather than performed.
+ */
+export function purgeProfileDir(profile: Profile): { purged: boolean; purgeNote?: string } {
+  if (!profile.dir || !existsSync(profile.dir)) return { purged: false };
+
+  // The identity the path is derived FROM is remote-supplied too, so validate it
+  // before deriving. `HostedStore.removeProfile` returns the server's body, and
+  // `toProfile` in cloud-accounts.ts is a plain field copy that never applies
+  // `profileSchema` — so a response naming `../claude/victim` normalises back
+  // inside the managed root, both checks below agree, and the delete lands on a
+  // different profile. Deriving from unvalidated input just moves the trust from
+  // `dir` to `name` rather than removing it. Slugs cannot contain a separator or
+  // a dot segment, which is exactly the property the derivation needs.
+  if (!profileNameSchema.safeParse(profile.name).success || !profileNameSchema.safeParse(profile.tool).success) {
+    return {
+      purged: false,
+      purgeNote: `refused to delete ${profile.dir}: "${profile.tool}/${profile.name}" is not a valid profile identity`,
+    };
+  }
+
+  // DERIVE the path to delete; never delete the one we were handed. On the
+  // hosted path `profile.dir` arrives in an API response, so trusting it makes
+  // the delete target remote-controlled. The canonical managed location is a
+  // pure function of (profiles root, tool, name), so the supplied dir only has
+  // to AGREE with it — and a supplied path that disagrees is refused and
+  // reported rather than deleted.
+  const expected = join(profilesDir(), profile.tool, profile.name);
+  if (!isRealManagedProfileDir(profile.dir) || !samePathOnDisk(profile.dir, expected)) {
+    return {
+      purged: false,
+      purgeNote:
+        `refused to delete ${profile.dir}: it is not the managed dir for ${profile.tool}/${profile.name} ` +
+        `(expected ${expected}). Remove it manually if that is genuinely intended.`,
+    };
+  }
+
+  rmSync(expected, { recursive: true, force: true });
+  return { purged: true };
+}
+
+/** Both paths resolved, so a symlink cannot make two different dirs compare equal. */
+function samePathOnDisk(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
 }
 
 export function renameProfile(oldName: string, newName: string, toolId?: string): Profile {
@@ -289,6 +367,12 @@ export interface UpdateOptions {
   metadata?: ProfileMetadata;
   description?: string;
   dir?: string;
+  /**
+   * The account uuid this profile belongs to, as backfilled from the dir's
+   * parked identity. Set only by the reconcile backfill, which refuses to
+   * overwrite a disagreeing value — see src/lib/uuid-backfill.ts.
+   */
+  accountUuid?: string;
 }
 
 export function updateProfile(name: string, opts: UpdateOptions): Profile {
@@ -316,6 +400,12 @@ export function updateProfile(name: string, opts: UpdateOptions): Profile {
     profile.metadata = { ...(profile.metadata ?? {}), ...(metadata ?? {}) };
   }
   if (opts.description !== undefined) profile.description = opts.description;
+  if (opts.accountUuid !== undefined) {
+    if (!isAccountUuid(opts.accountUuid)) {
+      throw new AccountsError(`accountUuid must be a uuid; got ${JSON.stringify(opts.accountUuid)}`);
+    }
+    profile.accountUuid = opts.accountUuid.toLowerCase();
+  }
   if (opts.dir !== undefined) {
     const dir = expandPath(opts.dir);
     if (store.profiles.some((p) => p !== profile && sameConfigDir(p.dir, dir))) {

@@ -197,6 +197,27 @@ export type {
   SyncResult,
   UnresolvedProfileBinding,
 } from "./lib/auth-store.js";
+// Credential → account identity binding: the one question containment cannot
+// ask ("were these BYTES legitimately filed under this uuid?").
+export {
+  CREDENTIAL_BINDING_METHOD,
+  buildCredentialClaimIndex,
+  classifyCredentialWrite,
+  credentialBindingConflicts,
+  credentialBindingRefusal,
+  credentialClaimants,
+  credentialFingerprintFromFile,
+  listCredentialBindings,
+  readCredentialBinding,
+} from "./lib/credential-binding.js";
+export type {
+  CredentialBinding,
+  CredentialBindingConflict,
+  CredentialBindingRefusal,
+  CredentialBindingRow,
+  CredentialClaimIndex,
+  CredentialWriteVerdict,
+} from "./lib/credential-binding.js";
 // THE uuid-keyed account enumerator (central store first, per-profile stores
 // as compat fallback). Consumers must reason over this instead of walking
 // profile dirs themselves.
