@@ -75,11 +75,11 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   it **refuses the render** and says so, unless nothing on disk claims the home
   has ever carried sources — the first-ever render of a new profile stays open.
 
-  Known limit, stated rather than papered over: the audit's `sourceIds` are
-  capped at `MAX_SOURCE_IDS` for reporting, so a fallback floor on a home
-  carrying more than that cap is PARTIAL. It still catches every drop touching
-  an id it can see, and is strictly better than the empty list this produced
-  before, but such a home should be repaired by re-running the canonical render.
+  The audit now carries an uncapped `preservationFloor` independently of its
+  bounded manifest summary, and carries that floor forward when a skipped or
+  failed run observes the manifest missing. That prevents an intermediate run
+  from erasing the fallback before the next render. Legacy audit records remain
+  capped until one successful render refreshes the durable floor.
   `--allow-instruction-reduction` bypasses the new refusal, so an operator with
   a corrupt manifest is never wedged out of their own launch.
 

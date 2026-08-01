@@ -1606,6 +1606,47 @@ describe("configs prelaunch floor integrity", () => {
     }
   });
 
+  test("REGRESSION review: a skipped run cannot erase the audit fallback before the next render", () => {
+    resetHome();
+    try {
+      const staleExport = join(home, "stale-after-skip.configs.json");
+      const p = profileInHome("claude");
+      writeManifest(p, "claude", INCUMBENT_IDS.map((id) => ({ id })));
+      writePriorAudit(p, "claude", INCUMBENT_IDS);
+
+      rmSync(join(p.dir, ".hasna", "session-render-manifest.json"));
+
+      // The first run has no readable identity input. It correctly skips, but
+      // recording that skip must not replace the only surviving copy of the
+      // incumbent floor with the currently missing manifest's empty summary.
+      const firstCalls: string[][] = [];
+      const first = runConfigsPrelaunch(p, getTool("claude"), {
+        identityExports: [join(home, "missing.configs.json")],
+        runner: renderingRunner(p, "claude", [], firstCalls),
+      });
+      expect(firstCalls).toHaveLength(0);
+      expect(first.result).toBe("skipped");
+      expect(first.prelaunch.lastRun?.manifest.drift).toBe("missing");
+      expect(first.prelaunch.lastRun?.preservationFloor?.sourceIds).toEqual(INCUMBENT_IDS);
+
+      writeExport(staleExport, SUPPLIED_IDS);
+      const secondCalls: string[][] = [];
+      const second = runConfigsPrelaunch(p, getTool("claude"), {
+        identityExports: [staleExport],
+        runner: renderingRunner(p, "claude", SUPPLIED_IDS, secondCalls),
+      });
+
+      // Before the review fix this was calls=1 / result="applied": the first
+      // skip had rewritten the audit to sourceCount=0, so this run called the
+      // missing manifest a fresh home and removed the three dropped sources.
+      expect(secondCalls).toHaveLength(0);
+      expect(second.result).toBe("skipped");
+      for (const id of DROPPED_IDS) expect(second.reason).toContain(id);
+    } finally {
+      cleanup();
+    }
+  });
+
   // ---- must-not-over-block controls -------------------------------------
   // A guard that refuses everything is its own outage, and it would satisfy
   // every assertion above. Each control below has to pass in the same run.

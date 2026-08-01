@@ -132,6 +132,21 @@ export interface ConfigsPrelaunchAudit {
    */
   droppedSourceIds?: string[];
   droppedSourceCount?: number;
+  /**
+   * Last trustworthy instruction floor, kept independently of the CURRENT
+   * manifest status below.
+   *
+   * A skipped or failed run still records the current manifest. If that file
+   * has just disappeared, replacing the previous audit with `sourceCount: 0`
+   * would erase the only surviving floor and make the next run look fresh.
+   * This snapshot is therefore carried forward while the manifest is missing
+   * or unreadable. It is uncapped because it feeds a safety comparison rather
+   * than a display surface.
+   */
+  preservationFloor?: {
+    sourceCount: number;
+    sourceIds: string[];
+  };
   updatedAt: string;
   manifest: {
     path: string;
@@ -380,7 +395,24 @@ export function recordConfigsPrelaunchAudit(
   configsTool: string | undefined,
   input: RecordConfigsPrelaunchAuditInput,
 ): ConfigsPrelaunchSummary {
+  const previous = readConfigsPrelaunchAudit(profile, tool);
   const manifest = assessConfigsManifest(profile, tool, configsTool);
+  const manifestSources = readManifestSourceIds(profile);
+  const previousFloor =
+    previous?.preservationFloor ??
+    (previous && previous.manifest.sourceCount > 0
+      ? {
+          sourceCount: previous.manifest.sourceCount,
+          sourceIds: [...previous.manifest.sourceIds],
+        }
+      : undefined);
+  const preservationFloor =
+    manifestSources.state === "ok"
+      ? {
+          sourceCount: manifest.sourceCount,
+          sourceIds: [...manifestSources.ids],
+        }
+      : previousFloor;
   const audit: ConfigsPrelaunchAudit = {
     schema: STATUS_SCHEMA,
     tool: tool.id,
@@ -398,6 +430,7 @@ export function recordConfigsPrelaunchAudit(
           droppedSourceCount: input.droppedSourceIds.length,
         }
       : {}),
+    ...(preservationFloor ? { preservationFloor } : {}),
     updatedAt: new Date().toISOString(),
     manifest: {
       path: manifest.path,

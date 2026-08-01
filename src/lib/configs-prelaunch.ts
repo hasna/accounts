@@ -256,19 +256,16 @@ type IncumbentFloor =
  * drop-check — which is what probe B on todos `8776dba9` demonstrated was
  * missing.
  *
- * Known limit, stated rather than papered over: the audit's `sourceIds` are
- * capped at MAX_SOURCE_IDS for reporting, so a fallback floor on a home carrying
- * more than that cap is PARTIAL. A partial floor still catches every drop that
- * touches an id it can see, and is strictly better than the empty list this code
- * used to produce — but it is not equivalent to the manifest, and a home in that
- * state should be repaired by re-running the canonical render rather than left
- * on the fallback.
+ * New audits carry an uncapped `preservationFloor` separately from the bounded
+ * manifest summary. Older audits have only the capped summary, so their fallback
+ * remains partial until one successful render refreshes the durable floor.
  */
 function resolveIncumbentFloor(profile: Profile, tool: ToolDef): IncumbentFloor {
   const read = readManifestSourceIds(profile);
   if (read.state === "ok") return { ids: read.ids, origin: "manifest" };
 
-  const recorded = readConfigsPrelaunchAudit(profile, tool)?.manifest;
+  const audit = readConfigsPrelaunchAudit(profile, tool);
+  const recorded = audit?.preservationFloor ?? audit?.manifest;
   if (recorded && recorded.sourceIds.length > 0) return { ids: [...recorded.sourceIds], origin: "audit" };
 
   const manifestDetail =
