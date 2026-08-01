@@ -4,10 +4,7 @@ import type { Profile } from "../types.js";
 import { profilesDir } from "../storage.js";
 import { AccountsError, profileNameSchema } from "../types.js";
 import {
-  addProfile,
   expandPath,
-  findProfile,
-  lockProfileTool,
   type AddOptions,
 } from "./profiles.js";
 import { DEFAULT_TOOL } from "./tools.js";
@@ -85,34 +82,5 @@ export async function importProfile(
   };
   const profile = await store.addProfile(addOpts);
   if (tool.id === "claude") ensureProfileAuthSnapshot(profile.dir, tool);
-  return profile;
-}
-
-/**
- * @deprecated Local-only synchronous compatibility shim. New callers should
- * use prepareLogin(), whose async Store path also supports cloud custom tools.
- */
-export function ensureProfileForLogin(name: string, toolId = DEFAULT_TOOL): Profile {
-  const mode = (
-    process.env.HASNA_ACCOUNTS_STORAGE_MODE ||
-    process.env.ACCOUNTS_STORAGE_MODE ||
-    ""
-  ).trim().toLowerCase();
-  const apiConfigured = Boolean(
-    (process.env.HASNA_ACCOUNTS_API_URL || process.env.ACCOUNTS_API_URL) &&
-    (process.env.HASNA_ACCOUNTS_API_KEY || process.env.ACCOUNTS_API_KEY),
-  );
-  if (mode === "cloud" || mode === "self_hosted" || (mode !== "local" && apiConfigured)) {
-    throw new AccountsError(
-      "ensureProfileForLogin is a local-only compatibility shim; use async prepareLogin in API mode",
-    );
-  }
-  const existing = findProfile(name, toolId);
-  if (existing) {
-    lockProfileTool(existing.name, existing.tool);
-    return existing;
-  }
-  const profile = addProfile({ name, tool: toolId, description: "created for login" });
-  lockProfileTool(profile.name, profile.tool);
   return profile;
 }

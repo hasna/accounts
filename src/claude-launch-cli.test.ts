@@ -35,6 +35,7 @@ let securityBin: string;
 
 const WINDOWS_CLEANUP_RETRIES = 20;
 const WINDOWS_CLEANUP_RETRY_DELAY_MS = 100;
+const WINDOWS_BUILT_CLI_TIMEOUT_MS = 30_000;
 
 function removeTestDirectory(path: string): void {
   rmSync(path, {
@@ -472,7 +473,7 @@ process.exit(29);
   } finally {
     removeTestDirectory(batchBin);
   }
-});
+}, WINDOWS_BUILT_CLI_TIMEOUT_MS);
 
 test("headless launch keeps Claude stdout clean and returns its exit code", () => {
   addProfile("acct");
@@ -692,7 +693,7 @@ test("two concurrent profiles serialize keychain use and restore inherited state
   expect(securityText).not.toContain("credential-alpha-value");
   expect(securityText).not.toContain("credential-beta-value");
   expect(securityText).not.toContain("credential-prior-value");
-});
+}, 15_000);
 
 test("keychain lock timeout does not launch or alter inherited credentials", () => {
   addProfile("acct", "profile-credential-value");

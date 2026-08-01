@@ -1,16 +1,17 @@
 // Self-hosted (`mode=self_hosted`) registry backend for the accounts CLI.
 //
 // LOCKED ARCHITECTURE: when `HASNA_ACCOUNTS_API_URL` + `HASNA_ACCOUNTS_API_KEY`
-// are set, the account *registry* (profiles + current selections) is read from
-// and written to the app's cloud HTTP API at `<API_URL>/v1` with the bearer key
-// — never the local JSON store, never a raw DSN. Built on the `@hasna/contracts`
-// HTTP storage client, so it inherits retries, timeout, idempotency and JSON
-// error mapping.
+// are set and `ACCOUNTS_HOME` is not overridden, the account *registry*
+// (profiles + current selections) is read from and written to the app's cloud
+// HTTP API at `<API_URL>/v1` with the bearer key — never the local JSON store,
+// never a raw DSN. Built on the `@hasna/contracts` HTTP storage client, so it
+// inherits retries, timeout, idempotency and JSON error mapping.
 //
-// Without an explicit mode, both API env vars select cloud and an incomplete
-// pair stays local. Explicit `self_hosted`/`cloud` fails closed unless both
-// vars exist; explicit `local` forces local. Only the retired
-// `remote`/`hybrid`/`s3` aliases are ignored.
+// Without an explicit mode, both API env vars select cloud unless an
+// `ACCOUNTS_HOME` override requests an isolated local registry; an incomplete
+// pair also stays local. Explicit `self_hosted`/`cloud` fails closed unless
+// both vars exist and wins over `ACCOUNTS_HOME`; explicit `local` forces local.
+// Only the retired `remote`/`hybrid`/`s3` aliases are ignored.
 //
 // Registry vs local: the cloud is the source of truth for account metadata
 // (name, tool, email, displayName, identity, cardLast4, metadata, description,
@@ -40,6 +41,10 @@ export interface CloudAccount {
   description?: string;
   createdAt: string;
   lastUsedAt?: string;
+  /** R-P1-4: the tool-native/on-disk name, when it differs from `name`. */
+  nativeName?: string;
+  /** R-P1-4: former registry name(s) this profile has answered to. */
+  aliases?: string[];
 }
 
 export interface CloudCurrentSelection {
@@ -70,6 +75,10 @@ export interface CloudUpdateInput {
   dir?: string;
   description?: string;
   lastUsedAt?: string;
+  /** R-P1-4: last-write-wins (a single fixed on-disk identifier). */
+  nativeName?: string;
+  /** R-P1-4: APPENDED (deduped) to the record's existing aliases server-side — never a replace. */
+  aliases?: string[];
 }
 
 /**
@@ -112,6 +121,8 @@ function toProfile(account: CloudAccount): Profile {
     ...(account.description ? { description: account.description } : {}),
     createdAt: account.createdAt,
     ...(account.lastUsedAt ? { lastUsedAt: account.lastUsedAt } : {}),
+    ...(account.nativeName ? { nativeName: account.nativeName } : {}),
+    ...(account.aliases && account.aliases.length > 0 ? { aliases: account.aliases } : {}),
   };
 }
 
@@ -125,10 +136,29 @@ const RETIRED_MODES = new Set(["remote", "hybrid", "s3"]);
 const MODE_ENV_KEYS = ["HASNA_ACCOUNTS_STORAGE_MODE", "ACCOUNTS_STORAGE_MODE", "HASNA_ACCOUNTS_MODE"] as const;
 
 /**
+ * Return the first canonical authority in env-key precedence order. Retired
+ * words are absent authority, so they must be skipped rather than allowed to
+ * hide a canonical value from a lower-priority compatibility key.
+ */
+function explicitStorageMode(env: NodeJS.ProcessEnv): string {
+  for (const key of MODE_ENV_KEYS) {
+    const rawMode = (env[key] ?? "").trim().toLowerCase();
+    if (!rawMode || RETIRED_MODES.has(rawMode)) continue;
+    if (CANONICAL_MODES.has(rawMode)) return rawMode;
+    throw new AccountsError(
+      `invalid accounts storage mode "${rawMode}"; expected local, self_hosted, or cloud`,
+    );
+  }
+  return "";
+}
+
+/**
  * Bridge the fleet flip's two-var convention to the contracts resolver. The
  * toggle is the presence of BOTH `HASNA_ACCOUNTS_API_URL` and
  * `HASNA_ACCOUNTS_API_KEY`: when both are set (and mode is not explicitly
- * `local`) the client uses the cloud HTTP transport; otherwise local.
+ * `local`, and `ACCOUNTS_HOME` is not overridden) the client uses the cloud
+ * HTTP transport; otherwise local. An explicit hosted mode still wins over an
+ * `ACCOUNTS_HOME` override.
  *
  * Canonical modes are enforced here. Explicit `self_hosted`/`cloud` requires
  * both API variables and fails before the contracts resolver if either is
@@ -137,19 +167,8 @@ const MODE_ENV_KEYS = ["HASNA_ACCOUNTS_STORAGE_MODE", "ACCOUNTS_STORAGE_MODE", "
 function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const url = env.HASNA_ACCOUNTS_API_URL || env.ACCOUNTS_API_URL;
   const key = env.HASNA_ACCOUNTS_API_KEY || env.ACCOUNTS_API_KEY;
-  const rawMode = (
-    env.HASNA_ACCOUNTS_STORAGE_MODE ||
-    env.ACCOUNTS_STORAGE_MODE ||
-    env.HASNA_ACCOUNTS_MODE ||
-    ""
-  ).trim().toLowerCase();
-  const explicitMode = CANONICAL_MODES.has(rawMode) ? rawMode : "";
-
-  if (rawMode && !explicitMode && !RETIRED_MODES.has(rawMode)) {
-    throw new AccountsError(
-      `invalid accounts storage mode "${rawMode}"; expected local, self_hosted, or cloud`,
-    );
-  }
+  const explicitMode = explicitStorageMode(env);
+  const hasHomeOverride = Boolean(env.ACCOUNTS_HOME?.trim());
 
   const next: NodeJS.ProcessEnv = { ...env };
   for (const k of MODE_ENV_KEYS) delete next[k];
@@ -165,6 +184,10 @@ function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
       throw new AccountsError(`${explicitMode} storage mode requires ${missing}`);
     }
     next.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
+  } else if (hasHomeOverride) {
+    // A scoped home is an explicit request for an isolated local registry.
+    // This prevents probes and agents from inheriting production API authority.
+    next.HASNA_ACCOUNTS_STORAGE_MODE = "local";
   } else if (url && key) {
     // Both self_hosted and cloud use the identical cloud-http transport; the
     // canonical runtime word contracts expects is `cloud`.
@@ -251,6 +274,8 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       if (input.dir !== undefined) body.dir = input.dir;
       if (input.description !== undefined) body.description = input.description;
       if (input.lastUsedAt !== undefined) body.lastUsedAt = input.lastUsedAt;
+      if (input.nativeName !== undefined) body.nativeName = input.nativeName;
+      if (input.aliases !== undefined) body.aliases = input.aliases;
       const updated = await t.patch<CloudAccount>(
         `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}`,
         body,

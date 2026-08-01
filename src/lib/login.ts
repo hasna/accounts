@@ -6,7 +6,7 @@ import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
-import { getProfileToolLock, lockProfileTool } from "./profiles.js";
+import { lockProfileTool } from "./profiles.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
@@ -300,9 +300,8 @@ async function promptForUnavailableTool(
 async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<Profile> {
   const existing = await store.findProfile(name, tool.id);
   const profile = existing ?? (await store.addProfile({ name, tool: tool.id, description: "created for login" }));
-  // The tool lock is a machine-local disambiguation for bare commands; only the
-  // LocalStore keeps it. In api mode the shared registry (+ explicit --tool)
-  // resolves the profile, so there is no local lock to write.
+  // Keep the selected tool in the machine-local compatibility map. Ambiguous
+  // bare commands still require --tool; the lock is not a resolver.
   if (store.transport === "local") lockProfileTool(profile.name, profile.tool);
   return profile;
 }
@@ -314,11 +313,6 @@ async function selectLoginTool(
   store: AccountsStore,
 ): Promise<ToolDef> {
   if (opts.toolId) return store.resolveTool(opts.toolId);
-
-  if (store.transport === "local") {
-    const lockedTool = getProfileToolLock(name);
-    if (lockedTool) return store.resolveTool(lockedTool);
-  }
 
   const matches = (await store.listProfiles()).filter((profile) => profile.name === name);
   if (matches.length === 1) {

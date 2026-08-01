@@ -159,8 +159,8 @@ test("unsupported permission preset fails clearly", () => {
 
 // Registries created before the one-account-one-tool rule can hold the same
 // name under several tools. Those rows are grandfathered: still resolvable
-// (with --tool, or a tool lock), still switchable — but the name cannot spread
-// to yet another tool.
+// with --tool, still switchable — but the name cannot spread to yet another
+// tool.
 function seedGrandfatheredDuplicates(name: string, tools: string[]): void {
   const store = loadStore();
   for (const tool of tools) {
@@ -408,14 +408,17 @@ test("use sets the active profile per tool and bumps lastUsedAt", () => {
   expect(getProfileToolLock("play")).toBe("codex");
 });
 
-test("tool lock resolves grandfathered shared profile names for bare commands", () => {
+test("tool lock does not resolve grandfathered shared profile names for bare commands", () => {
   seedGrandfatheredDuplicates("work", ["claude", "codex"]);
   expect(() => getProfile("work")).toThrow(AccountsError);
 
   useProfile("work", "codex");
 
   expect(getProfileToolLock("work")).toBe("codex");
-  expect(getProfile("work").tool).toBe("codex");
+  expect(() => getProfile("work")).toThrow(
+    'profile "work" exists for multiple tools (claude, codex); pass --tool',
+  );
+  expect(getProfile("work", "codex").tool).toBe("codex");
 });
 
 test("rename updates the current pointer too", () => {
@@ -728,4 +731,29 @@ test("explicit dir is honored and created", () => {
   const p = addProfile({ name: "c", dir });
   expect(p.dir).toBe(dir);
   expect(existsSync(dir)).toBe(true);
+});
+
+// R-P1-4 (2026-07-31-accounts-debloat-design.md): renamed records gain
+// `aliases: [<old-name>]` and `nativeName: <tool-native/on-disk name>`. This
+// task does NOT wire that into `renameProfile` automatically (see the PR
+// description); it adds the supported write path — `updateProfile` — that a
+// migration or operator uses to record it explicitly.
+test("updateProfile sets nativeName and appends aliases (deduped, order preserved)", () => {
+  addProfile({ name: "account005-codewith", tool: "codewith" });
+  const first = updateProfile("account005-codewith", { nativeName: "account005", aliases: ["account005"] });
+  expect(first.nativeName).toBe("account005");
+  expect(first.aliases).toEqual(["account005"]);
+
+  // A second recorded rename appends rather than replacing.
+  const second = updateProfile("account005-codewith", { aliases: ["account005-old"] });
+  expect(second.aliases).toEqual(["account005", "account005-old"]);
+
+  // Re-recording an alias that is already present does not duplicate it.
+  const third = updateProfile("account005-codewith", { aliases: ["account005"] });
+  expect(third.aliases).toEqual(["account005", "account005-old"]);
+});
+
+test("updateProfile rejects a nativeName that is not a valid profile-name slug", () => {
+  addProfile({ name: "account005-codewith", tool: "codewith" });
+  expect(() => updateProfile("account005-codewith", { nativeName: "not a slug!" })).toThrow(AccountsError);
 });

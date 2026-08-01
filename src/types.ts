@@ -98,6 +98,35 @@ const sharedConfigSourceSchema = z
     return parts.every((part, index) => part !== ".." || index === 0);
   }, "may only ascend one level above the tool's shared home");
 
+/** One (target file, source files, keys) merge rule for a tool's shared config. */
+const sharedConfigSpecSchema = z.object({
+  /** Profile-relative JSON file the keys are merged into. */
+  target: pathSegmentSchema,
+  /**
+   * Shared-home-relative JSON files read for those keys, in priority order.
+   * Members are unioned across all of them and the first definition of a
+   * given member name wins, so put rendered files ahead of raw ones.
+   */
+  sources: z.array(sharedConfigSourceSchema).min(1).max(8),
+  keys: z.array(sharedConfigKeySchema).min(1).max(16),
+  /** Member names never shared into a profile, whatever a source says. */
+  exclude: z.array(sharedConfigMemberSchema).max(64).optional(),
+  /**
+   * Refuse to launch the profile when the machine declares these keys and the
+   * profile still lacks them after seeding. For safety configuration whose
+   * absence has no symptom — a hook that is not registered simply never fires,
+   * so a profile missing it is indistinguishable from a guarded one until the
+   * incident it was built to prevent.
+   *
+   * Deliberately opt-in per spec rather than applied to every shared key: a
+   * missing MCP server is a degraded session, while a missing guard is a silent
+   * one, and only the second is worth refusing to start over.
+   */
+  required: z.boolean().optional(),
+});
+
+export type SharedConfigSpec = z.infer<typeof sharedConfigSpecSchema>;
+
 const portableEnvNameSchema = z
   .string()
   .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "must be a portable environment variable name");
@@ -120,6 +149,18 @@ export const toolDefSchema = z.object({
   accountFile: z.string().optional(),
   emailPath: z.array(z.string()).optional(),
   /**
+   * A subdirectory of `defaultDir` in which the TOOL ITSELF keeps its profile
+   * directories, when it has its own profile mechanism (codewith:
+   * `~/.codewith/auth_profiles/<name>`).
+   *
+   * Declared here rather than mapped tool-by-tool in the enumerator because
+   * those directories hold real registry rows — 22 of the merged view's records
+   * are codewith — and an enumerator that hardcodes one tool's layout silently
+   * omits the next tool that grows one. Absent means the tool has no native
+   * profiles root and only the managed layout applies.
+   */
+  nativeProfilesDir: pathSegmentSchema.optional(),
+  /**
    * Capability directories (skills, subagents, …) that belong to the human, not
    * to the account: linked from the tool's shared home into every profile so one
    * corpus serves all of them. Credentials are never listed here.
@@ -129,21 +170,17 @@ export const toolDefSchema = z.object({
    * Capability configuration that cannot be linked because the profile's own
    * file is rewritten in place (Claude Code stores MCP servers alongside OAuth
    * state). The listed keys are merged member-by-member instead.
+   *
+   * A LIST, because one tool can keep shared capability in more than one file
+   * and the two are not interchangeable: Claude Code reads MCP servers from
+   * `.claude.json` and hooks from `settings.json`. A single spec forced one
+   * target, so whichever file lost the argument could never be seeded — which
+   * is how every profile minted after a hook sweep was born without the hook
+   * while looking completely normal. A bare object stays valid and means one
+   * spec, so custom tools already in the registry keep working.
    */
   sharedConfig: z
-    .object({
-      /** Profile-relative JSON file the keys are merged into. */
-      target: pathSegmentSchema,
-      /**
-       * Shared-home-relative JSON files read for those keys, in priority order.
-       * Members are unioned across all of them and the first definition of a
-       * given member name wins, so put rendered files ahead of raw ones.
-       */
-      sources: z.array(sharedConfigSourceSchema).min(1).max(8),
-      keys: z.array(sharedConfigKeySchema).min(1).max(16),
-      /** Member names never shared into a profile, whatever a source says. */
-      exclude: z.array(sharedConfigMemberSchema).max(64).optional(),
-    })
+    .union([sharedConfigSpecSchema, z.array(sharedConfigSpecSchema).min(1).max(8)])
     .optional(),
   /**
    * Where the tool keeps conversation history, so a session started under one
@@ -185,8 +222,8 @@ const metadataValueSchema = z.union([
   z.boolean(),
   z.null(),
 ]);
-type MetadataValue = z.infer<typeof metadataValueSchema>;
-const metadataSchema = z
+export type MetadataValue = z.infer<typeof metadataValueSchema>;
+export const metadataSchema = z
   .unknown()
   .superRefine((value, ctx) => {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -234,9 +271,32 @@ function nonBlankStringSchema(label: string) {
   return z.string().refine((value) => value.trim().length > 0, `${label} must not be empty`);
 }
 
-export const profileSchema = z.object({
+/**
+ * The account uuid that owns this profile, as recorded in the central auth
+ * store at `<accountsHome>/auth/<uuid>/`. Optional because it is backfilled —
+ * a profile whose parked identity is unrecoverable keeps it absent and earns a
+ * health finding rather than a guessed binding.
+ */
+const accountUuidSchema = z
+  .string()
+  .regex(
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/,
+    "accountUuid must be a uuid",
+  );
+
+const profileObjectSchema = z.object({
   name: profileNameSchema,
   tool: slugSchema,
+  /**
+   * The canonical name for the field `tool` has always held. PR-1 introduces it
+   * as a MIRROR, not a replacement: `tool` stays the persisted key for one
+   * release so every existing reader keeps working, and new code reads through
+   * {@link profileProvider}. When the two disagree the record is refused rather
+   * than one being silently preferred — a record whose provider and tool point
+   * at different apps has no correct interpretation.
+   */
+  provider: slugSchema.optional(),
+  accountUuid: accountUuidSchema.optional(),
   email: z.string().email().optional(),
   displayName: nonBlankStringSchema("display name").optional(),
   identity: nonBlankStringSchema("identity").optional(),
@@ -246,9 +306,46 @@ export const profileSchema = z.object({
   description: z.string().optional(),
   createdAt: z.string(),
   lastUsedAt: z.string().optional(),
+  /**
+   * The tool-native/on-disk name for this profile, when it differs from
+   * `name` — the identifier the TOOL ITSELF still uses (e.g. a codewith
+   * `--auth-profile` value), unaffected by a registry-side rename. Recorded so
+   * a rename is auditable rather than merely performed: R-P1-4
+   * (`2026-07-31-accounts-debloat-design.md`).
+   */
+  nativeName: profileNameSchema.optional(),
+  /**
+   * Every former registry name this profile has answered to, oldest first.
+   * Grows by one on each recorded rename; never pruned. Distinct from
+   * `nativeName`: `nativeName` is the tool's single fixed on-disk identifier,
+   * while `aliases` is the full history of display names a caller may still
+   * look this profile up by.
+   */
+  aliases: z.array(profileNameSchema).max(64).optional(),
+});
+
+export const profileSchema = profileObjectSchema.superRefine((profile, ctx) => {
+  if (profile.provider !== undefined && profile.provider !== profile.tool) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["provider"],
+      message: `provider "${profile.provider}" disagrees with tool "${profile.tool}" for profile "${profile.name}"`,
+    });
+  }
 });
 
 export type Profile = z.infer<typeof profileSchema>;
+
+/**
+ * The provider a profile belongs to, read through the alias.
+ *
+ * The single accessor every new caller uses, so that flipping the persisted key
+ * from `tool` to `provider` in a later release is a change to this function
+ * rather than to every call site.
+ */
+export function profileProvider(profile: Pick<Profile, "tool"> & { provider?: string }): string {
+  return profile.provider ?? profile.tool;
+}
 
 export const storeSchema = z.object({
   version: z.literal(1),
@@ -259,7 +356,7 @@ export const storeSchema = z.object({
    * (e.g. ~/.claude + ~/.claude.json on disk for IDE use).
    */
   applied: z.record(z.string(), z.string()).default({}),
-  /** Map of profile/account name -> preferred tool id for bare commands. */
+  /** Map of profile/account name -> last selected tool id, kept for compatibility. */
   toolLocks: z.record(slugSchema, slugSchema).default({}),
   profiles: z.array(profileSchema).default([]),
   /** User-registered tools (apps) added at runtime, on top of built-ins. */

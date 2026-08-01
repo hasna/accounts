@@ -267,7 +267,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migrations 0003/0004/0005 upgrade existing data and are restart-idempotent", async () => {
+  test("migrations 0003-0006 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
@@ -275,6 +275,10 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       (migration) => migration.id === "accounts_0003_custom_tools",
     );
     const beforeCustomTools = appMigrations.slice(0, customToolsIndex);
+    const fixturePurgeIndex = appMigrations.findIndex(
+      (migration) => migration.id === "accounts_0006_purge_test_tool_fixtures",
+    );
+    const beforeFixturePurge = appMigrations.slice(0, fixturePurgeIndex);
 
     await new MigrationLedger(client, beforeCustomTools).migrate();
     expect(
@@ -292,7 +296,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       ["migration-probe", "valid", "migration-orphan", "missing"],
     );
 
-    const upgraded = await new MigrationLedger(client, appMigrations).migrate();
+    const upgraded = await new MigrationLedger(client, beforeFixturePurge).migrate();
     expect(
       upgraded.plan.find((item) => item.migration.id === "accounts_0003_custom_tools")?.state,
     ).toBe("pending");
@@ -332,6 +336,79 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       },
     ]);
 
+    const leakedToolIds = [
+      "fake-login",
+      "fake-variant",
+      "missing-review",
+      "review-state-shape",
+    ];
+    for (const id of [...leakedToolIds, "migration-keep-tool"]) {
+      await client.execute(
+        `INSERT INTO custom_tools (id, definition)
+         VALUES ($1, $2::jsonb)`,
+        [
+          id,
+          JSON.stringify({
+            id,
+            label: id,
+            envVar: "MIGRATION_FIXTURE_HOME",
+            defaultDir: `/home/test/.config/${id}`,
+            bin: id,
+          }),
+        ],
+      );
+      await client.execute(
+        "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
+        [id, "migration-fixture-profile"],
+      );
+    }
+    await client.execute(
+      "INSERT INTO current_selections (tool, name) VALUES ($1, $2)",
+      ["fake-login", "migration-fixture-profile"],
+    );
+
+    const purged = await new MigrationLedger(client, appMigrations).migrate();
+    expect(
+      purged.plan.find(
+        (item) => item.migration.id === "accounts_0006_purge_test_tool_fixtures",
+      )?.state,
+    ).toBe("pending");
+    expect(
+      await client.many<{ id: string }>(
+        "SELECT id FROM custom_tools WHERE id = ANY($1::text[]) ORDER BY id",
+        [leakedToolIds],
+      ),
+    ).toEqual([]);
+    expect(
+      await client.many<{ tool: string }>(
+        "SELECT tool FROM accounts WHERE tool = ANY($1::text[]) ORDER BY tool",
+        [leakedToolIds],
+      ),
+    ).toEqual([]);
+    expect(
+      await client.many<{ tool: string }>(
+        "SELECT tool FROM current_selections WHERE tool = ANY($1::text[]) ORDER BY tool",
+        [leakedToolIds],
+      ),
+    ).toEqual([]);
+    expect(
+      await client.many<{ id: string }>(
+        "SELECT id FROM custom_tool_tombstones WHERE id = ANY($1::text[]) ORDER BY id",
+        [leakedToolIds],
+      ),
+    ).toEqual(leakedToolIds.map((id) => ({ id })));
+    expect(
+      await client.get<{ id: string }>("SELECT id FROM custom_tools WHERE id = $1", [
+        "migration-keep-tool",
+      ]),
+    ).toEqual({ id: "migration-keep-tool" });
+    expect(
+      await client.get<{ tool: string; name: string }>(
+        "SELECT tool, name FROM accounts WHERE tool = $1",
+        ["migration-keep-tool"],
+      ),
+    ).toEqual({ tool: "migration-keep-tool", name: "migration-fixture-profile" });
+
     await client.close();
     client = openClient();
     const restarted = await new MigrationLedger(client, appMigrations).migrate();
@@ -346,8 +423,13 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     const tombstoneMigration = appMigrations.find(
       (migration) => migration.id === "accounts_0005_custom_tool_tombstones",
     );
+    const fixturePurgeMigration = appMigrations.find(
+      (migration) => migration.id === "accounts_0006_purge_test_tool_fixtures",
+    );
     expect(tombstoneMigration).toBeDefined();
+    expect(fixturePurgeMigration).toBeDefined();
     await client.execute(tombstoneMigration!.sql);
+    await client.execute(fixturePurgeMigration!.sql);
     const fullMigration = await new MigrationLedger(client, accountsMigrations()).migrate();
     expect(
       fullMigration.plan
@@ -513,6 +595,8 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0003_custom_tools",
       "accounts_0004_current_selection_account_fk",
       "accounts_0005_custom_tool_tombstones",
+      "accounts_0006_purge_test_tool_fixtures",
+      "accounts_0007_alias_records",
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,

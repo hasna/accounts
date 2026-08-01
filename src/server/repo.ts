@@ -7,6 +7,7 @@
 // requires the account to exist and stamps last_used_at.
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
+import { evaluateNameFree, type NameInvariantVerdict } from "../lib/name-invariant.js";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
 import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
 
@@ -22,6 +23,10 @@ export interface Account {
   description?: string;
   createdAt: string;
   lastUsedAt?: string;
+  /** R-P1-4: the tool-native/on-disk name, when it differs from `name`. */
+  nativeName?: string;
+  /** R-P1-4: former registry name(s) this profile has answered to. */
+  aliases?: string[];
 }
 
 export interface CurrentSelection {
@@ -44,6 +49,17 @@ export interface AccountsStore {
   listCustomTools(): Promise<ToolDef[]>;
   addCustomTool(def: ToolDef): Promise<ToolDef>;
   removeCustomTool(id: string): Promise<boolean>;
+  /**
+   * The third implementation of the one-name-one-provider contract (the other
+   * two are LocalStore and ApiStore in src/lib/store.ts).
+   *
+   * The server table is the PRIMARY universe: it is what `accounts list`
+   * returns, and two of the named regression fixtures exist only as rows here.
+   * READ-ONLY and warn-semantics in PR-1 — it reports, and `create`/`rename`
+   * keep refusing duplicates on their own. PR-2 backs it with the 0006
+   * UNIQUE(name) constraint, at which point the database refuses too.
+   */
+  assertNameFree(name: string, provider: string): Promise<NameInvariantVerdict>;
 }
 
 interface AccountRow {
@@ -58,6 +74,13 @@ interface AccountRow {
   description: string | null;
   created_at: string | Date;
   last_used_at: string | Date | null;
+  /**
+   * R-P1-4. Optional on the TYPE (not just nullable) because fixtures/tests
+   * written before migration 0007 don't carry the column at all — `undefined`
+   * and `null` both mean "no native name recorded".
+   */
+  native_name?: string | null;
+  aliases?: unknown;
 }
 
 /**
@@ -107,6 +130,29 @@ function iso(value: string | Date | null | undefined): string | undefined {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
+/**
+ * Parse the `aliases` JSONB column back into a string array. Tolerant of
+ * `undefined`/`null` (no column yet, or genuinely unset) and of the driver
+ * returning JSONB as an already-parsed array or as a raw JSON string,
+ * mirroring `parseMetadata`'s tolerance below. Returns `undefined` (not `[]`)
+ * for "nothing recorded" so `Account.aliases` matches the client `Profile`
+ * schema's `.optional()` rather than always-present-but-empty.
+ */
+function parseAliases(value: unknown): string[] | undefined {
+  if (value === null || value === undefined) return undefined;
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!Array.isArray(parsed)) return undefined;
+  const aliases = parsed.filter((v): v is string => typeof v === "string");
+  return aliases.length > 0 ? aliases : undefined;
+}
+
 function parseMetadata(value: unknown): Record<string, string | number | boolean | null> {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, string | number | boolean | null>;
@@ -137,6 +183,9 @@ function rowToAccount(row: AccountRow): Account {
   if (row.description !== null) account.description = row.description;
   const lastUsed = iso(row.last_used_at);
   if (lastUsed) account.lastUsedAt = lastUsed;
+  if (row.native_name !== null && row.native_name !== undefined) account.nativeName = row.native_name;
+  const aliases = parseAliases(row.aliases);
+  if (aliases) account.aliases = aliases;
   return account;
 }
 
@@ -225,6 +274,30 @@ export class AccountsRepo implements AccountsStore {
         );
   }
 
+  /**
+   * Report whether `name` is free for `provider`, from the accounts table.
+   *
+   * Scoped to the one name rather than loading the table: the universe passed
+   * to `evaluateNameFree` only has to contain the rows that could hold this
+   * name, and a full-table read on every pre-flight would be a needless scan.
+   */
+  async assertNameFree(name: string, provider: string): Promise<NameInvariantVerdict> {
+    const rows = await this.client.many<{ tool: string; name: string; email: string | null }>(
+      "SELECT tool, name, email FROM accounts WHERE name = $1",
+      [name],
+    );
+    return evaluateNameFree(
+      name,
+      provider,
+      rows.map((row) => ({
+        name: row.name,
+        provider: row.tool,
+        ...(row.email ? { email: row.email } : {}),
+        source: "server",
+      })),
+    );
+  }
+
   async create(input: CreateAccountInput): Promise<Account> {
     return this.client.transaction(async (client) => {
       // Tool lock first, then name lock. Every path that needs both takes them
@@ -270,6 +343,16 @@ export class AccountsRepo implements AccountsStore {
     const mergedMetadata =
       input.metadata !== undefined ? { ...current.metadata, ...input.metadata } : undefined;
 
+    // R-P1-4: aliases are APPENDED (deduped), never replaced — this input is
+    // the increment a rename records, not the full history. Same merge
+    // discipline as metadata above, for the same reason: a caller that only
+    // knows about the one rename it just performed must not be able to
+    // silently erase aliases recorded by an earlier one.
+    const mergedAliases =
+      input.aliases !== undefined
+        ? [...new Set([...(current.aliases ?? []), ...input.aliases])]
+        : undefined;
+
     const sets: string[] = [];
     const params: unknown[] = [];
     let i = 1;
@@ -286,6 +369,8 @@ export class AccountsRepo implements AccountsStore {
     if (input.dir !== undefined) put("dir", input.dir);
     if (input.description !== undefined) put("description", input.description);
     if (input.lastUsedAt !== undefined) put("last_used_at", input.lastUsedAt);
+    if (input.nativeName !== undefined) put("native_name", input.nativeName);
+    if (mergedAliases !== undefined) put("aliases", JSON.stringify(mergedAliases), "::jsonb");
 
     if (sets.length === 0) return current;
 

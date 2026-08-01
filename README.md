@@ -15,8 +15,8 @@ Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** 
 - **Multi-tool** — first-class built-ins for Claude, Takumi, Codex CLI, Codex
   App, Codewith, Gemini, opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build;
   custom tools via `accounts tools add`.
-- **Tool lock-in** — first login/use chooses the tool for a profile name, so
-  later bare commands like `accounts launch work` keep using that tool.
+- **Tool-specific profiles** — each profile belongs to one tool, and older
+  duplicate names must pass `--tool` on bare commands.
 - **Local-first** — the registry defaults to `~/.hasna/accounts/`; network access is opt-in
   for API storage and usage refreshes. No telemetry is sent by default.
 - **Open source** — source, docs, and contribution guidelines live in this repository.
@@ -85,13 +85,12 @@ accounts switch work --tool codex-app --launch
 accounts codex-app menubar
 ```
 
-`codex` and `codex-app` are separate tool ids for the same account name. If you
-run `accounts login personal` before either profile is locked, the chooser shows
-both options; choosing one locks bare commands for `personal` to that tool. Use
-`--tool codex` or `--tool codex-app` when you want to bypass or change that
-choice explicitly. The same rule applies to future registered variants such as a
-custom `claude-app` or `claude-cowork`: each tool id gets its own profile
-directory and can be selected without changing the account name.
+`codex` and `codex-app` are separate tool ids. If a registry created by an older
+version contains the same account name for both, pass `--tool codex` or
+`--tool codex-app` to choose explicitly; bare profile commands reject the
+ambiguous name even when login has stored a tool selection. The same rule
+applies to registered variants such as a custom `claude-app` or
+`claude-cowork`: each tool id gets its own profile directory.
 
 Each `codex-app` profile gets its own `CODEX_HOME` and
 `--user-data-dir=<profile>/electron-user-data`. Before login, launch, switch, or
@@ -261,7 +260,9 @@ Printed POSIX handoffs validate every environment-variable name, single-quote
 every value and command word without expansion, and place an explicit `env --`
 option boundary before assignments. Profile directories and custom `extraEnv`
 values therefore retain spaces, quotes, newlines, backslashes, dollars,
-backticks, and leading hyphens as data rather than shell syntax.
+backticks, and leading hyphens as data rather than shell syntax. Public restart
+commands replace non-empty credential-named environment assignments with
+`env -u NAME`; empty credential variables remain explicit empty assignments.
 
 Accounts otherwise preserves the caller's same-binding environment, including
 `PATH`, proxy and TLS settings, Bedrock/Vertex selection, and AWS/Google SDK
@@ -270,7 +271,9 @@ other logging controls remain caller-trusted: Accounts does not claim to
 sanitize arbitrary provider configuration or a command the caller edits after
 generation.
 
-Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
+Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md). The additive v2
+migration preflight and durability contract is documented in
+[docs/V2_MIGRATION_SIDECAR.md](docs/V2_MIGRATION_SIDECAR.md).
 
 ## What is isolated, and what is shared
 
@@ -584,6 +587,15 @@ keys may use letters, digits, `_`, `.`, `:`, and `-`; object prototype keys such
 as `__proto__`, `prototype`, and `constructor` are rejected. Do not store
 secrets, tokens, full card numbers, or billing addresses in profile metadata.
 
+A registry rename can be recorded, not just performed: `accounts set <name>
+--native-name <tool-native-name>` records the identifier the tool itself still
+uses on disk, and `accounts set <name> --alias <old-name>` (repeatable) records
+a former registry name — appended to the profile's alias history, never
+replacing it. `accounts show <old-name>` then resolves the exact-name match as
+before AND prints a disambiguation line for any OTHER profile whose aliases
+record `<old-name>` as one of its former names, so an old name never silently
+answers "no such profile" for something that was only renamed.
+
 ## Agent / MCP Switching
 
 `accounts` ships a stdio MCP server:
@@ -697,6 +709,8 @@ Registry access is selected through `AccountsStore`:
 
 - `local` uses the atomic on-machine JSON registry.
 - `self_hosted` and `cloud` use the authenticated Accounts HTTP API.
+- `ACCOUNTS_HOME` selects an isolated local registry even when API URL/key are
+  inherited; set an explicit `self_hosted`/`cloud` mode to override it.
 - Explicit `self_hosted`/`cloud` modes fail closed unless both the API URL
   and key are configured.
 - Retired `remote`, `hybrid`, and `s3` aliases are ignored for migration

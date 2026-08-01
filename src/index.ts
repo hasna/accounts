@@ -1,19 +1,24 @@
 // Public library surface for @hasna/accounts.
 export * from "./types.js";
-export { loadStore, saveStore, storePath, accountsHome, profilesDir } from "./storage.js";
+export { storePath, accountsHome, profilesDir } from "./storage.js";
 export {
   BUILTIN_TOOLS,
   DEFAULT_TOOL,
-  getTool,
-  listTools,
   isBuiltinTool,
-  addCustomTool,
-  removeCustomTool,
   mergeToolArgs,
   launchArgsFor,
   normalizePermissionPreset,
   permissionArgsFor,
 } from "./lib/tools.js";
+export {
+  addCustomTool,
+  getTool,
+  ensureProfileForLogin,
+  listTools,
+  loadStore,
+  removeCustomTool,
+  saveStore,
+} from "./lib/local-compat.js";
 export { profileEnv, formatEnvAssignments, formatExportLines } from "./lib/env.js";
 export {
   ensureSharedCapabilities,
@@ -31,8 +36,8 @@ export type {
   SharedEntryStatus,
 } from "./lib/shared-capabilities.js";
 export { detectEmail } from "./lib/detect.js";
+export { expandPath } from "./lib/profiles.js";
 export {
-  expandPath,
   listProfiles,
   findProfile,
   getProfile,
@@ -45,12 +50,13 @@ export {
   redetectEmail,
   useProfile,
   currentProfile,
-} from "./lib/profiles.js";
+} from "./lib/local-compat.js";
 export type { AddOptions, RemoveOptions, UpdateOptions, ProfileMetadata, ProfileMetadataValue } from "./lib/profiles.js";
 export { resolveStore } from "./lib/store.js";
 export type { AccountsStore, CurrentEntry, RemoveResult } from "./lib/store.js";
-export { applyProfile, appliedProfile, appliedProfileName } from "./lib/apply.js";
-export { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
+export { applyProfile, appliedProfileName } from "./lib/apply.js";
+export { appliedProfile } from "./lib/local-compat.js";
+export { importProfile } from "./lib/import-profile.js";
 export type { ImportOptions } from "./lib/import-profile.js";
 export {
   detectToolAvailability,
@@ -191,10 +197,37 @@ export type {
   SyncResult,
   UnresolvedProfileBinding,
 } from "./lib/auth-store.js";
+// Credential → account identity binding: the one question containment cannot
+// ask ("were these BYTES legitimately filed under this uuid?").
+export {
+  CREDENTIAL_BINDING_METHOD,
+  buildCredentialClaimIndex,
+  classifyCredentialWrite,
+  credentialBindingConflicts,
+  credentialBindingRefusal,
+  credentialClaimants,
+  credentialFingerprintFromFile,
+  listCredentialBindings,
+  readCredentialBinding,
+} from "./lib/credential-binding.js";
+export type {
+  CredentialBinding,
+  CredentialBindingConflict,
+  CredentialBindingRefusal,
+  CredentialBindingRow,
+  CredentialClaimIndex,
+  CredentialWriteVerdict,
+} from "./lib/credential-binding.js";
 // THE uuid-keyed account enumerator (central store first, per-profile stores
 // as compat fallback). Consumers must reason over this instead of walking
 // profile dirs themselves.
-export { buildIdentityIndex, dirAccountUuid } from "./lib/identity-index.js";
+export {
+  buildIdentityIndex,
+  describeAccountStatus,
+  dirAccountUuid,
+  statusNeedsOperator,
+  statusWithoutValidAccessToken,
+} from "./lib/identity-index.js";
 export type {
   AccountDoor,
   AccountDoorRole,

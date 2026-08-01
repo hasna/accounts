@@ -1,5 +1,7 @@
 node_modules/
+.npm-drain-cache/
 dist/
+.npm-cache/
 *.db
 *.db-wal
 *.db-shm
@@ -9,6 +11,7 @@ dist/
 .hasna/
 .secrets/
 coverage/
+.codex-runtime.*/
 
 # projects CLI generates a machine-specific CLAUDE.md (local only)
 CLAUDE.md

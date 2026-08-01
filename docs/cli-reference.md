@@ -12,8 +12,8 @@ command. Arguments after a variadic `[args...]` are passed to the target tool.
 | `accounts import [name]` | Name defaults to `main`; `-t, --tool` (default `claude`), `-d, --dir`, `-e, --email`, `--description`, `--copy` |
 | `accounts login <name>` | `-t, --tool`; without it, Accounts uses the profile’s locked tool or an interactive tool chooser |
 | `accounts list` | Alias `ls`; `-t, --tool`, `--json` |
-| `accounts show <name>` | `-t, --tool`, `--json` |
-| `accounts set <name>` | `-t, --tool`, `-e, --email`, `--display-name`, `--identity`, `--card-last4`, repeatable `--metadata`, `--description`, `-d, --dir`; at least one update is required |
+| `accounts show <name>` | `-t, --tool`, `--json`; also prints an `alias note:` line per OTHER profile whose `aliases` record `<name>` as a former name of theirs (R-P1-4) |
+| `accounts set <name>` | `-t, --tool`, `-e, --email`, `--display-name`, `--identity`, `--card-last4`, repeatable `--metadata`, `--description`, `-d, --dir`, `--native-name`, repeatable `--alias` (appends, never replaces); at least one update is required |
 | `accounts detect <name>` | `-t, --tool`; re-detects email from the tool’s account file |
 | `accounts rename <name> <new-name>` | `-t, --tool` |
 | `accounts remove <name>` | Alias `rm`; `-t, --tool`, `--purge` to delete a managed config directory |
@@ -100,8 +100,16 @@ with links after verification.
 | `accounts auth status` | `--json`; list the UUID-keyed identity index |
 | `accounts auth migrate` | `--json`; mirror every Claude profile snapshot into the central store |
 | `accounts auth sweep` | `--json`, `--delete`; dry-run by default, and deletion moves bytes to `auth-trash` |
+| `accounts auth bindings` | `--json`, `--conflicts`; which credential each account claims. **Exits 1** when one credential is claimed by more than one account — see `docs/auth-store.md` |
 | `accounts health` | Alias `readiness`; `--json`; exits nonzero only when status is `unavailable` |
 | `accounts doctor` | `--accept-capability-baseline`; errors on missing dirs, stale pointers, or broken shared capabilities |
+| `accounts registry` | `-t, --tool`, `--json`, `--contradictions`; reconcile name, dir, identity and credential |
+| `accounts registry --invariant` | Report names held by more than one provider, over the merged universe |
+| `accounts registry --backfill-uuid` | Plan each profile's `accountUuid` from its parked identity; `--apply` to write (local transport only) |
+| `accounts registry --write-manifest` | Record today's `(name, provider)` pairs as the grandfather manifest; `--apply` to write |
+
+See [One name, one provider](name-invariant.md) for what the invariant checks,
+why it currently warns instead of refusing, and what flips it.
 
 See [Central auth snapshot store](auth-store.md) for sweep safeguards and
 compatibility behavior.

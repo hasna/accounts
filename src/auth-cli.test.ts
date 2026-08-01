@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -118,4 +118,103 @@ test("auth status survives a profile with a malformed accountUuid and still list
   const malformed = rows.filter((r) => r.accountUuid === "not-a-uuid" || r.accountUuid === "corrupted-value");
   expect(malformed.length).toBe(2);
   expect(malformed.every((r) => r.central === false)).toBe(true);
+});
+
+// --- credential → account binding (todos bc32e38c) ----------------------------
+
+const UUID_OTHER = "44444444-dddd-4ddd-8ddd-444444444444";
+
+/** Write a central entry directly: identity file plus credential file. */
+function seedCentral(uuid: string, email: string, refreshToken: string): void {
+  const dir = join(home, "auth", uuid);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: email } }),
+  );
+  writeFileSync(
+    join(dir, "credentials.json"),
+    JSON.stringify({
+      claudeAiOauth: { accessToken: `${email}-access`, refreshToken, expiresAt: Date.now() + 60_000 },
+    }),
+  );
+}
+
+test("auth bindings reports a clean estate and exits 0", () => {
+  seedCentral(UUID, "one@example.com", "one-refresh");
+  seedCentral(UUID_OTHER, "two@example.com", "two-refresh");
+
+  const json = runCli("auth", "bindings", "--json");
+  expect(json.status).toBe(0);
+  const payload = JSON.parse(json.stdout) as {
+    method: string;
+    bindings: Array<{ accountUuid: string; fingerprint?: string }>;
+    conflicts: unknown[];
+  };
+  expect(payload.method).toBe("sha256-refresh-token/v1");
+  expect(payload.bindings.map((b) => b.accountUuid).sort()).toEqual([UUID, UUID_OTHER].sort());
+  expect(payload.conflicts).toEqual([]);
+  // Two distinct accounts, two distinct fingerprints — the property the
+  // conflict check rests on, asserted rather than assumed.
+  expect(new Set(payload.bindings.map((b) => b.fingerprint)).size).toBe(2);
+  // Never a token value, in any encoding this command could emit.
+  expect(json.stdout).not.toContain("one-refresh");
+  expect(json.stdout).not.toContain("two-refresh");
+});
+
+test("auth bindings flags one credential claimed by two accounts and exits 1", () => {
+  seedCentral(UUID, "one@example.com", "shared-refresh");
+  seedCentral(UUID_OTHER, "two@example.com", "shared-refresh");
+
+  const json = runCli("auth", "bindings", "--json");
+  // Non-zero on a corrupt estate: a scripted caller must not be able to read
+  // "the command ran" as "the estate is fine".
+  expect(json.status).toBe(1);
+  const payload = JSON.parse(json.stdout) as {
+    conflicts: Array<{ accountUuids: string[]; emails: string[] }>;
+  };
+  expect(payload.conflicts.length).toBe(1);
+  expect(payload.conflicts[0]!.accountUuids.sort()).toEqual([UUID, UUID_OTHER].sort());
+  expect(json.stdout).not.toContain("shared-refresh");
+
+  const human = runCli("auth", "bindings");
+  expect(human.status).toBe(1);
+  expect(human.stdout).toContain("claimed by 2");
+  expect(human.stdout).not.toContain("shared-refresh");
+});
+
+test("auth migrate REFUSES to file a credential another account already claims, and exits 1", () => {
+  // The other account legitimately owns `shared-refresh`: it is that account's
+  // credential of record in its own central slot.
+  seedCentral(UUID_OTHER, "two@example.com", "shared-refresh");
+
+  // This profile's identity files all say UUID; only its credential bytes are
+  // the other account's. Every containment gate passes.
+  const dir = join(home, "contaminated-profile");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: UUID, emailAddress: "one@example.com" } }),
+  );
+  writeFileSync(
+    join(dir, ".credentials.json"),
+    JSON.stringify({
+      claudeAiOauth: { accessToken: "x-access", refreshToken: "shared-refresh", expiresAt: Date.now() + 60_000 },
+    }),
+  );
+  expect(runCli("add", "oneprof", "--dir", dir, "--email", "one@example.com").status).toBe(0);
+
+  const migrate = runCli("auth", "migrate", "--json");
+  expect(migrate.status).toBe(1);
+  const rows = JSON.parse(migrate.stdout) as Array<Record<string, unknown>>;
+  const row = rows.find((r) => r.profile === "oneprof");
+  expect(row?.credentials).toBe("refused");
+  expect(String(row?.credentialsReason)).toContain("bound to another account");
+  // Nothing was filed under this account.
+  expect(existsSync(join(home, "auth", UUID, "credentials.json"))).toBe(false);
+  // And the account that does own the credential is untouched.
+  expect(
+    JSON.parse(readFileSync(join(home, "auth", UUID_OTHER, "credentials.json"), "utf8")).claudeAiOauth
+      .refreshToken,
+  ).toBe("shared-refresh");
 });

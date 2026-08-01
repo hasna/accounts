@@ -9,8 +9,8 @@ one tool: creating or renaming into a name already held under a different tool
 is refused on both transports (`nameConflict` in `src/lib/profiles.ts` and
 `src/server/repo.ts`). Registries written before that rule may still hold the
 same name under several tools; those rows stay resolvable — bare name lookup is
-allowed only when it resolves to one profile (or a tool lock disambiguates),
-otherwise commands must pass `--tool`.
+allowed only when it resolves to one profile, otherwise commands must pass
+`--tool`.
 
 Each tool (e.g. `claude`) tracks **two registry pointers** plus an optional **isolated runtime** mode:
 
@@ -71,11 +71,14 @@ Generated handoffs target POSIX sh/bash/zsh syntax. `src/lib/env.ts` rejects
 non-portable variable names, quotes every value as a non-expanding POSIX word,
 and inserts `env --` before assignments so a leading-hyphen provider binary
 cannot be parsed as an `env` option. Embedded quotes, newlines, backslashes,
-dollars, and backticks remain literal. Tool schemas validate `extraEnv` keys
-at registration/load time, while the renderer validates again at the execution
-boundary for defense in depth. fish, nushell, and PowerShell output is not
-claimed; use an Accounts-owned launch there (or `accounts shell` for
-fish/nushell when `SHELL` identifies that shell).
+dollars, and backticks remain literal. A public restart command renders a
+non-empty credential-named environment value as `env -u NAME` instead of a
+runnable `[REDACTED]` assignment; deliberately empty credential values remain
+empty assignments. Tool schemas validate `extraEnv` keys at registration/load
+time, while the renderer validates again at the execution boundary for defense
+in depth. fish, nushell, and PowerShell output is not claimed; use an
+Accounts-owned launch there (or `accounts shell` for fish/nushell when `SHELL`
+identifies that shell).
 
 Do not broaden that list without evidence that another control dumps provider
 requests. `PATH`, proxy/TLS configuration, Bedrock/Vertex selection, and
@@ -307,6 +310,13 @@ The store keeps account ownership metadata directly on each profile:
 - `cardLast4` — optional payment card last four digits only, validated as `^\d{4}$`.
 - `metadata` — JSON-safe string/finite-number/boolean/null map for operational tags;
   reserved object prototype keys are rejected.
+- `nativeName` — the tool-native/on-disk name, when it differs from the registry
+  `name` (R-P1-4). Last-write-wins; set with `accounts set <name> --native-name <value>`.
+- `aliases` — former registry name(s) this profile has answered to (R-P1-4).
+  Set with `accounts set <name> --alias <old-name>` (repeatable); APPENDED and
+  deduped, never replaced. `accounts show <old-name>` resolves the exact-name
+  match as usual and additionally prints a disambiguation line for any OTHER
+  profile whose `aliases` records `<old-name>`.
 
 Never store secrets, access tokens, full card numbers, billing addresses, or
 private identity documents in `metadata`.

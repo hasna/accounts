@@ -180,3 +180,98 @@ describe("AccountsRepo advisory lock keys", () => {
     expect(fixture.lockKeys.filter((key) => key.startsWith("accounts:tool:"))).toEqual([]);
   });
 });
+
+/**
+ * A minimal non-transactional client for `update()`, which does not open a
+ * transaction (see `AccountsRepo.update`). Records the SQL + params passed to
+ * `one()` so the test can assert the generated SET clause without re-deriving
+ * the whole query builder.
+ */
+function updateRecordingClient(existingRow: typeof OLD_ROW) {
+  let lastOneCall: { sql: string; params: unknown[] } | undefined;
+  const client = {
+    pool: {} as never,
+    close: async () => {},
+    async query() {
+      return { rows: [], rowCount: 0 };
+    },
+    async many() {
+      return [];
+    },
+    async get() {
+      return existingRow;
+    },
+    async one(sql: string, params: unknown[]) {
+      lastOneCall = { sql, params };
+      // Merge naively for the return value: good enough to assert shape back
+      // through rowToAccount, without re-implementing SQL.
+      return { ...existingRow, aliases: params[0], native_name: existingRow.name === "old" ? undefined : undefined };
+    },
+    async execute() {},
+  } as unknown as PoolQueryClient;
+  return { client, lastCall: () => lastOneCall };
+}
+
+describe("AccountsRepo.update — alias records (R-P1-4)", () => {
+  test("update includes native_name and aliases (JSONB) in the SET clause when provided", async () => {
+    const fixture = updateRecordingClient(OLD_ROW);
+    await new AccountsRepo(fixture.client).update("claude", "old", {
+      nativeName: "account005",
+      aliases: ["account005"],
+    } as never);
+    const call = fixture.lastCall();
+    expect(call).toBeDefined();
+    expect(call!.sql).toContain("native_name = $");
+    expect(call!.sql).toContain("aliases = $");
+    expect(call!.sql).toMatch(/aliases = \$\d+::jsonb/);
+    expect(call!.params).toContain("account005");
+    expect(call!.params).toContain(JSON.stringify(["account005"]));
+  });
+
+  test("rowToAccount parses a jsonb aliases column back into a string array", async () => {
+    const row = { ...OLD_ROW, native_name: "account005", aliases: ["account005", "account005-old"] };
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async query() {
+        return { rows: [], rowCount: 0 };
+      },
+      async many() {
+        return [];
+      },
+      async get() {
+        return row;
+      },
+      async one() {
+        return row;
+      },
+      async execute() {},
+    } as unknown as PoolQueryClient;
+    const account = await new AccountsRepo(client).get("claude", "old");
+    expect(account?.nativeName).toBe("account005");
+    expect(account?.aliases).toEqual(["account005", "account005-old"]);
+  });
+
+  test("rowToAccount tolerates a row with no aliases/native_name columns at all (pre-migration fixtures)", async () => {
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async query() {
+        return { rows: [], rowCount: 0 };
+      },
+      async many() {
+        return [];
+      },
+      async get() {
+        return OLD_ROW;
+      },
+      async one() {
+        return OLD_ROW;
+      },
+      async execute() {},
+    } as unknown as PoolQueryClient;
+    const account = await new AccountsRepo(client).get("claude", "old");
+    expect(account?.nativeName).toBeUndefined();
+    expect(account?.aliases).toBeUndefined();
+  });
+});

@@ -11,13 +11,19 @@ import {
 } from "./env.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
 import { resolveStore, type AccountsStore } from "./store.js";
+import type { SwitchAccountResult } from "./switch-account.js";
 import {
   BUILTIN_TOOLS,
   getTool,
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./tools.js";
-import { redactArgv, redactEnvironment, redactText } from "./redaction.js";
+import {
+  isSensitiveCredentialKey,
+  redactArgv,
+  redactEnvironment,
+  redactText,
+} from "./redaction.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
 
@@ -62,8 +68,25 @@ export interface PublicSwitchResult {
   message: string;
 }
 
-function commandLine(env: Record<string, string>, command: string[]): string {
-  return `${formatEnvAssignments(env)} ${command.map(quotePosixShellWord).join(" ")}`.trim();
+function commandLine(
+  env: Record<string, string>,
+  command: string[],
+  unsetEnvKeys: readonly string[] = [],
+): string {
+  const assignments = formatEnvAssignments(env, process.env, unsetEnvKeys);
+  return `${assignments} ${command.map(quotePosixShellWord).join(" ")}`.trim();
+}
+
+function publicCommandLine(env: Record<string, string>, command: string[]): string {
+  const publicEnv = redactEnvironment(env);
+  const unsetEnvKeys: string[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (value !== "" && isSensitiveCredentialKey(name)) {
+      delete publicEnv[name];
+      unsetEnvKeys.push(name);
+    }
+  }
+  return commandLine(publicEnv, command, unsetEnvKeys);
 }
 
 /** Return a trusted display label without reflecting caller-controlled custom labels. */
@@ -81,9 +104,11 @@ export function publicSwitchMessage(
     : `${profileName} is now the active ${toolLabel} profile`;
 }
 
-/** Project an internal launch result to the only shape allowed on public output. */
-export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
-  const command = redactArgv(result.command);
+/** Project an internal switch result to the only shape allowed on public output. */
+export function publicSwitchResult(result: SwitchResult | SwitchAccountResult): PublicSwitchResult {
+  const launchResult = "command" in result ? result : undefined;
+  const command = redactArgv(launchResult?.command ?? []);
+  const applied = "dirKind" in result ? result.dirKind === "live-default" : result.applied;
   const toolLabel = publicToolLabel(result.tool.id);
   return {
     schema: "hasna.accounts.switch-output/v1",
@@ -95,13 +120,13 @@ export function publicSwitchResult(result: SwitchResult): PublicSwitchResult {
       id: result.tool.id,
       label: toolLabel,
     },
-    applied: result.applied,
-    active: result.active,
+    applied,
+    active: launchResult?.active ?? true,
     command,
-    commandLine: commandLine(redactEnvironment(result.env), command),
-    ...(result.permissions ? { permissions: redactText(result.permissions) } : {}),
+    commandLine: launchResult ? publicCommandLine(launchResult.env, command) : "",
+    ...(launchResult?.permissions ? { permissions: redactText(launchResult.permissions) } : {}),
     restartRequired: result.restartRequired,
-    message: publicSwitchMessage(result.profile.name, toolLabel, result.applied),
+    message: publicSwitchMessage(result.profile.name, toolLabel, applied),
   };
 }
 

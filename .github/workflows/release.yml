@@ -1,0 +1,199 @@
+name: Release npm package
+
+on:
+  push:
+    tags:
+      - "npm/accounts/v*"
+
+concurrency:
+  group: hasna-accounts-npm-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'hasna/accounts'
+    runs-on: ubuntu-latest
+    environment: npm-release
+    env:
+      NPM_DIST_TAG_TOKEN_CONFIGURED: ${{ secrets.NPM_DIST_TAG_TOKEN != '' }}
+      # The preflight's admin credential is MINTED PER RUN from a GitHub App
+      # rather than stored. A stored installation token would expire about an
+      # hour after it was created and then fail the preflight as an
+      # authorization error — strictly worse than the honest "not configured"
+      # failure this gate exists to give. So presence is checked on the App
+      # credentials, which do not expire on that timescale.
+      RELEASE_APP_ID_CONFIGURED: ${{ secrets.RELEASE_APP_ID != '' }}
+      RELEASE_APP_PRIVATE_KEY_CONFIGURED: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: accounts_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d accounts_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Fail before checkout, install, and preflight so a missing credential is
+      # reported as a provisioning gap by name instead of surfacing minutes later
+      # inside the preflight output.
+      - name: Verify release environment is provisioned
+        run: |
+          set -euo pipefail
+          missing=0
+          if [[ "$NPM_DIST_TAG_TOKEN_CONFIGURED" != "true" ]]; then
+            echo "::error::NPM_DIST_TAG_TOKEN is not configured in the npm-release environment of this repository"
+            missing=1
+          fi
+          if [[ "$RELEASE_APP_ID_CONFIGURED" != "true" ]]; then
+            echo "::error::RELEASE_APP_ID is not configured in the npm-release environment of this repository"
+            missing=1
+          fi
+          if [[ "$RELEASE_APP_PRIVATE_KEY_CONFIGURED" != "true" ]]; then
+            echo "::error::RELEASE_APP_PRIVATE_KEY is not configured in the npm-release environment of this repository"
+            missing=1
+          fi
+          if [[ "$missing" != "0" ]]; then
+            echo "::error::See docs/RELEASING.md 'Release environment provisioning'. Until these exist no tag can publish."
+            exit 1
+          fi
+          echo "release environment secrets are present"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+
+      # Mint a short-lived, installation-scoped token for the preflight's live
+      # ruleset and environment reads. Short-lived and scoped beats a long-lived
+      # PAT: nothing durable exists to leak, and the credential cannot outlive
+      # the run that used it.
+      #
+      # `repositories: accounts` is load-bearing, not tidiness: the preflight
+      # asserts this credential reaches exactly one repository, so widening it
+      # here fails the release rather than silently granting more.
+      - name: Mint release admin token
+        id: release-admin-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: accounts
+          # Without these the token inherits every permission the installation
+          # holds on this repository — measured as ~35 scopes including
+          # contents:write, packages:write and secrets:write. Pinning takes it
+          # to two.
+          #
+          # READ, deliberately, and it is the whole point: a verification
+          # credential must not be able to author the artifact it certifies.
+          # Measured against this App on this repository — with
+          # `administration: write` an attempt to CREATE a ruleset returned
+          # HTTP 201 (created, then deleted); with `administration: read` the
+          # same attempt returned 403. A token that can write rulesets makes
+          # verifyReleaseRulesets() tautological: it would attest the
+          # protections exist AND that the reader could have created them.
+          permission-administration: read
+          permission-metadata: read
+
+      - name: Verify pinned release toolchain
+        run: node scripts/assert-toolchain.mjs
+
+      - name: Install locked dependencies with release-age quarantine
+        run: bun install --frozen-lockfile --minimum-release-age 604800
+
+      - name: Reject high-severity dependency advisories
+        run: bun audit --audit-level high
+
+      - name: Verify protected release identity and live tag ruleset
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Verify release
+        run: |
+          set -euo pipefail
+          bun run typecheck
+          bun run test:compat
+          bun test
+          bun run test:provenance-crypto
+          bun run build
+          bun run contracts:no-cloud-scan
+          bun test src/sdk.test.ts src/contracts.test.ts
+          bun run contracts:conformance
+          bun run vendor-kit:check
+          bun run conformance
+          ACCOUNTS_REQUIRE_POSTGRES=1 \
+            HASNA_ACCOUNTS_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/accounts_test \
+            bun run test:postgres
+
+      - name: Bind tag, commit, and deterministic package
+        run: >-
+          bun run scripts/release-provenance.ts candidate
+          --out "$RUNNER_TEMP/release-candidate.json"
+          --artifact "$RUNNER_TEMP/release-candidate.tgz"
+
+      - name: Reject an existing immutable version
+        run: >-
+          bun run scripts/release-provenance.ts ensure-unpublished
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Reverify live controls immediately before publication
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Publish preserved candidate under version quarantine
+        run: >-
+          bun run scripts/release-provenance.ts publish-staged
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Verify staged registry bytes, provenance, signatures, and CLI
+        run: >-
+          bun run scripts/release-provenance.ts verify-registry
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+          --phase staged
+
+      - name: Reverify live controls immediately before promotion
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}
+        run: bun run scripts/release-provenance.ts preflight
+
+      - name: Promote the verified version to its intended dist-tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+        run: >-
+          bun run scripts/release-provenance.ts promote
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Verify final dist-tag agreement
+        run: >-
+          bun run scripts/release-provenance.ts verify-registry
+          --candidate "$RUNNER_TEMP/release-candidate.json"
+          --phase promoted

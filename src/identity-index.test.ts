@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -90,6 +90,66 @@ test("two dirs holding the same accountUuid collapse into ONE identity with two 
   expect(identity.status).toBe("ok");
 });
 
+test("a registered live-only profile is an owning door before any auth snapshot exists", () => {
+  const uuid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  const dir = makeDir("live-only");
+  writeLive(dir, { uuid, email: "live-only@example.com" });
+
+  // This is the first-capture state from the defect: neither the legacy
+  // per-profile snapshot nor its central mirror has been created yet.
+  expect(existsSync(join(dir, ".accounts-auth", "oauth-account.json"))).toBe(false);
+  expect(existsSync(centralAuthDir(uuid))).toBe(false);
+
+  const index = buildIdentityIndex([{ name: "live-only", dir }], tool());
+  const identity = index.find((entry) => entry.accountUuid === uuid)!;
+
+  expect(identity.credential?.source).toBe("dir-live");
+  expect(identity.doors).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ dir, role: "own-identity", profileName: "live-only" }),
+      expect.objectContaining({ dir, role: "current-occupant", profileName: "live-only" }),
+    ]),
+  );
+});
+
+test("a live-only default profile reads its identity from the parent account file", () => {
+  const uuid = "cccccccc-3333-4333-8333-cccccccccccc";
+  const fakeHome = makeDir("default-home");
+  const dir = join(fakeHome, ".claude");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(fakeHome, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: uuid, emailAddress: "default@example.com" } }),
+  );
+  writeFileSync(join(dir, ".credentials.json"), credentialJson({ uuid, email: "default@example.com" }));
+
+  const defaultTool = { ...tool(), defaultDir: dir };
+  const index = buildIdentityIndex([{ name: "default", dir }], defaultTool);
+  const identity = index.find((entry) => entry.accountUuid === uuid);
+
+  expect(identity).toBeDefined();
+  expect(identity!.doors).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ dir, role: "own-identity", profileName: "default" }),
+      expect.objectContaining({ dir, role: "current-occupant", profileName: "default" }),
+    ]),
+  );
+});
+
+test("a switch marker prevents a live-only occupant from becoming the profile owner", () => {
+  const uuid = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+  const dir = makeDir("marked-live-only");
+  writeLive(dir, { uuid, email: "guest@example.com" });
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(join(dir, ".accounts-auth", "switched-account.json"), JSON.stringify({ profile: "guest" }));
+
+  const index = buildIdentityIndex([{ name: "marked-live-only", dir }], tool());
+  const identity = index.find((entry) => entry.accountUuid === uuid)!;
+
+  expect(identity.doors.some((door) => door.role === "current-occupant")).toBe(true);
+  expect(identity.doors.some((door) => door.role === "own-identity")).toBe(false);
+});
+
 test("a switched dir maps its LIVE occupant and its OWN snapshot to different identities", () => {
   // account003-style: dir's own identity is "owner@", but the live files hold
   // "guest@" after an in-place switch. The guest's token must never be
@@ -109,13 +169,43 @@ test("a switched dir maps its LIVE occupant and its OWN snapshot to different id
   expect(owner.doors.some((d) => d.role === "own-identity")).toBe(true);
 });
 
-test("an account whose only credential is expired reports status expired, not a crash", () => {
-  const dir = makeDir("expired");
+test("an aged-out access token with a refresh token reports needs-refresh, not a crash and not expired", () => {
+  // This assertion used to read `expired`, and the word was wrong: the fixture
+  // has always carried a refresh token, so the account is alive and the tool
+  // renews it on next use. Reporting it as `expired` is the defect — six live
+  // accounts read as dead from it on 2026-07-29 — so the expectation is
+  // corrected here rather than preserved. `expired` keeps a test of its own
+  // below, with a fixture that is actually dead.
+  const dir = makeDir("aged-out");
   writeLive(dir, { uuid: "uuid-exp", email: "tired@example.com", expiresInMs: -60_000 });
   writeSnapshot(dir, { uuid: "uuid-exp", email: "tired@example.com", expiresInMs: -60_000 });
 
-  const index = buildIdentityIndex([{ name: "expired", dir }], tool());
+  const index = buildIdentityIndex([{ name: "aged-out", dir }], tool());
   expect(index).toHaveLength(1);
+  expect(index[0]!.credential?.renewable).toBe(true);
+  expect(index[0]!.status).toBe("needs-refresh");
+  // Unchanged: no VALID access token, so nothing is handed out.
+  expect(accessTokenForAccount(index[0]!)).toBeUndefined();
+});
+
+test("an account with no refresh token reports expired — the word now means genuinely dead", () => {
+  const dir = makeDir("dead");
+  mkdirSync(join(dir, ".accounts-auth"), { recursive: true });
+  writeFileSync(
+    join(dir, ".accounts-auth", "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: "uuid-dead", emailAddress: "dead@example.com" } }),
+  );
+  writeFileSync(
+    join(dir, ".accounts-auth", "credentials.json"),
+    // No refreshToken key at all: re-authentication is the only fix.
+    JSON.stringify({
+      claudeAiOauth: { accessToken: "SYNTHETIC-dead-access", expiresAt: Date.now() - 60_000 },
+    }),
+  );
+
+  const index = buildIdentityIndex([{ name: "dead", dir }], tool());
+  expect(index).toHaveLength(1);
+  expect(index[0]!.credential?.renewable).toBe(false);
   expect(index[0]!.status).toBe("expired");
   expect(accessTokenForAccount(index[0]!)).toBeUndefined();
 });
