@@ -15,8 +15,8 @@ Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** 
 - **Multi-tool** — first-class built-ins for Claude, Takumi, Codex CLI, Codex
   App, Codewith, Gemini, opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build;
   custom tools via `accounts tools add`.
-- **Tool lock-in** — first login/use chooses the tool for a profile name, so
-  later bare commands like `accounts launch work` keep using that tool.
+- **Tool-specific profiles** — each profile belongs to one tool, and older
+  duplicate names must pass `--tool` on bare commands.
 - **Local-first** — the registry defaults to `~/.hasna/accounts/`; network access is opt-in
   for API storage and usage refreshes. No telemetry is sent by default.
 - **Open source** — source, docs, and contribution guidelines live in this repository.
@@ -85,13 +85,12 @@ accounts switch work --tool codex-app --launch
 accounts codex-app menubar
 ```
 
-`codex` and `codex-app` are separate tool ids for the same account name. If you
-run `accounts login personal` before either profile is locked, the chooser shows
-both options; choosing one locks bare commands for `personal` to that tool. Use
-`--tool codex` or `--tool codex-app` when you want to bypass or change that
-choice explicitly. The same rule applies to future registered variants such as a
-custom `claude-app` or `claude-cowork`: each tool id gets its own profile
-directory and can be selected without changing the account name.
+`codex` and `codex-app` are separate tool ids. If a registry created by an older
+version contains the same account name for both, pass `--tool codex` or
+`--tool codex-app` to choose explicitly; bare profile commands reject the
+ambiguous name even when login has stored a tool selection. The same rule
+applies to registered variants such as a custom `claude-app` or
+`claude-cowork`: each tool id gets its own profile directory.
 
 Each `codex-app` profile gets its own `CODEX_HOME` and
 `--user-data-dir=<profile>/electron-user-data`. Before login, launch, switch, or

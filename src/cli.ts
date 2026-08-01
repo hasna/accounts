@@ -719,7 +719,7 @@ program
   .command("login")
   .argument("<name>", "profile name")
   .description("choose or launch a tool login flow inside an isolated profile dir")
-  .option("-t, --tool <tool>", "tool to use for this profile; locks bare commands to that tool")
+  .option("-t, --tool <tool>", "tool to use for this profile when creating it or when the name is ambiguous")
   .action(
     action(async (name: string, opts: { tool?: string }) => {
       const store = resolveStore();
