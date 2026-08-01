@@ -6,6 +6,15 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.32] - 2026-08-02
+
+Ships the instruction-preservation fixes from tasks `29b09fa1` and `328064bc`
+as one release. In addition to refusing reductions against a readable manifest,
+the prelaunch guard now fails closed when the manifest is missing and the audit
+is truncated, internally inconsistent, or older than the rendered instruction
+files that remain on disk. A genuinely fresh home with no manifest, no audit,
+and no rendered instruction files remains permitted.
+
 ### Fixed
 
 - **A prelaunch render can no longer REDUCE a home's instruction sources
@@ -82,6 +91,21 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   capped until one successful render refreshes the durable floor.
   `--allow-instruction-reduction` bypasses the new refusal, so an operator with
   a corrupt manifest is never wedged out of their own launch.
+
+- **A stale audit can no longer make a non-empty instruction home look fresh
+  (todos `328064bc`).** The prior fallback trusted any non-empty audit id list,
+  even when its count was stale or its bounded list was explicitly truncated;
+  it also treated a zero-source audit plus a missing manifest as a first render.
+  A replicated account005 shape — 20 rendered source files, an audit remembering
+  3, a deleted manifest, and a 4-source export — therefore issued the renderer
+  and reduced the home while reporting the incumbent guard as armed.
+
+  The fallback now rejects truncated or count-mismatched audit records and
+  compares their claimed count with the independent per-source files under
+  `.hasna/instructions`. If more rendered files remain than the audit remembers,
+  the render is refused before the renderer is called. This disk check is what
+  distinguishes the affected live homes from the correct first-render path,
+  which has neither an instructions directory nor a primary instruction file.
 
 ## [0.2.30] - 2026-08-01
 
