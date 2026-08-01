@@ -433,6 +433,11 @@ export function runConfigsPrelaunch(
       reason,
       identityExportCount: identityExports.length,
       shortfallGuard,
+      // The full list, structured. `reason` is prose and is capped at
+      // MAX_REASON_LENGTH; an eight-id refusal measured 220 characters and named
+      // two of them before cutting off mid-list, so the audit would have been
+      // least informative exactly where most was being removed.
+      droppedSourceIds: wouldDropSourceIds,
     });
     return {
       skipped: true,

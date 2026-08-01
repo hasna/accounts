@@ -86,6 +86,18 @@ export interface ConfigsPrelaunchAudit {
   statusCode?: number | null;
   identityExportCount: number;
   shortfallGuard?: ConfigsShortfallGuardState;
+  /**
+   * Instruction source ids a refused render would have removed.
+   *
+   * Structured rather than left to `reason`, which is prose and is capped at
+   * MAX_REASON_LENGTH. Measured on the real fixture: an eight-id refusal
+   * produced a reason of exactly 220 characters that named two of them and cut
+   * off mid-list, so "the audit names the dropped ids" was false for precisely
+   * the cases with the most to say. Bound the record by COUNT, like sourceIds,
+   * never by truncating the middle of the payload.
+   */
+  droppedSourceIds?: string[];
+  droppedSourceCount?: number;
   updatedAt: string;
   manifest: {
     path: string;
@@ -115,6 +127,7 @@ export interface RecordConfigsPrelaunchAuditInput {
   statusCode?: number | null;
   identityExportCount?: number;
   shortfallGuard?: ConfigsShortfallGuardState;
+  droppedSourceIds?: string[];
 }
 
 const STATUS_SCHEMA = "hasna.accounts.configs-prelaunch/v1" as const;
@@ -345,6 +358,12 @@ export function recordConfigsPrelaunchAudit(
     ...(input.statusCode !== undefined ? { statusCode: input.statusCode } : {}),
     identityExportCount: input.identityExportCount ?? 0,
     ...(input.shortfallGuard ? { shortfallGuard: input.shortfallGuard } : {}),
+    ...(input.droppedSourceIds && input.droppedSourceIds.length > 0
+      ? {
+          droppedSourceIds: input.droppedSourceIds.slice(0, MAX_SOURCE_IDS),
+          droppedSourceCount: input.droppedSourceIds.length,
+        }
+      : {}),
     updatedAt: new Date().toISOString(),
     manifest: {
       path: manifest.path,
