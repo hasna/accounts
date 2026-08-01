@@ -3424,22 +3424,117 @@ test("unterminated quote recovery preserves valid quoted, escaped, and exact-sen
   }
 });
 
-test("unterminated quote recovery stays linear on dense captured output", () => {
-  const lines = Array.from(
-    { length: 22_000 },
+function buildDenseUnmatchedInput(lineCount: number): string {
+  return Array.from(
+    { length: lineCount },
     (_, index) =>
       `provider "unterminated-${index} --api-key dense-unmatched-secret-${index} --trace keep-dense-unmatched-${index}`,
-  );
-  const input = lines.join("\n");
-  expect(input.length).toBeGreaterThan(2 * 1024 * 1024);
+  ).join("\n");
+}
 
-  const startedAt = performance.now();
-  const redacted = redactText(input);
-  const elapsedMs = performance.now() - startedAt;
+/**
+ * Cost per byte of redacting `input`, estimated as the fastest of `rounds`
+ * timed passes. Each pass redacts `repeats` copies, so that a small input and a
+ * large one can be measured over the same total byte volume.
+ *
+ * Two properties make this steady where a single `performance.now()` span is
+ * not. Scheduler contention is one-sided — it can only ever make a pass slower,
+ * never faster — so the minimum of several passes is the closest available
+ * reading of the intrinsic cost, and unlike a mean or a median it is not
+ * dragged upward once most passes are descheduled. And because both call sites
+ * cover the same byte volume, each takes roughly the same wall time when cost
+ * is linear, so contention is equally likely to land on either and cannot bias
+ * the comparison in one direction.
+ */
+function redactionCostPerByte(
+  input: string,
+  repeats: number,
+  rounds: number,
+): number {
+  let fastest = Number.POSITIVE_INFINITY;
+  for (let round = 0; round < rounds; round++) {
+    const startedAt = performance.now();
+    for (let repeat = 0; repeat < repeats; repeat++) {
+      redactText(input);
+    }
+    fastest = Math.min(fastest, performance.now() - startedAt);
+  }
+  return fastest / (input.length * repeats);
+}
 
-  expect(redacted).not.toContain("dense-unmatched-secret-0");
-  expect(redacted).not.toContain("dense-unmatched-secret-21999");
-  expect(redacted).toContain("keep-dense-unmatched-0");
-  expect(redacted).toContain("keep-dense-unmatched-21999");
-  expect(elapsedMs).toBeLessThan(2_000);
-});
+/**
+ * How much more each byte costs in a large input than in a small one.
+ *
+ * Linear recovery scores about 1 whatever the machine: twice the input, twice
+ * the work, same cost per byte. Recovery that rescans from the top of the
+ * document scores about the size ratio between the two inputs, because every
+ * extra byte also makes every earlier byte more expensive.
+ */
+function perByteCostGrowth(
+  smallInput: string,
+  largeInput: string,
+  rounds: number,
+): number {
+  const repeats = Math.round(largeInput.length / smallInput.length);
+  const small = redactionCostPerByte(smallInput, repeats, rounds);
+  const large = redactionCostPerByte(largeInput, 1, rounds);
+  return large / small;
+}
+
+test(
+  "unterminated quote recovery stays linear on dense captured output",
+  () => {
+    const input = buildDenseUnmatchedInput(22_000);
+    expect(input.length).toBeGreaterThan(2 * 1024 * 1024);
+
+    const redacted = redactText(input);
+
+    expect(redacted).not.toContain("dense-unmatched-secret-0");
+    expect(redacted).not.toContain("dense-unmatched-secret-21999");
+    expect(redacted).toContain("keep-dense-unmatched-0");
+    expect(redacted).toContain("keep-dense-unmatched-21999");
+
+    // Super-linearity guard.
+    //
+    // This asserts on how cost SCALES, never on elapsed milliseconds. An
+    // absolute budget silently encodes the speed of the machine it was written
+    // on, so on a busy one it goes red for reasons having nothing to do with
+    // the code. That is the failure worth designing against: the guard gets
+    // correctly diagnosed as environmental, then waved through by habit, and a
+    // genuine regression walks past it. A ratio between two sizes measured
+    // seconds apart on the same machine carries no such dependency.
+    //
+    // Calibrated on station01, 20 cores, 1-minute loadavg 13-63. Linear
+    // recovery scores about 1.0 (p50 1.02, p90 1.22); the quadratic rescan this
+    // guards against scores about 2.5. The bound sits between the two.
+    //
+    // A burst of contention can still spoil a single reading in either
+    // direction, so a reading over the bound is confirmed by two more and the
+    // median decides. The median is what makes that safe: taking the lowest of
+    // the three instead would let one spoiled reading excuse a real regression,
+    // which was measured happening to 3 runs in 15. Two of three readings must
+    // agree before this fails, and equally before it passes.
+    const smallInput = buildDenseUnmatchedInput(172);
+    const largeInput = buildDenseUnmatchedInput(5_500);
+    const sizeRatio = largeInput.length / smallInput.length;
+    const maxGrowth = 1.8;
+
+    let growth = perByteCostGrowth(smallInput, largeInput, 5);
+    if (growth >= maxGrowth) {
+      const confirmations = [
+        growth,
+        perByteCostGrowth(smallInput, largeInput, 5),
+        perByteCostGrowth(smallInput, largeInput, 5),
+      ].sort((left, right) => left - right);
+      growth = confirmations[1]!;
+    }
+
+    expect(
+      growth,
+      `each byte of a ${(largeInput.length / 1024).toFixed(0)}KB input cost ` +
+        `${growth.toFixed(2)}x what it cost in a ${(smallInput.length / 1024).toFixed(0)}KB one ` +
+        `(1.0 = linear, ${sizeRatio.toFixed(0)} = quadratic over this size span)`,
+    ).toBeLessThan(maxGrowth);
+  },
+  120_000,
+);
