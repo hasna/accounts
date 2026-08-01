@@ -28,6 +28,13 @@ export interface AccountsProfileLoginReadiness {
   status: AccountsReadinessStatus;
   validator: "claude-auth-snapshot" | "local-presence-only" | "unavailable";
   valid: boolean | null;
+  /**
+   * Not valid, but the tool renews it on use because the refresh token is
+   * intact. Consumers that pick profiles for real work MUST read this before
+   * treating a non-valid profile as dead: an aged-out access token is the
+   * normal resting state of a parked account, not a broken one.
+   */
+  renewable?: boolean;
   authStatus?: ClaudeProfileAuthStatus;
   oauthAccountPresent?: boolean;
   credentialPayloadPresent?: boolean;
@@ -36,6 +43,13 @@ export interface AccountsProfileLoginReadiness {
   credentialExpiresAt?: string;
   keychainSnapshotPresent?: boolean;
   snapshotPresent?: boolean;
+  /**
+   * The profile's config dir currently carries a DIFFERENT account. Every
+   * credential field above then describes this profile's own parked copy, and
+   * the profile cannot launch until the dir is reconciled — so this is reported
+   * explicitly rather than left to be inferred from an expiry.
+   */
+  dirOccupiedByAnotherAccount?: boolean;
   reasons: string[];
   nextActions: string[];
 }
@@ -200,16 +214,47 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
   }
 
   const health = claudeProfileAuthHealth(profile.dir, tool);
+  // `unavailable` means "this profile cannot be used". A renewable credential
+  // CAN be used — the tool mints a fresh access token from the intact refresh
+  // token on the next request — so it is `degraded`: usable, wants attention.
+  // Collapsing it to `unavailable` is what let a downstream pool manager
+  // quarantine ten live Claude accounts as dead.
+  // An occupied dir CANNOT launch — `healSwitchedProfileDir` refuses it outright
+  // while a live session holds the guest's account. So it must never read `ok`,
+  // whatever the profile's own parked credential looks like.
+  //
+  // #63 detected occupancy and offered the reconcile action but left `status`
+  // alone, so the same payload said `dirOccupiedByAnotherAccount: true` and
+  // `status: "ok"` — and everything that reads a verdict rather than a flag was
+  // told the profile was fine. Measured on station01: five profiles reporting
+  // `ok` that `accounts launch` refused by name. `degraded`, not `unavailable`:
+  // the profile's own credential is parked and intact, so this is one
+  // reconcile away from usable rather than broken.
+  const credentialStatus: AccountsReadinessStatus =
+    health.status === "ok" ? "ok" : health.status === "unknown" || health.renewable ? "degraded" : "unavailable";
   const status: AccountsReadinessStatus =
-    health.status === "ok" ? "ok" : health.status === "unknown" ? "degraded" : "unavailable";
-  const nextActions =
-    status === "ok"
+    health.dirOccupiedByAnotherAccount && credentialStatus === "ok" ? "degraded" : credentialStatus;
+  // An occupied dir needs reconciling, not re-authenticating: the profile's own
+  // credential is parked and intact, and telling an operator to re-login would
+  // send them through a browser flow that fixes nothing. Named first so it is
+  // the action they read.
+  const nextActions = [
+    ...(health.dirOccupiedByAnotherAccount
+      ? [
+          `Profile ${profile.name}'s config dir currently carries another account. ` +
+            `Reconcile it with accounts switch-account ${profile.name} --dir ${profile.dir} ` +
+            `(its own credential is parked, so re-authenticating is not the fix).`,
+        ]
+      : []),
+    ...(status === "ok"
       ? []
-      : [`Run accounts login ${profile.name} --tool ${tool.id} to refresh the Claude auth snapshot.`];
+      : [`Run accounts login ${profile.name} --tool ${tool.id} to refresh the Claude auth snapshot.`]),
+  ];
   return {
     status,
     validator: "claude-auth-snapshot",
     valid: health.valid,
+    renewable: health.renewable,
     authStatus: health.status,
     oauthAccountPresent: health.oauthAccountPresent,
     credentialPayloadPresent: health.credentialPayloadPresent,
@@ -218,6 +263,7 @@ function profileLoginReadiness(profile: Profile, tool: ToolDef | undefined): Acc
     ...(health.credentialExpiresAt ? { credentialExpiresAt: health.credentialExpiresAt } : {}),
     keychainSnapshotPresent: health.keychainSnapshotPresent,
     snapshotPresent: health.snapshotPresent,
+    dirOccupiedByAnotherAccount: health.dirOccupiedByAnotherAccount,
     reasons: health.reasons,
     nextActions,
   };

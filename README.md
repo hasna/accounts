@@ -261,7 +261,9 @@ Printed POSIX handoffs validate every environment-variable name, single-quote
 every value and command word without expansion, and place an explicit `env --`
 option boundary before assignments. Profile directories and custom `extraEnv`
 values therefore retain spaces, quotes, newlines, backslashes, dollars,
-backticks, and leading hyphens as data rather than shell syntax.
+backticks, and leading hyphens as data rather than shell syntax. Public restart
+commands replace non-empty credential-named environment assignments with
+`env -u NAME`; empty credential variables remain explicit empty assignments.
 
 Accounts otherwise preserves the caller's same-binding environment, including
 `PATH`, proxy and TLS settings, Bedrock/Vertex selection, and AWS/Google SDK
@@ -699,6 +701,8 @@ Registry access is selected through `AccountsStore`:
 
 - `local` uses the atomic on-machine JSON registry.
 - `self_hosted` and `cloud` use the authenticated Accounts HTTP API.
+- `ACCOUNTS_HOME` selects an isolated local registry even when API URL/key are
+  inherited; set an explicit `self_hosted`/`cloud` mode to override it.
 - Explicit `self_hosted`/`cloud` modes fail closed unless both the API URL
   and key are configured.
 - Retired `remote`, `hybrid`, and `s3` aliases are ignored for migration

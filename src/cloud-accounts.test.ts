@@ -109,6 +109,23 @@ describe("resolveAccountsCloud", () => {
     if (r.transport === "cloud-http") expect(r.api.baseUrl).toBe(`${BASE}/v1`);
   });
 
+  test("ACCOUNTS_HOME forces local when URL+KEY are inherited", () => {
+    expect(
+      resolveAccountsCloud({ ...cloudEnv, ACCOUNTS_HOME: "/tmp/accounts-probe" } as NodeJS.ProcessEnv)
+        .transport,
+    ).toBe("local");
+  });
+
+  test("explicit hosted mode wins over ACCOUNTS_HOME", () => {
+    expect(
+      resolveAccountsCloud({
+        ...cloudEnv,
+        ACCOUNTS_HOME: "/tmp/accounts-machine-state",
+        HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+      } as NodeJS.ProcessEnv).transport,
+    ).toBe("cloud-http");
+  });
+
   test("explicit STORAGE_MODE=local forces local even with URL+KEY", () => {
     expect(resolveAccountsCloud({ ...cloudEnv, HASNA_ACCOUNTS_STORAGE_MODE: "local" } as NodeJS.ProcessEnv).transport).toBe("local");
   });
