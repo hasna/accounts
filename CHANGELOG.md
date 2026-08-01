@@ -16,7 +16,12 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   for three profiles, a second for two more, with no conflict surfaced. A uuid
   now claimed by more than one profile in the same plan is downgraded to the
   existing `conflict` outcome for every row involved (never applied); unrelated,
-  unambiguous rows in the same plan are unaffected. (task `2b15400e`)
+  unambiguous rows in the same plan are unaffected. Fixed in two passes: a
+  uuid proposed by more than one FRESH backfill, and (found in review) a uuid
+  already RECORDED on one profile that a different profile's fresh backfill
+  also independently resolves to — the second is reachable the moment any
+  profile has been backfilled once, through the tool's own
+  dry-run → apply → re-run workflow. (task `2b15400e`)
 
 ## [0.2.29] - 2026-07-31
 
