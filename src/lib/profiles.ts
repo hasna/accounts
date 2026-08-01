@@ -373,6 +373,19 @@ export interface UpdateOptions {
    * overwrite a disagreeing value — see src/lib/uuid-backfill.ts.
    */
   accountUuid?: string;
+  /**
+   * R-P1-4: the tool-native/on-disk name for this profile, when it differs
+   * from `name`. Last-write-wins (unlike `aliases`, this is a single fixed
+   * identifier rather than a growing history).
+   */
+  nativeName?: string;
+  /**
+   * R-P1-4: former registry name(s) this profile has answered to. APPENDED
+   * to the existing list (deduped), never replaced — a `set --alias` call
+   * records one more historical name, it does not erase the ones already
+   * recorded by an earlier rename.
+   */
+  aliases?: string[];
 }
 
 export function updateProfile(name: string, opts: UpdateOptions): Profile {
@@ -405,6 +418,25 @@ export function updateProfile(name: string, opts: UpdateOptions): Profile {
       throw new AccountsError(`accountUuid must be a uuid; got ${JSON.stringify(opts.accountUuid)}`);
     }
     profile.accountUuid = opts.accountUuid.toLowerCase();
+  }
+  if (opts.nativeName !== undefined) {
+    const check = profileNameSchema.safeParse(opts.nativeName);
+    if (!check.success) {
+      throw new AccountsError(`nativeName must be a valid profile name; got ${JSON.stringify(opts.nativeName)}`);
+    }
+    profile.nativeName = check.data;
+  }
+  if (opts.aliases !== undefined) {
+    for (const alias of opts.aliases) {
+      const check = profileNameSchema.safeParse(alias);
+      if (!check.success) {
+        throw new AccountsError(`alias must be a valid profile name; got ${JSON.stringify(alias)}`);
+      }
+    }
+    const existing = profile.aliases ?? [];
+    const merged = [...existing];
+    for (const alias of opts.aliases) if (!merged.includes(alias)) merged.push(alias);
+    profile.aliases = merged;
   }
   if (opts.dir !== undefined) {
     const dir = expandPath(opts.dir);

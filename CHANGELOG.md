@@ -6,6 +6,22 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- **Alias records: a rename is recorded, not just performed (R-P1-4).**
+  Profiles gain two optional fields: `nativeName` (the tool-native/on-disk
+  name, when it differs from the registry `name`) and `aliases` (former
+  registry names this profile has answered to). `accounts show <old-name>`
+  now prints a disambiguation line naming the OTHER record that used to be
+  called that, instead of silently resolving only the exact-name match and
+  looking like the old name answers to nothing else. Write path:
+  `accounts set <name> --native-name <value> --alias <old-name>` (repeatable;
+  appends, never replaces). Cloud storage: migration `0007_alias_records`
+  adds `accounts.native_name`/`accounts.aliases` (JSONB). Deliberately NOT
+  wired into `accounts rename` automatically, and does not backfill the 13
+  records renamed by the earlier accounts-debloat migration — both are
+  separate, tracked work.
+
 ### Fixed
 
 - **CRITICAL: `registry --backfill-uuid` could silently write one `accountUuid`

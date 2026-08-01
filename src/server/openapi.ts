@@ -88,6 +88,12 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             description: { type: "string" },
             createdAt: { type: "string" },
             lastUsedAt: { type: "string" },
+            nativeName: { type: "string", description: "R-P1-4: tool-native/on-disk name, when it differs from `name`." },
+            aliases: {
+              type: "array",
+              items: { type: "string" },
+              description: "R-P1-4: former registry name(s) this profile has answered to.",
+            },
           },
         },
         AccountList: {
@@ -123,6 +129,12 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             dir: { type: "string" },
             description: { type: "string" },
             lastUsedAt: { type: "string" },
+            nativeName: { type: "string", description: "R-P1-4: last-write-wins." },
+            aliases: {
+              type: "array",
+              items: { type: "string" },
+              description: "R-P1-4: appended (deduped) to the record's existing aliases server-side — never a replace.",
+            },
           },
         },
         CurrentSelection: {

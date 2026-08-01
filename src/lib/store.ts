@@ -266,6 +266,8 @@ class ApiStore implements AccountsStore {
         metadata: opts.metadata,
         dir,
         description: opts.description,
+        nativeName: opts.nativeName,
+        aliases: opts.aliases,
       });
     } catch (error) {
       if (dir && created) rmSync(dir, { recursive: true, force: true });

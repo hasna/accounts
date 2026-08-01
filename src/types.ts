@@ -306,6 +306,22 @@ const profileObjectSchema = z.object({
   description: z.string().optional(),
   createdAt: z.string(),
   lastUsedAt: z.string().optional(),
+  /**
+   * The tool-native/on-disk name for this profile, when it differs from
+   * `name` — the identifier the TOOL ITSELF still uses (e.g. a codewith
+   * `--auth-profile` value), unaffected by a registry-side rename. Recorded so
+   * a rename is auditable rather than merely performed: R-P1-4
+   * (`2026-07-31-accounts-debloat-design.md`).
+   */
+  nativeName: profileNameSchema.optional(),
+  /**
+   * Every former registry name this profile has answered to, oldest first.
+   * Grows by one on each recorded rename; never pruned. Distinct from
+   * `nativeName`: `nativeName` is the tool's single fixed on-disk identifier,
+   * while `aliases` is the full history of display names a caller may still
+   * look this profile up by.
+   */
+  aliases: z.array(profileNameSchema).max(64).optional(),
 });
 
 export const profileSchema = profileObjectSchema.superRefine((profile, ctx) => {

@@ -729,3 +729,28 @@ test("explicit dir is honored and created", () => {
   expect(p.dir).toBe(dir);
   expect(existsSync(dir)).toBe(true);
 });
+
+// R-P1-4 (2026-07-31-accounts-debloat-design.md): renamed records gain
+// `aliases: [<old-name>]` and `nativeName: <tool-native/on-disk name>`. This
+// task does NOT wire that into `renameProfile` automatically (see the PR
+// description); it adds the supported write path — `updateProfile` — that a
+// migration or operator uses to record it explicitly.
+test("updateProfile sets nativeName and appends aliases (deduped, order preserved)", () => {
+  addProfile({ name: "account005-codewith", tool: "codewith" });
+  const first = updateProfile("account005-codewith", { nativeName: "account005", aliases: ["account005"] });
+  expect(first.nativeName).toBe("account005");
+  expect(first.aliases).toEqual(["account005"]);
+
+  // A second recorded rename appends rather than replacing.
+  const second = updateProfile("account005-codewith", { aliases: ["account005-old"] });
+  expect(second.aliases).toEqual(["account005", "account005-old"]);
+
+  // Re-recording an alias that is already present does not duplicate it.
+  const third = updateProfile("account005-codewith", { aliases: ["account005"] });
+  expect(third.aliases).toEqual(["account005", "account005-old"]);
+});
+
+test("updateProfile rejects a nativeName that is not a valid profile-name slug", () => {
+  addProfile({ name: "account005-codewith", tool: "codewith" });
+  expect(() => updateProfile("account005-codewith", { nativeName: "not a slug!" })).toThrow(AccountsError);
+});

@@ -310,6 +310,13 @@ The store keeps account ownership metadata directly on each profile:
 - `cardLast4` — optional payment card last four digits only, validated as `^\d{4}$`.
 - `metadata` — JSON-safe string/finite-number/boolean/null map for operational tags;
   reserved object prototype keys are rejected.
+- `nativeName` — the tool-native/on-disk name, when it differs from the registry
+  `name` (R-P1-4). Last-write-wins; set with `accounts set <name> --native-name <value>`.
+- `aliases` — former registry name(s) this profile has answered to (R-P1-4).
+  Set with `accounts set <name> --alias <old-name>` (repeatable); APPENDED and
+  deduped, never replaced. `accounts show <old-name>` resolves the exact-name
+  match as usual and additionally prints a disambiguation line for any OTHER
+  profile whose `aliases` records `<old-name>`.
 
 Never store secrets, access tokens, full card numbers, billing addresses, or
 private identity documents in `metadata`.

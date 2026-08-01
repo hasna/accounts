@@ -8,6 +8,7 @@ import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
 import chalk from "chalk";
 import { AccountsError, profileProvider, type Profile, type ToolDef } from "./types.js";
+import { findAliasHolders, formatAliasNote } from "./lib/aliases.js";
 import {
   DEFAULT_TOOL,
   getTool,
@@ -613,8 +614,17 @@ program
       const p = await store.getProfile(name, opts.tool);
       const active = (await store.currentProfile(p.tool))?.name === p.name;
       const details = profileDetails(p, active);
+      // R-P1-4: `name` may ALSO be recorded as a former name of some OTHER
+      // profile (accounts005 renamed to account005-codewith, e.g.) — that
+      // other record still exists and is otherwise invisible from here, so
+      // resolving `p` exact-match must not be presented as the whole answer.
+      const aliasHolders = findAliasHolders(await store.listProfiles(), name);
       if (opts.json) {
-        console.log(JSON.stringify(details, null, 2));
+        const payload =
+          aliasHolders.length > 0
+            ? { ...details, aliasNotes: aliasHolders.map((h) => ({ name: h.name, tool: h.tool })) }
+            : details;
+        console.log(JSON.stringify(payload, null, 2));
         return;
       }
       const isApplied = details.applied;
@@ -630,6 +640,8 @@ program
       if (p.metadata && Object.keys(p.metadata).length > 0) {
         console.log(`  metadata:   ${JSON.stringify(p.metadata)}`);
       }
+      if (p.nativeName) console.log(`  nativeName: ${p.nativeName}`);
+      if (p.aliases && p.aliases.length > 0) console.log(`  aliases:    ${p.aliases.join(", ")}`);
       console.log(`  created:    ${p.createdAt}`);
       if (p.lastUsedAt) console.log(`  last used:  ${p.lastUsedAt}`);
       if (details.switchedAway) {
@@ -638,6 +650,9 @@ program
             `${chalk.bold(details.switchedAway.profile)} (in-place switch) — ` +
             `${p.name} cannot launch until it is reconciled: accounts switch-account ${p.name} --dir ${p.dir}`,
         );
+      }
+      for (const holder of aliasHolders) {
+        console.log(`  ${formatAliasNote(name, holder)}`);
       }
       printPrelaunchDetails(details.prelaunch);
     }),
@@ -2436,6 +2451,16 @@ program
   .option("--metadata <key=value>", "merge arbitrary JSON-safe metadata key=value (repeatable)", collectMetadata, [])
   .option("--description <text>", "set the description")
   .option("-d, --dir <path>", "set the config dir")
+  .option(
+    "--native-name <name>",
+    "record the tool-native/on-disk name for this profile, when it differs from its registry name (R-P1-4)",
+  )
+  .option(
+    "--alias <name>",
+    "record a former registry name this profile used to answer to (repeatable; appended, never replaces earlier aliases)",
+    collectRepeated,
+    [],
+  )
   .action(
     action(
       async (
@@ -2449,6 +2474,8 @@ program
           metadata?: string[];
           description?: string;
           dir?: string;
+          nativeName?: string;
+          alias?: string[];
         },
       ) => {
         if (
@@ -2458,9 +2485,13 @@ program
           opts.cardLast4 === undefined &&
           (!opts.metadata || opts.metadata.length === 0) &&
           opts.description === undefined &&
-          opts.dir === undefined
+          opts.dir === undefined &&
+          opts.nativeName === undefined &&
+          (!opts.alias || opts.alias.length === 0)
         ) {
-          die("nothing to set — pass --email, --display-name, --identity, --card-last4, --metadata, --description, or --dir");
+          die(
+            "nothing to set — pass --email, --display-name, --identity, --card-last4, --metadata, --description, --dir, --native-name, or --alias",
+          );
         }
         const p = await resolveStore().updateProfile(name, {
           tool: opts.tool,
@@ -2471,6 +2502,8 @@ program
           metadata: parseMetadataPairs(opts.metadata),
           description: opts.description,
           dir: opts.dir,
+          nativeName: opts.nativeName,
+          aliases: opts.alias && opts.alias.length > 0 ? opts.alias : undefined,
         });
         console.log(chalk.green(`✓ updated ${chalk.bold(p.name)}`));
       }
