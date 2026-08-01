@@ -3141,12 +3141,13 @@ test("folded redaction scaling stays linear across newline styles and multi-mega
     for (const [sizeIndex, input] of inputs.entries()) {
       const samples: number[] = [];
       let redacted = "";
-      for (let run = 0; run < 3; run++) {
+      for (let run = 0; run < 5; run++) {
         const startedAt = performance.now();
         redacted = redactText(input);
         samples.push(performance.now() - startedAt);
       }
-      elapsed.push(Math.min(...samples));
+      samples.sort((left, right) => left - right);
+      elapsed.push(samples[Math.floor(samples.length / 2)]!);
 
       expect(redacted).not.toContain("credential-seed");
       expect(redacted).not.toContain(
@@ -3156,9 +3157,14 @@ test("folded redaction scaling stays linear across newline styles and multi-mega
       expect(redacted).toContain("status=429 keep-after-scaling-record");
     }
 
-    expect(elapsed[0]!).toBeLessThan(200);
-    expect(elapsed[1]!).toBeLessThan(400);
-    expect(elapsed[2]!).toBeLessThan(800);
+    for (let index = 1; index < inputs.length; index++) {
+      const inputGrowth = inputs[index]!.length / inputs[index - 1]!.length;
+      const elapsedGrowth = elapsed[index]! / elapsed[index - 1]!;
+      expect(
+        elapsedGrowth,
+        `${JSON.stringify(lineEnding)} runtime grew ${elapsedGrowth.toFixed(2)}x for ${inputGrowth.toFixed(2)}x more input`,
+      ).toBeLessThan(inputGrowth * 2);
+    }
   }
 });
 
