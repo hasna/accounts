@@ -1,16 +1,17 @@
 // Self-hosted (`mode=self_hosted`) registry backend for the accounts CLI.
 //
 // LOCKED ARCHITECTURE: when `HASNA_ACCOUNTS_API_URL` + `HASNA_ACCOUNTS_API_KEY`
-// are set, the account *registry* (profiles + current selections) is read from
-// and written to the app's cloud HTTP API at `<API_URL>/v1` with the bearer key
-// — never the local JSON store, never a raw DSN. Built on the `@hasna/contracts`
-// HTTP storage client, so it inherits retries, timeout, idempotency and JSON
-// error mapping.
+// are set and `ACCOUNTS_HOME` is not overridden, the account *registry*
+// (profiles + current selections) is read from and written to the app's cloud
+// HTTP API at `<API_URL>/v1` with the bearer key — never the local JSON store,
+// never a raw DSN. Built on the `@hasna/contracts` HTTP storage client, so it
+// inherits retries, timeout, idempotency and JSON error mapping.
 //
-// Without an explicit mode, both API env vars select cloud and an incomplete
-// pair stays local. Explicit `self_hosted`/`cloud` fails closed unless both
-// vars exist; explicit `local` forces local. Only the retired
-// `remote`/`hybrid`/`s3` aliases are ignored.
+// Without an explicit mode, both API env vars select cloud unless an
+// `ACCOUNTS_HOME` override requests an isolated local registry; an incomplete
+// pair also stays local. Explicit `self_hosted`/`cloud` fails closed unless
+// both vars exist and wins over `ACCOUNTS_HOME`; explicit `local` forces local.
+// Only the retired `remote`/`hybrid`/`s3` aliases are ignored.
 //
 // Registry vs local: the cloud is the source of truth for account metadata
 // (name, tool, email, displayName, identity, cardLast4, metadata, description,
@@ -145,7 +146,9 @@ function explicitStorageMode(env: NodeJS.ProcessEnv): string {
  * Bridge the fleet flip's two-var convention to the contracts resolver. The
  * toggle is the presence of BOTH `HASNA_ACCOUNTS_API_URL` and
  * `HASNA_ACCOUNTS_API_KEY`: when both are set (and mode is not explicitly
- * `local`) the client uses the cloud HTTP transport; otherwise local.
+ * `local`, and `ACCOUNTS_HOME` is not overridden) the client uses the cloud
+ * HTTP transport; otherwise local. An explicit hosted mode still wins over an
+ * `ACCOUNTS_HOME` override.
  *
  * Canonical modes are enforced here. Explicit `self_hosted`/`cloud` requires
  * both API variables and fails before the contracts resolver if either is
@@ -155,6 +158,7 @@ function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const url = env.HASNA_ACCOUNTS_API_URL || env.ACCOUNTS_API_URL;
   const key = env.HASNA_ACCOUNTS_API_KEY || env.ACCOUNTS_API_KEY;
   const explicitMode = explicitStorageMode(env);
+  const hasHomeOverride = Boolean(env.ACCOUNTS_HOME?.trim());
 
   const next: NodeJS.ProcessEnv = { ...env };
   for (const k of MODE_ENV_KEYS) delete next[k];
@@ -170,6 +174,10 @@ function deriveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
       throw new AccountsError(`${explicitMode} storage mode requires ${missing}`);
     }
     next.HASNA_ACCOUNTS_STORAGE_MODE = "cloud";
+  } else if (hasHomeOverride) {
+    // A scoped home is an explicit request for an isolated local registry.
+    // This prevents probes and agents from inheriting production API authority.
+    next.HASNA_ACCOUNTS_STORAGE_MODE = "local";
   } else if (url && key) {
     // Both self_hosted and cloud use the identical cloud-http transport; the
     // canonical runtime word contracts expects is `cloud`.

@@ -9,7 +9,7 @@ import {
   profileCredentialsSnapshot,
   profileOAuthSnapshot,
 } from "./claude-layout.js";
-import { centralAuthRoot, isAccountUuid } from "./auth-store.js";
+import { centralAuthRoot, isAccountUuid, profileAccountUuid } from "./auth-store.js";
 import { classifyCredentialFile, isRestorableState, type CredentialState } from "./credential-state.js";
 import { canonicalConfigDir, sameConfigDir } from "./safe-path.js";
 
@@ -345,13 +345,26 @@ export function buildIdentityIndex(
 
     // Layer A — whoever's account currently occupies the dir's live files.
     // Read BEFORE layer B so the owner's door can record that it is displaced;
-    // both layers are read from the same dir in the same pass, so this is a
-    // reordering, not an extra read.
-    const livePaths = profileAccountJsonPaths(dir, tool);
-    const occupant = oauthIdentityFrom(livePaths.length > 0 ? readJson(livePaths[0]!) : undefined);
+    // both layers are read from the same profile layout in one pass, so this is
+    // a reordering rather than a second profile scan.
+    let occupant: OAuthIdentity | undefined;
+    for (const path of profileAccountJsonPaths(dir, tool)) {
+      occupant = oauthIdentityFrom(readJson(path));
+      if (occupant) break;
+    }
 
     // Layer B — the dir's OWN identity (survives in-place switches away).
-    const own = oauthIdentityFrom(readJson(profileOAuthSnapshot(dir)));
+    //
+    // A newly registered profile can legitimately have only live auth: no
+    // legacy per-profile snapshot and no central mirror yet. In that first-
+    // capture state the live identity is also the profile binding, so expose an
+    // own-identity door for selectors to switch through. `profileAccountUuid`
+    // owns the binding rule and fails closed when a switch marker exists, so a
+    // switched guest is never promoted from current occupant to profile owner.
+    const snapshotOwn = oauthIdentityFrom(readJson(profileOAuthSnapshot(dir)));
+    const own =
+      snapshotOwn ??
+      (occupant && profileAccountUuid(dir, tool) === occupant.accountUuid ? occupant : undefined);
     if (own) {
       // Squatted only when someone else is actually in the dir. No occupant is
       // "parked and idle", and the owner occupying its own dir is the normal
@@ -368,7 +381,9 @@ export function buildIdentityIndex(
           ...(own.email ? { email: own.email } : {}),
           ...(displacedBy ? { occupiedBy: displacedBy } : {}),
         },
-        credentialRef(profileCredentialsSnapshot(dir), "profile-snapshot"),
+        snapshotOwn
+          ? credentialRef(profileCredentialsSnapshot(dir), "profile-snapshot")
+          : credentialRef(dirCredentialsFile(dir), "dir-live"),
       );
     }
 
@@ -473,11 +488,99 @@ export function accountLiveDoorsElsewhere(
   return live;
 }
 
-/** The accountUuid currently occupying a config dir's live account file. */
+/**
+ * Other dirs currently PRESENTING this account that do not OWN it — guests
+ * carrying it after an in-place switch, or dirs whose own binding is unreadable.
+ *
+ * DELIBERATELY UNFILTERED BY CREDENTIAL STATE, unlike `accountLiveDoorsElsewhere`
+ * above, and that difference is the entire point of this function existing
+ * separately rather than being a flag on that one.
+ *
+ * The two answer different questions over different domains:
+ *
+ *   - `accountLiveDoorsElsewhere` asks "could a token rotation revoke a WORKING
+ *     copy somewhere else", so it rightly drops doors holding nothing
+ *     restorable — a husk cannot be revoked.
+ *   - this asks "would a write REACH a dir that another account owns", and the
+ *     broker's `enumerateCopies` adds a `dir-live` write target for EVERY
+ *     `current-occupant` door with no state filter whatsoever
+ *     (`credential-broker.ts`, the `dirLiveCopy` branch). A guest dir whose own
+ *     credential happens to be a husk is therefore still a write target.
+ *
+ * A gate built on the FILTERED set is blind to exactly those dirs while the
+ * write set still contains them — measured: a guest dir holding a husk was
+ * written through while the gate reported no guests present. The gate and the
+ * write set must range over the same doors, so this one ranges over all of them.
+ *
+ * Ownership is decided the same way the index builds roles: a dir OWNS this
+ * account when it also carries an `own-identity` door for it, and a dir with no
+ * such door is reported as a guest.
+ *
+ * KNOWN GAP — this does NOT fail closed on an unreadable own-binding, and an
+ * earlier version of this comment claimed that it did. `buildIdentityIndex`
+ * computes `own = snapshotOwn ?? (occupant && profileAccountUuid(...) === occupant ...)`,
+ * and when the parked snapshot is missing OR CORRUPT, `profileAccountUuid`
+ * falls through to the dir's LIVE account file — the very file that makes the
+ * dir a guest candidate. A guest whose `oauth-account.json` is unparseable
+ * therefore mints an `own-identity` door and is classified here as an owner.
+ * Measured at the time of writing: unreachable on this fleet (no registered
+ * profile has a corrupt own-binding snapshot) and doubly guarded in practice,
+ * because every real guest dir also carries a `switched-account.json` marker and
+ * `profileAccountUuid` DOES fail closed on an existing marker. Closing it
+ * properly belongs to the index's ownership rule rather than to this predicate;
+ * do not read this function as a fail-closed guard until that lands.
+ */
+export function accountGuestOccupantDoorsElsewhere(
+  index: ReadonlyArray<AccountIdentity>,
+  accountUuid: string,
+  excludeDir: string,
+): string[] {
+  const wanted = accountUuid.toLowerCase();
+  const identity = index.find((entry) => entry.accountUuid.toLowerCase() === wanted);
+  if (!identity) return [];
+
+  const seen = new Set<string>();
+  const guests: string[] = [];
+  for (const door of identity.doors) {
+    if (door.role !== "current-occupant") continue;
+    if (sameConfigDir(door.dir, excludeDir)) continue;
+    const canonical = canonicalConfigDir(door.dir);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    const owns = identity.doors.some(
+      (other) => other.role === "own-identity" && sameConfigDir(other.dir, door.dir),
+    );
+    if (!owns) guests.push(door.dir);
+  }
+  return guests;
+}
+
+/**
+ * The accountUuid currently occupying a config dir's live account file.
+ *
+ * ITERATES EVERY CANDIDATE PATH, exactly as `buildIdentityIndex`'s layer A
+ * does (see the `occupant` loop above) — same order, same first-match-wins
+ * precedence. It must, because `profileAccountJsonPaths` returns a SECOND path
+ * — the PARENT `.claude.json` — precisely when the dir is `tool.defaultDir`,
+ * which is the standard Claude layout (claude-layout.ts:48).
+ *
+ * Reading only `paths[0]` made this function DISAGREE WITH THE ENUMERATOR on
+ * the default dir: the index still raised a door for it, while the predicate
+ * reported "no account here". While the predicate only gated WRITES that was
+ * latent — the dir merely could not receive. Once it also gates SOURCES, the
+ * disagreement means the live default dir cannot DONATE either, and
+ * convergence for a single-account default layout silently degrades to "no
+ * restorable credential copy". With a stale sibling present it is worse than a
+ * no-op: the stale copy is crowned and written to central with a FRESH mtime,
+ * and since `betterCredential` tie-breaks on mtime it then durably outranks
+ * the genuinely fresher live credential.
+ */
 export function dirAccountUuid(dir: string, tool: ToolDef): string | undefined {
-  const paths = profileAccountJsonPaths(dir, tool);
-  if (paths.length === 0) return undefined;
-  return oauthIdentityFrom(readJson(paths[0]!))?.accountUuid;
+  for (const path of profileAccountJsonPaths(dir, tool)) {
+    const identity = oauthIdentityFrom(readJson(path));
+    if (identity) return identity.accountUuid;
+  }
+  return undefined;
 }
 
 /**

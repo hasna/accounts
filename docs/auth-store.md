@@ -19,9 +19,10 @@ The legacy store `.accounts-auth/` inside each profile config dir was
 ## Layout
 
 ```
-~/.hasna/accounts/auth/<accountUuid>/credentials.json    # .credentials.json payload
-~/.hasna/accounts/auth/<accountUuid>/oauth-account.json  # { oauthAccount: {...} }
-~/.hasna/accounts/auth-trash/<timestamp>/<uuid>/         # entries removed by `auth sweep --delete`
+~/.hasna/accounts/auth/<accountUuid>/credentials.json         # .credentials.json payload
+~/.hasna/accounts/auth/<accountUuid>/oauth-account.json       # { oauthAccount: {...} }
+~/.hasna/accounts/auth/<accountUuid>/credential-binding.json  # which credential this account claims
+~/.hasna/accounts/auth-trash/<timestamp>/<uuid>/              # entries removed by `auth sweep --delete`
 ```
 
 `accountUuid` must be a strict UUID — it becomes a path segment, and a hostile
@@ -32,6 +33,73 @@ The profile→account **binding** resolves from the per-profile snapshot first
 (owner-true even when the dir's live files were switched to another account by
 `switch-account`), then the dir's account file. A switched-away dir with no
 snapshot has no resolvable binding on purpose — never bind a foreign identity.
+
+## Credential → account binding
+
+The binding above answers *which account a **directory** belongs to*. It cannot
+answer *which account the **bytes** belong to*, and that is a different
+question with its own failure.
+
+**Measured on station01:** the central store held 18 accounts with 18 distinct
+emails but only **8 distinct credentials** — one credential filed under **eight**
+different account uuids. Eight identities cannot share one OAuth credential, so
+at most one of those bindings was true and the other seven accounts had silently
+lost their credential while every health surface stayed green.
+
+Until 0.2.27 a credential's only binding was **containment** — whose credential
+this is was answered by the directory the file sat in. That is only as
+trustworthy as the last thing that wrote the directory, and the two files making
+the claim (`oauth-account.json` and `credentials.json`) are written by
+**separate code paths**. When they disagree, every containment gate passes,
+ranking is identity-blind by construction (`betterCredential` compares health
+structs, which carry no identity), and the freshest file wins.
+
+So each credential also carries a **content** binding:
+
+- **The fingerprint is `sha256` of the REFRESH TOKEN**, not of the file. Two
+  copies of one credential are routinely spelled differently on disk — raw-byte
+  copy vs compact `JSON.stringify`, and Claude Code rewrites the access token in
+  place every eight hours — so a whole-file digest reports two spellings of one
+  credential as two credentials and misses exactly the duplication that matters.
+  The refresh token is also the *harm*: two files holding the same one is the
+  mutual-revocation hazard the broker exists to prevent.
+- **No token value is emitted.** The token is hashed and discarded; only
+  `sha256:<hex>` leaves the module, the record is 0600, and the CLI prints 12
+  hex characters.
+- **A claim is the central slot's current contents, plus the record's
+  fingerprint and one predecessor.** Current contents count as a claim so an
+  estate that predates this feature is protected from the first write onward
+  rather than needing a migration. The one predecessor covers the interval
+  between the true owner rotating and the next converge seeing it.
+- **Refusal happens only on positive proof**, and this is a *different posture*
+  from containment on purpose. Containment default-**denies** (an unattributable
+  dir may neither donate nor receive) because a dir either claims an account or
+  does not. Content binding cannot: a credential never filed anywhere has no
+  claimant, and refusing that would stop any account acquiring its first
+  binding. The two layers are complementary; neither weakens the other.
+
+Enforced in both directions, for the reason PR #97 made containment symmetric —
+a credential that may not be **written** under an account may equally not be
+**adopted** as that account's source of truth:
+
+| site | effect |
+|---|---|
+| `syncCredentialsFile` | `credentials: "refused"` + `credentialsReason`; nothing written |
+| broker `rankedCopies` | the copy is not eligible as a **source**; reported in `skipped` |
+| broker `fanOut` | the payload reaches **no** target, central included |
+
+**What this does not buy.** A claim rests on the central store's current
+contents plus one predecessor, so once the true owner has rotated twice, an
+older credential of theirs is no longer claimed and could be filed elsewhere.
+That is a stale credential rather than a live one, and `betterCredential`
+already ranks it last — stated rather than glossed, because a guard trusted past
+its reach is how the next one gets through.
+
+Inspect with `accounts auth bindings [--json] [--conflicts]`. It exits **1**
+when any credential is claimed by more than one account: every such case is
+provably wrong, the losing side has no credential of its own left, and
+`accounts login <profile>` is the only repair. The command reports; it never
+chooses.
 
 ## Compatibility window (0.2.15 ⇄ 0.2.16)
 

@@ -37,6 +37,17 @@ import {
   profileSwitchedAccountMarker,
 } from "./claude-layout.js";
 import { assertSafeWritePath, writeFileAtomic } from "./safe-path.js";
+// Cyclic by design and safe: `credential-binding.ts` uses this module's central
+// PATH helpers, all of which are hoisted `export function` declarations reached
+// only from inside function bodies. Nothing here runs at module-evaluation time,
+// so neither half can observe the other half-initialised. The alternative —
+// re-deriving `<home>/auth/<uuid>/…` in a second place — is the hardcoded
+// duplicate this repo's rules forbid, and would drift the day the layout moves.
+import {
+  credentialBindingRefusalForFile,
+  credentialFingerprintFromBytes,
+  recordCredentialBinding,
+} from "./credential-binding.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -201,22 +212,10 @@ function uuidFromOAuthRecord(oauth: JsonRecord | undefined): string | undefined 
   return typeof uuid === "string" && UUID_RE.test(uuid) ? uuid.toLowerCase() : undefined;
 }
 
-/**
- * An identity token for CONFLICT DETECTION only — deliberately NOT filtered
- * through `UUID_RE` the way `uuidFromOAuthRecord` is.
- *
- * The two jobs differ. Binding resolution turns a uuid into a filesystem path
- * under the central store, so it must reject anything malformed. Conflict
- * detection only has to notice that two identities DIFFER, and treating a
- * malformed-but-present uuid as "no identity" would wave a destroying write
- * straight through on exactly the inputs least likely to be well-formed.
- * Empty and whitespace-only are still unknown: they carry no identity to
- * compare.
- */
-function identityToken(oauth: JsonRecord | undefined): string | undefined {
-  const uuid = oauth?.accountUuid;
-  if (typeof uuid !== "string") return undefined;
-  const token = uuid.trim().toLowerCase();
+/** A non-empty, case-insensitive identity field used only for conflict detection. */
+function identityToken(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const token = value.trim().toLowerCase();
   return token.length > 0 ? token : undefined;
 }
 
@@ -232,25 +231,56 @@ function identityToken(oauth: JsonRecord | undefined): string | undefined {
  * degraded; it cannot separate two healthy credentials belonging to different
  * accounts. Only an identity check can.
  *
- * THE RULE, matching `recoverParkedCredential`'s gate: own must be KNOWN, live
- * may be unknown, compared case-insensitively. The asymmetry is deliberate —
- * `own` is what gets written, so it must be established before it can be
- * defended; `live` only ever detects a conflict, so an unreadable live identity
- * cannot prove one and must not block a legitimate refresh.
+ * Compare the strongest field that is known on BOTH records: account uuid
+ * first, then email address. UUID remains authoritative when both records have
+ * one, even if their emails happen to match. The email fallback matters for
+ * profiles created by Claude versions that omit `accountUuid`; without it the
+ * guard is inert for that whole class and a foreign login can still replace
+ * both parked files. A field present on only one side cannot prove a conflict.
  *
- * An unknown `own` is the FIRST-CAPTURE case, not a conflict: a profile that
- * has never been snapshotted has no claim to defend, and refusing here would
- * stop it ever acquiring one. That is the one leg where this differs from
- * `recoverParkedCredential`, where unknown own identity IS a refusal — there,
- * restoring would pair the guest's identity with this profile's credential,
- * which is active harm rather than a missing precondition.
+ * A snapshot with neither usable field is the FIRST-CAPTURE case, not a
+ * conflict: a profile that has never established an identity has no claim to
+ * defend, and refusing here would stop it ever acquiring one. That is the one
+ * leg where this differs from `recoverParkedCredential`, where unknown own
+ * identity IS a refusal — there, restoring would pair the guest's identity with
+ * this profile's credential, which is active harm rather than a missing
+ * precondition.
  */
 export function dirLiveIdentityIsForeign(profileDir: string, tool?: ToolDef): boolean {
-  const own = identityToken(oauthRecordFromSnapshot(profileDir));
-  if (!own) return false;
-  const live = identityToken(liveOAuthRecordUnfiltered(profileDir, tool));
-  if (!live) return false;
-  return own !== live;
+  return dirLiveIdentityRelation(profileDir, tool) === "foreign";
+}
+
+/**
+ * How the dir's LIVE account relates to the profile's OWN parked identity.
+ *
+ * `dirLiveIdentityIsForeign` above collapses everything that is not a proven
+ * conflict into `false`, which is the right answer for the WRITE paths it
+ * guards: they must fail OPEN on an unreadable identity or a profile would
+ * never acquire its first snapshot. Read paths need the third answer as well.
+ * "The dir is provably its own" and "we cannot tell" call for different
+ * fallbacks — the first lets a stale switch marker be disregarded, the second
+ * must fail CLOSED on it — and a boolean cannot express that.
+ *
+ *   own          a field pair readable on both sides is equal
+ *   foreign      a field pair readable on both sides differs
+ *   own-unknown  the profile's parked record has neither identity field (first capture)
+ *   live-unknown the dir's live account carries no field comparable to the parked one
+ */
+export type DirLiveIdentityRelation = "own" | "foreign" | "own-unknown" | "live-unknown";
+
+export function dirLiveIdentityRelation(profileDir: string, tool?: ToolDef): DirLiveIdentityRelation {
+  const own = oauthRecordFromSnapshot(profileDir);
+  const live = liveOAuthRecordUnfiltered(profileDir, tool);
+
+  const ownUuid = identityToken(own?.accountUuid);
+  const liveUuid = identityToken(live?.accountUuid);
+  if (ownUuid && liveUuid) return ownUuid === liveUuid ? "own" : "foreign";
+
+  const ownEmail = identityToken(own?.emailAddress);
+  const liveEmail = identityToken(live?.emailAddress);
+  if (ownEmail && liveEmail) return ownEmail === liveEmail ? "own" : "foreign";
+
+  return ownUuid || ownEmail ? "live-unknown" : "own-unknown";
 }
 
 /**
@@ -286,7 +316,15 @@ export function centralCredentialsPathForProfile(profileDir: string, tool?: Tool
 
 // --- write path: mirror per-profile snapshots into the central store ---------
 
-export type SyncFileAction = "created" | "updated" | "kept" | "none";
+/**
+ * `refused` is not a failure to write — it is a REFUSAL to file bytes that
+ * provably belong to another account (see `credential-binding.ts`). It is
+ * spelled apart from `none`/`kept` because those two mean "nothing to do" and
+ * this one means "something is wrong with the estate": collapsing it into
+ * either is how the original corruption stayed invisible while every surface
+ * read green.
+ */
+export type SyncFileAction = "created" | "updated" | "kept" | "none" | "refused";
 
 export interface SyncResult {
   synced: boolean;
@@ -295,6 +333,8 @@ export interface SyncResult {
   email?: string;
   centralDir?: string;
   credentials?: SyncFileAction;
+  /** Present exactly when `credentials === "refused"` — safe to print, never a token. */
+  credentialsReason?: string;
   oauth?: SyncFileAction;
 }
 
@@ -314,7 +354,12 @@ function syncOAuthFile(uuid: string, source: JsonRecord): SyncFileAction {
   return action;
 }
 
-function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): SyncFileAction {
+interface CredentialSyncOutcome {
+  action: SyncFileAction;
+  reason?: string;
+}
+
+function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): CredentialSyncOutcome {
   // Candidates: the per-profile snapshot, plus the dir's live credential file
   // when no switch-marker FILE claims it for another account (fail closed —
   // see switchMarkerFilePresent) AND the dir's live identity does not itself
@@ -331,20 +376,43 @@ function syncCredentialsFile(uuid: string, profileDir: string, tool?: ToolDef): 
     .filter((path) => existsSync(path) && !lstatSync(path).isSymbolicLink())
     .map((path) => ({ path, health: credentialHealth(path) }))
     .filter((c): c is { path: string; health: CredentialHealthPresent } => c.health.exists);
-  if (candidates.length === 0) return "none";
+  if (candidates.length === 0) return { action: "none" };
   const best = candidates.reduce((a, b) => (betterCredential(a.health, b.health) === a.health ? a : b));
+
+  // CONTENT binding, checked before anything is compared or written. The gates
+  // above are all CONTAINMENT gates — they ask what the directory claims, and a
+  // directory's claim is only as good as the last thing that wrote it. When a
+  // profile's `oauth-account.json` says A while its `credentials.json` holds B's
+  // material, every check above passes and B's credential is filed under A. That
+  // is the measured P0 (one credential under eight uuids), and only the payload
+  // itself can answer it.
+  //
+  // Placed BEFORE the `kept` comparisons on purpose: an already-contaminated
+  // slot then reports `refused` on every sync instead of a reassuring `kept`.
+  // A wrong state that reports "nothing to do" is exactly what let this run for
+  // weeks with every health surface green.
+  const refusal = credentialBindingRefusalForFile(uuid, best.path);
+  if (refusal) return { action: "refused", reason: refusal.reason };
 
   const centralPath = centralCredentialsSnapshot(uuid);
   const centralHealth = credentialHealth(centralPath);
   const bytes = readFileSync(best.path);
+  const bind = () => {
+    const fingerprint = credentialFingerprintFromBytes(bytes);
+    if (fingerprint) {
+      recordCredentialBinding(uuid, fingerprint, { evidence: "central-write", sourceKind: "profile-snapshot" });
+    }
+  };
   if (!centralHealth.exists) {
     writeCentralFile(centralPath, bytes);
-    return "created";
+    bind();
+    return { action: "created" };
   }
-  if (betterCredential(best.health, centralHealth) !== best.health) return "kept";
-  if (readFileSync(centralPath).equals(bytes)) return "kept";
+  if (betterCredential(best.health, centralHealth) !== best.health) return { action: "kept" };
+  if (readFileSync(centralPath).equals(bytes)) return { action: "kept" };
   writeCentralFile(centralPath, bytes);
-  return "updated";
+  bind();
+  return { action: "updated" };
 }
 
 /**
@@ -369,7 +437,8 @@ export function syncProfileSnapshotToCentral(profileDir: string, tool?: ToolDef)
     uuid,
     ...(email ? { email } : {}),
     centralDir: centralAuthDir(uuid),
-    credentials,
+    credentials: credentials.action,
+    ...(credentials.reason ? { credentialsReason: credentials.reason } : {}),
     oauth,
   };
 }
