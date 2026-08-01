@@ -387,6 +387,11 @@ everything listed under `0.2.25` as well as the fix below.
 
 ### Fixed
 
+- Purge the leaked `fake-login`, `fake-variant`, `missing-review`, and
+  `review-state-shape` test tools (and their dependent fixture profiles) from
+  the production PostgreSQL registry. Migration `0006` tombstones the ids so
+  legacy account writers cannot recreate them implicitly.
+
 - Share capabilities across profiles instead of isolating them. A profile is an
   isolated config dir, so pointing Claude Code at a freshly created one gave it
   none of the machine's skills, subagents, or MCP servers — only credentials are
