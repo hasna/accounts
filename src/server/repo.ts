@@ -7,6 +7,7 @@
 // requires the account to exist and stamps last_used_at.
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
+import { evaluateNameFree, type NameInvariantVerdict } from "../lib/name-invariant.js";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
 import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
 
@@ -44,6 +45,17 @@ export interface AccountsStore {
   listCustomTools(): Promise<ToolDef[]>;
   addCustomTool(def: ToolDef): Promise<ToolDef>;
   removeCustomTool(id: string): Promise<boolean>;
+  /**
+   * The third implementation of the one-name-one-provider contract (the other
+   * two are LocalStore and ApiStore in src/lib/store.ts).
+   *
+   * The server table is the PRIMARY universe: it is what `accounts list`
+   * returns, and two of the named regression fixtures exist only as rows here.
+   * READ-ONLY and warn-semantics in PR-1 — it reports, and `create`/`rename`
+   * keep refusing duplicates on their own. PR-2 backs it with the 0006
+   * UNIQUE(name) constraint, at which point the database refuses too.
+   */
+  assertNameFree(name: string, provider: string): Promise<NameInvariantVerdict>;
 }
 
 interface AccountRow {
@@ -223,6 +235,30 @@ export class AccountsRepo implements AccountsStore {
           `a profile named "${name}" already exists for tool "${holder.tool}"; ` +
             "account names must be unique across tools",
         );
+  }
+
+  /**
+   * Report whether `name` is free for `provider`, from the accounts table.
+   *
+   * Scoped to the one name rather than loading the table: the universe passed
+   * to `evaluateNameFree` only has to contain the rows that could hold this
+   * name, and a full-table read on every pre-flight would be a needless scan.
+   */
+  async assertNameFree(name: string, provider: string): Promise<NameInvariantVerdict> {
+    const rows = await this.client.many<{ tool: string; name: string; email: string | null }>(
+      "SELECT tool, name, email FROM accounts WHERE name = $1",
+      [name],
+    );
+    return evaluateNameFree(
+      name,
+      provider,
+      rows.map((row) => ({
+        name: row.name,
+        provider: row.tool,
+        ...(row.email ? { email: row.email } : {}),
+        source: "server",
+      })),
+    );
   }
 
   async create(input: CreateAccountInput): Promise<Account> {

@@ -292,11 +292,32 @@ test("launch syncs Claude profile credentials into keychain before spawning", ()
   expect(keychainPayload).toContain("acct@example.com-access-token");
 });
 
+/**
+ * Prelaunch renders only when it has an instruction source to render FROM.
+ * These tests are about the render being WIRED UP, so they have to supply one;
+ * the no-sources path (skip, home untouched, launch still succeeds) is covered
+ * in src/empty-instruction-render.test.ts.
+ */
+function giveInstructionSource(name: string, tool: string): void {
+  const path = join(home, `${name}-${tool}.configs.json`);
+  writeFileSync(
+    path,
+    JSON.stringify({
+      contract: "hasna.identities.configs-instructions/v1",
+      // Same id the fake configs binary writes into the manifest, so this
+      // exercises the wiring rather than the shortfall guard.
+      sources: [{ id: "global-codewith", layer: "global", content: "rules" }],
+    }) + "\n",
+  );
+  expect(runCli("set", name, "--tool", tool, "--identity", path).status).toBe(0);
+}
+
 test("launch runs configs apply by default before spawning", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
   writeFakeConfigs();
   const configsLog = join(home, "fake-configs.log");
   expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
   const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
   expect(profile).toBeTruthy();
 
@@ -311,11 +332,99 @@ test("launch runs configs apply by default before spawning", () => {
   expect(readLogEntries()[0]?.tool).toBe("claude");
 });
 
+test("launch still PROCEEDS when a profile has no instruction sources, leaving its home alone", () => {
+  // The live invocation is bare `accounts launch accountNNN --tool claude
+  // --permissions dangerous` — no --allow-configs-failure, no --skip-configs,
+  // ~15 concurrent on the fleet. So the no-sources path has to be proven at the
+  // CLI boundary, not just through an injected runner: if prelaunch throws here
+  // the process exits non-zero and every pooled agent stops starting, which is
+  // the 0.2.9 breakage. Emptying the home instead is the defect this whole
+  // change exists to remove. Neither is acceptable, so: exit 0, home untouched.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs-no-sources.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
+  expect(profile).toBeTruthy();
+  expect(profile!.identity ?? "").toBe("");
+
+  // A home already carrying rules from an earlier render. Stale-but-present has
+  // to survive: it is strictly better than the empty home that replaced it.
+  const indexPath = join(profile!.dir, "CLAUDE.md");
+  const existing = "# claude session instructions\n\nPR-first landing is the default.\n";
+  writeFileSync(indexPath, existing);
+
+  const result = runCliWith(["launch", "acct", "--tool", "claude", "--", "--version"], {
+    env: { FAKE_CONFIGS_LOG: configsLog },
+  });
+
+  expect(result.status).toBe(0);
+  expect(readFileSync(indexPath, "utf8")).toBe(existing);
+  // The renderer is never invoked, so it cannot have written an empty home.
+  expect(existsSync(configsLog)).toBe(false);
+  // The launch actually happened.
+  expect(readLogEntries()[0]?.tool).toBe("claude");
+  // And it said so, rather than failing silently.
+  expect(`${result.stderr}${result.stdout}`).toContain("no instruction sources resolved");
+});
+
+test("the shortfall guard is ARMED in production, not just reachable from a library call", () => {
+  // The guard shipped inert: it existed, had tests, and nothing in the CLI ever
+  // passed it an expectation, so in production it compared a render against the
+  // export that produced it. A library-level test cannot catch that — only
+  // driving the real binary can. This asserts the wiring, not the algorithm.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs-shortfall.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
+
+  // Asserted through the FLAG, not the environment variable. The library reads
+  // the env itself, so an env-based assertion passes even with cli.ts reverted —
+  // measured, not assumed: removing the wiring left that version of this test
+  // green, which would have shipped a second inert guard behind a green test.
+  // `--required-instruction-source` exists only if cli.ts threads it through.
+  const result = runCliWith(
+    [
+      "launch",
+      "acct",
+      "--tool",
+      "claude",
+      "--required-instruction-source",
+      "hasna-agent-operating-rules",
+      "--",
+      "--version",
+    ],
+    { env: { FAKE_CONFIGS_LOG: configsLog } },
+  );
+
+  expect(result.status).not.toBe(0);
+  expect(`${result.stderr}${result.stdout}`).toContain("missing 1 of 1 required instruction sources");
+  expect(`${result.stderr}${result.stdout}`).toContain("hasna-agent-operating-rules");
+});
+
+test("the same launch succeeds when the required rule IS rendered", () => {
+  // Positive control: without it the test above would pass on any launch failure.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs-shortfall-ok.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
+
+  const result = runCliWith(
+    ["launch", "acct", "--tool", "claude", "--required-instruction-source", "global-codewith", "--", "--version"],
+    { env: { FAKE_CONFIGS_LOG: configsLog } },
+  );
+
+  expect(result.status).toBe(0);
+});
+
 test("switch --launch runs configs apply by default before spawning", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
   writeFakeConfigs();
   const configsLog = join(home, "fake-configs.log");
   expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  giveInstructionSource("acct", "claude");
   const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
   expect(profile).toBeTruthy();
 

@@ -18,7 +18,12 @@ import {
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./tools.js";
-import { redactArgv, redactEnvironment, redactText } from "./redaction.js";
+import {
+  isSensitiveCredentialKey,
+  redactArgv,
+  redactEnvironment,
+  redactText,
+} from "./redaction.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
 
@@ -63,8 +68,25 @@ export interface PublicSwitchResult {
   message: string;
 }
 
-function commandLine(env: Record<string, string>, command: string[]): string {
-  return `${formatEnvAssignments(env)} ${command.map(quotePosixShellWord).join(" ")}`.trim();
+function commandLine(
+  env: Record<string, string>,
+  command: string[],
+  unsetEnvKeys: readonly string[] = [],
+): string {
+  const assignments = formatEnvAssignments(env, process.env, unsetEnvKeys);
+  return `${assignments} ${command.map(quotePosixShellWord).join(" ")}`.trim();
+}
+
+function publicCommandLine(env: Record<string, string>, command: string[]): string {
+  const publicEnv = redactEnvironment(env);
+  const unsetEnvKeys: string[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (value !== "" && isSensitiveCredentialKey(name)) {
+      delete publicEnv[name];
+      unsetEnvKeys.push(name);
+    }
+  }
+  return commandLine(publicEnv, command, unsetEnvKeys);
 }
 
 /** Return a trusted display label without reflecting caller-controlled custom labels. */
@@ -101,7 +123,7 @@ export function publicSwitchResult(result: SwitchResult | SwitchAccountResult): 
     applied,
     active: launchResult?.active ?? true,
     command,
-    commandLine: launchResult ? commandLine(redactEnvironment(launchResult.env), command) : "",
+    commandLine: launchResult ? publicCommandLine(launchResult.env, command) : "",
     ...(launchResult?.permissions ? { permissions: redactText(launchResult.permissions) } : {}),
     restartRequired: result.restartRequired,
     message: publicSwitchMessage(result.profile.name, toolLabel, applied),

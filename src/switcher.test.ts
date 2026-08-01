@@ -40,8 +40,11 @@ afterEach(() => {
   delete process.env.ACCOUNTS_TEST_LIVE_DIR;
 });
 
-function writeOAuth(dir: string, email: string) {
-  writeFileSync(join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: email } }));
+function writeOAuth(dir: string, email: string, accountUuid?: string) {
+  writeFileSync(
+    join(dir, ".claude.json"),
+    JSON.stringify({ oauthAccount: { ...(accountUuid ? { accountUuid } : {}), emailAddress: email } }),
+  );
   writeFileSync(
     join(dir, ".credentials.json"),
     JSON.stringify({
@@ -335,7 +338,7 @@ test("public switch projection keeps a cleared auth variable cleared in the rest
   expect(output.commandLine).not.toContain("[REDACTED]");
 });
 
-test("public switch projection still redacts a non-empty credential-named launch variable", async () => {
+test("public switch projection unsets a non-empty credential-named launch variable", async () => {
   addCustomTool({
     id: "env-secret-tool",
     label: "Env Secret Tool",
@@ -350,7 +353,9 @@ test("public switch projection still redacts a non-empty credential-named launch
   const output = publicSwitchResult(internal);
 
   expect(internal.env.TOOL_API_KEY).toBe("switch-env-secret-value");
-  expect(output.commandLine).toContain("TOOL_API_KEY='[REDACTED]'");
+  expect(output.commandLine).toContain("-u TOOL_API_KEY");
+  expect(output.commandLine).not.toContain("TOOL_API_KEY=");
+  expect(output.commandLine).not.toContain("[REDACTED]");
   expect(output.commandLine).not.toContain("switch-env-secret-value");
   expect(JSON.stringify(output)).not.toContain("switch-env-secret-value");
 });
@@ -881,12 +886,16 @@ test("apply restores fresher profile-root credentials over a stale snapshot", as
 
 test("apply refreshes a stale oauth snapshot from the profile dir", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "work-oauth-fresh-"));
-  writeOAuth(workDir, "old@example.com");
+  const accountUuid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  writeOAuth(workDir, "old@example.com", accountUuid);
   addProfile({ name: "work", dir: workDir, email: "old@example.com" });
   const tool = getTool("claude");
   ensureProfileAuthSnapshot(workDir, tool);
 
-  writeOAuth(workDir, "renamed@example.com");
+  // The stable uuid proves this is an email change on the same account, not a
+  // foreign in-session login. Without either a matching uuid or email there is
+  // no safe way for the snapshot gate to distinguish those two events.
+  writeOAuth(workDir, "renamed@example.com", accountUuid);
   const future = new Date(Date.now() + 5000);
   utimesSync(join(workDir, ".claude.json"), future, future);
 

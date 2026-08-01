@@ -1,5 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
@@ -12,6 +12,7 @@ import {
   recordConfigsPrelaunchAudit,
   type ConfigsPrelaunchAuditResult,
   type ConfigsPrelaunchSummary,
+  type ConfigsShortfallGuardState,
 } from "./configs-prelaunch-status.js";
 
 export type ConfigsPrelaunchMode = "plan" | "apply" | "skip";
@@ -25,6 +26,31 @@ export interface ConfigsPrelaunchOptions {
   sessionId?: string;
   identityExports?: string[];
   includeProfileIdentity?: boolean;
+  /**
+   * Render a home with NO instruction rules on purpose.
+   *
+   * Off by default, and it must stay that way. This used to be inferred from
+   * "the profile has no identity export", which is the normal state of every
+   * pooled `accountNNN` profile — so the renderer's empty-source guard was
+   * disarmed on essentially every call, and twenty-six agent homes ended up
+   * carrying no operating rules at all while every surface reported `ok`.
+   */
+  allowEmptySources?: boolean;
+  /**
+   * Instruction source ids the rendered home MUST end up carrying.
+   *
+   * Zero sources is the loud failure; a SHORTFALL is the quiet one, and the
+   * quiet one ran undetected for weeks. `claude/account005` rendered 3 of 10
+   * sources — missing the core operating rules and the credential-hygiene rule
+   * — and every surface called it healthy, because the render ran, exited 0 and
+   * produced a well-formed manifest. Counting is not enough: a home carrying
+   * three arbitrary rules is not a governed home, so the caller states which
+   * ids have to be there and the render is rejected if any are absent.
+   *
+   * Left empty, the check falls back to "render everything that was supplied",
+   * which still catches a renderer silently dropping sources.
+   */
+  requiredSourceIds?: string[];
   skipReason?: string;
   runner?: ConfigsRunner;
 }
@@ -70,9 +96,10 @@ export function configsPrelaunchCommand(
     "--session-id",
     opts.sessionId ?? `accounts:${tool.id}:${profile.name}`,
     ...identityExports.flatMap((path) => ["--identity-export", path]),
-    // No instruction sources: tell configs this is an explicit empty render so it
-    // produces a valid sourceCount:0 manifest instead of failing closed.
-    ...(identityExports.length === 0 ? ["--allow-empty-sources"] : []),
+    // Only when the caller explicitly asked for an empty home. Having no
+    // instruction sources is a fault to report, not a reason to suppress the
+    // renderer's guard against rendering nothing.
+    ...(opts.allowEmptySources === true ? ["--allow-empty-sources"] : []),
   ];
 }
 
@@ -132,6 +159,57 @@ function resolveIdentityExports(profile: Profile, tool: ToolDef, opts: ConfigsPr
   }
   if (failed) return { paths: exports, bypassReason: "identity instruction export failed" };
   return { paths: [...exports, exportPath] };
+}
+
+/**
+ * Instruction source ids an export declares.
+ *
+ * Best-effort by design: an unreadable or unexpected export yields no required
+ * ids rather than throwing, because this feeds a SAFETY check and a check that
+ * crashes on a malformed input is a check that gets removed. A malformed export
+ * still fails the render itself, where the error belongs.
+ */
+function readIdentityExportSourceIds(path: string): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as { sources?: Array<{ id?: unknown }> };
+    if (!Array.isArray(raw?.sources)) return [];
+    return raw.sources.map((source) => source?.id).filter((id): id is string => typeof id === "string" && id.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Environment key carrying the canonical instruction sources a governed home
+ * must end up with. Comma-separated ids.
+ *
+ * Configuration rather than a constant in this file on purpose: accounts does
+ * not own the rule set and must not encode it. It only needs to be told, by
+ * something that is NOT the artefact under test, what to expect.
+ */
+export const REQUIRED_INSTRUCTION_SOURCES_ENV = "HASNA_ACCOUNTS_REQUIRED_INSTRUCTION_SOURCES";
+
+/**
+ * The instruction sources a render must produce, from a source INDEPENDENT of
+ * the render being checked.
+ *
+ * This independence is the whole point. The guard shipped inert because its
+ * expected value was derived from the same export it was validating, which
+ * cannot fail: a stale export declaring three rules renders three, and the
+ * comparison passes while the home is missing seven. Returns an empty list when
+ * nothing is configured, and callers must treat that as "cannot check" rather
+ * than "checked and fine".
+ */
+export function resolveRequiredInstructionSourceIds(
+  opts: { env?: NodeJS.ProcessEnv; explicit?: string[] } = {},
+): string[] {
+  if (opts.explicit && opts.explicit.length > 0) return [...opts.explicit];
+  const raw = (opts.env ?? process.env)[REQUIRED_INSTRUCTION_SOURCES_ENV];
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
 }
 
 function defaultRunner(command: string, args: string[]) {
@@ -222,6 +300,72 @@ export function runConfigsPrelaunch(
     };
   }
   const identityExports = resolved.paths;
+
+  // Nothing to render FROM. Skip the render entirely and leave whatever the home
+  // already has in place.
+  //
+  // The three wrong answers, all of which were shipped at some point:
+  //  - render it empty anyway (what happened until now): the home is stripped to
+  //    a stub and the agent launches with no operating rules, graded `applied`.
+  //  - let the renderer refuse and propagate that: `configs session apply`
+  //    exits 1 and this function throws by default, so bare
+  //    `accounts launch accountNNN` aborts. Every pooled profile is
+  //    identity-less, so that fails every launch on the fleet.
+  //  - swallow it: the estate looks healthy while nothing is governed.
+  //
+  // A stale-but-present instruction home beats an empty one and beats a dead
+  // launch, so this skips loudly and lets the launch continue.
+  if (mode === "apply" && identityExports.length === 0 && opts.allowEmptySources !== true) {
+    // Keep WHY there is nothing to render. "The identity export failed" and
+    // "no identity was ever configured" need different actions from an operator,
+    // and collapsing them into one message sent earlier investigations the wrong
+    // way.
+    const reason =
+      (resolved.bypassReason ? `${resolved.bypassReason}; ` : "") +
+      `no instruction sources resolved for ${tool.id}/${profile.name}; ` +
+      `kept the existing instruction home instead of rendering an empty one. ` +
+      `Set an identity export (accounts set ${profile.name} --tool ${tool.id} --identity <path>) ` +
+      `or pass --allow-empty-instructions to render an empty home on purpose.`;
+    process.stderr.write(`accounts: ${reason}\n`);
+    // `bypassed` when something failed on the way here, `skipped` when there was
+    // simply nothing configured. Neither is `ok`, so no surface reads the
+    // profile as governed.
+    const outcome: ConfigsPrelaunchAuditResult = resolved.bypassReason ? "bypassed" : "skipped";
+    const prelaunch = recordConfigsPrelaunchAudit(profile, tool, configsTool, {
+      mode,
+      result: outcome,
+      allowFailure,
+      reason,
+      identityExportCount: 0,
+    });
+    return {
+      skipped: true,
+      mode,
+      result: outcome,
+      reason,
+      command: [],
+      identityExports: [],
+      allowFailure,
+      prelaunch,
+    };
+  }
+
+  // What this render is REQUIRED to end up carrying, and — just as important —
+  // whether that expectation is INDEPENDENT of the thing being checked.
+  //
+  //   armed   an expectation supplied from outside: a caller literal, or the
+  //           configured canonical set. This can actually fail.
+  //   unarmed nothing configured, so the only available expectation is the
+  //           export itself. That comparison catches a renderer DROPPING a
+  //           source it was handed, and cannot catch an export that was already
+  //           short — which is the case that ran for weeks. Recorded by name so
+  //           its silence is never read as coverage.
+  const independentRequiredSourceIds = resolveRequiredInstructionSourceIds({ explicit: opts.requiredSourceIds });
+  const shortfallGuard: ConfigsShortfallGuardState =
+    independentRequiredSourceIds.length > 0 ? "armed" : "unarmed";
+  const requiredSourceIds =
+    shortfallGuard === "armed" ? independentRequiredSourceIds : identityExports.flatMap(readIdentityExportSourceIds);
+
   const command = configsPrelaunchCommand(profile, tool, { ...opts, identityExports });
   const [bin, ...args] = command;
   const result = runner(bin!, args);
@@ -236,6 +380,7 @@ export function runConfigsPrelaunch(
       reason: `configs prelaunch ${mode} failed`,
       statusCode: result.status,
       identityExportCount: identityExports.length,
+      shortfallGuard,
     });
     throw new AccountsError(`configs prelaunch ${mode} failed for ${tool.id}/${profile.name}${detail}`);
   }
@@ -248,6 +393,7 @@ export function runConfigsPrelaunch(
       reason,
       statusCode: result.status,
       identityExportCount: identityExports.length,
+      shortfallGuard,
     });
     return {
       skipped: false,
@@ -264,8 +410,30 @@ export function runConfigsPrelaunch(
 
   if (mode === "apply") {
     const manifest = assessConfigsManifest(profile, tool, configsTool);
-    if (manifest.drift !== "ok") {
-      const reason = `session render manifest ${manifest.drift}: ${manifest.reasons.join("; ") || "not fresh"}`;
+    // A render that wrote a well-formed home containing NO rules is the failure
+    // that hid the longest, because every other signal reads clean: the command
+    // exits 0, the manifest parses, nothing drifted. The home is simply empty of
+    // instructions, and an agent launched into it runs with no operating rules.
+    // Grading that as `applied` is what let it persist across twenty-six
+    // profiles unnoticed, so it is checked here rather than inferred elsewhere.
+    const emptyRender = opts.allowEmptySources !== true && manifest.drift === "ok" && manifest.sourceCount === 0;
+    // The SHORTFALL check. A render that dropped some of what it was given is
+    // the failure mode that survived undetected longest, precisely because it
+    // looks identical to success everywhere else. Only trustworthy when the
+    // manifest listed its ids in full; a truncated list cannot prove absence.
+    const missingSources =
+      manifest.drift === "ok" && !manifest.sourceIdsTruncated
+        ? requiredSourceIds.filter((id) => !manifest.sourceIds.includes(id))
+        : [];
+    if (manifest.drift !== "ok" || emptyRender || missingSources.length > 0) {
+      const reason = emptyRender
+        ? `session render produced no instruction sources for ${tool.id}/${profile.name}; the home would carry no operating rules`
+        : missingSources.length > 0
+          ? `session render for ${tool.id}/${profile.name} is missing ${missingSources.length} of ` +
+            `${requiredSourceIds.length} required instruction sources ` +
+            `(${missingSources.slice(0, 5).join(", ")}${missingSources.length > 5 ? ", …" : ""}); ` +
+            `the home would run without them`
+          : `session render manifest ${manifest.drift}: ${manifest.reasons.join("; ") || "not fresh"}`;
       const prelaunch = recordConfigsPrelaunchAudit(profile, tool, configsTool, {
         mode,
         result: allowFailure ? "bypassed" : "failed",
@@ -273,6 +441,7 @@ export function runConfigsPrelaunch(
         reason: allowFailure ? `${reason}; --allow-configs-failure` : reason,
         statusCode: result.status,
         identityExportCount: identityExports.length,
+        shortfallGuard,
       });
       if (!allowFailure) throw new AccountsError(`configs prelaunch ${mode} failed for ${tool.id}/${profile.name}: ${reason}`);
       return {
@@ -297,6 +466,7 @@ export function runConfigsPrelaunch(
     reason: identityBypass,
     statusCode: result.status,
     identityExportCount: identityExports.length,
+    shortfallGuard,
   });
   return {
     skipped: false,

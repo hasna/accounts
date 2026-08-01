@@ -9,6 +9,7 @@ import { createHandler, type ServiceContext } from "./app.js";
 import type { Account, AccountsStore, CurrentSelection } from "./repo.js";
 import { SCOPES } from "./config.js";
 import { AccountsError } from "../types.js";
+import { evaluateNameFree } from "../lib/name-invariant.js";
 
 const SIGNING_SECRET = "test-signing-secret-accounts-dir-guard";
 
@@ -73,6 +74,13 @@ class SpyStore implements AccountsStore {
   }
   async removeCustomTool(): Promise<boolean> {
     return true;
+  }
+  async assertNameFree(name: string, provider: string) {
+    return evaluateNameFree(
+      name,
+      provider,
+      [...this.accounts.values()].map((a) => ({ name: a.name, provider: a.tool })),
+    );
   }
 }
 

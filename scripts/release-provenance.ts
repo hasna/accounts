@@ -675,9 +675,19 @@ function workflowIdentity(
     env.NPM_DIST_TAG_TOKEN_CONFIGURED === "true",
     "NPM_DIST_TAG_TOKEN is not configured in the protected release environment",
   );
+  // The preflight's administration credential is MINTED per run from a GitHub
+  // App, so the thing that can be missing from the environment is the App's
+  // credentials — not a token. Asserting the old
+  // RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED here would fail every run with a
+  // message naming a secret the design deliberately no longer stores, which is
+  // a false report of the cause rather than an honest one.
   check(
-    env.RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED === "true",
-    "RELEASE_GITHUB_ADMIN_TOKEN is not configured in the protected release environment",
+    env.RELEASE_APP_ID_CONFIGURED === "true",
+    "RELEASE_APP_ID is not configured in the protected release environment",
+  );
+  check(
+    env.RELEASE_APP_PRIVATE_KEY_CONFIGURED === "true",
+    "RELEASE_APP_PRIVATE_KEY is not configured in the protected release environment",
   );
   check(manifest.publishConfig?.registry === REGISTRY, `publish registry must be ${REGISTRY}`);
   check(manifest.publishConfig?.access === "public", "publish access must be public");
@@ -800,21 +810,31 @@ export function verifyReleaseRulesets(input: unknown): { id: number; name: strin
         ["creation", "update", "deletion"].every((type) => types.includes(type)),
       "release tag rules must be exactly creation, update, and deletion",
     );
+    // This once required `bypass_actors` to be exactly one OrganizationAdmin
+    // always-bypass. That check is NOT satisfiable by a credential fit to make
+    // it: GitHub withholds `bypass_actors` from `administration: read` and
+    // returns it only to `administration: write` — measured on this repository,
+    // same ruleset, permission the only variable. And a write-capable token was
+    // measured CREATING a ruleset (HTTP 201; a read-only token got 403), which
+    // makes the attestation tautological — it would prove the protections exist
+    // and that the reader could have authored them. A credential that can write
+    // the artifact it certifies is not a verification credential.
+    //
+    // So the release verifies what a read-only credential can honestly prove:
+    // that IT cannot bypass this ruleset. `current_user_can_bypass` is returned
+    // at read level and fails closed here on any value but "never".
+    //
+    // What this deliberately no longer proves IN-RUN: that no OTHER actor holds
+    // a bypass. That is a property of the org's ruleset configuration rather
+    // than of a release, it cannot be read without write authority, and it is
+    // therefore audited out-of-band instead of by the credential under test.
     check(
-      ruleset.bypass_actors !== undefined,
-      "release tag ruleset bypass actors are unavailable; administration-read authority is required",
+      ruleset.current_user_can_bypass !== undefined,
+      "release tag ruleset bypass posture is unavailable; administration-read authority is required",
     );
-    check(Array.isArray(ruleset.bypass_actors), "ruleset bypass actors must be an array");
     check(
-      ruleset.bypass_actors.length === 1,
-      "release tag ruleset must have exactly one organization-admin always bypass",
-    );
-    const actor = record(ruleset.bypass_actors[0], "ruleset bypass actor");
-    check(
-      actor.actor_id === null &&
-        actor.actor_type === "OrganizationAdmin" &&
-        actor.bypass_mode === "always",
-      "release tag ruleset must have exactly one organization-admin always bypass",
+      ruleset.current_user_can_bypass === "never",
+      "the release credential must not be able to bypass the release tag ruleset",
     );
     return {
       id: integer(ruleset.id, "ruleset id"),
@@ -826,39 +846,46 @@ export function verifyReleaseRulesets(input: unknown): { id: number; name: strin
   );
 }
 
+// The administration credential is a GitHub App installation token minted for
+// this run, so it has no user identity: `GET /user` answers 403 "Resource not
+// accessible by integration" for any installation token. The binding this
+// asserts instead is the credential's SCOPE — it must reach exactly this one
+// repository and nothing else. That is narrower than the personal token it
+// replaces, which necessarily carried everything its owner could reach.
+//
+// Administration-read authority is proven separately and already fails closed:
+// GitHub omits `bypass_actors` from a ruleset read without it, and
+// verifyReleaseRulesets() rejects a ruleset whose bypass actors are absent.
 export function verifyReleaseEnvironment(
   environmentInput: unknown,
   policiesInput: unknown,
   actorPermissionInput: unknown,
-  administrationIdentityInput: unknown,
-  administrationPermissionInput: unknown,
+  administrationScopeInput: unknown,
+  repositoryInput: unknown,
 ): void {
   const environment = record(environmentInput, "GitHub release environment");
   const actorPermission = record(actorPermissionInput, "GitHub release actor permission");
   const actor = record(actorPermission.user, "GitHub release actor");
-  const administrationIdentity = record(
-    administrationIdentityInput,
-    "GitHub administration credential identity",
-  );
-  const administrationPermission = record(
-    administrationPermissionInput,
-    "GitHub administration credential permission",
-  );
-  const administrationUser = record(
-    administrationPermission.user,
-    "GitHub administration credential permission user",
+  const repository = text(repositoryInput, "release repository");
+  const administrationScope = record(
+    administrationScopeInput,
+    "GitHub administration credential scope",
   );
   check(actorPermission.permission === "admin", "release actor must have repository admin permission");
   check(
-    administrationPermission.permission === "admin",
-    "administration credential needs repository admin read authority",
+    Array.isArray(administrationScope.repositories),
+    "administration credential scope must list its repositories",
   );
   check(
-    administrationIdentity.id === actor.id &&
-      administrationIdentity.login === actor.login &&
-      administrationUser.id === actor.id &&
-      administrationUser.login === actor.login,
-    "administration credential must belong to the release actor",
+    administrationScope.total_count === 1 && administrationScope.repositories.length === 1,
+    "administration credential must be scoped to exactly one repository",
+  );
+  check(
+    text(
+      record(administrationScope.repositories[0], "administration credential repository").full_name,
+      "administration credential repository full name",
+    ) === repository,
+    "administration credential must be scoped to the release repository",
   );
   check(environment.name === RELEASE_ENVIRONMENT, `release environment must be ${RELEASE_ENVIRONMENT}`);
   check(Array.isArray(environment.protection_rules), "release environment protection rules must be an array");
@@ -988,7 +1015,7 @@ async function assertLiveReleaseControls(
     environment,
     policies,
     actorPermission,
-    administrationIdentity,
+    administrationScope,
   ] = await Promise.all([
     fetchJson(
       githubUrl(`/repos/${repository}/rulesets?includes_parents=true&targets=tag&per_page=100`),
@@ -1012,7 +1039,11 @@ async function assertLiveReleaseControls(
       MAX_JSON_BYTES,
       headers,
     ),
-    fetchJson(githubUrl("/user"), MAX_JSON_BYTES, administrationHeaders),
+    fetchJson(
+      githubUrl("/installation/repositories?per_page=100"),
+      MAX_JSON_BYTES,
+      administrationHeaders,
+    ),
   ]);
   check(Array.isArray(summaries), "GitHub rulesets response must be an array");
   const details = await Promise.all(summaries.map(async (entry, index) => {
@@ -1024,24 +1055,16 @@ async function assertLiveReleaseControls(
       administrationHeaders,
     );
   }));
-  const administration = record(administrationIdentity, "GitHub administration credential identity");
-  const administrationName = encodeURIComponent(
-    text(administration.login, "GitHub administration credential login"),
-  );
-  const administrationPermission = await fetchJson(
-    githubUrl(`/repos/${repository}/collaborators/${administrationName}/permission`),
-    MAX_JSON_BYTES,
-    administrationHeaders,
-  );
   const ruleset = verifyReleaseRulesets(details);
   verifyReleaseEnvironment(
     environment,
     policies,
     actorPermission,
-    administrationIdentity,
-    administrationPermission,
+    administrationScope,
+    repository,
   );
   console.log(`verified active release tag ruleset ${ruleset.name} (${ruleset.id})`);
+  console.log(`verified administration credential scoped to ${repository} alone`);
   console.log(`verified protected ${RELEASE_ENVIRONMENT} environment and tag policy`);
 }
 

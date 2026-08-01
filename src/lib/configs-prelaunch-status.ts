@@ -30,6 +30,18 @@ export interface ConfigsPrelaunchManifestStatus {
   reasons: string[];
 }
 
+/**
+ * Whether the shortfall check had an expectation INDEPENDENT of the render it
+ * was checking.
+ *
+ * `unarmed` is not a soft pass. It means the only available expectation was the
+ * export itself, so the check could catch a renderer dropping a source but not
+ * an export that was already short — the case that ran undetected for weeks.
+ * Recorded explicitly so a surface can distinguish "checked and fine" from
+ * "could not check", which is the distinction the whole incident turned on.
+ */
+export type ConfigsShortfallGuardState = "armed" | "unarmed";
+
 export interface ConfigsPrelaunchAudit {
   schema: "hasna.accounts.configs-prelaunch/v1";
   tool: string;
@@ -40,6 +52,7 @@ export interface ConfigsPrelaunchAudit {
   reason?: string;
   statusCode?: number | null;
   identityExportCount: number;
+  shortfallGuard?: ConfigsShortfallGuardState;
   updatedAt: string;
   manifest: {
     path: string;
@@ -68,6 +81,7 @@ export interface RecordConfigsPrelaunchAuditInput {
   reason?: string;
   statusCode?: number | null;
   identityExportCount?: number;
+  shortfallGuard?: ConfigsShortfallGuardState;
 }
 
 const STATUS_SCHEMA = "hasna.accounts.configs-prelaunch/v1" as const;
@@ -297,6 +311,7 @@ export function recordConfigsPrelaunchAudit(
     ...(input.reason ? { reason: input.reason.slice(0, MAX_REASON_LENGTH) } : {}),
     ...(input.statusCode !== undefined ? { statusCode: input.statusCode } : {}),
     identityExportCount: input.identityExportCount ?? 0,
+    ...(input.shortfallGuard ? { shortfallGuard: input.shortfallGuard } : {}),
     updatedAt: new Date().toISOString(),
     manifest: {
       path: manifest.path,

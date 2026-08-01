@@ -224,11 +224,11 @@ function ruleset(ruleTypes = ["creation", "update", "deletion"]) {
     name: "protect-npm-accounts-release-tags",
     target: "tag",
     enforcement: "active",
-    bypass_actors: [{
-      actor_id: null,
-      actor_type: "OrganizationAdmin",
-      bypass_mode: "always",
-    }],
+    // Shaped as `administration: read` actually returns it — measured on the
+    // live ruleset: `current_user_can_bypass` present, `bypass_actors` absent.
+    // The fixture must match the credential the release actually uses, or it
+    // asserts a response the workflow can never receive.
+    current_user_can_bypass: "never",
     conditions: {
       ref_name: {
         include: ["refs/tags/npm/accounts/v*"],
@@ -294,7 +294,8 @@ test("accepts only the exact tokenless protected GitHub OIDC workflow and pinned
     GITHUB_WORKFLOW_REF: `${candidate.repository}/${RELEASE_WORKFLOW}@refs/tags/${candidate.tag}`,
     GITHUB_SHA: candidate.commit,
     NPM_DIST_TAG_TOKEN_CONFIGURED: "true",
-    RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: "true",
+    RELEASE_APP_ID_CONFIGURED: "true",
+    RELEASE_APP_PRIVATE_KEY_CONFIGURED: "true",
     ACTIONS_ID_TOKEN_REQUEST_URL: "https://example.invalid/oidc",
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "present",
   };
@@ -322,8 +323,12 @@ test("accepts only the exact tokenless protected GitHub OIDC workflow and pinned
   }, tools)).toThrow("NPM_DIST_TAG_TOKEN is not configured");
   expect(() => assertTrustedPublishEnvironment(manifest, {
     ...env,
-    RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED: "false",
-  }, tools)).toThrow("RELEASE_GITHUB_ADMIN_TOKEN is not configured");
+    RELEASE_APP_ID_CONFIGURED: "false",
+  }, tools)).toThrow("RELEASE_APP_ID is not configured");
+  expect(() => assertTrustedPublishEnvironment(manifest, {
+    ...env,
+    RELEASE_APP_PRIVATE_KEY_CONFIGURED: "false",
+  }, tools)).toThrow("RELEASE_APP_PRIVATE_KEY is not configured");
   expect(() => assertTrustedPublishEnvironment(manifest, {
     ...env,
     "NPM_CONFIG_//REGISTRY.NPMJS.ORG/:_AUTHTOKEN": "forbidden",
@@ -393,8 +398,17 @@ test("requires a live active release-tag ruleset with immutable restricted autho
     id: 19_812_295,
     name: "protect-npm-accounts-release-tags",
   });
-  const { bypass_actors: _hiddenByGitHub, ...readOnlyRuleset } = ruleset();
-  expect(() => verifyReleaseRulesets([readOnlyRuleset])).toThrow("bypass actors are unavailable");
+  // GitHub withholds the bypass posture without administration-read authority.
+  const { current_user_can_bypass: _withheld, ...withoutPosture } = ruleset();
+  expect(() => verifyReleaseRulesets([withoutPosture]))
+    .toThrow("bypass posture is unavailable");
+  // A credential that CAN bypass the ruleset it is certifying is rejected —
+  // this is the check that replaced the bypass_actors enumeration, and it is
+  // the one a read-only credential can honestly make.
+  expect(() => verifyReleaseRulesets([{ ...ruleset(), current_user_can_bypass: "always" }]))
+    .toThrow("must not be able to bypass");
+  expect(() => verifyReleaseRulesets([{ ...ruleset(), current_user_can_bypass: "pull_request" }]))
+    .toThrow("must not be able to bypass");
   expect(() => verifyReleaseRulesets([{ ...ruleset(), enforcement: "evaluate" }]))
     .toThrow("no active tag ruleset");
   expect(() => verifyReleaseRulesets([{
@@ -425,27 +439,13 @@ test("requires a live active release-tag ruleset with immutable restricted autho
     .toThrow("exactly creation, update, and deletion");
   expect(() => verifyReleaseRulesets([ruleset(["creation", "update"])]))
     .toThrow("exactly creation, update, and deletion");
-  expect(() => verifyReleaseRulesets([{ ...ruleset(), bypass_actors: [] }]))
-    .toThrow("exactly one organization-admin");
-  expect(() => verifyReleaseRulesets([{
+  // A stray `bypass_actors` in the payload must not resurrect the old
+  // enumeration or change the verdict: the release no longer decides on it,
+  // and an extra field is not a reason to pass or fail.
+  expect(verifyReleaseRulesets([{
     ...ruleset(),
-    bypass_actors: [{
-      actor_id: 123,
-      actor_type: "Team",
-      bypass_mode: "always",
-    }],
-  }])).toThrow("exactly one organization-admin");
-  expect(() => verifyReleaseRulesets([{
-    ...ruleset(),
-    bypass_actors: [
-      ...ruleset().bypass_actors,
-      {
-        actor_id: 123,
-        actor_type: "Team",
-        bypass_mode: "always",
-      },
-    ],
-  }])).toThrow("exactly one organization-admin");
+    bypass_actors: [{ actor_id: 123, actor_type: "Team", bypass_mode: "always" }],
+  }])).toEqual({ id: 19_812_295, name: "protect-npm-accounts-release-tags" });
   expect(() => verifyReleaseRulesets([{
     ...ruleset(),
     rules: [...ruleset().rules, { type: "required_signatures" }],
@@ -477,21 +477,25 @@ test("requires protected release-environment reviewers and an exact tag deployme
     role_name: "admin",
     user: { id: 123, login: "release-owner" },
   };
-  const administrationCredential = {
-    identity: { id: 123, login: "release-owner" },
-    permission: actor,
+  // The administration credential is an App installation token minted per run.
+  // It has no user identity — `GET /user` is 403 for any installation token —
+  // so the binding asserted is its SCOPE: exactly this one repository.
+  const repository = "hasna/accounts";
+  const administrationScope = {
+    total_count: 1,
+    repositories: [{ id: 1, full_name: "hasna/accounts" }],
   };
   expect(() => verifyReleaseEnvironment(
     environment,
     policies,
     actor,
-    administrationCredential.identity,
-    administrationCredential.permission,
+    administrationScope,
+    repository,
   )).not.toThrow();
   expect(() => verifyReleaseEnvironment({
     ...environment,
     protection_rules: [{ type: "branch_policy" }],
-  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+  }, policies, actor, administrationScope, repository))
     .toThrow("require reviewers");
   expect(() => verifyReleaseEnvironment({
     ...environment,
@@ -503,7 +507,7 @@ test("requires protected release-environment reviewers and an exact tag deployme
       },
       { type: "branch_policy" },
     ],
-  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+  }, policies, actor, administrationScope, repository))
     .toThrow("allow the authorized reviewer");
   expect(() => verifyReleaseEnvironment({
     ...environment,
@@ -515,22 +519,22 @@ test("requires protected release-environment reviewers and an exact tag deployme
       },
       { type: "branch_policy" },
     ],
-  }, policies, actor, administrationCredential.identity, administrationCredential.permission))
+  }, policies, actor, administrationScope, repository))
     .toThrow("exactly match the live release actor");
   expect(() => verifyReleaseEnvironment(environment, policies, {
     ...actor,
     permission: "write",
-  }, administrationCredential.identity, administrationCredential.permission))
+  }, administrationScope, repository))
     .toThrow("repository admin permission");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
     branch_policies: [{ id: 456, name: "npm/accounts/v*", type: "branch" }],
-  }, actor, administrationCredential.identity, administrationCredential.permission))
+  }, actor, administrationScope, repository))
     .toThrow("exact npm/accounts/v* tag policy");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
     branch_policies: [{ id: 456, name: "npm/accounts/*", type: "tag" }],
-  }, actor, administrationCredential.identity, administrationCredential.permission))
+  }, actor, administrationScope, repository))
     .toThrow("exact npm/accounts/v* tag policy");
   expect(() => verifyReleaseEnvironment(environment, {
     ...policies,
@@ -539,22 +543,46 @@ test("requires protected release-environment reviewers and an exact tag deployme
       { id: 456, name: "npm/accounts/v*", type: "tag" },
       { id: 789, name: "main", type: "branch" },
     ],
-  }, actor, administrationCredential.identity, administrationCredential.permission))
+  }, actor, administrationScope, repository))
     .toThrow("exactly one deployment tag policy");
+  // A credential that reaches a second repository is rejected: the whole point
+  // of the scope binding is that it cannot be a broad, reusable credential.
   expect(() => verifyReleaseEnvironment(
     environment,
     policies,
     actor,
-    { id: 999, login: "other-admin" },
-    { permission: "admin", user: { id: 999, login: "other-admin" } },
-  )).toThrow("administration credential must belong to the release actor");
+    {
+      total_count: 2,
+      repositories: [
+        { id: 1, full_name: "hasna/accounts" },
+        { id: 2, full_name: "hasna/todos" },
+      ],
+    },
+    repository,
+  )).toThrow("scoped to exactly one repository");
+  // Correctly narrow, but narrowed to the WRONG repository.
   expect(() => verifyReleaseEnvironment(
     environment,
     policies,
     actor,
-    administrationCredential.identity,
-    { ...administrationCredential.permission, permission: "write" },
-  )).toThrow("administration credential needs repository admin read authority");
+    { total_count: 1, repositories: [{ id: 2, full_name: "hasna/todos" }] },
+    repository,
+  )).toThrow("scoped to the release repository");
+  // total_count and the array must agree; a truncated page must not read as narrow.
+  expect(() => verifyReleaseEnvironment(
+    environment,
+    policies,
+    actor,
+    { total_count: 7, repositories: [{ id: 1, full_name: "hasna/accounts" }] },
+    repository,
+  )).toThrow("scoped to exactly one repository");
+  expect(() => verifyReleaseEnvironment(
+    environment,
+    policies,
+    actor,
+    { total_count: 1 },
+    repository,
+  )).toThrow("must list its repositories");
 });
 
 test("allows only advancing or exact-idempotent semantic promotion", () => {
@@ -1973,11 +2001,37 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(workflow).toContain("group: hasna-accounts-npm-release");
   expect(workflow).not.toContain("group: release-${{ github.ref }}");
   expect(workflow).toContain("id-token: write");
-  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED");
-  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN: ${{ secrets.RELEASE_GITHUB_ADMIN_TOKEN }}");
+  // The admin credential is minted per run from the App, never stored, so the
+  // presence gate gets the App credentials and the preflight steps get the
+  // minted token. Asserting the secret form is ABSENT keeps a stored
+  // installation token — which would expire mid-life and fail as an
+  // authorization error — from creeping back in.
+  expect(workflow).toContain("RELEASE_APP_ID_CONFIGURED");
+  expect(workflow).toContain("RELEASE_APP_PRIVATE_KEY_CONFIGURED");
+  expect(workflow).not.toContain("secrets.RELEASE_GITHUB_ADMIN_TOKEN");
+  expect(workflow).toContain("uses: actions/create-github-app-token");
+  expect(workflow).toContain("repositories: accounts");
+  // The permission pin is the whole of the P1-1 remedy and it is ONE YAML line.
+  // Nothing at runtime can defend it: current_user_can_bypass has no
+  // discriminating power over the permission level — a token minted with
+  // administration:write returns "never" too, while also being able to author
+  // the ruleset it certifies. Measured: write -> POST /rulesets 201 CREATED,
+  // read -> 403. So a silent regression from read back to write is invisible
+  // everywhere except here.
+  expect(workflow).toContain("permission-administration: read");
+  expect(workflow).toContain("permission-metadata: read");
+  expect(workflow).not.toContain("permission-administration: write");
+  expect(workflow).toContain(
+    "RELEASE_GITHUB_ADMIN_TOKEN: ${{ steps.release-admin-token.outputs.token }}",
+  );
   expect(
-    workflow.match(/RELEASE_GITHUB_ADMIN_TOKEN: \$\{\{ secrets\.RELEASE_GITHUB_ADMIN_TOKEN \}\}/g),
+    workflow.match(
+      /RELEASE_GITHUB_ADMIN_TOKEN: \$\{\{ steps\.release-admin-token\.outputs\.token \}\}/g,
+    ),
   ).toHaveLength(3);
+  // The token must be minted before the first step that consumes it.
+  expect(workflow.indexOf("id: release-admin-token"))
+    .toBeLessThan(workflow.indexOf("release-provenance.ts preflight"));
   expect(workflow).toContain("bun run test:provenance-crypto");
   expect(workflow).toContain(`node-version: "${RELEASE_NODE_VERSION}"`);
   expect(workflow).toContain(`bun-version: "${RELEASE_BUN_VERSION}"`);
@@ -2147,8 +2201,45 @@ test("release workflow names its missing environment secrets before doing any wo
   const secretsStep = workflow.indexOf("NPM_DIST_TAG_TOKEN is not configured");
   expect(secretsStep).toBeGreaterThan(-1);
   expect(secretsStep).toBeLessThan(preflightStep);
-  expect(workflow).toContain("RELEASE_GITHUB_ADMIN_TOKEN is not configured");
+  // Each credential the release actually depends on must still fail BY NAME.
+  // The admin token is minted rather than stored, so the names that can be
+  // missing are the App's, not the token's.
+  expect(workflow).toContain("RELEASE_APP_ID is not configured");
+  expect(workflow).toContain("RELEASE_APP_PRIVATE_KEY is not configured");
   expect(workflow.indexOf("uses: actions/checkout")).toBeGreaterThan(secretsStep);
+});
+
+// This test exists because the fixture-based tests above CANNOT catch env drift
+// between the workflow and the script: they hand-write the environment, so they
+// assert a state the workflow may no longer produce. That is exactly how a
+// release-blocking defect shipped — the workflow stopped exporting
+// RELEASE_GITHUB_ADMIN_TOKEN_CONFIGURED while workflowIdentity() still required
+// it, and every test stayed green because every fixture supplied it by hand.
+//
+// So derive the contract from the two artefacts instead of restating it: what
+// the script REQUIRES must be exactly what the workflow PROVIDES. Equality is
+// deliberate rather than subset — a presence flag the workflow exports and
+// nothing reads is dead configuration that reads as a live guard.
+test("every *_CONFIGURED flag the script requires is exactly the set the workflow exports", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  const script = readFileSync(
+    new URL("./release-provenance.ts", import.meta.url),
+    "utf8",
+  );
+  const provided = new Set(
+    [...workflow.matchAll(/^\s+([A-Z][A-Z0-9_]*_CONFIGURED):/gm)].map((m) => m[1]),
+  );
+  const required = new Set(
+    [...script.matchAll(/env\.([A-Z][A-Z0-9_]*_CONFIGURED)/g)].map((m) => m[1]),
+  );
+  // Positive control on the extractors themselves: an empty set on either side
+  // would make the comparison vacuously pass in the direction that loses.
+  expect(provided.size).toBeGreaterThan(0);
+  expect(required.size).toBeGreaterThan(0);
+  expect([...required].sort()).toEqual([...provided].sort());
 });
 
 // `test` is a required status check on main and a separate job would not be, so
