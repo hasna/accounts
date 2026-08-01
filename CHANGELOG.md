@@ -6,6 +6,41 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- **A prelaunch render can no longer REDUCE a home's instruction sources
+  (todos `c461ce8a`).** Measured on station01 2026-08-01: 25 of 30 claude
+  profile homes held a canonical 19-source render alongside a 12-source
+  identity export. `accounts launch` renders from the export, and
+  `configs session apply` then deletes the seven unmatched managed files as
+  `stale managed file removed` — so a single launch silently stripped seven
+  doctrine rules from a governed home, at rc=0, recorded as `result: applied`.
+  `account028` had already fired; the other 24 were one launch away.
+
+  The render is now refused **before it runs** whenever the identity exports
+  declare a strict subset of what the home's existing manifest already carries.
+  The home is kept, the dropped ids are named on stderr and in the audit, the
+  run records `result: skipped`, and **the launch still proceeds** — the
+  disposition already used one branch up for the no-sources case. Failing closed
+  *after* the render, which is where the previous guard sat, buys the corruption
+  and a dead launch together.
+
+  The floor comes from the home's own prior manifest, so it is independent of
+  the export being validated and needs no configured rule list. `accounts` still
+  does not encode the canonical set. The shortfall guard gains a third state,
+  `incumbent`, distinct from `armed` and `unarmed`, so a surface can tell
+  "checked against the home's own floor" from "could not check".
+
+  Deliberate retirements go through the new `--allow-instruction-reduction`
+  (`allowSourceReduction`), which skips the floor entirely.
+
+- **The shortfall check no longer disarms itself at the display cap.** It
+  compared against `manifest.sourceIds`, truncated at `MAX_SOURCE_IDS` (20) for
+  the bounded audit record, and skipped the comparison outright once
+  `sourceIdsTruncated` was set. With a canonical set of 19 the guard was one
+  rule away from silently reporting nothing missing, forever. Comparison now
+  uses a new uncapped `readManifestSourceIds()`; the audit record stays bounded.
+
 ## [0.2.30] - 2026-08-01
 
 Ships the alias capability, which was merged after `0.2.29` had already been
