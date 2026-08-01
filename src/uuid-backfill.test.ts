@@ -11,7 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildProfileRegistry } from "./lib/profile-registry.js";
-import { applyAccountUuidBackfill, planAccountUuidBackfill } from "./lib/uuid-backfill.js";
+import { applyAccountUuidBackfill, planAccountUuidBackfill, summarizeBackfill } from "./lib/uuid-backfill.js";
 import { getTool } from "./lib/tools.js";
 
 const OWN_UUID = "11111111-1111-4111-8111-111111111111";
@@ -207,5 +207,107 @@ describe("plan shape", () => {
     makeCentral(OWN_UUID, "own@example.com");
     const plan = planFor([makeProfileDir("acct-k", { own: OWN_UUID }), makeProfileDir("acct-l", {})]);
     expect(plan.every((row) => row.provider === "claude")).toBe(true);
+  });
+});
+
+describe("a uuid claimed by more than one profile — CRITICAL, task 2b15400e", () => {
+  // Measured on live data 2026-08-01: `accounts registry --backfill-uuid --tool
+  // claude` (dry run) proposed the SAME uuid as `backfilled` for THREE separate
+  // profiles (account001, account002, account088) and a second uuid for TWO more
+  // (account032, account039), while `summary.conflict` read 0 throughout. Each
+  // row is planned independently in `planOne` with no cross-row check, so two
+  // profiles independently resolving the same parked identity both look like
+  // clean, confirmed, "safe to write" backfills. This is exactly the join this
+  // module exists to forbid, arrived at without using any of the three named
+  // forbidden joins: two directories can genuinely each have the SAME uuid
+  // parked at `.accounts-auth/oauth-account.json`, and per-row planning cannot
+  // see that from a single row.
+  //
+  // The design spec names this — one uuid claimed twice within one provider —
+  // as the abort condition. A `backfilled` outcome is documented as "confirmed,
+  // safe to write" (docs/name-invariant.md); a uuid proposed for two profiles is
+  // not safe to write for either, because at most one of the two bindings can be
+  // correct and nothing here can say which — the same epistemic problem the
+  // existing per-profile `conflict` outcome already refuses to guess through.
+
+  test("REGRESSION: two profiles independently resolving the SAME uuid are both flagged, never backfilled", () => {
+    makeCentral(OWN_UUID, "shared@example.com");
+    const plan = planFor([
+      makeProfileDir("account001", { own: OWN_UUID }),
+      makeProfileDir("account002", { own: OWN_UUID }),
+      makeProfileDir("account088", { own: OWN_UUID }),
+    ]);
+    const summary = summarizeBackfill(plan);
+
+    // The exact defect: on unfixed code this reads backfilled=3, conflict=0.
+    expect(summary.conflict).toBeGreaterThan(0);
+    expect(summary.backfilled).toBe(0);
+
+    for (const row of plan) {
+      expect(row.outcome).toBe("conflict");
+      expect(row.accountUuid).toBeUndefined();
+      expect(row.reason).toMatch(/more than one|also.*profile|claimed.*twice/i);
+    }
+  });
+
+  test("a duplicate claim does not swallow an UNRELATED, unambiguous profile in the same plan", () => {
+    makeCentral(OWN_UUID, "shared@example.com");
+    makeCentral(SECOND_UUID, "clean@example.com");
+    const plan = planFor([
+      makeProfileDir("account001", { own: OWN_UUID }),
+      makeProfileDir("account002", { own: OWN_UUID }),
+      makeProfileDir("account-clean", { own: SECOND_UUID }),
+    ]);
+    const byName = new Map(plan.map((p) => [p.profileName, p]));
+    expect(byName.get("account001")!.outcome).toBe("conflict");
+    expect(byName.get("account002")!.outcome).toBe("conflict");
+    expect(byName.get("account-clean")!.outcome).toBe("backfilled");
+    expect(byName.get("account-clean")!.accountUuid).toBe(SECOND_UUID);
+  });
+
+  test("two INDEPENDENT duplicate groups in one plan are both caught, matching the live-data shape", () => {
+    // account001/account002/account088 collide on one uuid; account032/account039
+    // collide on a second, distinct uuid — exactly the shape measured live.
+    makeCentral(OWN_UUID, "group-a@example.com");
+    makeCentral(SECOND_UUID, "group-b@example.com");
+    const plan = planFor([
+      makeProfileDir("account001", { own: OWN_UUID }),
+      makeProfileDir("account002", { own: OWN_UUID }),
+      makeProfileDir("account088", { own: OWN_UUID }),
+      makeProfileDir("account032", { own: SECOND_UUID }),
+      makeProfileDir("account039", { own: SECOND_UUID }),
+    ]);
+    const summary = summarizeBackfill(plan);
+    expect(summary.conflict).toBe(5);
+    expect(summary.backfilled).toBe(0);
+  });
+
+  test("applyAccountUuidBackfill never writes a uuid that was claimed by more than one profile", async () => {
+    makeCentral(OWN_UUID, "shared@example.com");
+    const plan = planFor([
+      makeProfileDir("account001", { own: OWN_UUID }),
+      makeProfileDir("account002", { own: OWN_UUID }),
+    ]);
+    const touched: string[] = [];
+    const applied = await applyAccountUuidBackfill(
+      {
+        async updateProfile(name: string) {
+          touched.push(name);
+          return {};
+        },
+      },
+      plan,
+    );
+    expect(applied).toEqual([]);
+    expect(touched).toEqual([]);
+  });
+
+  test("POSITIVE CONTROL: a uuid resolved by exactly one profile is unaffected and still backfills", () => {
+    // Proves the duplicate check is discriminating rather than blanket-suppressing
+    // every backfilled row once any conflict exists anywhere in the run.
+    makeCentral(OWN_UUID, "solo@example.com");
+    const plan = planFor([makeProfileDir("account-solo", { own: OWN_UUID })]);
+    expect(plan[0]!.outcome).toBe("backfilled");
+    expect(plan[0]!.accountUuid).toBe(OWN_UUID);
   });
 });

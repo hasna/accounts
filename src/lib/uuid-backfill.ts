@@ -77,7 +77,69 @@ export function planAccountUuidBackfill(
   existing: ReadonlyMap<string, string> = new Map(),
 ): BackfillPlanEntry[] {
   const centralUuids = new Set(registry.central.map((entry) => entry.accountUuid.toLowerCase()));
-  return registry.entries.map((entry) => planOne(entry, centralUuids, existing));
+  const plan = registry.entries.map((entry) => planOne(entry, centralUuids, existing));
+  return resolveDuplicateClaims(plan);
+}
+
+/**
+ * CRITICAL, task 2b15400e. `planOne` decides each row in isolation, so it
+ * cannot see that two different profiles both independently resolved the SAME
+ * parked identity — two directories can each genuinely carry the same
+ * `.accounts-auth/oauth-account.json` uuid (a stale copy, a botched restore, a
+ * shared parent dir), and per-row planning reads both as clean, confirmed,
+ * `backfilled` rows. Measured live on 2026-08-01: one uuid proposed for
+ * account001/account002/account088, a second for account032/account039, and
+ * `summary.conflict` read 0 throughout — the exact guard this series exists to
+ * provide, reporting clean while the condition it guards against is present.
+ *
+ * `backfilled` is documented as "confirmed, safe to write"
+ * (docs/name-invariant.md). A uuid claimed by more than one profile is not
+ * safe to write for ANY of them: at most one binding can be correct and
+ * nothing here can say which — the identical epistemic problem the per-row
+ * `conflict` outcome already refuses to guess through for a single profile
+ * whose existing record disagrees with its parked identity. This is that same
+ * refusal, applied across rows instead of within one: reuse `conflict` rather
+ * than invent a second outcome, so `applyAccountUuidBackfill` (which already
+ * writes only `backfilled` rows) requires no change to stop applying these.
+ *
+ * Deliberately NOT a whole-plan abort: an unrelated, unambiguous row elsewhere
+ * in the same plan is untouched and still backfills. Refusing the entire run
+ * over one duplicate would also block every unrelated, already-confirmed
+ * profile in it, which is the same reasoning docs/name-invariant.md gives for
+ * why the merged-universe check WARNS instead of refusing outright while real
+ * data is dirty. The narrower, per-row refusal already closes the actual
+ * hazard: `--apply` will never write a uuid this function cannot say is
+ * uniquely claimed.
+ */
+function resolveDuplicateClaims(plan: BackfillPlanEntry[]): BackfillPlanEntry[] {
+  const claimants = new Map<string, BackfillPlanEntry[]>();
+  for (const row of plan) {
+    if (row.outcome !== "backfilled" || !row.accountUuid) continue;
+    const rows = claimants.get(row.accountUuid) ?? [];
+    rows.push(row);
+    claimants.set(row.accountUuid, rows);
+  }
+
+  const duplicated = new Map([...claimants.entries()].filter(([, rows]) => rows.length > 1));
+  if (duplicated.size === 0) return plan;
+
+  return plan.map((row) => {
+    const uuid = row.accountUuid;
+    if (row.outcome !== "backfilled" || !uuid || !duplicated.has(uuid)) return row;
+    const selfLabel = row.profileName ?? "(unregistered)";
+    const siblings = duplicated
+      .get(uuid)!
+      .map((r) => r.profileName ?? "(unregistered)")
+      .filter((label) => label !== selfLabel);
+    const { accountUuid: _drop, ...withoutUuid } = row;
+    return {
+      ...withoutUuid,
+      outcome: "conflict",
+      reason:
+        `${uuid} is also the parked identity resolved for ${siblings.join(", ")}; refusing to apply — ` +
+        "a uuid claimed by more than one profile means at most one binding is correct and this cannot say which",
+    };
+  });
 }
 
 function planOne(

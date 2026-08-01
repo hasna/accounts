@@ -6,6 +6,18 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- **CRITICAL: `registry --backfill-uuid` could silently write one `accountUuid`
+  onto multiple profiles.** `planAccountUuidBackfill` planned each profile in
+  isolation, so two directories that independently resolved the SAME parked
+  identity both read as clean, confirmed `backfilled` rows and
+  `summary.conflict` reported `0` throughout. Measured live: one uuid proposed
+  for three profiles, a second for two more, with no conflict surfaced. A uuid
+  now claimed by more than one profile in the same plan is downgraded to the
+  existing `conflict` outcome for every row involved (never applied); unrelated,
+  unambiguous rows in the same plan are unaffected. (task `2b15400e`)
+
 ## [0.2.29] - 2026-07-31
 
 The first release intended to go through the release workflow rather than
