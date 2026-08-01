@@ -34,6 +34,14 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   Deliberate retirements go through the new `--allow-instruction-reduction`
   (`allowSourceReduction`), which skips the floor entirely.
 
+  The refusal records `droppedSourceIds` / `droppedSourceCount` as structured
+  fields on the audit. The prose `reason` is capped at `MAX_REASON_LENGTH`
+  (220): measured on the real station01 fixture, an eight-id refusal produced a
+  reason of exactly 220 characters that named two ids and cut off mid-list, so
+  the audit was least informative in exactly the cases where the most was being
+  removed. The structured fields are bounded by count, like `sourceIds`, rather
+  than by slicing the middle out of the payload.
+
 - **The shortfall check no longer disarms itself at the display cap.** It
   compared against `manifest.sourceIds`, truncated at `MAX_SOURCE_IDS` (20) for
   the bounded audit record, and skipped the comparison outright once

@@ -1326,6 +1326,43 @@ describe("configs prelaunch instruction preservation", () => {
     }
   });
 
+  test("records EVERY dropped id in the audit, not just what fits in the prose reason", () => {
+    // The prose `reason` is capped at MAX_REASON_LENGTH (220). Measured on the
+    // real station01 fixture, an eight-id refusal produced a reason of exactly
+    // 220 characters naming two of them and cutting off mid-list — so the audit
+    // was least informative precisely where the most was being removed, while
+    // the changelog claimed the ids were named there. Bound by count, not by
+    // slicing the middle out of the payload.
+    resetHome();
+    try {
+      const longIncumbent = Array.from({ length: 9 }, (_, i) => `global-a-deliberately-long-instruction-source-id-number-${i}`);
+      const exportPath = join(home, "short-export.configs.json");
+      writeExport(exportPath, longIncumbent.slice(0, 2));
+      const p = profileInHome("claude", { identity: exportPath });
+      writeManifest(p, "claude", longIncumbent.map((id) => ({ id })));
+
+      const result = runConfigsPrelaunch(p, getTool("claude"), {
+        runner: renderingRunner(p, "claude", longIncumbent.slice(0, 2), []),
+      });
+      expect(result.result).toBe("skipped");
+
+      const audit = JSON.parse(
+        readFileSync(join(p.dir, ".hasna", "accounts", "prelaunch-status.json"), "utf8"),
+      ) as { reason?: string; droppedSourceIds?: string[]; droppedSourceCount?: number };
+
+      // The prose really is truncated — this is the condition being defended
+      // against, so assert it rather than assume it.
+      expect(audit.reason!.length).toBe(220);
+      expect(audit.reason).not.toContain(longIncumbent[8]);
+
+      // …and the structured field carries all seven regardless.
+      expect(audit.droppedSourceCount).toBe(7);
+      expect(audit.droppedSourceIds).toEqual(longIncumbent.slice(2));
+    } finally {
+      cleanup();
+    }
+  });
+
   test("still renders when the export covers everything the home carries", () => {
     // The must-not-over-block control. A guard that blocks every launch is its
     // own outage, so the ordinary case has to be shown passing in the same run
