@@ -840,3 +840,105 @@ test("a valid identity still purges — the identity check refuses only bad inpu
   expect(result.purgeNote).toBeUndefined();
   expect(existsSync(p.dir)).toBe(false);
 });
+
+// --- the status line reaches the profile's own settings.json (4f2e0bd2) ------
+//
+// Claude Code reads `statusLine` from $CLAUDE_CONFIG_DIR/settings.json, exactly
+// like `hooks`, and `accounts` points CLAUDE_CONFIG_DIR at the profile dir. A
+// status line configured on the machine therefore reaches the machine's shared
+// home and nothing else: every profile minted after a one-time seeding sweep is
+// born without it and silently shows no status line (measured 2026-08-02 on
+// station01: 22 of 33 claude profiles carried the key, and the 11 that did not
+// were the contiguous newest block — account033..account041 plus `anya`, which
+// is what a snapshot sweep followed by continued minting looks like).
+//
+// The key is seeded, never authored here: no command string, path, or binary
+// name appears in this package. What lands in a profile is whatever the
+// machine's own settings.json declares, so this stays a mechanism and the fleet
+// supplies the policy — the same split the `hooks` spec above already makes.
+
+/** Shape Claude Code actually reads: a command-type status line row. */
+function seedSharedStatusLine(root: string, command: string): void {
+  const existing = existsSync(join(root, "settings.json")) ? readJson(join(root, "settings.json")) : {};
+  writeFileSync(
+    join(root, "settings.json"),
+    JSON.stringify({ ...existing, statusLine: { type: "command", command, padding: 0 } }),
+  );
+}
+
+test("a profile is BORN with the machine's statusLine in its own settings.json", () => {
+  seedSharedStatusLine(sharedHome, "statusline render");
+
+  const p = addProfile({ name: "statusline-at-birth" });
+
+  const settingsPath = join(p.dir, "settings.json");
+  expect(existsSync(settingsPath)).toBe(true);
+  const statusLine = readJson(settingsPath).statusLine as Record<string, unknown>;
+  expect(statusLine).toEqual({ type: "command", command: "statusline render", padding: 0 });
+});
+
+test("a profile created before the statusLine spec is repaired through the same code path", () => {
+  // The 10 profiles already on disk: minted while the machine declared no
+  // status line, then repaired by the ensure pass that runs on env/launch/switch.
+  const p = addProfile({ name: "statusline-legacy" });
+  const settingsPath = join(p.dir, "settings.json");
+  const born = existsSync(settingsPath) ? readJson(settingsPath).statusLine : undefined;
+  expect(born).toBeUndefined();
+
+  seedSharedStatusLine(sharedHome, "statusline render");
+  ensureSharedCapabilities(p.dir, getTool("claude"));
+
+  expect(readJson(join(p.dir, "settings.json")).statusLine).toEqual({
+    type: "command",
+    command: "statusline render",
+    padding: 0,
+  });
+});
+
+test("a profile's own statusLine member wins, and unseen members are still seeded", () => {
+  seedSharedStatusLine(sharedHome, "/shared/statusline render");
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "own-statusline" });
+  writeFileSync(
+    join(p.dir, "settings.json"),
+    JSON.stringify({ statusLine: { type: "command", command: "/profile/mine.sh" } }),
+  );
+
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+  ensureSharedCapabilities(p.dir, getTool("claude"));
+
+  const statusLine = readJson(join(p.dir, "settings.json")).statusLine as Record<string, unknown>;
+  // union by member name, profile always wins — the documented merge semantics
+  expect(statusLine.command).toBe("/profile/mine.sh");
+  expect(statusLine.padding).toBe(0);
+});
+
+test("a machine that declares NO statusLine seeds none, and still launches", () => {
+  // The negative control. Without it this spec could be satisfied by a rule that
+  // writes a statusLine unconditionally, which would author policy in code and
+  // put a broken command into every profile on a machine that wants none.
+  const p = addProfile({ name: "no-statusline-machine" });
+
+  const settingsPath = join(p.dir, "settings.json");
+  // Nothing to seed from either spec, so the file is not created at all; if some
+  // other rule does create it, it must still carry no statusLine.
+  const statusLine = existsSync(settingsPath) ? readJson(settingsPath).statusLine : undefined;
+  expect(statusLine).toBeUndefined();
+  // statusLine is deliberately NOT `required`: an absent status line is visible
+  // on screen, unlike an absent guard hook, so it must never refuse a launch.
+  expect(() => assertProfileGuarded(p.dir, getTool("claude"))).not.toThrow();
+});
+
+test("a machine that declares a statusLine still never refuses a launch for a profile missing it", () => {
+  seedSharedStatusLine(sharedHome, "statusline render");
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
+  const p = addProfile({ name: "statusline-unseeded" });
+  process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+
+  const row = sharedCapabilityHealth(p.dir, getTool("claude")).config.find((c) => c.key === "statusLine");
+  expect(row).toBeDefined();
+  expect(row!.status).toBe("missing");
+  expect(row!.target).toBe(join(p.dir, "settings.json"));
+  // reported by doctor, never fatal
+  expect(() => assertProfileGuarded(p.dir, getTool("claude"))).not.toThrow();
+});
