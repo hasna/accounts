@@ -86,6 +86,28 @@ export const BUILTIN_TOOLS: ToolDef[] = [
         // refused launch.
         required: true,
       },
+      // The status line is the same mechanism as hooks and a DIFFERENT policy,
+      // which is why it is its own spec rather than another key on the one
+      // above. Claude Code reads `statusLine` from
+      // `<CLAUDE_CONFIG_DIR>/settings.json` too, so a status line configured in
+      // the machine's shared home reaches that home and no profile — every
+      // profile minted after a one-time seeding sweep is born without one.
+      // Measured 2026-08-02 on station01: 22 of 33 claude profiles had the key
+      // and the 11 that did not were the contiguous newest block, which is what
+      // a snapshot sweep plus continued minting looks like.
+      //
+      // NOT `required`: an absent status line is visible on screen, so it is a
+      // cosmetic loss, where an absent guard hook is silent. Refusing a launch
+      // over it would trade a missing status bar for an unusable profile.
+      //
+      // As with hooks, no command is named here. Whatever the machine's own
+      // settings.json declares is what a profile inherits, so the binary's path
+      // is machine configuration and never a constant in this package.
+      {
+        target: "settings.json",
+        sources: ["settings.json"],
+        keys: ["statusLine"],
+      },
     ],
     // Measured on this machine: transcripts live at
     // `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<sessionId>.jsonl`, with
