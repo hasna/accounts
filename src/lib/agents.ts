@@ -44,7 +44,12 @@ export interface ProcessInfo {
   configDir?: string;
 }
 
-export type ProcessScanner = (toolId: string) => ProcessInfo[];
+export interface ProcessScanResult {
+  available: boolean;
+  processes: ProcessInfo[];
+}
+
+export type ProcessScanner = (toolId: string) => ProcessInfo[] | ProcessScanResult;
 
 function isProjectedRecord(value: unknown): value is AgentEntry {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -1486,13 +1491,35 @@ export function isToolSessionCommand(
 
 /** Scan running processes for agent sessions of a tool (pid, ppid, command, config dir). */
 export function scanToolProcesses(toolId = "claude"): ProcessInfo[] {
+  return scanToolProcessesWithAvailability(toolId).processes;
+}
+
+/**
+ * Scan with an explicit coverage verdict. The public array-only scanner keeps
+ * its historical best-effort contract, while callers that distinguish "none"
+ * from "could not inspect" can fail closed.
+ */
+export function scanToolProcessesWithAvailability(
+  toolId = "claude",
+  targetPlatform: NodeJS.Platform = platform(),
+): ProcessScanResult {
+  // Kernel-owned executable and environment attribution below uses Linux
+  // /proc. `ps` alone is not enough: its command text is mutable, and treating
+  // an unverified empty result as coverage makes every macOS/Windows profile
+  // look vacant even while a provider process is running.
+  if (targetPlatform !== "linux" || !readProcessExecutable(process.pid)) {
+    return { available: false, processes: [] };
+  }
+
   const tool = getTool(toolId);
   const bin = tool.bin ?? toolId;
   const res = spawnSync("ps", ["-axo", "pid=,ppid=,args="], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });
-  if (res.status !== 0 || !res.stdout) return [];
+  if (res.error || res.status !== 0 || !res.stdout) {
+    return { available: false, processes: [] };
+  }
 
   const out: ProcessInfo[] = [];
   for (const line of res.stdout.split("\n")) {
@@ -1516,7 +1543,7 @@ export function scanToolProcesses(toolId = "claude"): ProcessInfo[] {
     const configDir = readProcessEnvVar(pid, tool.envVar);
     out.push({ pid, ppid, command, ...(configDir ? { configDir } : {}) });
   }
-  return out;
+  return { available: true, processes: out };
 }
 
 /** Read the kernel-owned executable identity for a process (Linux /proc only). */

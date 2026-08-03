@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { writeUsageCache } from "./lib/auto-switch.js";
 import { BUILTIN_TOOLS } from "./lib/builtin-tools.js";
 import { writeSwitchedAccountMarker } from "./lib/claude-auth.js";
-import type { ProcessInfo } from "./lib/agents.js";
+import {
+  scanToolProcessesWithAvailability,
+  type ProcessInfo,
+} from "./lib/agents.js";
 import { resolveStore } from "./lib/store.js";
 import { parseUsageResponse } from "./lib/usage.js";
 import { collectProfilesUsage } from "./lib/usage-report.js";
@@ -289,6 +292,30 @@ test("default profile usage covers every registered tool, stays cache-only, and 
   ]) {
     expect(profileJson).not.toContain(forbidden);
   }
+});
+
+test("unavailable process coverage stays unknown instead of reporting every profile vacant", async () => {
+  const report = await collectProfilesUsage(
+    {
+      env: fixtureEnv(),
+      processScanner: () => ({ available: false, processes: [] }),
+    },
+    resolveStore(fixtureEnv()),
+  );
+
+  expect(report.profiles.every((profile) => profile.occupancy.status === "unknown")).toBe(true);
+  expect(report.profiles.every((profile) => profile.occupancy.scanAvailable === false)).toBe(true);
+});
+
+test("the default scanner declares platforms without Linux process attribution unavailable", () => {
+  expect(scanToolProcessesWithAvailability("claude", "darwin")).toEqual({
+    available: false,
+    processes: [],
+  });
+  expect(scanToolProcessesWithAvailability("claude", "win32")).toEqual({
+    available: false,
+    processes: [],
+  });
 });
 
 test("tool filtering returns only that registered profile and scans only that tool", async () => {

@@ -25,7 +25,12 @@ import {
 } from "./readiness.js";
 import { readSwitchedAccountMarker } from "./claude-auth.js";
 import { sameConfigDir } from "./safe-path.js";
-import { scanToolProcesses, type ProcessInfo, type ProcessScanner } from "./agents.js";
+import {
+  scanToolProcessesWithAvailability,
+  type ProcessInfo,
+  type ProcessScanner,
+  type ProcessScanResult,
+} from "./agents.js";
 import type { Profile } from "../types.js";
 
 /**
@@ -363,12 +368,17 @@ export async function collectProfilesUsage(
     entries.push(profile);
     profilesByTool.set(profile.tool, entries);
   }
-  const scanner = opts.processScanner ?? scanToolProcesses;
+  const scanner = opts.processScanner ?? scanToolProcessesWithAvailability;
   const processesByTool = new Map<string, ProcessInfo[]>();
   const scanFailedTools = new Set<string>();
   for (const tool of profilesByTool.keys()) {
     try {
-      processesByTool.set(tool, scanner(tool));
+      const scanned = scanner(tool);
+      const result: ProcessScanResult = Array.isArray(scanned)
+        ? { available: true, processes: scanned }
+        : scanned;
+      if (!result.available) scanFailedTools.add(tool);
+      processesByTool.set(tool, result.processes);
     } catch {
       scanFailedTools.add(tool);
       processesByTool.set(tool, []);
