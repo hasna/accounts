@@ -503,9 +503,13 @@ test("credential-binding: the FIRST write of an unseen credential is not filed u
     writeOAuth(profileOAuthSnapshot(dirA), UUID_A, "a@example.com");
     writeCred(profileCredentialsSnapshot(dirA), shared, NEW);
 
-    // The central store has NEVER seen this credential: no slot holds it, no
-    // binding record names it. That is the bootstrap condition.
-    expect(credentialClaimants(credentialFingerprintFromBytes(Buffer.from(credBytes(shared)))!)).toEqual([]);
+    // The bootstrap condition, stated over the store that populates the gate:
+    // the CENTRAL store has never seen this credential — no slot holds it and
+    // no binding record names it — so the claim index the pre-#120 gate builds
+    // is empty of these bytes.
+    expect(existsSync(centralCredentialsSnapshot(UUID_B))).toBe(false);
+    expect(readCredentialBinding(UUID_B)).toBeUndefined();
+    expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(false);
 
     const result = syncProfileSnapshotToCentral(dirA, tool);
 

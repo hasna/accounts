@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { accountsHome } from "../storage.js";
+import { accountsHome, profilesDir } from "../storage.js";
 import {
   centralAuthDir,
   centralAuthRoot,
@@ -9,6 +9,7 @@ import {
   centralOAuthSnapshot,
   isAccountUuid,
 } from "./auth-store.js";
+import { profileCredentialsSnapshot, profileOAuthSnapshot } from "./claude-layout.js";
 import { writeFileAtomic } from "./safe-path.js";
 
 /**
@@ -281,18 +282,85 @@ function centralAccountUuids(): string[] {
   return uuids.sort();
 }
 
+/**
+ * THE BOOTSTRAP CLAIM (todos 713f3a80).
+ *
+ * The central store alone cannot answer the FIRST write of a credential it has
+ * never seen. `recordCredentialBinding` runs only AFTER a successful central
+ * write, so on that first write the index the gate consults is empty of these
+ * bytes, `classifyCredentialWrite` returns "bind", and the credential is filed
+ * under whichever uuid asked — including the wrong one. The gate was populated
+ * by the very write it polices, which made it vacuous exactly once per
+ * credential, which is exactly the once that matters.
+ *
+ * A PROFILE'S PARKED SNAPSHOT IS EVIDENCE THAT DOES NOT DEPEND ON THAT WRITE.
+ * `<profile>/.accounts-auth/oauth-account.json` names the account whose
+ * credential is parked beside it in `credentials.json`, and that pair is
+ * written before, and independently of, any central sync. When TWO profiles'
+ * snapshots name TWO different accounts and hold ONE refresh token, at most one
+ * of them is true — the "one credential under eight uuids" shape — and the
+ * central store need never have seen the token for that to be provable.
+ *
+ * THIS IS STILL NOT CONTAINMENT REASONING. A container's claim is only as good
+ * as the last thing that wrote it, and nothing here trusts a container to say
+ * "these bytes are mine". It uses the containers only to COUNT how many
+ * distinct accounts assert ownership of one token, and refuses when the answer
+ * is more than one. A single asserting profile — the ordinary case — claims the
+ * fingerprint for itself and changes no verdict, so a legitimate first sync
+ * still binds.
+ *
+ * ONLY THE PARKED SNAPSHOT PAIR IS READ, never the dir's LIVE
+ * `.credentials.json`. The live file is the outgoing-identity door: after an
+ * in-place switch it legitimately carries the CURRENT OCCUPANT's credential
+ * rather than the dir's own, so counting it would report an ordinary switch as
+ * a conflict.
+ */
+function profileSnapshotClaims(): Array<{ uuid: string; fingerprint: string }> {
+  const root = profilesDir();
+  let entries: string[];
+  try {
+    if (!existsSync(root) || !statSync(root).isDirectory()) return [];
+    entries = readdirSync(root);
+  } catch {
+    return [];
+  }
+  const claims: Array<{ uuid: string; fingerprint: string }> = [];
+  for (const entry of entries) {
+    const dir = join(root, entry);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const oauth = readJsonFile(profileOAuthSnapshot(dir))?.oauthAccount;
+    if (!oauth || typeof oauth !== "object") continue;
+    const uuid = (oauth as JsonRecord).accountUuid;
+    // Strict-uuid parity with `centralAccountUuids`: a snapshot naming
+    // something that is not an account uuid asserts nothing.
+    if (typeof uuid !== "string" || !isAccountUuid(uuid)) continue;
+    const fingerprint = credentialFingerprintFromFile(profileCredentialsSnapshot(dir));
+    if (!fingerprint) continue;
+    claims.push({ uuid: uuid.toLowerCase(), fingerprint });
+  }
+  return claims;
+}
+
 export function buildCredentialClaimIndex(): CredentialClaimIndex {
   const index: CredentialClaimIndex = new Map();
-  for (const uuid of centralAccountUuids()) {
-    for (const fingerprint of bindingClaimsForAccount(uuid)) {
-      const holders = index.get(fingerprint);
-      if (holders) {
-        if (!holders.includes(uuid)) holders.push(uuid);
-      } else {
-        index.set(fingerprint, [uuid]);
-      }
+  const add = (fingerprint: string, uuid: string): void => {
+    const holders = index.get(fingerprint);
+    if (holders) {
+      if (!holders.includes(uuid)) holders.push(uuid);
+    } else {
+      index.set(fingerprint, [uuid]);
     }
+  };
+  for (const uuid of centralAccountUuids()) {
+    for (const fingerprint of bindingClaimsForAccount(uuid)) add(fingerprint, uuid);
   }
+  // Added AFTER the central claims, so central remains the primary record and
+  // this only ever widens the set of accounts known to assert a fingerprint.
+  for (const { uuid, fingerprint } of profileSnapshotClaims()) add(fingerprint, uuid);
   return index;
 }
 
