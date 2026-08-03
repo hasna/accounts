@@ -138,7 +138,7 @@ this is keyed on `oauthAccount.accountUuid`:
 
 - the identity index (`src/lib/identity-index.ts`) enumerates distinct
   accounts across every store, deduplicated by uuid;
-- usage is queried **once per account**, not per dir, and cached per uuid;
+- Claude usage is queried **once per account**, not per dir, and cached per uuid;
 - the selector returns an *account*, then resolves which profile door can
   serve it;
 - after a switch the hook re-reads the dir's active uuid and **asserts it
@@ -156,18 +156,34 @@ changes one implementation, not call sites.
 ## Commands
 
 ```bash
-accounts usage                 # per-account usage: headroom, windows, resets, doors
-accounts usage --json          # machine-readable; includes the session's currentUuid
-accounts usage --refresh       # bypass cache (also the hook's background cache warmer)
+accounts usage                 # every registered profile: usage/proxy, switch time, occupancy, launchability
+accounts usage --tool codewith # filter the same profile view to one tool
+accounts usage --json          # hasna.accounts.usage-profiles/v1 + legacy Claude accounts/currentUuid
+accounts usage --refresh       # explicitly refresh supported usage (also the Claude hook's cache warmer)
 accounts pick --healthiest     # non-interactive: most-headroom account, never the current one
 accounts pick --healthiest --no-act --json   # selection only, no apply
 accounts usage-hook            # the UserPromptSubmit handler (fail-open, cached-only)
 accounts usage-hook --print-install          # the settings.json snippet — NOT auto-installed
 ```
 
+The default `accounts usage` path does not call providers. Each registered
+profile gets a safe row with cached native rate-limit headroom when available
+(Claude today), otherwise an explicit readiness proxy or unknown state. Missing
+session/weekly axes stay unknown rather than becoming invented 100% values.
+Process occupancy is derived without exposing commands or config paths, and
+unattributed processes keep occupancy unknown. The launchability verdict is
+conservative: tools whose local auth cannot be validated report `unknown`, not
+`yes`.
+
+The JSON root retains the previous Claude `accounts` array and `currentUuid` so
+account-level consumers can migrate independently. The versioned `profiles`
+array is the cross-provider coordinator surface; it contains names and status
+data only, never credentials or auth payloads.
+
 ### What the status words mean
 
-`status` is a credential-**liveness** verdict and nothing else. The report never
+In the retained Claude `accounts` array, `status` is a credential-**liveness**
+verdict and nothing else. The report never
 crashes on a bad credential; it names the state:
 
 | status | meaning | operator action |

@@ -72,10 +72,17 @@ Configs prelaunch is supported for Claude, Codex, Codewith, opencode, and Cursor
 
 | Command | Options |
 | --- | --- |
-| `accounts usage` | `-t, --tool` (Claude-only, default Claude), `--refresh`, `--max-age <seconds>`, `--json`, `--quiet` |
+| `accounts usage` | All registered tools by default; optional `-t, --tool <tool>` filter, `--refresh`, `--max-age <seconds>`, `--json`, `--quiet` |
 | `accounts usage-hook` | `-t, --tool`, `--dir`, `--threshold`, `--min-headroom`, `--min-session-headroom`, `--cooldown`, `--max-age`, `--print-install` |
 
-The hook is fail-open and cache-only. It is not installed automatically. See
+`accounts usage` is cache-only by default. Its `hasna.accounts.usage-profiles/v1`
+JSON contains one safe row per registered profile (usage/readiness, last switch,
+occupancy, active/applied, launchability) and retains the root Claude `accounts`
+array for existing consumers. `--refresh` is the explicit provider-usage
+network gate; currently Claude supplies native session/weekly quota counters and
+other tools report the nearest supported readiness proxy.
+
+The Claude usage hook remains fail-open and cache-only. It is not installed automatically. See
 [Usage-aware automatic switching](usage-aware-switching.md) for required cache
 warming and the two-window selection rules.
 

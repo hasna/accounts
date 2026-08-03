@@ -17,6 +17,16 @@ import {
 } from "./auto-switch.js";
 import { fetchAccountUsage, type AccountUsage, type UsageFetchError } from "./usage.js";
 import { activeCooldowns, readExhaustionLedger } from "./exhaustion-ledger.js";
+import { deriveWindowHealth } from "./usage-windows.js";
+import {
+  getAccountsReadiness,
+  type AccountsProfileReadiness,
+  type AccountsReadinessStatus,
+} from "./readiness.js";
+import { readSwitchedAccountMarker } from "./claude-auth.js";
+import { sameConfigDir } from "./safe-path.js";
+import { scanToolProcesses, type ProcessInfo, type ProcessScanner } from "./agents.js";
+import type { Profile } from "../types.js";
 
 /**
  * `accounts usage` collector: one usage query per distinct ACCOUNT (uuid),
@@ -56,6 +66,8 @@ export interface CollectUsageOptions {
   tool?: string;
   /** Ignore the cache and query the endpoint for every account. */
   refresh?: boolean;
+  /** Return cache misses as unknown instead of querying the provider. */
+  cachedOnly?: boolean;
   /** Cache tolerance for reads (ms). */
   maxAgeMs?: number;
   fetchImpl?: typeof fetch;
@@ -97,6 +109,7 @@ export async function collectAccountsUsage(
       if (!opts.refresh) {
         const cached = readUsageCache(identity.accountUuid, maxAgeMs);
         if (cached?.usage) return { ...base, usage: cached.usage, source: "cache" };
+        if (opts.cachedOnly) return base;
       }
 
       const token = accessTokenForAccount(identity);
@@ -128,6 +141,274 @@ export async function collectAccountsUsage(
       return { ...base, error: result.error, source: "fetch" };
     }),
   );
+}
+
+export type ProfileUsageAvailability =
+  | {
+      kind: "rate-limit";
+      source: "cache" | "fetch";
+      fetchedAt: string;
+      sessionHeadroom: number | null;
+      weeklyHeadroom: number | null;
+    }
+  | {
+      kind: "readiness-proxy";
+      status: AccountsReadinessStatus;
+      reason: "no-cached-rate-limit-data" | "provider-rate-limit-unavailable";
+    }
+  | {
+      kind: "unknown";
+      reason: "profile-readiness-unavailable";
+    };
+
+export type ProfileOccupancy = {
+  status: "occupied" | "vacant" | "unknown";
+  scanAvailable: boolean;
+  processCount: number;
+  /** Tool processes that could not be attributed to any registered profile. */
+  unattributedProcessCount: number;
+};
+
+export type ProfileLaunchability = {
+  status: "yes" | "no" | "unknown";
+  reason:
+    | "ready"
+    | "provider-unavailable"
+    | "profile-directory-missing"
+    | "profile-directory-occupied"
+    | "profile-unavailable"
+    | "auth-unavailable"
+    | "auth-renewable"
+    | "auth-not-locally-verifiable"
+    | "profile-readiness-unavailable";
+};
+
+/**
+ * Safe, operator-facing row for the cross-tool usage view. Deliberately omits
+ * config paths, process commands, auth payloads, and provider responses: the
+ * coordinator needs selection signals, not the underlying credential surface.
+ */
+export interface ProfileUsageEntry {
+  name: string;
+  tool: string;
+  usage: ProfileUsageAvailability;
+  lastSwitchAt: string | null;
+  lastSwitchSource: "profile-selection" | "in-place-switch" | "unknown";
+  occupancy: ProfileOccupancy;
+  active: boolean;
+  applied: boolean;
+  launchable: ProfileLaunchability;
+}
+
+export interface ProfilesUsageReport {
+  schema: "hasna.accounts.usage-profiles/v1";
+  generatedAt: string;
+  profiles: ProfileUsageEntry[];
+  /** Existing Claude account-level data retained for backwards compatibility. */
+  accounts: AccountUsageEntry[];
+}
+
+export interface CollectProfilesUsageOptions {
+  /** Filter the registered profile view to one tool. */
+  tool?: string;
+  /** Explicitly refresh provider usage. Default is cache-only. */
+  refresh?: boolean;
+  maxAgeMs?: number;
+  fetchImpl?: typeof fetch;
+  env?: NodeJS.ProcessEnv;
+  now?: Date;
+  processScanner?: ProcessScanner;
+}
+
+function readinessKey(tool: string, name: string): string {
+  return `${tool}\0${name}`;
+}
+
+function latestSwitch(profile: Profile): Pick<ProfileUsageEntry, "lastSwitchAt" | "lastSwitchSource"> {
+  const selectedAt = profile.lastUsedAt;
+  const switchedAt =
+    profile.tool === "claude" ? readSwitchedAccountMarker(profile.dir)?.switchedAt : undefined;
+  const selectedMs = selectedAt ? Date.parse(selectedAt) : Number.NaN;
+  const switchedMs = switchedAt ? Date.parse(switchedAt) : Number.NaN;
+
+  if (Number.isFinite(switchedMs) && (!Number.isFinite(selectedMs) || switchedMs > selectedMs)) {
+    return { lastSwitchAt: switchedAt!, lastSwitchSource: "in-place-switch" };
+  }
+  if (selectedAt) return { lastSwitchAt: selectedAt, lastSwitchSource: "profile-selection" };
+  if (switchedAt) return { lastSwitchAt: switchedAt, lastSwitchSource: "in-place-switch" };
+  return { lastSwitchAt: null, lastSwitchSource: "unknown" };
+}
+
+function profileUsageAvailability(
+  profile: Profile,
+  readiness: AccountsProfileReadiness | undefined,
+  account: AccountUsageEntry | undefined,
+  now: Date,
+): ProfileUsageAvailability {
+  if (account?.usage) {
+    const health = deriveWindowHealth(account.usage, { now });
+    return {
+      kind: "rate-limit",
+      source: account.source === "fetch" ? "fetch" : "cache",
+      fetchedAt: account.usage.fetchedAt,
+      // A missing window is UNKNOWN, not 100% headroom. deriveWindowHealth's
+      // 100 defaults are ranking identities and must not become measurements.
+      sessionHeadroom: health.session ? health.sessionHeadroom : null,
+      weeklyHeadroom:
+        health.weekly || health.unknown.length > 0 ? health.weeklyHeadroom : null,
+    };
+  }
+  if (!readiness) return { kind: "unknown", reason: "profile-readiness-unavailable" };
+  return {
+    kind: "readiness-proxy",
+    status: readiness.status,
+    reason:
+      profile.tool === "claude"
+        ? "no-cached-rate-limit-data"
+        : "provider-rate-limit-unavailable",
+  };
+}
+
+function profileLaunchability(
+  readiness: AccountsProfileReadiness | undefined,
+  providerAvailable: boolean | undefined,
+): ProfileLaunchability {
+  if (!readiness) {
+    return { status: "unknown", reason: "profile-readiness-unavailable" };
+  }
+  if (providerAvailable === false) return { status: "no", reason: "provider-unavailable" };
+  if (!readiness.dir.exists) return { status: "no", reason: "profile-directory-missing" };
+  if (readiness.login.dirOccupiedByAnotherAccount) {
+    return { status: "no", reason: "profile-directory-occupied" };
+  }
+  if (readiness.status === "unavailable") {
+    return { status: "no", reason: "profile-unavailable" };
+  }
+  if (readiness.login.validator !== "claude-auth-snapshot") {
+    return { status: "unknown", reason: "auth-not-locally-verifiable" };
+  }
+  if (readiness.login.valid) return { status: "yes", reason: "ready" };
+  if (readiness.login.renewable) return { status: "yes", reason: "auth-renewable" };
+  return { status: "no", reason: "auth-unavailable" };
+}
+
+function profileOccupancy(
+  profile: Profile,
+  processes: readonly ProcessInfo[],
+  profilesForTool: readonly Profile[],
+  scanAvailable: boolean,
+): ProfileOccupancy {
+  const processCount = processes.filter(
+    (process) => process.configDir && sameConfigDir(process.configDir, profile.dir),
+  ).length;
+  const unattributedProcessCount = processes.filter(
+    (process) =>
+      !process.configDir ||
+      !profilesForTool.some((candidate) => sameConfigDir(candidate.dir, process.configDir!)),
+  ).length;
+  if (!scanAvailable) {
+    return { status: "unknown", scanAvailable: false, processCount: 0, unattributedProcessCount: 0 };
+  }
+  return {
+    status: processCount > 0 ? "occupied" : unattributedProcessCount > 0 ? "unknown" : "vacant",
+    scanAvailable: true,
+    processCount,
+    unattributedProcessCount,
+  };
+}
+
+/**
+ * Build one fast cross-tool view. The default path is cache-only for provider
+ * usage and runs one generic process scan per represented tool; it never
+ * invokes a provider once per profile. `refresh` is the explicit network gate
+ * and still queries Claude once per distinct account via collectAccountsUsage.
+ */
+export async function collectProfilesUsage(
+  opts: CollectProfilesUsageOptions = {},
+  store: AccountsStore = resolveStore(opts.env),
+): Promise<ProfilesUsageReport> {
+  const now = opts.now ?? new Date();
+  if (opts.tool) await store.resolveTool(opts.tool);
+
+  const [profiles, readiness, accounts] = await Promise.all([
+    store.listProfiles(opts.tool),
+    getAccountsReadiness({ env: opts.env, now, store }),
+    opts.tool && opts.tool !== "claude"
+      ? Promise.resolve([])
+      : collectAccountsUsage(
+          {
+            tool: "claude",
+            ...(opts.refresh ? { refresh: true } : { cachedOnly: true }),
+            ...(opts.maxAgeMs !== undefined ? { maxAgeMs: opts.maxAgeMs } : {}),
+            ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+          },
+          store,
+        ),
+  ]);
+
+  const readinessByProfile = new Map(
+    readiness.profiles.map((entry) => [readinessKey(entry.tool, entry.name), entry]),
+  );
+  const providerAvailableByTool = new Map(
+    readiness.providers.map((provider) => [provider.id, provider.available]),
+  );
+  const claudeAccountByProfile = new Map<string, AccountUsageEntry>();
+  for (const account of accounts) {
+    for (const name of account.profiles) claudeAccountByProfile.set(name, account);
+  }
+
+  const profilesByTool = new Map<string, Profile[]>();
+  for (const profile of profiles) {
+    const entries = profilesByTool.get(profile.tool) ?? [];
+    entries.push(profile);
+    profilesByTool.set(profile.tool, entries);
+  }
+  const scanner = opts.processScanner ?? scanToolProcesses;
+  const processesByTool = new Map<string, ProcessInfo[]>();
+  const scanFailedTools = new Set<string>();
+  for (const tool of profilesByTool.keys()) {
+    try {
+      processesByTool.set(tool, scanner(tool));
+    } catch {
+      scanFailedTools.add(tool);
+      processesByTool.set(tool, []);
+    }
+  }
+
+  return {
+    schema: "hasna.accounts.usage-profiles/v1",
+    generatedAt: now.toISOString(),
+    profiles: profiles
+      .slice()
+      .sort((a, b) => a.tool.localeCompare(b.tool) || a.name.localeCompare(b.name))
+      .map((profile) => {
+        const profileReadiness = readinessByProfile.get(readinessKey(profile.tool, profile.name));
+        return {
+          name: profile.name,
+          tool: profile.tool,
+          usage: profileUsageAvailability(
+            profile,
+            profileReadiness,
+            profile.tool === "claude" ? claudeAccountByProfile.get(profile.name) : undefined,
+            now,
+          ),
+          ...latestSwitch(profile),
+          occupancy: profileOccupancy(
+            profile,
+            processesByTool.get(profile.tool) ?? [],
+            profilesByTool.get(profile.tool) ?? [],
+            !scanFailedTools.has(profile.tool),
+          ),
+          active: profileReadiness?.active ?? false,
+          applied: profileReadiness?.applied ?? false,
+          launchable: profileLaunchability(
+            profileReadiness,
+            providerAvailableByTool.get(profile.tool),
+          ),
+        };
+      }),
+    accounts,
+  };
 }
 
 function doorNames(identity: AccountIdentity, role: "own-identity" | "current-occupant"): string[] {
