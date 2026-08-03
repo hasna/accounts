@@ -81,9 +81,7 @@ import {
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
 import {
   buildIdentityIndex,
-  describeAccountStatus,
   dirAccountUuid,
-  statusNeedsOperator,
 } from "./lib/identity-index.js";
 import { buildProfileRegistry, credentialKeyForEntry } from "./lib/profile-registry.js";
 import { applyAccountUuidBackfill, planAccountUuidBackfill, summarizeBackfill } from "./lib/uuid-backfill.js";
@@ -107,13 +105,11 @@ import {
   readExhaustionLedger,
   recordExhaustion,
 } from "./lib/exhaustion-ledger.js";
-import { deriveWindowHealth } from "./lib/usage-windows.js";
 import {
-  collectAccountsUsage,
+  collectProfilesUsage,
   DEFAULT_USAGE_CACHE_MAX_AGE_MS,
   pickHealthiestAccount,
-  usageDoorSummary,
-  type AccountUsageEntry,
+  type ProfileUsageEntry,
 } from "./lib/usage-report.js";
 import { adoptOrphanOccupant, findOrphanOccupants } from "./lib/orphan-occupant.js";
 import {
@@ -1137,89 +1133,87 @@ program
     ),
   );
 
-function formatUsageEntry(entry: AccountUsageEntry, currentUuid?: string): string {
-  const who = entry.email ?? entry.accountUuid;
-  const marker = entry.accountUuid === currentUuid ? chalk.cyan(" (this session)") : "";
-  const lines: string[] = [];
-  if (entry.status !== "ok") {
-    // A bare status word sent an operator to re-authenticate a live account, so
-    // the status always carries its gloss. `needs-refresh` is the routine state
-    // of any parked copy older than the 8-hour access-token life and is painted
-    // as a non-problem; only the statuses that need a human are highlighted.
-    const paint = statusNeedsOperator(entry.status) ? chalk.yellow : chalk.dim;
-    lines.push(
-      `  ${chalk.bold(who)}${marker} — ${paint(entry.status)} ` +
-        chalk.dim(`(${describeAccountStatus(entry.status)})`),
-    );
-  } else if (entry.error) {
-    lines.push(`  ${chalk.bold(who)}${marker} — ${chalk.red(`${entry.error.kind}: ${entry.error.message}`)}`);
-  } else if (entry.usage) {
-    // Report the two windows the SELECTOR ranks on, not the collapsed
-    // single-scalar headroom — a display that shows one number contradicts the
-    // thing making the decision as soon as the windows disagree.
-    const health = deriveWindowHealth(entry.usage);
-    const paint = (value: number) =>
-      (value <= 10 ? chalk.red : value <= 25 ? chalk.yellow : chalk.green)(`${Math.round(value)}%`);
-    lines.push(
-      `  ${chalk.bold(who)}${marker} — ${paint(health.sessionHeadroom)} session / ` +
-        `${paint(health.weeklyHeadroom)} weekly headroom ${chalk.dim(`(${entry.source})`)}`,
-    );
-    const classOf = new Map<string, string>();
-    for (const w of [health.session, health.weekly, ...health.unknown]) {
-      if (w) classOf.set(w.id, w.windowClass);
-    }
-    for (const w of entry.usage.windows) {
-      const reset = w.resetsAt ? ` resets ${w.resetsAt}` : "";
-      const active = w.isActive ? chalk.yellow(" [active]") : "";
-      const cls = w.scoped ? "scoped" : (classOf.get(w.id) ?? "unknown");
-      // A window whose reset has passed is stale, not saturated. Saying "100%
-      // used" for a window the selector treats as recovered is the exact
-      // contradiction this line exists to avoid.
-      const rolled = [health.session, health.weekly, ...health.unknown].some(
-        (h) => h?.id === w.id && h.rolled,
-      );
-      const used = rolled
-        ? `${Math.round(w.utilization)}% used at last read — window has since RESET`
-        : `${Math.round(w.utilization)}% used`;
-      lines.push(chalk.dim(`      ${w.id} [${cls}]: ${used}${reset}`) + active);
-    }
-  }
-  const doors = usageDoorSummary(entry);
-  if (doors.length) lines.push(chalk.dim(`      ${doors.join(" · ")}`));
-  return lines.join("\n");
+function formatProfileUsage(entry: ProfileUsageEntry): string {
+  const headroom = (value: number | null): string =>
+    value === null ? "unknown" : `${Math.round(value)}%`;
+  const usage =
+    entry.usage.kind === "rate-limit"
+      ? `${headroom(entry.usage.sessionHeadroom)} session / ${headroom(entry.usage.weeklyHeadroom)} weekly (${entry.usage.source})`
+      : entry.usage.kind === "readiness-proxy"
+        ? `usage unknown; readiness ${entry.usage.status}`
+        : "usage unknown; readiness unknown";
+  const last = entry.lastSwitchAt ?? "unknown";
+  const occupancy =
+    entry.occupancy.status === "occupied"
+      ? `occupied (${entry.occupancy.processCount})`
+      : entry.occupancy.status === "unknown"
+        ? entry.occupancy.scanAvailable
+          ? `unknown (${entry.occupancy.unattributedProcessCount} unattributed)`
+          : "unknown (scan unavailable)"
+        : "vacant";
+  const state = [entry.active ? "active" : "", entry.applied ? "applied" : ""]
+    .filter(Boolean)
+    .join(", ") || "inactive";
+  const launch =
+    entry.launchable.status === "yes"
+      ? chalk.green(`yes (${entry.launchable.reason})`)
+      : entry.launchable.status === "no"
+        ? chalk.red(`no (${entry.launchable.reason})`)
+        : chalk.yellow(`unknown (${entry.launchable.reason})`);
+  return (
+    `${chalk.cyan(entry.tool)}/${chalk.bold(entry.name)}  ${usage}\n` +
+    chalk.dim(`    last switch ${last} · ${occupancy} · ${state} · launchable `) +
+    launch
+  );
 }
 
 program
   .command("usage")
-  .description("usage per ACCOUNT from Claude's /api/oauth/usage — one query per distinct account, however many dirs hold it")
-  .option("-t, --tool <tool>", "tool id (usage is Claude-only today)", DEFAULT_TOOL)
-  .option("--refresh", "ignore the cache and query the endpoint for every account")
+  .description("fast usage, occupancy, and launchability view across every registered coding-agent profile")
+  .option("-t, --tool <tool>", "filter to one tool id")
+  .option("--refresh", "refresh provider usage where supported (Claude: once per distinct account)")
   .option("--max-age <seconds>", "accept cached usage up to this old", String(DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000))
   .option("--json", "output JSON")
   .option("--quiet", "no output — refresh the cache and exit (used by the usage hook)")
   .action(
-    action(async (opts: { tool: string; refresh?: boolean; maxAge: string; json?: boolean; quiet?: boolean }) => {
-      const entries = await collectAccountsUsage(
+    action(async (opts: { tool?: string; refresh?: boolean; maxAge: string; json?: boolean; quiet?: boolean }) => {
+      const report = await collectProfilesUsage(
         {
-          tool: opts.tool,
+          ...(opts.tool ? { tool: opts.tool } : {}),
           ...(opts.refresh ? { refresh: true } : {}),
           maxAgeMs: Number.parseInt(opts.maxAge, 10) * 1000,
         },
         resolveStore(),
       );
       if (opts.quiet) return;
-      const tool = getTool(opts.tool);
-      const currentUuid = dirAccountUuid(resolveSessionConfigDir(tool), tool);
+      const includeClaude = !opts.tool || opts.tool === "claude";
+      const claude = includeClaude ? getTool("claude") : undefined;
+      const currentUuid = claude ? dirAccountUuid(resolveSessionConfigDir(claude), claude) : undefined;
       if (opts.json) {
-        console.log(JSON.stringify({ ...(currentUuid ? { currentUuid } : {}), accounts: entries }, null, 2));
+        console.log(
+          JSON.stringify(
+            {
+              schema: report.schema,
+              generatedAt: report.generatedAt,
+              ...(opts.tool ? { tool: opts.tool } : {}),
+              ...(currentUuid ? { currentUuid } : {}),
+              profiles: report.profiles,
+              // Preserve the existing root account array so Claude usage
+              // consumers can adopt the versioned profile surface gradually.
+              accounts: report.accounts,
+            },
+            null,
+            2,
+          ),
+        );
         return;
       }
-      if (entries.length === 0) {
-        console.log(chalk.yellow("no Claude accounts found across profiles"));
+      if (report.profiles.length === 0) {
+        console.log(chalk.yellow(opts.tool ? `no ${opts.tool} profiles found` : "no profiles found"));
         return;
       }
       console.log("");
-      for (const entry of entries) console.log(formatUsageEntry(entry, currentUuid));
+      for (const entry of report.profiles) console.log(formatProfileUsage(entry));
       console.log("");
     }),
   );
