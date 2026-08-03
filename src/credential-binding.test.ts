@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { convergeIdentityCredential, ensureFreshIdentityCredential } from "./lib/credential-broker.js";
@@ -21,6 +21,7 @@ import {
   recordCredentialBinding,
 } from "./lib/credential-binding.js";
 import { getTool } from "./lib/tools.js";
+import { profilesDir } from "./storage.js";
 
 /**
  * CREDENTIAL → ACCOUNT IDENTITY BINDING (todos bc32e38c).
@@ -460,5 +461,57 @@ test("credential-binding: the binding record is written 0600 and carries its met
     expect(raw.accountUuid).toBe(UUID_A);
     expect(typeof raw.boundAt).toBe("string");
     expect(JSON.stringify(raw)).not.toContain("A-refresh");
+  });
+});
+
+// --- the bootstrap gap ---------------------------------------------------------
+
+/**
+ * THE BOOTSTRAP GAP (todos 713f3a80).
+ *
+ * PR #120 gated the token HANDOUT by credential content, which makes an
+ * already-mis-recorded credential non-exploitable at the point of USE. It does
+ * not stop the MIS-RECORD, because the claim index this gate consults is built
+ * ONLY from the CENTRAL store (`centralAccountUuids()` in
+ * `buildCredentialClaimIndex`) — and the central binding is written by the very
+ * write it polices, AFTER that write succeeds.
+ *
+ * So on the FIRST cross-write of a credential the central store has never seen,
+ * `credentialBindingRefusal` finds no claimant, `classifyCredentialWrite`
+ * returns "bind", the write proceeds, and the credential is recorded under the
+ * WRONG uuid. Every later check then reads that false record as authoritative.
+ *
+ * The evidence the gate is missing is already on disk and is independent of the
+ * write being policed: B's OWN profile dir names B in `oauth-account.json` and
+ * holds these bytes in `credentials.json`. Two containers naming two different
+ * accounts hold ONE refresh token; at most one of them is telling the truth,
+ * and this is exactly the "one credential under eight uuids" shape.
+ */
+test("credential-binding: the FIRST write of an unseen credential is not filed under a foreign account", () => {
+  withHome(() => {
+    const shared = cred("shared");
+
+    // B's own profile dir: container names B, credential is B's. This is the
+    // independent claim — it exists before, and regardless of, the write below.
+    const dirB = join(profilesDir(), "bee");
+    writeOAuth(profileOAuthSnapshot(dirB), UUID_B, "b@example.com");
+    writeCred(profileCredentialsSnapshot(dirB), shared, NEW);
+
+    // A's profile dir, contaminated by the switch-account cross-write: its
+    // container says A, its credential bytes are B's.
+    const dirA = join(profilesDir(), "ay");
+    writeOAuth(profileOAuthSnapshot(dirA), UUID_A, "a@example.com");
+    writeCred(profileCredentialsSnapshot(dirA), shared, NEW);
+
+    // The central store has NEVER seen this credential: no slot holds it, no
+    // binding record names it. That is the bootstrap condition.
+    expect(credentialClaimants(credentialFingerprintFromBytes(Buffer.from(credBytes(shared)))!)).toEqual([]);
+
+    const result = syncProfileSnapshotToCentral(dirA, tool);
+
+    // B's credential must not become A's credential of record.
+    expect(result.credentials).toBe("refused");
+    expect(readCredentialBinding(UUID_A)).toBeUndefined();
+    expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(false);
   });
 });
