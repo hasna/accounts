@@ -20,6 +20,7 @@ import {
   readCredentialBinding,
   recordCredentialBinding,
 } from "./lib/credential-binding.js";
+import { addProfile } from "./lib/profiles.js";
 import { getTool } from "./lib/tools.js";
 import { profilesDir } from "./storage.js";
 
@@ -514,6 +515,50 @@ test("credential-binding: the FIRST write of an unseen credential is not filed u
     const result = syncProfileSnapshotToCentral(dirA, tool);
 
     // B's credential must not become A's credential of record.
+    expect(result.credentials).toBe("refused");
+    expect(readCredentialBinding(UUID_A)).toBeUndefined();
+    expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(false);
+  });
+});
+
+test("credential-binding: bootstrap claims include the real managed profiles/<tool>/<name> layout", () => {
+  withHome(() => {
+    const shared = cred("shared-managed");
+    const profileB = addProfile({ name: "managed-bee", tool: "claude" });
+    const profileA = addProfile({ name: "managed-ay", tool: "claude" });
+
+    expect(profileB.dir).toBe(join(profilesDir(), "claude", "managed-bee"));
+    expect(profileA.dir).toBe(join(profilesDir(), "claude", "managed-ay"));
+    writeOAuth(profileOAuthSnapshot(profileB.dir), UUID_B, "b@example.com");
+    writeCred(profileCredentialsSnapshot(profileB.dir), shared, NEW);
+    writeOAuth(profileOAuthSnapshot(profileA.dir), UUID_A, "a@example.com");
+    writeCred(profileCredentialsSnapshot(profileA.dir), shared, NEW);
+
+    const result = syncProfileSnapshotToCentral(profileA.dir, tool);
+
+    expect(result.credentials).toBe("refused");
+    expect(readCredentialBinding(UUID_A)).toBeUndefined();
+    expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(false);
+  });
+});
+
+test("credential-binding: bootstrap claims include registered profile dirs outside profilesDir", () => {
+  withHome((home) => {
+    const shared = cred("shared-external");
+    const dirB = join(home, "registered-external-bee");
+    const dirA = join(home, "registered-external-ay");
+    addProfile({ name: "external-bee", tool: "claude", dir: dirB });
+    addProfile({ name: "external-ay", tool: "claude", dir: dirA });
+
+    expect(dirB.startsWith(profilesDir())).toBe(false);
+    expect(dirA.startsWith(profilesDir())).toBe(false);
+    writeOAuth(profileOAuthSnapshot(dirB), UUID_B, "b@example.com");
+    writeCred(profileCredentialsSnapshot(dirB), shared, NEW);
+    writeOAuth(profileOAuthSnapshot(dirA), UUID_A, "a@example.com");
+    writeCred(profileCredentialsSnapshot(dirA), shared, NEW);
+
+    const result = syncProfileSnapshotToCentral(dirA, tool);
+
     expect(result.credentials).toBe("refused");
     expect(readCredentialBinding(UUID_A)).toBeUndefined();
     expect(existsSync(centralCredentialsSnapshot(UUID_A))).toBe(false);

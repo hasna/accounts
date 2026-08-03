@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { accountsHome, profilesDir } from "../storage.js";
+import { accountsHome, loadMachineStore, profilesDir } from "../storage.js";
 import {
   centralAuthDir,
   centralAuthRoot,
@@ -315,8 +315,7 @@ function centralAccountUuids(): string[] {
  * rather than the dir's own, so counting it would report an ordinary switch as
  * a conflict.
  */
-function profileSnapshotClaims(): Array<{ uuid: string; fingerprint: string }> {
-  const root = profilesDir();
+function childDirectories(root: string): string[] {
   let entries: string[];
   try {
     if (!existsSync(root) || !statSync(root).isDirectory()) return [];
@@ -324,14 +323,42 @@ function profileSnapshotClaims(): Array<{ uuid: string; fingerprint: string }> {
   } catch {
     return [];
   }
-  const claims: Array<{ uuid: string; fingerprint: string }> = [];
+  const dirs: string[] = [];
   for (const entry of entries) {
     const dir = join(root, entry);
     try {
-      if (!statSync(dir).isDirectory()) continue;
+      if (statSync(dir).isDirectory()) dirs.push(dir);
     } catch {
-      continue;
+      // A profile that vanished or became unreadable during the scan asserts
+      // nothing; the other independent claims must still be considered.
     }
+  }
+  return dirs;
+}
+
+function profileSnapshotClaims(): Array<{ uuid: string; fingerprint: string }> {
+  const dirs = new Set<string>();
+  // Keep the historical flat layout, and scan one level below it for the real
+  // managed layout: `<profiles>/<tool>/<name>`. The previous one-level scan
+  // inspected only the tool directory and therefore missed every profile
+  // created by `addProfile`.
+  for (const firstLevel of childDirectories(profilesDir())) {
+    dirs.add(firstLevel);
+    for (const secondLevel of childDirectories(firstLevel)) dirs.add(secondLevel);
+  }
+  // A registered profile may deliberately live in a tool-owned config root
+  // outside `profilesDir()` (non-copy import and explicit `add --dir`). Those
+  // paths are first-class sync sources, so omitting them recreates the same
+  // bootstrap gap on a supported path. The machine store is local evidence;
+  // an absent or unreadable registry must not discard the on-disk claims above.
+  try {
+    for (const profile of loadMachineStore().profiles) dirs.add(profile.dir);
+  } catch {
+    // Preserve the existing failure-isolated, read-only scan posture.
+  }
+
+  const claims: Array<{ uuid: string; fingerprint: string }> = [];
+  for (const dir of dirs) {
     const oauth = readJsonFile(profileOAuthSnapshot(dir))?.oauthAccount;
     if (!oauth || typeof oauth !== "object") continue;
     const uuid = (oauth as JsonRecord).accountUuid;
