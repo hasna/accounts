@@ -8,6 +8,10 @@ import {
   centralAuthDir,
 } from "./lib/identity-index.js";
 import { getTool } from "./lib/tools.js";
+import {
+  credentialFingerprintFromBytes,
+  recordCredentialBinding,
+} from "./lib/credential-binding.js";
 
 let home: string;
 let root: string;
@@ -335,4 +339,37 @@ test("central scan skips non-UUID directory names (parity with listCentralAccoun
 
   const index = buildIdentityIndex([], tool());
   expect(index).toHaveLength(0);
+});
+
+test("a central credential FINGERPRINT-BOUND to another account is NOT handed out as this account's token", () => {
+  // The cross-write this task is about, in its already-happened state: account
+  // A's central slot holds account B's credential bytes, and the binding index
+  // already records that fingerprint as B's. `buildIdentityIndex` still raises
+  // A — the container names A — so the ONLY thing standing between a caller and
+  // B's live token is the handout gate in `accessTokenForAccount`.
+  const A = "aaaaaaaa-9999-4999-8999-aaaaaaaa9999";
+  const B = "bbbbbbbb-9999-4999-8999-bbbbbbbb9999";
+
+  const central = centralAuthDir(A);
+  mkdirSync(central, { recursive: true });
+  writeFileSync(
+    join(central, "oauth-account.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: A, emailAddress: "a@example.com" } }),
+  );
+  // B's bytes, under A's container. Valid, unexpired, well-formed.
+  const foreign = credentialJson({ uuid: B, email: "b@example.com", accessToken: "B-SECRET-TOKEN" });
+  writeFileSync(join(central, "credentials.json"), foreign);
+
+  // B claims this credential by content — recorded BEFORE A ever asks.
+  const fingerprint = credentialFingerprintFromBytes(foreign);
+  expect(fingerprint).toBeDefined();
+  recordCredentialBinding(B, fingerprint!, { evidence: "central-write", sourceKind: "central" });
+
+  const index = buildIdentityIndex([], tool());
+  expect(index).toHaveLength(1);
+  expect(index[0]!.accountUuid).toBe(A);
+  // Precondition: the file is valid, so `.valid` alone cannot save us.
+  expect(index[0]!.credential?.valid).toBe(true);
+
+  expect(accessTokenForAccount(index[0]!)).toBeUndefined();
 });

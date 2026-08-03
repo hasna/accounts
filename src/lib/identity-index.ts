@@ -10,6 +10,7 @@ import {
   profileOAuthSnapshot,
 } from "./claude-layout.js";
 import { centralAuthRoot, isAccountUuid, profileAccountUuid } from "./auth-store.js";
+import { credentialBindingRefusalForFile } from "./credential-binding.js";
 import { classifyCredentialFile, isRestorableState, type CredentialState } from "./credential-state.js";
 import { canonicalConfigDir, sameConfigDir } from "./safe-path.js";
 
@@ -587,9 +588,31 @@ export function dirAccountUuid(dir: string, tool: ToolDef): string | undefined {
  * The account's current access token, or undefined when none is valid. Read
  * lazily from the winning credential file so index building never holds
  * secrets in memory longer than a caller needs.
+ *
+ * GATED BY CONTENT, NOT BY CONTAINER. `identity.credential.valid` says only
+ * that the file parses and has not expired — it says nothing about WHOSE
+ * credential it is. A `.credentials.json` payload carries no identity field of
+ * its own, so the container is the only thing naming an occupant, and the
+ * container is exactly what a cross-write forges: the central slot for account
+ * A can hold account B's bytes while still being, by its path, "A's".
+ *
+ * That is why the check here is `credentialBindingRefusalForFile` (the same
+ * gate PR #99 put on the write path) and NOT a comparison against an identity
+ * "recorded in" the snapshot. There is no such recorded identity to compare —
+ * the central copy's only container is its own uuid-keyed path, so reading it
+ * back and comparing would reduce to `uuid === uuid` and pass unconditionally.
+ * Only the sha256-of-refresh-token fingerprint distinguishes the two accounts,
+ * because only it is derived from the bytes themselves.
+ *
+ * This is the LAST gate before a secret leaves the process. Convergence gates
+ * which copy is ADOPTED; this gates what is HANDED OUT, and it must hold even
+ * for an estate already cross-written by a version predating the write gate —
+ * that corruption is on disk today and no write-side fix removes it
+ * retroactively.
  */
 export function accessTokenForAccount(identity: AccountIdentity): string | undefined {
   if (!identity.credential?.valid) return undefined;
+  if (credentialBindingRefusalForFile(identity.accountUuid, identity.credential.path)) return undefined;
   const raw = readJson(identity.credential.path);
   const oauth = raw?.claudeAiOauth;
   if (!oauth || typeof oauth !== "object") return undefined;
