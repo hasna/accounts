@@ -119,6 +119,13 @@ export const DEFAULT_MIN_TTL_MS = 15 * 60 * 1000;
 export const ENSURE_FRESH_TRIGGER_TTL_MS = 2 * DEFAULT_MIN_TTL_MS;
 /** Network cap for the token exchange; well under the lock's staleness bound. */
 const EXCHANGE_TIMEOUT_MS = 15_000;
+/**
+ * `convergeDirCredential` runs inside a UserPromptSubmit hook whose documented
+ * deadline is 15 seconds. Keep the registry allowlist read to one short
+ * attempt so a stalled registry reaches the caller's fail-open notice instead
+ * of being killed by the hook runner first.
+ */
+const ACTIVE_REGISTRY_TIMEOUT_MS = 2_000;
 
 export type BrokerCopyKind = "central" | "profile-snapshot" | "dir-live";
 
@@ -532,7 +539,10 @@ export function assertRegisteredConfigDir(
  * outage degrades to one skipped convergence, never a blocked session.
  */
 async function activeRegistryProfiles(): Promise<Array<{ name?: string; dir: string }>> {
-  const store = resolveStore();
+  const store = resolveStore(process.env, {
+    timeoutMs: ACTIVE_REGISTRY_TIMEOUT_MS,
+    retry: false,
+  });
   return (await store.listProfiles()).map((profile) => ({ name: profile.name, dir: profile.dir }));
 }
 

@@ -121,6 +121,17 @@ function serveCloudRegistry(accounts: Array<{ name: string; dir: string }>): str
   return `http://127.0.0.1:${server.port}`;
 }
 
+/** Accept the registry request but never produce headers or a body. */
+function serveHangingCloudRegistry(): string {
+  server = Bun.serve({
+    port: 0,
+    fetch() {
+      return new Promise<Response>(() => {});
+    },
+  });
+  return `http://127.0.0.1:${server.port}`;
+}
+
 function configureCloudMode(url: string): void {
   // Explicit cloud mode wins over the ACCOUNTS_HOME override (deriveEnv in
   // cloud-accounts.ts), which is exactly the fleet shape: cloud registry,
@@ -194,6 +205,41 @@ test("cloud mode: an unreachable registry is an error, never a silent local fall
   // back to the local file, which is the defect class this suite pins).
   expect(message).not.toMatch(/not a registered profile dir/);
   expect(existsSync(centralCredentialsSnapshot(UUID))).toBe(false);
+});
+
+test("usage-hook fails open before its 15-second deadline when the cloud registry hangs", async () => {
+  const dir = makeDir(home, "cloud-hang", UUID, {
+    accessToken: "at-cloud-hang",
+    refreshToken: "rt-cloud-hang",
+    expiresAt: Date.now() + 7 * HOUR,
+  });
+  configureCloudMode(serveHangingCloudRegistry());
+  const childEnv = { ...process.env };
+  delete childEnv.BUN_CONFIG_VERBOSE_FETCH;
+  delete childEnv.NODE_DEBUG;
+  delete childEnv.NODE_DEBUG_NATIVE;
+  const child = Bun.spawn(
+    [process.execPath, "run", "src/cli.ts", "usage-hook", "--dir", dir],
+    {
+      cwd: process.cwd(),
+      env: childEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+  }, 7_000);
+
+  const status = await child.exited;
+  clearTimeout(timer);
+  const stdout = await new Response(child.stdout).text();
+
+  expect(timedOut).toBe(false);
+  expect(status).toBe(0);
+  expect(stdout).toMatch(/per-session credential convergence is NOT running/);
 });
 
 // --- local mode unchanged ---------------------------------------------------
