@@ -732,7 +732,7 @@ program
         process.exit(1);
       }
       const { profile, tool, args: loginArgs } = prepared;
-      const env = profileEnv(profile, tool);
+      const env = await profileEnv(profile, tool);
       await store.useProfile(name, tool.id);
       console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
       console.log(chalk.dim(`  config dir: ${profile.dir}`));
@@ -839,7 +839,7 @@ program
         } else if (mode === "env") {
           const profile = await store.getProfile(picked.profileName, opts.tool);
           prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
-          console.log(formatExportLines(profileEnv(profile, tool)));
+          console.log(formatExportLines(await profileEnv(profile, tool)));
         }
         return;
       }
@@ -853,7 +853,7 @@ program
       } else if (result.mode === "env") {
         const tool = getTool(result.profile.tool);
         prepareClaudeProfileKeychain(result.profile.dir, tool, result.profile.name);
-        console.log(formatExportLines(profileEnv(result.profile, tool)));
+        console.log(formatExportLines(await profileEnv(result.profile, tool)));
       }
     }),
   );
@@ -1312,8 +1312,9 @@ program
         //     the sessions themselves essentially never trigger the tool's own
         //     uncoordinated refresh. Fire-and-forget, like the cache warmer.
         // Both fail OPEN — the prompt always goes through.
+        let brokerConvergeFailure: string | undefined;
         try {
-          const converged = convergeDirCredential(configDir, { tool });
+          const converged = await convergeDirCredential(configDir, { tool });
           if (converged) {
             usageHookLog(
               `broker-converge uuid=${converged.accountUuid} writes=${converged.writes.length}` +
@@ -1332,11 +1333,22 @@ program
             }
           }
         } catch (error) {
-          usageHookLog(
-            `broker-converge failed error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
-          );
+          // The log line alone is the failure mode bug 2865f9f5 measured:
+          // 1,175 refusals in one log file while every affected session
+          // proceeded unprotected and nobody saw a symptom. Keep the log,
+          // and ALSO carry the reason forward so it reaches the operator as
+          // a systemMessage on this hook's own stdout payload (throttled
+          // below, merged after runUsageHook so stdout stays one JSON doc).
+          brokerConvergeFailure = error instanceof Error ? error.message : String(error);
+          usageHookLog(`broker-converge failed error=${JSON.stringify(brokerConvergeFailure)}`);
         }
 
+        const noticeIntervalMs =
+          hookNumber(
+            opts.noticeInterval,
+            "ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S",
+            DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000,
+          ) * 1000;
         const outcome = await runUsageHook(
           {
             configDir,
@@ -1356,12 +1368,7 @@ program
                 "ACCOUNTS_USAGE_CACHE_STALE_MAX_AGE_S",
                 DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS / 1000,
               ) * 1000,
-            noticeIntervalMs:
-              hookNumber(
-                opts.noticeInterval,
-                "ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S",
-                DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000,
-              ) * 1000,
+            noticeIntervalMs,
           },
           {
             currentAccountUuid: (dir) => dirAccountUuid(dir, tool),
@@ -1409,6 +1416,29 @@ program
           `${outcome.action}${outcome.reason ? ` reason=${JSON.stringify(outcome.reason)}` : ""}` +
             ` dir=${JSON.stringify(configDir)}`,
         );
+        // A refused/failed convergence is a session running unprotected — the
+        // dir will not adopt a sibling's rotation, which is the blanking race
+        // the broker exists to prevent. Surface it on the hook's own payload
+        // (merged, so stdout stays a single JSON document), throttled per the
+        // same notice state the other degraded notices use.
+        if (brokerConvergeFailure) {
+          try {
+            const notices = readHookNoticeState() ?? {};
+            const last = Date.parse(notices["broker-converge-failed"] ?? "");
+            const now = Date.now();
+            if (!Number.isFinite(last) || now - last >= noticeIntervalMs) {
+              writeHookNoticeState({ ...notices, "broker-converge-failed": new Date(now).toISOString() });
+              const notice =
+                `accounts: per-session credential convergence is NOT running for this session — ` +
+                `${brokerConvergeFailure} The session keeps working on the credential its config dir ` +
+                `already holds, but it will not adopt a sibling session's rotation until this is fixed.`;
+              outcome.systemMessage = outcome.systemMessage ? `${notice}\n${outcome.systemMessage}` : notice;
+            }
+          } catch {
+            // The notice is best-effort; an unwritable ACCOUNTS_HOME must not
+            // turn a fail-open hook into a broken one.
+          }
+        }
         const output = hookOutputJson(outcome);
         if (output) console.log(output);
       } catch (error) {
@@ -1561,7 +1591,7 @@ program
       if (!profile) die(`no active profile for "${toolId}". Use \`accounts use <name>\` first.`);
       const tool = getTool(profile.tool);
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
-      console.log(formatExportLines(profileEnv(profile, tool)));
+      console.log(formatExportLines(await profileEnv(profile, tool)));
     }),
   );
 
@@ -1583,7 +1613,7 @@ addConfigsOptions(program
       const tool = getTool(profile.tool);
       const plan = planClaudeLaunch(tool, args, opts);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
-      const env = profileEnv(profile, tool);
+      const env = await profileEnv(profile, tool);
       const launchArgs = mergeToolArgs(tool, plan.args, { permissions: opts.permissions, profile });
       if (!plan.nonInteractive) await store.useProfile(name, tool.id);
       console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([tool.bin, ...launchArgs]).join(" ")}`));
@@ -1622,7 +1652,7 @@ addConfigsOptions(program
       });
       if (launch.nonInteractive) {
         runConfigsPrelaunch(plan.profile, plan.tool, configsPrelaunchOptions(opts));
-        const env = profileEnv(plan.profile, plan.tool);
+        const env = await profileEnv(plan.profile, plan.tool);
         const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
         console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([plan.tool.bin, ...runArgs]).join(" ")}`));
         const code = await runClaudeLaunch(
@@ -1749,7 +1779,7 @@ program
       const store = resolveStore();
       const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
-      const env = profileEnv(profile, tool);
+      const env = await profileEnv(profile, tool);
       await store.useProfile(name, tool.id);
       const shell = process.env.SHELL || "/bin/sh";
       console.log(chalk.dim(`→ subshell with ${formatEnvAssignments(env)} (exit to leave)`));

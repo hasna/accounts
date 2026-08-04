@@ -6,6 +6,38 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- **`convergeDirCredential` resolves its security allowlist from the ACTIVE
+  registry (`resolveStore()`), not the local file (todos `2865f9f5`).**
+  Measured on station01 2026-08-03/04: the usage-hook's per-session
+  convergence was refused on EVERY cloud-only profile dir — 1,175 refusals in
+  one log file, 292 in the next — because the guard's allowlist came from
+  `listProfiles()` (the local `accounts.json`, 7 claude profiles) while
+  `accounts list`/`launch`/`credential-sync` resolve the cloud registry (31).
+  The hook swallowed each refusal into a log line and the session proceeded
+  with NO convergence, which is the husk-recurrence window: a dir that never
+  adopts a sibling's rotation is a dir whose next refresh blanks it.
+  `convergeDirCredential` is now async and, when no `profiles` are passed,
+  reads the same registry the rest of the CLI uses. A genuinely unregistered
+  dir is still refused (the exfiltration gate is unchanged and covered by a
+  test on both sides of this change), and a failing registry read rejects
+  rather than silently falling back to the local file.
+
+- **A refused or failed per-session convergence is no longer silent.** The
+  usage-hook now carries the failure onto its own stdout payload as a
+  throttled `systemMessage` (same notice state as the other degraded
+  notices), and the launch path's previously EMPTY catch in `profileEnv`
+  records the failure on stderr before launching on the dir's current
+  credential. Fail-open behavior is unchanged on both paths.
+
+### Changed
+
+- **`profileEnv` (package root export) is now async** — it awaits the
+  dir-level credential convergence it already performed, whose allowlist
+  resolution can now reach the hosted registry. TypeScript consumers get a
+  compile-time signal; the returned env is unchanged.
+
 ## [0.2.32] - 2026-08-02
 
 Ships the instruction-preservation fixes from tasks `29b09fa1` and `328064bc`

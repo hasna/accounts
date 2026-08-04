@@ -160,7 +160,7 @@ export async function switchProfile(
   // repaired, or `switch` (the headline way to change profiles) leaves it
   // broken for every later isolated launch.
   ensureSharedCapabilities(profile.dir, tool);
-  const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : profileEnv(profile, tool);
+  const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : await profileEnv(profile, tool);
   const command = commandFor(profile, tool, opts);
   prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
   const restartRequired = opts.resume === true || applied || mode === "env";

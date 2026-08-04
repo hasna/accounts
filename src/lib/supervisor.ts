@@ -1083,7 +1083,7 @@ export async function runSupervisedTool(
     // shared registry (cloud in api mode) is the single source of truth — never
     // a local-only write that would diverge from the cloud "current".
     await store.useProfile(profile.name, tool.id);
-    const env = profileEnv(profile, tool);
+    const env = await profileEnv(profile, tool);
     log(
       `accounts supervisor: starting ${redactText(tool.bin)} for ${profile.name}`,
     );

@@ -90,7 +90,7 @@ test("addProfile materializes shared skills and agents at creation", () => {
   expect(lstatSync(join(p.dir, "skills")).isSymbolicLink()).toBe(true);
 });
 
-test("profileEnv repairs a profile created before shared capabilities existed", () => {
+test("profileEnv repairs a profile created before shared capabilities existed", async () => {
   // Simulate the 23 profiles already on disk: created while no shared home was known.
   process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
   const p = addProfile({ name: "legacy" });
@@ -98,7 +98,7 @@ test("profileEnv repairs a profile created before shared capabilities existed", 
   expect(existsSync(join(p.dir, "agents"))).toBe(false);
 
   process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
-  const env = profileEnv(p, getTool("claude"));
+  const env = await profileEnv(p, getTool("claude"));
   expect(env.CLAUDE_CONFIG_DIR).toBe(p.dir);
   expect(realpathSync(join(p.dir, "skills"))).toBe(realpathSync(join(sharedHome, "skills")));
   expect(realpathSync(join(p.dir, "agents"))).toBe(realpathSync(join(sharedHome, "agents")));
@@ -175,9 +175,9 @@ test("a profile whose dir IS the shared home is left alone", () => {
   expect(lstatSync(join(sharedHome, "skills")).isSymbolicLink()).toBe(false);
 });
 
-test("tools that declare no shared entries are untouched", () => {
+test("tools that declare no shared entries are untouched", async () => {
   const p = addProfile({ name: "codexprofile", tool: "codex" });
-  profileEnv(p, getTool("codex"));
+  await profileEnv(p, getTool("codex"));
   expect(existsSync(join(p.dir, "skills"))).toBe(false);
   expect(existsSync(join(p.dir, "agents"))).toBe(false);
 });
@@ -631,7 +631,7 @@ test("sharedCapabilityHealth reports an unguarded profile as a problem", () => {
 // Both directions are asserted, because an assertion that cannot refuse is
 // decoration and one that cannot pass bricks every launch on the machine.
 
-test("profileEnv REFUSES a profile missing required shared config", () => {
+test("profileEnv REFUSES a profile missing required shared config", async () => {
   seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
   process.env.ACCOUNTS_SHARED_HOME_CLAUDE = join(home, "does-not-exist");
   const p = addProfile({ name: "bare" });
@@ -642,18 +642,18 @@ test("profileEnv REFUSES a profile missing required shared config", () => {
   // when the assertion runs — the real-world case is an unwritable dir.
   writeFileSync(join(p.dir, "settings.json"), "{ not json");
 
-  expect(() => profileEnv(p, getTool("claude"))).toThrow(AccountsError);
-  expect(() => profileEnv(p, getTool("claude"))).toThrow(/refusing to launch/);
+  await expect(profileEnv(p, getTool("claude"))).rejects.toThrow(AccountsError);
+  await expect(profileEnv(p, getTool("claude"))).rejects.toThrow(/refusing to launch/);
 });
 
-test("the refusal names its own override, and the override works", () => {
+test("the refusal names its own override, and the override works", async () => {
   seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
   const p = addProfile({ name: "override" });
   writeFileSync(join(p.dir, "settings.json"), "{ not json");
 
   let message = "";
   try {
-    profileEnv(p, getTool("claude"));
+    await profileEnv(p, getTool("claude"));
   } catch (err) {
     message = (err as Error).message;
   }
@@ -661,24 +661,24 @@ test("the refusal names its own override, and the override works", () => {
 
   process.env.ACCOUNTS_ALLOW_UNGUARDED_PROFILE = "1";
   try {
-    expect(profileEnv(p, getTool("claude")).CLAUDE_CONFIG_DIR).toBe(p.dir);
+    expect((await profileEnv(p, getTool("claude"))).CLAUDE_CONFIG_DIR).toBe(p.dir);
   } finally {
     delete process.env.ACCOUNTS_ALLOW_UNGUARDED_PROFILE;
   }
 });
 
-test("the assertion PASSES for a normally created profile, and on a machine with no hooks", () => {
+test("the assertion PASSES for a normally created profile, and on a machine with no hooks", async () => {
   // (a) machine declares hooks -> profile is seeded -> launch proceeds.
   seedSharedHooks(sharedHome, "/opt/guards/env-dump-guard.sh");
   const guarded = addProfile({ name: "normal" });
-  expect(profileEnv(guarded, getTool("claude")).CLAUDE_CONFIG_DIR).toBe(guarded.dir);
+  expect((await profileEnv(guarded, getTool("claude"))).CLAUDE_CONFIG_DIR).toBe(guarded.dir);
 
   // (b) machine declares NO hooks -> nothing to enforce -> launch proceeds.
   // Without this the check would refuse every launch on every machine that does
   // not use hooks, which is the same defect pointed the other way.
   rmSync(join(sharedHome, "settings.json"), { force: true });
   const plain = addProfile({ name: "no-hooks-machine" });
-  expect(profileEnv(plain, getTool("claude")).CLAUDE_CONFIG_DIR).toBe(plain.dir);
+  expect((await profileEnv(plain, getTool("claude"))).CLAUDE_CONFIG_DIR).toBe(plain.dir);
 });
 
 // --- P1 from adversarial review (Seneca, PR #105): partial coverage ---------

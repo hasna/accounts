@@ -22,6 +22,7 @@ import { buildIdentityIndex, dirAccountUuid } from "./identity-index.js";
 import { withIdentityLock, withIdentityLockSync, type IdentityLockOptions } from "./identity-lock.js";
 import { listProfiles } from "./profiles.js";
 import { sameConfigDir, writeFileAtomic } from "./safe-path.js";
+import { resolveStore } from "./store.js";
 import { getTool } from "./tools.js";
 
 /**
@@ -118,6 +119,13 @@ export const DEFAULT_MIN_TTL_MS = 15 * 60 * 1000;
 export const ENSURE_FRESH_TRIGGER_TTL_MS = 2 * DEFAULT_MIN_TTL_MS;
 /** Network cap for the token exchange; well under the lock's staleness bound. */
 const EXCHANGE_TIMEOUT_MS = 15_000;
+/**
+ * `convergeDirCredential` runs inside a UserPromptSubmit hook whose documented
+ * deadline is 15 seconds. Keep the registry allowlist read to one short
+ * attempt so a stalled registry reaches the caller's fail-open notice instead
+ * of being killed by the hook runner first.
+ */
+const ACTIVE_REGISTRY_TIMEOUT_MS = 2_000;
 
 export type BrokerCopyKind = "central" | "profile-snapshot" | "dir-live";
 
@@ -176,9 +184,19 @@ export interface EnsureFreshReport extends ConvergeReport {
 export interface BrokerOptions {
   tool?: ToolDef;
   /**
-   * Profile dirs to consider. Omitted, the LOCAL registry is read — every
-   * profile of every tool, matching `crossDirectoryView`'s reasoning: a Claude
-   * account can sit live in a dir registered under any tool.
+   * Profile dirs to consider — every profile of every tool, matching
+   * `crossDirectoryView`'s reasoning: a Claude account can sit live in a dir
+   * registered under any tool.
+   *
+   * Omitted, `convergeDirCredential` resolves the ACTIVE registry through
+   * `resolveStore()` (the cloud ApiStore when the machine is configured for
+   * it, the local file otherwise) — the same registry every other surface
+   * uses. Through 0.2.32 it read the LOCAL file unconditionally, so on a
+   * cloud-mode machine every cloud-only profile dir was refused as
+   * unregistered and per-session convergence silently died (bug 2865f9f5).
+   * The SYNC identity-level entry points (`convergeIdentityCredential`) still
+   * default to the local file: they cannot await a store, and their callers
+   * (credential-sync, the hook) pass the resolved profiles down.
    */
   profiles?: ReadonlyArray<{ name?: string; dir: string }>;
   /**
@@ -504,9 +522,36 @@ export function assertRegisteredConfigDir(
   }
 }
 
-export function convergeDirCredential(configDir: string, opts: BrokerOptions = {}): ConvergeReport | undefined {
+/**
+ * The allowlist source for dir-level convergence: the ACTIVE registry, read
+ * through the same `resolveStore()` every other registry surface uses (cloud
+ * ApiStore when configured, the local file otherwise). NOT `listProfiles()`:
+ * that reads the local file unconditionally, which on a cloud-mode machine
+ * describes a fraction of the fleet's profiles — measured 7 of 31 on
+ * station01 — so every cloud-only profile dir was refused as unregistered and
+ * the hook's per-session convergence silently died (bug 2865f9f5).
+ *
+ * A failing registry read REJECTS rather than falling back to the local file:
+ * a dead registry must be distinguishable from "this dir is not registered",
+ * and a silent local fallback would reintroduce the exact wrong-allowlist
+ * refusal this function exists to remove. Callers are fail-open (the hook
+ * logs and surfaces, the launch path records and launches), so a registry
+ * outage degrades to one skipped convergence, never a blocked session.
+ */
+async function activeRegistryProfiles(): Promise<Array<{ name?: string; dir: string }>> {
+  const store = resolveStore(process.env, {
+    timeoutMs: ACTIVE_REGISTRY_TIMEOUT_MS,
+    retry: false,
+  });
+  return (await store.listProfiles()).map((profile) => ({ name: profile.name, dir: profile.dir }));
+}
+
+export async function convergeDirCredential(
+  configDir: string,
+  opts: BrokerOptions = {},
+): Promise<ConvergeReport | undefined> {
   const tool = opts.tool ?? getTool("claude");
-  const profiles = opts.profiles ?? listProfiles();
+  const profiles = opts.profiles ?? (await activeRegistryProfiles());
   assertRegisteredConfigDir(configDir, profiles);
   const uuid = dirAccountUuid(configDir, tool);
   if (!uuid || !isAccountUuid(uuid)) return undefined;

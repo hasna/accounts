@@ -505,7 +505,7 @@ test("profileEnv self-heals a switched-away profile dir with no live sessions", 
   expect(dirEmail(alphaDir)).toBe("beta@example.com");
 
   const { getProfile } = await import("./lib/profiles.js");
-  profileEnv(getProfile("alpha", "claude"), tool());
+  await profileEnv(getProfile("alpha", "claude"), tool());
 
   // Launching alpha must run ALPHA's account again, not beta's leftovers.
   expect(dirEmail(alphaDir)).toBe("alpha@example.com");
@@ -521,7 +521,7 @@ test("profileEnv refuses to heal while a live session still runs on the dir", as
   writeFileSync(join(alphaDir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
 
   const { getProfile } = await import("./lib/profiles.js");
-  expect(() => profileEnv(getProfile("alpha", "claude"), tool())).toThrow(/live session/);
+  await expect(profileEnv(getProfile("alpha", "claude"), tool())).rejects.toThrow(/live session/);
   // The running session's identity must not be yanked out from under it.
   expect(dirEmail(alphaDir)).toBe("beta@example.com");
 });

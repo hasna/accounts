@@ -362,8 +362,8 @@ test("DEFAULT-DIR SOURCE: a STALE sibling never outranks the live default dir", 
   });
 });
 
-test("EXFILTRATION GATE: converging an UNREGISTERED dir is refused outright", () => {
-  withHome((home) => {
+test("EXFILTRATION GATE: converging an UNREGISTERED dir is refused outright", async () => {
+  await withHomeAsync(async (home) => {
     const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
     const victimDir = makeDir(home, "victim", UUID, fresh);
     // Attacker plants a dir OUTSIDE the registry carrying the victim's
@@ -376,16 +376,16 @@ test("EXFILTRATION GATE: converging an UNREGISTERED dir is refused outright", ()
     });
     const before = readFileSync(join(attackerDir, ".credentials.json"), "utf8");
 
-    expect(() =>
+    await expect(
       convergeDirCredential(attackerDir, { tool, profiles: [{ name: "victim", dir: victimDir }] }),
-    ).toThrow(/not a registered profile dir/);
+    ).rejects.toThrow(/not a registered profile dir/);
     // Nothing moved: the planted file is exactly as planted.
     expect(readFileSync(join(attackerDir, ".credentials.json"), "utf8")).toBe(before);
   });
 });
 
-test("POSITIVE CONTROL for the gate: the same dir, registered, converges", () => {
-  withHome((home) => {
+test("POSITIVE CONTROL for the gate: the same dir, registered, converges", async () => {
+  await withHomeAsync(async (home) => {
     const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
     const victimDir = makeDir(home, "victim", UUID, fresh);
     const old = new Date(Date.now() - 2 * HOUR);
@@ -395,7 +395,7 @@ test("POSITIVE CONTROL for the gate: the same dir, registered, converges", () =>
       expiresAt: Date.now() - HOUR,
     }, { mtime: old });
 
-    const report = convergeDirCredential(siblingDir, {
+    const report = await convergeDirCredential(siblingDir, {
       tool,
       profiles: [
         { name: "victim", dir: victimDir },

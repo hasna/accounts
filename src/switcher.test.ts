@@ -189,7 +189,7 @@ test("profileEnv removes Claude API-helper settings before OAuth exists", async 
   writeFileSync(join(dir, "settings.json"), JSON.stringify({ apiKeyHelper: "/tmp/helper" }));
   addProfile({ name: "preoauth", dir });
 
-  const env = profileEnv(getProfile("preoauth", "claude"), getTool("claude"));
+  const env = await profileEnv(getProfile("preoauth", "claude"), getTool("claude"));
 
   const settings = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")) as { apiKeyHelper?: string };
   expect(settings.apiKeyHelper).toBeUndefined();
@@ -203,7 +203,7 @@ test("profileEnv clears Claude API auth environment variables", async () => {
   addProfile({ name: "envclean", dir });
   ensureProfileAuthSnapshot(dir, getTool("claude"));
 
-  const env = profileEnv(getProfile("envclean", "claude"), getTool("claude"));
+  const env = await profileEnv(getProfile("envclean", "claude"), getTool("claude"));
 
   expect(env.CLAUDE_CONFIG_DIR).toBe(dir);
   expect(env.ANTHROPIC_API_KEY).toBe("");

@@ -44,8 +44,8 @@ describe("repository metadata", () => {
     expect(packageMetadata.devDependencies?.["@modelcontextprotocol/sdk"]).toBe(
       "^1.27.1",
     );
-    expect(packageMetadata.devDependencies?.["fast-uri"]).toBe("3.1.4");
-    expect(packageMetadata.overrides?.["fast-uri"]).toBe("3.1.4");
+    expect(packageMetadata.devDependencies?.["fast-uri"]).toBe("3.1.5");
+    expect(packageMetadata.overrides?.["fast-uri"]).toBe("3.1.5");
     expect(mcpBuild).toBe(
       "bun build src/mcp.ts --outdir dist --target node --external @hasna/contracts",
     );
