@@ -195,9 +195,9 @@ test("a grandfathered duplicate name cannot spread to a third tool", () => {
   );
 });
 
-test("profileEnv renders extra per-tool environment templates", () => {
+test("profileEnv renders extra per-tool environment templates", async () => {
   const p = addProfile({ name: "ops", tool: "opencode" });
-  const env = profileEnv(p, getTool("opencode"));
+  const env = await profileEnv(p, getTool("opencode"));
   expect(env.OPENCODE_CONFIG_DIR).toBe(p.dir);
   expect(env.XDG_CONFIG_HOME).toBe(join(p.dir, "xdg-config"));
   expect(env.XDG_DATA_HOME).toBe(join(p.dir, "xdg-data"));
@@ -276,7 +276,7 @@ test("generated handoffs reject non-portable environment variable names", () => 
   ).toThrow(AccountsError);
 });
 
-test("profileEnv cannot restore request-debug keys from custom tool settings", () => {
+test("profileEnv cannot restore request-debug keys from custom tool settings", async () => {
   const tool = addCustomTool({
     id: "debug-overlay",
     label: "Debug Overlay",
@@ -292,7 +292,7 @@ test("profileEnv cannot restore request-debug keys from custom tool settings", (
   });
   const profile = addProfile({ name: "ops", tool: tool.id });
 
-  const env = profileEnv(profile, tool);
+  const env = await profileEnv(profile, tool);
 
   expect(Object.keys(env).filter((name) =>
     ["bun_config_verbose_fetch", "node_debug", "node_debug_native"].includes(name.toLowerCase())
@@ -301,36 +301,36 @@ test("profileEnv cannot restore request-debug keys from custom tool settings", (
   expect(env.DEBUG_OVERLAY_HOME).toBe(profile.dir);
 });
 
-test("claude profile env isolates Telegram channel state", () => {
+test("claude profile env isolates Telegram channel state", async () => {
   const p = addProfile({ name: "telegram", tool: "claude" });
-  const env = profileEnv(p, getTool("claude"));
+  const env = await profileEnv(p, getTool("claude"));
   expect(env.CLAUDE_CONFIG_DIR).toBe(p.dir);
   expect(env.TELEGRAM_STATE_DIR).toBe(join(p.dir, "channels", "telegram"));
   expect(formatExportLines(env)).toContain("export TELEGRAM_STATE_DIR=");
 });
 
-test("codex app profile env isolates CODEX_HOME and file credentials", () => {
+test("codex app profile env isolates CODEX_HOME and file credentials", async () => {
   const p = addProfile({ name: "desktop", tool: "codex-app" });
-  const env = profileEnv(p, getTool("codex-app"));
+  const env = await profileEnv(p, getTool("codex-app"));
   expect(env.CODEX_HOME).toBe(p.dir);
   expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toContain('cli_auth_credentials_store = "file"');
 });
 
-test("codex app profile env forces existing root credentials store to file", () => {
+test("codex app profile env forces existing root credentials store to file", async () => {
   const p = addProfile({ name: "desktop", tool: "codex-app" });
   writeFileSync(
     join(p.dir, "config.toml"),
     ['# existing Codex config', 'cli_auth_credentials_store = "keychain"', 'model = "gpt-5"', ""].join("\n"),
   );
 
-  profileEnv(p, getTool("codex-app"));
+  await profileEnv(p, getTool("codex-app"));
 
   expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toBe(
     ['# existing Codex config', 'cli_auth_credentials_store = "file"', 'model = "gpt-5"', ""].join("\n"),
   );
 });
 
-test("codex app profile env does not duplicate an existing root file credentials store", () => {
+test("codex app profile env does not duplicate an existing root file credentials store", async () => {
   const p = addProfile({ name: "desktop", tool: "codex-app" });
   const comments = Array.from({ length: 12 }, (_, index) => `# imported config line ${index + 1}`);
   writeFileSync(
@@ -347,7 +347,7 @@ test("codex app profile env does not duplicate an existing root file credentials
     ].join("\n"),
   );
 
-  profileEnv(p, getTool("codex-app"));
+  await profileEnv(p, getTool("codex-app"));
 
   const config = readFileSync(join(p.dir, "config.toml"), "utf8");
   const rootConfig = config.split("[profiles.default]")[0]!;
@@ -359,14 +359,14 @@ test("codex app profile env does not duplicate an existing root file credentials
   );
 });
 
-test("codex app profile env inserts a root credentials store before tables", () => {
+test("codex app profile env inserts a root credentials store before tables", async () => {
   const p = addProfile({ name: "desktop", tool: "codex-app" });
   writeFileSync(
     join(p.dir, "config.toml"),
     ['[profiles.default]', 'cli_auth_credentials_store = "keychain"', 'model = "gpt-5"', ""].join("\n"),
   );
 
-  profileEnv(p, getTool("codex-app"));
+  await profileEnv(p, getTool("codex-app"));
 
   expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toBe(
     [
@@ -380,11 +380,11 @@ test("codex app profile env inserts a root credentials store before tables", () 
   );
 });
 
-test("codex app profile env inserts a root credentials store before array tables", () => {
+test("codex app profile env inserts a root credentials store before array tables", async () => {
   const p = addProfile({ name: "desktop", tool: "codex-app" });
   writeFileSync(join(p.dir, "config.toml"), ['[[mcp_servers]]', 'command = "node"', ""].join("\n"));
 
-  profileEnv(p, getTool("codex-app"));
+  await profileEnv(p, getTool("codex-app"));
 
   expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toBe(
     ['cli_auth_credentials_store = "file"', "", "[[mcp_servers]]", 'command = "node"', ""].join("\n"),

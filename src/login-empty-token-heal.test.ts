@@ -104,7 +104,7 @@ test("launch heals a rotated-away root when the account is live in a second prof
   expect(credentialHealth(rootPath)).toMatchObject({ exists: true, refreshTokenLength: 0 });
 
   // Launch materialization (what a launched Claude session triggers).
-  profileEnv(primary, getTool("claude"));
+  await profileEnv(primary, getTool("claude"));
 
   // The root now carries a real credential again...
   const healed = credentialHealth(rootPath);
@@ -148,7 +148,7 @@ test("launch does NOT heal when the account is live in a GUEST dir (bb267228 bou
   const rootPath = join(dir, ".credentials.json");
   const guestBefore = readFileSync(join(guest.dir, ".credentials.json"));
 
-  profileEnv(primary, getTool("claude"));
+  await profileEnv(primary, getTool("claude"));
 
   // The husk survives: no converge fired.
   const after = credentialHealth(rootPath);
@@ -198,7 +198,7 @@ test("launch does NOT heal when the guest dir's own credential is a HUSK (gate/w
 
   const guestBefore = readFileSync(join(guest.dir, ".credentials.json"));
 
-  profileEnv(primary, getTool("claude"));
+  await profileEnv(primary, getTool("claude"));
 
   // The guest dir — owned by another account — must not be written through.
   expect(readFileSync(join(guest.dir, ".credentials.json")).equals(guestBefore)).toBe(true);
@@ -234,7 +234,7 @@ test("launch does NOT heal a MIS-BOUND dir whose live identity is a different ac
   writeFileSync(join(sibling.dir, ".claude.json"), accountFile(OWN_UUID, "own@example.test"));
 
   const rootPath = join(dir, ".credentials.json");
-  profileEnv(profile, getTool("claude"));
+  await profileEnv(profile, getTool("claude"));
 
   // The root must stay the husk — the fix must not write OWN_UUID's credential
   // into a dir that currently presents DECOY_UUID.

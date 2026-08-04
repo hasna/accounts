@@ -184,13 +184,13 @@ test("the refusal writes nothing — neither dir is touched", () => {
   expect(readFileSync(join(squatted, ".credentials.json"))).toEqual(liveElsewhereBefore);
 });
 
-test("the launch path refuses it too — a blanket launch cannot create the second copy", () => {
+test("the launch path refuses it too — a blanket launch cannot create the second copy", async () => {
   // `profileEnv` runs recovery on EVERY launch, so a gate that only exists on
   // the CLI path would still let a dozen agents starting up do the damage.
   const { predecessor, squatted } = twoCopiesOfOneAccount();
   const liveElsewhereBefore = readFileSync(join(squatted, ".credentials.json"));
 
-  expect(() => profileEnv({ name: "predecessor", tool: "claude", dir: predecessor }, tool())).not.toThrow();
+  await expect(profileEnv({ name: "predecessor", tool: "claude", dir: predecessor }, tool())).resolves.toBeDefined();
 
   expect(classifyCredentialFile(join(predecessor, ".credentials.json")).state).toBe("rotated-away");
   expect(readFileSync(join(squatted, ".credentials.json"))).toEqual(liveElsewhereBefore);
@@ -276,7 +276,7 @@ test("POSITIVE CONTROL: a park that IS the account's current credential still re
   expect(JSON.parse(readFileSync(join(dir, ".credentials.json"), "utf8")).claudeAiOauth.accessToken).toBe("z-access");
 });
 
-test("an unreadable profile registry FAILS CLOSED rather than restoring blind", () => {
+test("an unreadable profile registry FAILS CLOSED rather than restoring blind", async () => {
   // The launch path has no profile list of its own, so it reads the registry.
   // If that read fails, whether the account is live elsewhere is unknown — and
   // an unknown must not be spent as a "no". The cost of a wrong refusal is
@@ -296,7 +296,7 @@ test("an unreadable profile registry FAILS CLOSED rather than restoring blind", 
   expect(result.outcome).toBe("cross-directory-unknown");
   expect(readFileSync(join(dir, ".credentials.json"))).toEqual(husk);
   // And it still must not throw on the launch path.
-  expect(() => profileEnv({ name: "failclosed", tool: "claude", dir }, toolDef)).not.toThrow();
+  await expect(profileEnv({ name: "failclosed", tool: "claude", dir }, toolDef)).resolves.toBeDefined();
   // Still nothing written after the launch-path call either.
   expect(readFileSync(join(dir, ".credentials.json"))).toEqual(husk);
 });
@@ -317,11 +317,11 @@ test("a caller that supplies the profile list is not affected by an unreadable r
   expect(result.outcome).toBe("recovered");
 });
 
-test("POSITIVE CONTROL: the launch path still recovers the account031 shape", () => {
+test("POSITIVE CONTROL: the launch path still recovers the account031 shape", async () => {
   const dir = makeProfile("huskenv", UUID_Z, "z");
   writeFileSync(join(dir, ".credentials.json"), rotatedAwayJson());
 
-  profileEnv({ name: "huskenv", tool: "claude", dir }, tool());
+  await profileEnv({ name: "huskenv", tool: "claude", dir }, tool());
 
   expect(classifyCredentialFile(join(dir, ".credentials.json")).state).toBe("usable");
 });

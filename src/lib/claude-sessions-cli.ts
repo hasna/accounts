@@ -411,7 +411,7 @@ async function resumeSession(
   }
 
   const tool = getTool("claude");
-  const env = profileEnv(targetProfile, tool);
+  const env = await profileEnv(targetProfile, tool);
   console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv(plan.command).join(" ")}`));
   const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
   // Resume attaches Claude to a credential-bearing provider session, so the

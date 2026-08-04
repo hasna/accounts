@@ -95,7 +95,7 @@ export function controlledProbeEnv(
   return providerLaunchEnv(parentEnv, ...overlays);
 }
 
-export function profileEnv(profile: Profile, tool: ToolDef): Record<string, string> {
+export async function profileEnv(profile: Profile, tool: ToolDef): Promise<Record<string, string>> {
   const env: Record<string, string> = {
     [tool.envVar]: profile.dir,
   };
@@ -162,9 +162,20 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
     // Best-effort: a launch must never fail on a heal.
     if (recovery.outcome === "account-live-elsewhere" && recovery.noGuestOccupantDoorsElsewhere === true) {
       try {
-        convergeDirCredential(profile.dir, { tool });
-      } catch {
-        // The session still launches and reaches its own auth error.
+        await convergeDirCredential(profile.dir, { tool });
+      } catch (error) {
+        // Best-effort stands: a launch must never fail on a heal. But a
+        // refused or failed convergence means this session starts on whatever
+        // credential the dir already holds — through 0.2.32 this catch was
+        // EMPTY, so the launch path degraded with no trace anywhere (the
+        // silent half of bug 2865f9f5). Say so where the operator can see it;
+        // stderr is safe for every consumer of this env (launch, `accounts
+        // env` command substitution, the supervisor).
+        console.error(
+          `accounts: credential convergence for ${profile.dir} failed before launch — ` +
+            `${error instanceof Error ? error.message : String(error)}. ` +
+            `The session launches on the dir's current credential.`,
+        );
       }
     }
     // A dir left switched to another account by `switch-account` must not
