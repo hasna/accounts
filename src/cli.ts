@@ -1245,11 +1245,22 @@ Tuning (env or flags): ACCOUNTS_USAGE_SWITCH_THRESHOLD (default ${DEFAULT_SWITCH
 ACCOUNTS_USAGE_SWITCH_MIN_HEADROOM (${DEFAULT_MIN_HEADROOM}), ACCOUNTS_USAGE_SWITCH_COOLDOWN_S (${DEFAULT_COOLDOWN_MS / 1000}),
 ACCOUNTS_USAGE_CACHE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_MAX_AGE_MS / 1000}),
 ACCOUNTS_USAGE_CACHE_STALE_MAX_AGE_S (${DEFAULT_USAGE_CACHE_STALE_MAX_AGE_MS / 1000}),
-ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S (${DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000}).
+ACCOUNTS_USAGE_HOOK_NOTICE_INTERVAL_S (${DEFAULT_HOOK_NOTICE_INTERVAL_MS / 1000}),
+ACCOUNTS_HOOK_ENSURE_FRESH (default OFF — when 1, a converged near-expiry access token also
+triggers a detached background token refresh; convergence itself is file I/O and always runs).
 Decisions use cached usage only; warm it with a cron/loop running: accounts usage --refresh --quiet
 A reading past the freshness age still decides — usage inside a window only rises, so a stale
 number can miss a switch but never invent one. Past the stale age the hook says so out loud.
 The cooldown is per config dir, so one session's switch never blocks another's.`;
+
+/**
+ * Is the hook's detached, per-session `--ensure-fresh` token exchange enabled?
+ * OFF unless explicitly set — see the decision recorded at the call site.
+ */
+function hookEnsureFreshEnabled(): boolean {
+  const raw = (process.env.ACCOUNTS_HOOK_ENSURE_FRESH ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
 
 function usageHookLog(line: string): void {
   try {
@@ -1322,13 +1333,49 @@ program
             );
             const ttl = converged.expiresInMs;
             if (converged.winner && (ttl === undefined || ttl < ENSURE_FRESH_TRIGGER_TTL_MS)) {
-              const cliPath = process.argv[1];
-              if (cliPath) {
-                spawn(
-                  process.execPath,
-                  [cliPath, "credential-sync", "--tool", opts.tool, "--dir", configDir, "--ensure-fresh", "--quiet"],
-                  { detached: true, stdio: "ignore" },
-                ).unref();
+              // A DETACHED TOKEN EXCHANGE, AND IT IS NOW OFF BY DEFAULT.
+              //
+              // This spawn predates bug 2865f9f5 and sits inside
+              // `if (converged)`, so the bug's throw was accidentally
+              // SUPPRESSING it for every cloud-only dir. Fixing the allowlist
+              // therefore made a network refresh reachable for ~24 more dirs
+              // — a behaviour change with no line of its own in that fix's
+              // diff, which is why no reviewer could see it.
+              //
+              // It collides with a live mitigation: `--ensure-fresh` was
+              // removed from the 10-minute credential-broker cron on
+              // 2026-08-03 as active-harm mitigation against credential
+              // husks. Two defensible positions (the exchange is protective;
+              // the exchange is the harm) and no measurement separating them,
+              // so the default is the one that changes nothing while that
+              // mitigation stands, and the decision is visible rather than
+              // implicit.
+              //
+              // SCOPE, stated precisely because the looser form overstates
+              // it: the guard above is `winner && ttl < TRIGGER`, so this
+              // was never "every prompt on every dir" — it is the session
+              // that converges a near-expiry credential. Pure CONVERGENCE
+              // (file I/O, the protective half) is unaffected and still runs
+              // on every prompt.
+              //
+              // Flip with ACCOUNTS_HOOK_ENSURE_FRESH=1 once a husk rate has
+              // been measured on either side; both branches log, so the log
+              // says which regime a session ran under.
+              if (hookEnsureFreshEnabled()) {
+                const cliPath = process.argv[1];
+                if (cliPath) {
+                  spawn(
+                    process.execPath,
+                    [cliPath, "credential-sync", "--tool", opts.tool, "--dir", configDir, "--ensure-fresh", "--quiet"],
+                    { detached: true, stdio: "ignore" },
+                  ).unref();
+                  usageHookLog(`broker-ensure-fresh spawned dir=${JSON.stringify(configDir)}`);
+                }
+              } else {
+                usageHookLog(
+                  `broker-ensure-fresh skipped reason="disabled by default; set ACCOUNTS_HOOK_ENSURE_FRESH=1 to enable"` +
+                    ` dir=${JSON.stringify(configDir)}`,
+                );
               }
             }
           }

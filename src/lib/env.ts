@@ -8,6 +8,7 @@ import {
 } from "./claude-auth.js";
 import { convergeDirCredential } from "./credential-broker.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
+import { redactText } from "./redaction.js";
 import { assertProfileGuarded, ensureSharedCapabilities } from "./shared-capabilities.js";
 
 /**
@@ -171,10 +172,18 @@ export async function profileEnv(profile: Profile, tool: ToolDef): Promise<Recor
         // silent half of bug 2865f9f5). Say so where the operator can see it;
         // stderr is safe for every consumer of this env (launch, `accounts
         // env` command substitution, the supervisor).
+        // Redacted on the way out: nicanor's probe found no reachable error
+        // message on this path carrying a credential value (synthetic-key
+        // check 0 hits against a positive control returning 1), so this is
+        // defence-in-depth rather than a known leak — but this is a NEW
+        // output surface on the credential-bearing launch path, and the
+        // cheapest moment to make it unable to print one is now.
         console.error(
-          `accounts: credential convergence for ${profile.dir} failed before launch — ` +
-            `${error instanceof Error ? error.message : String(error)}. ` +
-            `The session launches on the dir's current credential.`,
+          redactText(
+            `accounts: credential convergence for ${profile.dir} failed before launch — ` +
+              `${error instanceof Error ? error.message : String(error)}. ` +
+              `The session launches on the dir's current credential.`,
+          ),
         );
       }
     }

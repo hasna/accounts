@@ -120,12 +120,43 @@ export const ENSURE_FRESH_TRIGGER_TTL_MS = 2 * DEFAULT_MIN_TTL_MS;
 /** Network cap for the token exchange; well under the lock's staleness bound. */
 const EXCHANGE_TIMEOUT_MS = 15_000;
 /**
- * `convergeDirCredential` runs inside a UserPromptSubmit hook whose documented
- * deadline is 15 seconds. Keep the registry allowlist read to one short
- * attempt so a stalled registry reaches the caller's fail-open notice instead
- * of being killed by the hook runner first.
+ * Wall-clock ceiling for the ONE registry read that resolves the allowlist.
+ * `convergeDirCredential` runs inside a UserPromptSubmit hook whose deadline
+ * is 15 seconds, so this must fail open with a notice rather than let the hook
+ * runner kill the process — but it must also be ABOVE the real cost of the
+ * call it bounds, or it converts a working path into a permanent failure.
+ *
+ * IT WAS 2_000 AND THAT WAS BELOW THE FLOOR. Measured on station01 at load
+ * 16.16, isolated single `GET /accounts` (`--tool claude`, no hydrate second
+ * call), 13 samples: min 2.82s, median ~4.65s, max 10.12s — 13 of 13 exceeded
+ * 2s. Startup is bounded separately (local-mode runs 0.40/0.52/0.78s), so even
+ * the fastest sample carried >=2.04s of actual HTTP; the bare unauthenticated
+ * 404 to that host alone costs 0.73-1.48s. At 2s the read timed out, the
+ * allowlist rejected, and convergence was skipped EVERY PROMPT — bug
+ * 2865f9f5's own harm by a new route, differing only in that it now says so.
+ *
+ * It also defeated the union: the active half is read FIRST and a rejection
+ * short-circuits the function, so the local half never merged and a local-only
+ * dir was refused too. One under-set constant defeated both remediations.
+ *
+ * 8s, chosen from the 8-10s range at the LOW end, because the two failure
+ * directions are not symmetric:
+ *  - Slightly under-budget costs ONE skipped convergence, fail-open, with a
+ *    visible notice, and the 10-minute credential-broker cron still converges.
+ *  - Over-budget gets the whole hook KILLED at 15s, which takes auto-switching
+ *    down with it and prints nothing.
+ * So bias toward hook headroom. 8s clears the measured median by ~1.7x and the
+ * minimum by ~2.8x; it does NOT cover the 10.12s worst sample, and with only
+ * min/median/max published the number of the 13 samples falling between 8s and
+ * 10.12s is unknown. The rest of the hook — process start, converge, and the
+ * full usage path — measured 306-635ms over 5 local-mode runs at load ~16, so
+ * 8s leaves ~6.4s of the deadline spare; a usage pass that actually PERFORMS a
+ * switch does more work than those runs did, which is what the spare is for.
+ *
+ * Retries are disabled at the call site, so this is the ceiling for the whole
+ * read rather than one attempt of three.
  */
-const ACTIVE_REGISTRY_TIMEOUT_MS = 2_000;
+const ACTIVE_REGISTRY_TIMEOUT_MS = 8_000;
 
 export type BrokerCopyKind = "central" | "profile-snapshot" | "dir-live";
 
@@ -188,15 +219,15 @@ export interface BrokerOptions {
    * `crossDirectoryView`'s reasoning: a Claude account can sit live in a dir
    * registered under any tool.
    *
-   * Omitted, `convergeDirCredential` resolves the ACTIVE registry through
-   * `resolveStore()` (the cloud ApiStore when the machine is configured for
-   * it, the local file otherwise) — the same registry every other surface
-   * uses. Through 0.2.32 it read the LOCAL file unconditionally, so on a
-   * cloud-mode machine every cloud-only profile dir was refused as
-   * unregistered and per-session convergence silently died (bug 2865f9f5).
-   * The SYNC identity-level entry points (`convergeIdentityCredential`) still
-   * default to the local file: they cannot await a store, and their callers
-   * (credential-sync, the hook) pass the resolved profiles down.
+   * Omitted, `convergeDirCredential` resolves the UNION of the active
+   * registry (via `resolveStore()`, bounded by `ACTIVE_REGISTRY_TIMEOUT_MS`)
+   * and the local file — see `allowlistProfiles`. Through 0.2.32 it read the
+   * LOCAL file unconditionally, so on a cloud-mode machine every cloud-only
+   * profile dir was refused as unregistered and per-session convergence
+   * silently died (bug 2865f9f5). The SYNC identity-level entry points
+   * (`convergeIdentityCredential`) still default to the local file: they
+   * cannot await a store, and their callers (credential-sync, the hook) pass
+   * the resolved profiles down.
    */
   profiles?: ReadonlyArray<{ name?: string; dir: string }>;
   /**
@@ -523,27 +554,60 @@ export function assertRegisteredConfigDir(
 }
 
 /**
- * The allowlist source for dir-level convergence: the ACTIVE registry, read
- * through the same `resolveStore()` every other registry surface uses (cloud
- * ApiStore when configured, the local file otherwise). NOT `listProfiles()`:
- * that reads the local file unconditionally, which on a cloud-mode machine
- * describes a fraction of the fleet's profiles — measured 7 of 31 on
- * station01 — so every cloud-only profile dir was refused as unregistered and
- * the hook's per-session convergence silently died (bug 2865f9f5).
+ * The allowlist for dir-level convergence: the UNION of the ACTIVE registry
+ * (via `resolveStore()` — the cloud ApiStore when configured, the local file
+ * otherwise) and the LOCAL file.
  *
- * A failing registry read REJECTS rather than falling back to the local file:
- * a dead registry must be distinguishable from "this dir is not registered",
- * and a silent local fallback would reintroduce the exact wrong-allowlist
- * refusal this function exists to remove. Callers are fail-open (the hook
- * logs and surfaces, the launch path records and launches), so a registry
- * outage degrades to one skipped convergence, never a blocked session.
+ * Not the local file alone: that is bug 2865f9f5 — on a cloud-mode machine it
+ * describes a fraction of the fleet, so every cloud-only profile dir was
+ * refused as unregistered and the hook's per-session convergence silently
+ * died.
+ *
+ * Not the active registry alone either, which is what the first form of this
+ * fix shipped (#123) and is what this corrects: THE TWO REGISTRIES ARE NOT
+ * NESTED. Re-measured on station01 against merge `931feae9`, unfiltered by
+ * tool because this read is unfiltered — active 60 rows / 56 dirs, local 22,
+ * intersection 21, and ONE LOCAL-ONLY dir,
+ * `~/.hasna/accounts/profiles/claude/account022` (populated, `.claude.json`
+ * present), which the pre-#123 allowlist accepted and an active-only
+ * allowlist refuses. Trading 35 newly-fixed dirs for 1 newly-broken one is
+ * still this bug's own harm class, so the allowlist is the union and nothing
+ * regresses.
+ *
+ * Direction of failure is deliberate on each half. A failing ACTIVE read
+ * REJECTS: a dead registry must stay distinguishable from "this dir is not
+ * registered", and a silent local fallback would reintroduce exactly the
+ * wrong-allowlist refusal this function removes. A failing LOCAL read is
+ * swallowed, because losing that half only NARROWS the allowlist — the safe
+ * direction for a security gate — and an unreadable local file must not take
+ * the cloud-only dirs down with it.
+ *
+ * Rows carrying no dir are dropped: a cloud record's `dir` is machine-local
+ * and reads as `""` on a machine that has never materialized it, and an empty
+ * string must never participate in a path-equality allowlist.
  */
-async function activeRegistryProfiles(): Promise<Array<{ name?: string; dir: string }>> {
+async function allowlistProfiles(): Promise<Array<{ name?: string; dir: string }>> {
   const store = resolveStore(process.env, {
     timeoutMs: ACTIVE_REGISTRY_TIMEOUT_MS,
     retry: false,
   });
-  return (await store.listProfiles()).map((profile) => ({ name: profile.name, dir: profile.dir }));
+  const active = await store.listProfiles();
+  let local: ReadonlyArray<{ name?: string; dir: string }> = [];
+  try {
+    local = listProfiles();
+  } catch {
+    // Narrowing only; see above.
+  }
+  const merged: Array<{ name?: string; dir: string }> = [];
+  const seen = new Set<string>();
+  for (const profile of [...active, ...local]) {
+    if (!profile.dir || !profile.dir.trim()) continue;
+    const key = resolve(profile.dir);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push({ ...(profile.name ? { name: profile.name } : {}), dir: profile.dir });
+  }
+  return merged;
 }
 
 export async function convergeDirCredential(
@@ -551,7 +615,7 @@ export async function convergeDirCredential(
   opts: BrokerOptions = {},
 ): Promise<ConvergeReport | undefined> {
   const tool = opts.tool ?? getTool("claude");
-  const profiles = opts.profiles ?? (await activeRegistryProfiles());
+  const profiles = opts.profiles ?? (await allowlistProfiles());
   assertRegisteredConfigDir(configDir, profiles);
   const uuid = dirAccountUuid(configDir, tool);
   if (!uuid || !isAccountUuid(uuid)) return undefined;

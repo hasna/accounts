@@ -121,6 +121,34 @@ function serveCloudRegistry(accounts: Array<{ name: string; dir: string }>): str
   return `http://127.0.0.1:${server.port}`;
 }
 
+/**
+ * A registry that answers correctly but SLOWLY — the shape the real one has.
+ * The delay models the measured floor of a live `GET /accounts` on station01
+ * (min 2.82s, median ~4.65s at load 16.16), which is what made a 2s budget a
+ * permanent failure rather than a safety valve.
+ */
+function serveSlowCloudRegistry(delayMs: number, accounts: Array<{ name: string; dir: string }>): string {
+  server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (req.method === "GET" && url.pathname === "/v1/accounts") {
+        await Bun.sleep(delayMs);
+        return Response.json({
+          accounts: accounts.map((account) => ({
+            tool: "claude",
+            name: account.name,
+            dir: account.dir,
+            createdAt: "2026-08-04T00:00:00.000Z",
+          })),
+        });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  return `http://127.0.0.1:${server.port}`;
+}
+
 /** Accept the registry request but never produce headers or a body. */
 function serveHangingCloudRegistry(): string {
   server = Bun.serve({
@@ -228,18 +256,185 @@ test("usage-hook fails open before its 15-second deadline when the cloud registr
     },
   );
   let timedOut = false;
+  // 14s, not 7s. The property this test is named for is Claude Code's real
+  // 15-second hook deadline; 7s was a proxy chosen when the registry budget
+  // was 2s, and it would now fail purely because that budget was raised to 8s
+  // to clear the call's measured floor. Killing at 14s keeps the assertion
+  // strictly inside the deadline it claims to test, and the explicit elapsed
+  // bound below states the contract directly rather than by proxy — so an
+  // over-budget regression (say, a return to the 30s transport default) is
+  // still caught, by both.
   const timer = setTimeout(() => {
     timedOut = true;
     child.kill();
-  }, 7_000);
+  }, 14_000);
 
+  const startedAt = Date.now();
   const status = await child.exited;
+  const elapsed = Date.now() - startedAt;
   clearTimeout(timer);
   const stdout = await new Response(child.stdout).text();
 
   expect(timedOut).toBe(false);
+  expect(elapsed).toBeLessThan(15_000);
   expect(status).toBe(0);
   expect(stdout).toMatch(/per-session credential convergence is NOT running/);
+  // 30s: this test deliberately waits out the 8s registry budget plus process
+  // start, which exceeds bun's 5s default and would otherwise be killed with
+  // SIGTERM (status 143) and read as a product failure.
+}, 30_000);
+
+// --- the allowlist is the UNION of both registries --------------------------
+
+/** Write a local registry file with the given profile rows. */
+function writeLocalRegistry(rows: Array<{ name: string; dir: string }>): void {
+  writeFileSync(
+    join(home, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      current: {},
+      applied: {},
+      toolLocks: {},
+      profiles: rows.map((row) => ({
+        name: row.name,
+        tool: "claude",
+        dir: row.dir,
+        createdAt: "2026-08-04T00:00:00.000Z",
+      })),
+    }),
+  );
+}
+
+test("cloud mode: a LOCAL-ONLY dir still converges (the #123 regression)", async () => {
+  const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
+  const cloudOnlyDir = makeDir(home, "cloud-only", UUID, fresh);
+  const localOnlyDir = makeDir(home, "local-only", UUID, fresh);
+  // The measured station01 shape at merge 931feae9, unfiltered by tool
+  // because the allowlist read is unfiltered: active 60 rows / 56 dirs,
+  // local 22, intersection 21, LOCAL-ONLY 1 (account022). The registries are
+  // NOT nested, so an active-registry-only allowlist refuses a dir the
+  // pre-#123 allowlist accepted.
+  //
+  // HONEST SCOPE OF THAT ONE DIR, re-verified directly rather than taken on
+  // report: account022 has `.credentials.json exists: False` and
+  // `has oauthAccount key: False`, so `dirAccountUuid` returns undefined and
+  // `convergeDirCredential` returns early WHATEVER the allowlist decides.
+  // Today the union changes nothing observable for the only local-only dir on
+  // this box. That lowers the union's urgency, not its correctness: the
+  // allowlist must not narrow relative to what it accepted before, and a dir
+  // that gains a credential tomorrow must not need a registry migration to be
+  // converged. This fixture is populated so the property is actually
+  // exercised.
+  writeLocalRegistry([{ name: "local-only", dir: localOnlyDir }]);
+  configureCloudMode(serveCloudRegistry([{ name: "cloud-only", dir: cloudOnlyDir }]));
+
+  const localReport = await convergeDirCredential(localOnlyDir, { tool });
+  expect(localReport?.accountUuid).toBe(UUID);
+
+  // ...and the cloud-only dir, the original defect, still converges too.
+  const cloudReport = await convergeDirCredential(cloudOnlyDir, { tool });
+  expect(cloudReport?.accountUuid).toBe(UUID);
+});
+
+test("a SLOW-but-working registry still lets the union form (the 2s-budget compounding)", async () => {
+  const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
+  const cloudOnlyDir = makeDir(home, "cloud-only", UUID, fresh);
+  const localOnlyDir = makeDir(home, "local-only", UUID, fresh);
+  writeLocalRegistry([{ name: "local-only", dir: localOnlyDir }]);
+  // 3s: above the old 2_000 budget, below the new 8_000, and just above the
+  // 2.82s fastest real sample — i.e. a registry behaving NORMALLY, not a
+  // pathological one.
+  configureCloudMode(serveSlowCloudRegistry(3_000, [{ name: "cloud-only", dir: cloudOnlyDir }]));
+
+  // THE COMPOUNDING, and why one constant defeated two fixes: the active half
+  // is read FIRST and unguarded, so its rejection short-circuits
+  // allowlistProfiles and the local half never merges. Under a 2s budget this
+  // dir is refused even though it is in the local registry the union exists
+  // to preserve.
+  const localReport = await convergeDirCredential(localOnlyDir, { tool });
+  expect(localReport?.accountUuid).toBe(UUID);
+
+  const cloudReport = await convergeDirCredential(cloudOnlyDir, { tool });
+  expect(cloudReport?.accountUuid).toBe(UUID);
+  // 20s: two sequential 3s registry reads exceed bun's 5s default; without
+  // this the server is torn down by afterEach mid-flight and the failure
+  // reads as ConnectionRefused rather than as a timeout.
+}, 20_000);
+
+test("the union does NOT widen to a dir absent from BOTH registries", async () => {
+  const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
+  const cloudDir = makeDir(home, "cloud-known", UUID, fresh);
+  const localDir = makeDir(home, "local-known", UUID, fresh);
+  const plantedDir = makeDir(home, "planted-neither", UUID, fresh);
+  writeLocalRegistry([{ name: "local-known", dir: localDir }]);
+  configureCloudMode(serveCloudRegistry([{ name: "cloud-known", dir: cloudDir }]));
+  const before = readFileSync(join(plantedDir, ".credentials.json"), "utf8");
+
+  const message = await errorMessageOf(() => convergeDirCredential(plantedDir, { tool }));
+
+  expect(message).toMatch(/not a registered profile dir/);
+  expect(readFileSync(join(plantedDir, ".credentials.json"), "utf8")).toBe(before);
+});
+
+// --- the detached token exchange is a DELIBERATE, logged decision -----------
+
+/**
+ * Run the hook against a dir whose credential is inside the ensure-fresh
+ * trigger window, in local mode with that dir registered, and return the
+ * usage-hook log. `ACCOUNTS_CLAUDE_OAUTH_TOKEN_URL` is pinned to a dead port
+ * so that even the enabled branch cannot reach a real token endpoint.
+ */
+function runHookWithNearExpiryCredential(env: Record<string, string | undefined>): string {
+  const nearExpiry: Cred = {
+    accessToken: "at-near-expiry",
+    refreshToken: "rt-near-expiry",
+    // Inside ENSURE_FRESH_TRIGGER_TTL_MS (30 min), so the branch is reached.
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  };
+  const dir = makeDir(home, "ensure-fresh-dir", UUID, nearExpiry);
+  writeLocalRegistry([{ name: "ensure-fresh-dir", dir }]);
+
+  const result = spawnSync(process.execPath, ["run", "src/cli.ts", "usage-hook", "--dir", dir], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      ACCOUNTS_HOME: home,
+      ACCOUNTS_TEST_LIVE_DIR: liveBase,
+      ACCOUNTS_CLAUDE_OAUTH_TOKEN_URL: "http://127.0.0.1:1/oauth/token",
+      HASNA_ACCOUNTS_STORAGE_MODE: undefined,
+      ACCOUNTS_STORAGE_MODE: undefined,
+      HASNA_ACCOUNTS_MODE: undefined,
+      HASNA_ACCOUNTS_API_URL: undefined,
+      ACCOUNTS_API_URL: undefined,
+      HASNA_ACCOUNTS_API_KEY: undefined,
+      ACCOUNTS_API_KEY: undefined,
+      ...env,
+    },
+  });
+  expect(result.status).toBe(0);
+  const logPath = join(home, "logs", "usage-hook.log");
+  return existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+}
+
+test("the hook's detached token exchange is OFF by default, and says so", () => {
+  const log = runHookWithNearExpiryCredential({ ACCOUNTS_HOOK_ENSURE_FRESH: undefined });
+
+  // The converge itself ran — this is the branch guard, not a dead path.
+  expect(log).toMatch(/broker-converge uuid=/);
+  expect(log).toMatch(/broker-ensure-fresh skipped/);
+  expect(log).not.toMatch(/broker-ensure-fresh spawned/);
+});
+
+test("POSITIVE CONTROL for the gate: ACCOUNTS_HOOK_ENSURE_FRESH=1 spawns it", () => {
+  const log = runHookWithNearExpiryCredential({ ACCOUNTS_HOOK_ENSURE_FRESH: "1" });
+
+  // Without this, the test above would pass on a branch that can never fire —
+  // the vacuous-gate shape. Both branches are reachable and distinguishable.
+  expect(log).toMatch(/broker-ensure-fresh spawned/);
+  expect(log).not.toMatch(/broker-ensure-fresh skipped/);
 });
 
 // --- local mode unchanged ---------------------------------------------------
