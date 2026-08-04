@@ -242,6 +242,123 @@ test("usage-hook fails open before its 15-second deadline when the cloud registr
   expect(stdout).toMatch(/per-session credential convergence is NOT running/);
 });
 
+// --- the allowlist is the UNION of both registries --------------------------
+
+/** Write a local registry file with the given profile rows. */
+function writeLocalRegistry(rows: Array<{ name: string; dir: string }>): void {
+  writeFileSync(
+    join(home, "accounts.json"),
+    JSON.stringify({
+      version: 1,
+      current: {},
+      applied: {},
+      toolLocks: {},
+      profiles: rows.map((row) => ({
+        name: row.name,
+        tool: "claude",
+        dir: row.dir,
+        createdAt: "2026-08-04T00:00:00.000Z",
+      })),
+    }),
+  );
+}
+
+test("cloud mode: a LOCAL-ONLY dir still converges (the #123 regression)", async () => {
+  const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
+  const cloudOnlyDir = makeDir(home, "cloud-only", UUID, fresh);
+  const localOnlyDir = makeDir(home, "local-only", UUID, fresh);
+  // The measured station01 shape at merge 931feae9, unfiltered by tool
+  // because the allowlist read is unfiltered: active 60 rows / 56 dirs,
+  // local 22, intersection 21, LOCAL-ONLY 1 (account022, populated). The
+  // registries are NOT nested, so an active-registry-only allowlist refuses a
+  // dir the pre-#123 allowlist accepted.
+  writeLocalRegistry([{ name: "local-only", dir: localOnlyDir }]);
+  configureCloudMode(serveCloudRegistry([{ name: "cloud-only", dir: cloudOnlyDir }]));
+
+  const localReport = await convergeDirCredential(localOnlyDir, { tool });
+  expect(localReport?.accountUuid).toBe(UUID);
+
+  // ...and the cloud-only dir, the original defect, still converges too.
+  const cloudReport = await convergeDirCredential(cloudOnlyDir, { tool });
+  expect(cloudReport?.accountUuid).toBe(UUID);
+});
+
+test("the union does NOT widen to a dir absent from BOTH registries", async () => {
+  const fresh: Cred = { accessToken: "at-fresh", refreshToken: "rt-fresh", expiresAt: Date.now() + 7 * HOUR };
+  const cloudDir = makeDir(home, "cloud-known", UUID, fresh);
+  const localDir = makeDir(home, "local-known", UUID, fresh);
+  const plantedDir = makeDir(home, "planted-neither", UUID, fresh);
+  writeLocalRegistry([{ name: "local-known", dir: localDir }]);
+  configureCloudMode(serveCloudRegistry([{ name: "cloud-known", dir: cloudDir }]));
+  const before = readFileSync(join(plantedDir, ".credentials.json"), "utf8");
+
+  const message = await errorMessageOf(() => convergeDirCredential(plantedDir, { tool }));
+
+  expect(message).toMatch(/not a registered profile dir/);
+  expect(readFileSync(join(plantedDir, ".credentials.json"), "utf8")).toBe(before);
+});
+
+// --- the detached token exchange is a DELIBERATE, logged decision -----------
+
+/**
+ * Run the hook against a dir whose credential is inside the ensure-fresh
+ * trigger window, in local mode with that dir registered, and return the
+ * usage-hook log. `ACCOUNTS_CLAUDE_OAUTH_TOKEN_URL` is pinned to a dead port
+ * so that even the enabled branch cannot reach a real token endpoint.
+ */
+function runHookWithNearExpiryCredential(env: Record<string, string | undefined>): string {
+  const nearExpiry: Cred = {
+    accessToken: "at-near-expiry",
+    refreshToken: "rt-near-expiry",
+    // Inside ENSURE_FRESH_TRIGGER_TTL_MS (30 min), so the branch is reached.
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  };
+  const dir = makeDir(home, "ensure-fresh-dir", UUID, nearExpiry);
+  writeLocalRegistry([{ name: "ensure-fresh-dir", dir }]);
+
+  const result = spawnSync(process.execPath, ["run", "src/cli.ts", "usage-hook", "--dir", dir], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      ACCOUNTS_HOME: home,
+      ACCOUNTS_TEST_LIVE_DIR: liveBase,
+      ACCOUNTS_CLAUDE_OAUTH_TOKEN_URL: "http://127.0.0.1:1/oauth/token",
+      HASNA_ACCOUNTS_STORAGE_MODE: undefined,
+      ACCOUNTS_STORAGE_MODE: undefined,
+      HASNA_ACCOUNTS_MODE: undefined,
+      HASNA_ACCOUNTS_API_URL: undefined,
+      ACCOUNTS_API_URL: undefined,
+      HASNA_ACCOUNTS_API_KEY: undefined,
+      ACCOUNTS_API_KEY: undefined,
+      ...env,
+    },
+  });
+  expect(result.status).toBe(0);
+  const logPath = join(home, "logs", "usage-hook.log");
+  return existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+}
+
+test("the hook's detached token exchange is OFF by default, and says so", () => {
+  const log = runHookWithNearExpiryCredential({ ACCOUNTS_HOOK_ENSURE_FRESH: undefined });
+
+  // The converge itself ran — this is the branch guard, not a dead path.
+  expect(log).toMatch(/broker-converge uuid=/);
+  expect(log).toMatch(/broker-ensure-fresh skipped/);
+  expect(log).not.toMatch(/broker-ensure-fresh spawned/);
+});
+
+test("POSITIVE CONTROL for the gate: ACCOUNTS_HOOK_ENSURE_FRESH=1 spawns it", () => {
+  const log = runHookWithNearExpiryCredential({ ACCOUNTS_HOOK_ENSURE_FRESH: "1" });
+
+  // Without this, the test above would pass on a branch that can never fire —
+  // the vacuous-gate shape. Both branches are reachable and distinguishable.
+  expect(log).toMatch(/broker-ensure-fresh spawned/);
+  expect(log).not.toMatch(/broker-ensure-fresh skipped/);
+});
+
 // --- local mode unchanged ---------------------------------------------------
 
 test("local mode: the local registry still governs the allowlist by default", async () => {

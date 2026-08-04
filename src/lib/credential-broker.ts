@@ -188,15 +188,15 @@ export interface BrokerOptions {
    * `crossDirectoryView`'s reasoning: a Claude account can sit live in a dir
    * registered under any tool.
    *
-   * Omitted, `convergeDirCredential` resolves the ACTIVE registry through
-   * `resolveStore()` (the cloud ApiStore when the machine is configured for
-   * it, the local file otherwise) — the same registry every other surface
-   * uses. Through 0.2.32 it read the LOCAL file unconditionally, so on a
-   * cloud-mode machine every cloud-only profile dir was refused as
-   * unregistered and per-session convergence silently died (bug 2865f9f5).
-   * The SYNC identity-level entry points (`convergeIdentityCredential`) still
-   * default to the local file: they cannot await a store, and their callers
-   * (credential-sync, the hook) pass the resolved profiles down.
+   * Omitted, `convergeDirCredential` resolves the UNION of the active
+   * registry (via `resolveStore()`, bounded by `ACTIVE_REGISTRY_TIMEOUT_MS`)
+   * and the local file — see `allowlistProfiles`. Through 0.2.32 it read the
+   * LOCAL file unconditionally, so on a cloud-mode machine every cloud-only
+   * profile dir was refused as unregistered and per-session convergence
+   * silently died (bug 2865f9f5). The SYNC identity-level entry points
+   * (`convergeIdentityCredential`) still default to the local file: they
+   * cannot await a store, and their callers (credential-sync, the hook) pass
+   * the resolved profiles down.
    */
   profiles?: ReadonlyArray<{ name?: string; dir: string }>;
   /**
@@ -523,27 +523,60 @@ export function assertRegisteredConfigDir(
 }
 
 /**
- * The allowlist source for dir-level convergence: the ACTIVE registry, read
- * through the same `resolveStore()` every other registry surface uses (cloud
- * ApiStore when configured, the local file otherwise). NOT `listProfiles()`:
- * that reads the local file unconditionally, which on a cloud-mode machine
- * describes a fraction of the fleet's profiles — measured 7 of 31 on
- * station01 — so every cloud-only profile dir was refused as unregistered and
- * the hook's per-session convergence silently died (bug 2865f9f5).
+ * The allowlist for dir-level convergence: the UNION of the ACTIVE registry
+ * (via `resolveStore()` — the cloud ApiStore when configured, the local file
+ * otherwise) and the LOCAL file.
  *
- * A failing registry read REJECTS rather than falling back to the local file:
- * a dead registry must be distinguishable from "this dir is not registered",
- * and a silent local fallback would reintroduce the exact wrong-allowlist
- * refusal this function exists to remove. Callers are fail-open (the hook
- * logs and surfaces, the launch path records and launches), so a registry
- * outage degrades to one skipped convergence, never a blocked session.
+ * Not the local file alone: that is bug 2865f9f5 — on a cloud-mode machine it
+ * describes a fraction of the fleet, so every cloud-only profile dir was
+ * refused as unregistered and the hook's per-session convergence silently
+ * died.
+ *
+ * Not the active registry alone either, which is what the first form of this
+ * fix shipped (#123) and is what this corrects: THE TWO REGISTRIES ARE NOT
+ * NESTED. Re-measured on station01 against merge `931feae9`, unfiltered by
+ * tool because this read is unfiltered — active 60 rows / 56 dirs, local 22,
+ * intersection 21, and ONE LOCAL-ONLY dir,
+ * `~/.hasna/accounts/profiles/claude/account022` (populated, `.claude.json`
+ * present), which the pre-#123 allowlist accepted and an active-only
+ * allowlist refuses. Trading 35 newly-fixed dirs for 1 newly-broken one is
+ * still this bug's own harm class, so the allowlist is the union and nothing
+ * regresses.
+ *
+ * Direction of failure is deliberate on each half. A failing ACTIVE read
+ * REJECTS: a dead registry must stay distinguishable from "this dir is not
+ * registered", and a silent local fallback would reintroduce exactly the
+ * wrong-allowlist refusal this function removes. A failing LOCAL read is
+ * swallowed, because losing that half only NARROWS the allowlist — the safe
+ * direction for a security gate — and an unreadable local file must not take
+ * the cloud-only dirs down with it.
+ *
+ * Rows carrying no dir are dropped: a cloud record's `dir` is machine-local
+ * and reads as `""` on a machine that has never materialized it, and an empty
+ * string must never participate in a path-equality allowlist.
  */
-async function activeRegistryProfiles(): Promise<Array<{ name?: string; dir: string }>> {
+async function allowlistProfiles(): Promise<Array<{ name?: string; dir: string }>> {
   const store = resolveStore(process.env, {
     timeoutMs: ACTIVE_REGISTRY_TIMEOUT_MS,
     retry: false,
   });
-  return (await store.listProfiles()).map((profile) => ({ name: profile.name, dir: profile.dir }));
+  const active = await store.listProfiles();
+  let local: ReadonlyArray<{ name?: string; dir: string }> = [];
+  try {
+    local = listProfiles();
+  } catch {
+    // Narrowing only; see above.
+  }
+  const merged: Array<{ name?: string; dir: string }> = [];
+  const seen = new Set<string>();
+  for (const profile of [...active, ...local]) {
+    if (!profile.dir || !profile.dir.trim()) continue;
+    const key = resolve(profile.dir);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push({ ...(profile.name ? { name: profile.name } : {}), dir: profile.dir });
+  }
+  return merged;
 }
 
 export async function convergeDirCredential(
@@ -551,7 +584,7 @@ export async function convergeDirCredential(
   opts: BrokerOptions = {},
 ): Promise<ConvergeReport | undefined> {
   const tool = opts.tool ?? getTool("claude");
-  const profiles = opts.profiles ?? (await activeRegistryProfiles());
+  const profiles = opts.profiles ?? (await allowlistProfiles());
   assertRegisteredConfigDir(configDir, profiles);
   const uuid = dirAccountUuid(configDir, tool);
   if (!uuid || !isAccountUuid(uuid)) return undefined;

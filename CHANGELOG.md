@@ -8,6 +8,36 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ### Fixed
 
+- **The converge allowlist is the UNION of the active and local registries
+  (todos `2865f9f5`, follow-up to #123).** #123 re-pointed
+  `convergeDirCredential`'s allowlist from the local file to the active
+  registry, which fixed the cloud-only dirs and regressed the local-only ones
+  — the two registries are not nested. Re-measured on station01 at merge
+  `931feae9`, unfiltered by tool because the read is unfiltered: active 60
+  rows / 56 dirs, local 22, intersection 21, and one LOCAL-ONLY dir
+  (`account022`, populated) that the pre-#123 code accepted and #123 refuses.
+  The allowlist is now the union, so neither population regresses. A failing
+  ACTIVE read still rejects; a failing LOCAL read is swallowed, because losing
+  that half only narrows the gate.
+
+- **The hook's detached `--ensure-fresh` token exchange is OFF by default**
+  (`ACCOUNTS_HOOK_ENSURE_FRESH=1` re-enables). The spawn predates this bug and
+  sits inside `if (converged)`, so the refusal was accidentally suppressing it
+  for every cloud-only dir; fixing the allowlist made a network token refresh
+  reachable for ~24 more dirs as an invisible side effect. That collides with
+  the removal of the same operation from the 10-minute credential-broker cron
+  on 2026-08-03 (active-harm mitigation against credential husks), so the
+  default is the one that changes nothing while that mitigation stands. Both
+  branches log. Convergence itself is file I/O and still runs every prompt.
+
+- **The launch path's convergence-failure notice is redacted** before it
+  reaches stderr. Defence in depth on a new output surface on the
+  credential-bearing launch path; no reachable message on that path was found
+  to carry a credential value.
+
+
+### Fixed
+
 - **`convergeDirCredential` resolves its security allowlist from the ACTIVE
   registry (`resolveStore()`), not the local file (todos `2865f9f5`).**
   Measured on station01 2026-08-03/04: the usage-hook's per-session
