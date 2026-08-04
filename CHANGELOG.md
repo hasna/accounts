@@ -30,6 +30,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   default is the one that changes nothing while that mitigation stands. Both
   branches log. Convergence itself is file I/O and still runs every prompt.
 
+- **The registry allowlist read's timeout is raised from 2s to 8s.** 2s sat
+  BELOW the floor of the call it bounds: measured on station01 at load 16.16,
+  an isolated single `GET /accounts` ran min 2.82s / median ~4.65s / max
+  10.12s across 13 samples — 13 of 13 over 2s. The read therefore timed out,
+  the allowlist rejected, and convergence was skipped every prompt: this bug's
+  own harm by a new route. It also defeated the union, because the active half
+  is read first and its rejection short-circuits before the local half merges,
+  so one under-set constant disabled both remediations. 8s is chosen at the
+  low end of the measured-safe range: it clears the median by ~1.7x, and the
+  rest of the hook (start, converge, full usage path) measured 306-635ms over
+  5 runs, so ~6.4s of the 15s deadline stays spare for a usage pass that
+  actually performs a switch. Retries remain disabled, so 8s is the ceiling
+  for the whole read.
+
 - **The launch path's convergence-failure notice is redacted** before it
   reaches stderr. Defence in depth on a new output surface on the
   credential-bearing launch path; no reachable message on that path was found
