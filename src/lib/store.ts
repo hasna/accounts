@@ -67,6 +67,7 @@ import { resolveAccountsCloud, type AccountsCloudApi } from "./cloud-accounts.js
 import { assertSafeWritePath } from "./safe-path.js";
 import { assertNameFree, type NameInvariantVerdict } from "./name-invariant.js";
 import { grandfatheredPairs } from "./grandfather-manifest.js";
+import { ensureSharedCapabilities } from "./shared-capabilities.js";
 import {
   enumerateProfileDirs,
   mergedNameUniverse,
@@ -234,6 +235,10 @@ class ApiStore implements AccountsStore {
     const managed = opts.dir === undefined;
     const dir = managed ? join(profilesDir(), toolId, opts.name) : validatedDirectoryPath(opts.dir!);
     const created = prepareProfileDirectory(dir, managed);
+    // Keep the hosted transport's machine-local provisioning contract aligned
+    // with LocalStore: a profile must be born with the shared Claude settings
+    // that the selected machine declares, not repaired by a later sweep.
+    ensureSharedCapabilities(dir, tool);
     const email = opts.email ?? detectEmail(dir, tool) ?? undefined;
     try {
       return await this.api.create({

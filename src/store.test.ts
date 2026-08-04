@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveStore } from "./lib/store.js";
@@ -179,6 +179,43 @@ describe("ApiStore routes registry ops to /v1", () => {
         "GET /v1/tools",
         "POST /v1/accounts",
       ]);
+    });
+
+    test("API Claude profile is born with the machine's statusLine", async () => {
+      const sharedHome = join(home, "shared-claude");
+      mkdirSync(sharedHome, { recursive: true });
+      writeFileSync(
+        join(sharedHome, "settings.json"),
+        JSON.stringify({ statusLine: { type: "command", command: "/opt/statusline/render", padding: 0 } }),
+      );
+      const previousSharedHome = process.env.ACCOUNTS_SHARED_HOME_CLAUDE;
+      process.env.ACCOUNTS_SHARED_HOME_CLAUDE = sharedHome;
+
+      try {
+        const { fetchImpl } = mockFetch((c) => {
+          if (c.method === "POST" && c.url.endsWith("/accounts")) {
+            return {
+              status: 201,
+              body: {
+                tool: "claude",
+                name: "statusline-cloud",
+                dir: join(home, "profiles", "claude", "statusline-cloud"),
+                createdAt: "2020-01-01T00:00:00Z",
+              },
+            };
+          }
+          return { status: 404, body: { error: "not found" } };
+        });
+        const store = resolveStore(cloudEnv, { fetchImpl });
+        const profile = await store.addProfile({ name: "statusline-cloud", tool: "claude" });
+
+        expect(
+          JSON.parse(readFileSync(join(profile.dir, "settings.json"), "utf8")).statusLine,
+        ).toEqual({ type: "command", command: "/opt/statusline/render", padding: 0 });
+      } finally {
+        if (previousSharedHome === undefined) delete process.env.ACCOUNTS_SHARED_HOME_CLAUDE;
+        else process.env.ACCOUNTS_SHARED_HOME_CLAUDE = previousSharedHome;
+      }
     });
 
     test("cold custom-profile lookup hydrates launch resolution", async () => {
