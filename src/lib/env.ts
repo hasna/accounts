@@ -8,6 +8,7 @@ import {
 } from "./claude-auth.js";
 import { convergeDirCredential } from "./credential-broker.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
+import { storageEnvKeys } from "../generated/storage-kit/mode.js";
 import { redactText } from "./redaction.js";
 import { assertProfileGuarded, ensureSharedCapabilities } from "./shared-capabilities.js";
 
@@ -25,6 +26,68 @@ export const UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEYS = [
 
 const UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEY_SET = new Set(
   UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEYS.map((name) => name.toLowerCase()),
+);
+
+/**
+ * Authority over the accounts REGISTRY itself. `accounts` is the trusted wrapper and
+ * legitimately holds these in order to resolve a profile name to a config dir; the
+ * tool binary it launches is a coding agent running against an arbitrary,
+ * potentially prompt-injectable repository, and it needs the config dir and nothing
+ * else. So these stop at the spawn boundary.
+ *
+ * ENUMERATED, NOT PREFIX-MATCHED, and that is the whole point. A
+ * `startsWith("HASNA_ACCOUNTS")` scan reads as equivalent and is not: this package
+ * accepts unprefixed and differently-prefixed aliases for the same authority, and a
+ * prefix scan leaks every one of them. Each entry below cites the consumer that
+ * reads it, so the list can be re-derived rather than trusted:
+ *
+ *   HASNA_ACCOUNTS_API_KEY, ACCOUNTS_API_KEY
+ *     -> lib/cloud-accounts.ts deriveEnv(). Bearer credential for the registry /v1
+ *        API, and it is NOT read-only: list/create/update/rename/delete any profile
+ *        fleet-wide. ACCOUNTS_API_KEY is a full alias and has no HASNA_ prefix.
+ *   HASNA_ACCOUNTS_API_URL, ACCOUNTS_API_URL
+ *     -> lib/cloud-accounts.ts deriveEnv(). Not itself secret; denied so the child
+ *        cannot address the registry at all.
+ *   HASNA_ACCOUNTS_API_SIGNING_KEY, HASNA_API_SIGNING_KEY
+ *     -> server/config.ts resolveSigningSecret(). The HMAC secret that MINTS api
+ *        keys — strictly more powerful than the bearer token above. Note the
+ *        fallback's prefix is HASNA_, not HASNA_ACCOUNTS_.
+ *   HASNA_ACCOUNTS_DATABASE_URL, ACCOUNTS_DATABASE_URL
+ *     -> NOT hand-listed. Taken from storageEnvKeys("accounts").databaseUrlKeys in
+ *        src/generated/storage-kit/mode.ts, which is the same spec
+ *        resolveDatabaseUrl()/createCloudPoolFromEnv() consult for server/app.ts
+ *        and server/migrate.ts. A direct DSN carries its own password and is
+ *        unscoped SQL access to the whole registry — strictly worse than the
+ *        bearer token, which is at least bound to the /v1 API's own authz.
+ *
+ *        DERIVED RATHER THAN COPIED because copying it is what went wrong: the
+ *        first version of this list hand-wrote only the HASNA_-prefixed form and
+ *        silently leaked the bare `ACCOUNTS_DATABASE_URL` alias, which the kit
+ *        generates as `${token}_DATABASE_URL` and reads with equal authority.
+ *        That is the very failure this comment warns about, committed inside the
+ *        fix for it. Deriving from the resolver's own spec means the deny list
+ *        cannot drift from what the resolver accepts.
+ *
+ * DELIBERATELY NOT DENIED: the storage-MODE keys — including the bare
+ * `ACCOUNTS_STORAGE_MODE` alias from that same spec. When a mode is explicitly
+ * `cloud`/`self_hosted`, deriveEnv() THROWS on the now-absent key rather than
+ * silently reading a different store — a loud failure is the one we want, and
+ * stripping the mode would convert it into a silent fallback to a local registry.
+ * Also not denied: PATH, proxy, TLS, Bedrock/Vertex and cloud-SDK environment,
+ * which this module's existing policy keeps inside the caller's trust binding.
+ */
+export const REGISTRY_AUTHORITY_ENV_KEYS: readonly string[] = [
+  "HASNA_ACCOUNTS_API_KEY",
+  "ACCOUNTS_API_KEY",
+  "HASNA_ACCOUNTS_API_URL",
+  "ACCOUNTS_API_URL",
+  "HASNA_ACCOUNTS_API_SIGNING_KEY",
+  "HASNA_API_SIGNING_KEY",
+  ...storageEnvKeys("accounts").databaseUrlKeys,
+];
+
+const REGISTRY_AUTHORITY_ENV_KEY_SET = new Set(
+  REGISTRY_AUTHORITY_ENV_KEYS.map((name) => name.toLowerCase()),
 );
 const PORTABLE_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -76,12 +139,53 @@ function renderTemplate(value: string, profile: Profile): string {
   return value.replaceAll("{profileDir}", profile.dir).replaceAll("{profileName}", profile.name).replaceAll("{toolId}", profile.tool);
 }
 
+function removeRegistryAuthorityEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  for (const name of Object.keys(env)) {
+    if (REGISTRY_AUTHORITY_ENV_KEY_SET.has(name.toLowerCase())) delete env[name];
+  }
+  return env;
+}
+
 /**
  * Assemble the final environment at the credential-bearing provider boundary.
  * Scrubbing after every overlay prevents a custom tool setting from re-enabling
  * a dangerous inherited diagnostic, including on case-insensitive platforms.
+ *
+ * DENIES ACCOUNTS-REGISTRY AUTHORITY BY DEFAULT (todos 03dd035d). Every caller of
+ * this function spawns either the tool binary itself or a bounded helper, and none
+ * of them needs authority over the registry that decides which identity the tool
+ * runs as. Default-deny here rather than at the call sites, so a spawn site added
+ * later is contained without anyone remembering to contain it; the single context
+ * that legitimately keeps this authority opts out explicitly and by name below.
  */
 export function providerLaunchEnv(
+  parentEnv: NodeJS.ProcessEnv,
+  ...overlays: Array<NodeJS.ProcessEnv | Record<string, string>>
+): NodeJS.ProcessEnv {
+  return removeRegistryAuthorityEnv(
+    removeUnsafeProviderRequestDebugEnv(Object.assign({}, parentEnv, ...overlays)),
+  );
+}
+
+/**
+ * The one sanctioned exception to the registry-authority denial: `accounts shell`,
+ * which spawns the OPERATOR'S OWN interactive shell rather than an untrusted tool
+ * binary.
+ *
+ * Why this is an exception and not a hole. The operator already holds these
+ * credentials in the shell they typed the command into, and still holds them after
+ * they type `exit`; accounts removing them in between prevents nothing that the
+ * operator could not trivially do anyway, while breaking the ordinary case of
+ * running an `accounts` command inside the subshell — which, with the API key
+ * absent but a storage mode set, fails loudly, and with no mode set silently reads
+ * a DIFFERENT local registry. A control the constrained party can bypass in one
+ * command, whose cost is a silent wrong-store read, is not containment.
+ *
+ * The real boundary is the one `accounts launch` / `accounts run` cross: there
+ * accounts execs an untrusted binary directly, and that binary has no route to the
+ * credential except the one accounts hands it. That route is closed.
+ */
+export function operatorShellEnv(
   parentEnv: NodeJS.ProcessEnv,
   ...overlays: Array<NodeJS.ProcessEnv | Record<string, string>>
 ): NodeJS.ProcessEnv {

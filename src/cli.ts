@@ -69,7 +69,7 @@ import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.js";
-import { formatEnvAssignments, formatExportLines, profileEnv, providerLaunchEnv } from "./lib/env.js";
+import { formatEnvAssignments, formatExportLines, operatorShellEnv, profileEnv, providerLaunchEnv } from "./lib/env.js";
 import { redactText } from "./lib/redaction.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import {
@@ -1833,7 +1833,9 @@ program
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(shell, ["-i"], {
         stdio: "inherit",
-        env: providerLaunchEnv(process.env, env, { ACCOUNTS_ACTIVE: profile.name }),
+        // operatorShellEnv, not providerLaunchEnv: this is the operator's own
+        // interactive shell, not an untrusted tool binary. See lib/env.ts.
+        env: operatorShellEnv(process.env, env, { ACCOUNTS_ACTIVE: profile.name }),
       });
       process.exit(res.status ?? 0);
     }),
