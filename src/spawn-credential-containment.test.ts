@@ -47,7 +47,16 @@ let probeLog: string;
  *   HASNA_ACCOUNTS_API_URL / ACCOUNTS_API_URL  -> lib/cloud-accounts.ts (deriveEnv)
  *   HASNA_ACCOUNTS_API_SIGNING_KEY             -> server/config.ts (resolveSigningSecret)
  *   HASNA_API_SIGNING_KEY                      -> server/config.ts (resolveSigningSecret)
- *   HASNA_ACCOUNTS_DATABASE_URL                -> server/migrate.ts
+ *   HASNA_ACCOUNTS_DATABASE_URL                -> generated/storage-kit/mode.ts
+ *   ACCOUNTS_DATABASE_URL                      -> generated/storage-kit/mode.ts
+ *
+ * The last two are written as LITERALS here on purpose, even though the deny list
+ * now derives them from storageEnvKeys("accounts").databaseUrlKeys. If the test
+ * derived them the same way, a regression in that spec would remove the name from
+ * BOTH sides at once and the suite would go green while leaking. The bare
+ * ACCOUNTS_DATABASE_URL alias was missed by the first version of this fix and
+ * found by an independent reviewer — it is a literal here so that miss cannot
+ * recur silently.
  */
 const INDEPENDENT_CANARIES = [
   "HASNA_ACCOUNTS_API_KEY",
@@ -57,6 +66,7 @@ const INDEPENDENT_CANARIES = [
   "HASNA_ACCOUNTS_API_SIGNING_KEY",
   "HASNA_API_SIGNING_KEY",
   "HASNA_ACCOUNTS_DATABASE_URL",
+  "ACCOUNTS_DATABASE_URL",
 ] as const;
 
 /** Synthetic sentinels. Never a real credential; the probe never prints a value. */
@@ -68,6 +78,7 @@ const SENTINEL_ENV: Record<string, string> = {
   HASNA_ACCOUNTS_API_SIGNING_KEY: "synthetic-sentinel-signing",
   HASNA_API_SIGNING_KEY: "synthetic-sentinel-signing",
   HASNA_ACCOUNTS_DATABASE_URL: "postgres://synthetic.invalid/db",
+  ACCOUNTS_DATABASE_URL: "postgres://synthetic.invalid/db",
 };
 
 function removeTestDirectory(path: string): void {

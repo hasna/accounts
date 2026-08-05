@@ -8,6 +8,7 @@ import {
 } from "./claude-auth.js";
 import { convergeDirCredential } from "./credential-broker.js";
 import { ensureCodexAppProfileConfig } from "./codex-app.js";
+import { storageEnvKeys } from "../generated/storage-kit/mode.js";
 import { redactText } from "./redaction.js";
 import { assertProfileGuarded, ensureSharedCapabilities } from "./shared-capabilities.js";
 
@@ -51,25 +52,39 @@ const UNSAFE_PROVIDER_REQUEST_DEBUG_ENV_KEY_SET = new Set(
  *     -> server/config.ts resolveSigningSecret(). The HMAC secret that MINTS api
  *        keys — strictly more powerful than the bearer token above. Note the
  *        fallback's prefix is HASNA_, not HASNA_ACCOUNTS_.
- *   HASNA_ACCOUNTS_DATABASE_URL
- *     -> server/migrate.ts, server/app.ts. Direct DSN, carries its own password.
+ *   HASNA_ACCOUNTS_DATABASE_URL, ACCOUNTS_DATABASE_URL
+ *     -> NOT hand-listed. Taken from storageEnvKeys("accounts").databaseUrlKeys in
+ *        src/generated/storage-kit/mode.ts, which is the same spec
+ *        resolveDatabaseUrl()/createCloudPoolFromEnv() consult for server/app.ts
+ *        and server/migrate.ts. A direct DSN carries its own password and is
+ *        unscoped SQL access to the whole registry — strictly worse than the
+ *        bearer token, which is at least bound to the /v1 API's own authz.
  *
- * DELIBERATELY NOT DENIED: the storage-MODE keys. When a mode is explicitly
+ *        DERIVED RATHER THAN COPIED because copying it is what went wrong: the
+ *        first version of this list hand-wrote only the HASNA_-prefixed form and
+ *        silently leaked the bare `ACCOUNTS_DATABASE_URL` alias, which the kit
+ *        generates as `${token}_DATABASE_URL` and reads with equal authority.
+ *        That is the very failure this comment warns about, committed inside the
+ *        fix for it. Deriving from the resolver's own spec means the deny list
+ *        cannot drift from what the resolver accepts.
+ *
+ * DELIBERATELY NOT DENIED: the storage-MODE keys — including the bare
+ * `ACCOUNTS_STORAGE_MODE` alias from that same spec. When a mode is explicitly
  * `cloud`/`self_hosted`, deriveEnv() THROWS on the now-absent key rather than
  * silently reading a different store — a loud failure is the one we want, and
  * stripping the mode would convert it into a silent fallback to a local registry.
  * Also not denied: PATH, proxy, TLS, Bedrock/Vertex and cloud-SDK environment,
  * which this module's existing policy keeps inside the caller's trust binding.
  */
-export const REGISTRY_AUTHORITY_ENV_KEYS = [
+export const REGISTRY_AUTHORITY_ENV_KEYS: readonly string[] = [
   "HASNA_ACCOUNTS_API_KEY",
   "ACCOUNTS_API_KEY",
   "HASNA_ACCOUNTS_API_URL",
   "ACCOUNTS_API_URL",
   "HASNA_ACCOUNTS_API_SIGNING_KEY",
   "HASNA_API_SIGNING_KEY",
-  "HASNA_ACCOUNTS_DATABASE_URL",
-] as const;
+  ...storageEnvKeys("accounts").databaseUrlKeys,
+];
 
 const REGISTRY_AUTHORITY_ENV_KEY_SET = new Set(
   REGISTRY_AUTHORITY_ENV_KEYS.map((name) => name.toLowerCase()),
