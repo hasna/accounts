@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -15,6 +15,7 @@ import {
   profileOAuthSnapshot,
   profileSwitchedAccountMarker,
   profileUnreadableCredentialsDir,
+  CREDENTIALS_SNAPSHOT,
   OAUTH_SNAPSHOT,
   dirCredentialsFile,
 } from "./claude-layout.js";
@@ -392,6 +393,50 @@ export function liveOAuthEmail(): string | undefined {
   return typeof email === "string" && email ? email : undefined;
 }
 
+export const ORPHAN_SNAPSHOTS_DIR_NAME = "orphan-snapshots";
+
+/** Root under which unattributable outgoing credentials are parked. */
+export function orphanSnapshotsRoot(): string {
+  return join(accountsHome(), ORPHAN_SNAPSHOTS_DIR_NAME);
+}
+
+/**
+ * Park a config dir's outgoing live auth in a timestamped ORPHAN snapshot
+ * under {@link orphanSnapshotsRoot} (bug 04a350a9, task 61148ec0).
+ *
+ * Called when a switch is about to overwrite a dir's live credential and NO
+ * owning profile could be resolved for it (`detectDirOwner` returned
+ * undefined: the dir carries no account, no profile owns its email, or
+ * several profiles share it). 0.2.32 warned and overwrote — and because a
+ * rotated-in refresh token exists nowhere else, that destroyed the login
+ * outright. Parking is deliberately dumb: no identity guessing, no merging —
+ * a copy of the bytes plus the dir's oauth record, in a fresh timestamped
+ * directory, so a human (or a later reconcile flow) can recover the account.
+ *
+ * Orphan snapshots are an interim crash-net; the zero-copies invariant design
+ * (task aaf4c98f) supersedes them.
+ *
+ * Returns the snapshot directory, or undefined when the dir holds no live
+ * credential file (nothing to lose). Throws when the credential exists but
+ * cannot be parked — the caller must NOT proceed to overwrite it.
+ */
+export function parkOrphanDirAuth(sourceDir: string, tool: ToolDef): string | undefined {
+  const sourceCredentials = dirCredentialsFile(sourceDir);
+  if (!existsSync(sourceCredentials) || lstatSync(sourceCredentials).isSymbolicLink()) return undefined;
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = join(orphanSnapshotsRoot(), `${stamp}-${randomUUID().slice(0, 8)}`);
+  const credDest = join(dest, CREDENTIALS_SNAPSHOT);
+  assertSafeWritePath(credDest, { mustStayUnder: accountsHome() });
+  mkdirSync(dest, { recursive: true });
+  copyFileSync(sourceCredentials, credDest);
+  chmodSync(credDest, 0o600);
+
+  const oauth = readOAuthFromPaths([join(sourceDir, tool.accountFile ?? ".claude.json")]);
+  if (oauth) writeJsonFile(join(dest, OAUTH_SNAPSHOT), { oauthAccount: oauth }, accountsHome());
+  return dest;
+}
+
 /** Snapshot live Claude auth into a profile directory (used when switching away on apply). */
 export function snapshotLiveAuthToProfile(profileDir: string, _tool: ToolDef): void {
   const authDir = profileAuthDir(profileDir);
@@ -402,14 +447,26 @@ export function snapshotLiveAuthToProfile(profileDir: string, _tool: ToolDef): v
   const oauth = readOAuthFromPaths([live.homeJson]);
   if (oauth) writeJsonFile(profileOAuthSnapshot(profileDir), { oauthAccount: oauth }, profileDir);
 
+  // DOWNGRADE GUARD (bug 04a350a9, task 61148ec0). The live credential is not
+  // always a credential: when two dirs hold one account, the loser of the
+  // refresh-rotation race gets its `.credentials.json` BLANKED in place by
+  // Claude Code (empty tokens, expiresAt 0), and this copy then propagated
+  // that husk over the owning profile's parked snapshot — often the only good
+  // copy left. Rank with `betterCredential` exactly like the central store
+  // does (`syncCredentialsFile` never downgrades central): a genuinely rotated
+  // token still wins, a blank never does. The keychain write rides inside the
+  // guard because on a husked live default the machine keychain carries the
+  // same blanked secret.
   if (existsSync(live.credentialsFile)) {
     const dest = profileCredentialsSnapshot(profileDir);
-    assertSafeWritePath(dest, { mustStayUnder: profileDir });
-    copyFileSync(live.credentialsFile, dest);
+    if (!wouldDowngradeSnapshot(live.credentialsFile, dest)) {
+      assertSafeWritePath(dest, { mustStayUnder: profileDir });
+      copyFileSync(live.credentialsFile, dest);
 
-    if (keychainSupported()) {
-      const kc = readClaudeKeychain();
-      if (kc) writeJsonFile(profileKeychainSnapshot(profileDir), kc as unknown as JsonRecord, profileDir);
+      if (keychainSupported()) {
+        const kc = readClaudeKeychain();
+        if (kc) writeJsonFile(profileKeychainSnapshot(profileDir), kc as unknown as JsonRecord, profileDir);
+      }
     }
   }
 

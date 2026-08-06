@@ -10,6 +10,7 @@ import {
   dirOAuthEmail,
   ensureProfileAuthSnapshot,
   liveOAuthEmail,
+  parkOrphanDirAuth,
   profileOAuthEmail,
   readSwitchedAccountMarker,
   restoreClaudeAuthIntoDir,
@@ -299,6 +300,23 @@ export async function switchAccount(
         snapshotBackProfile = owner.name;
       } else {
         warnings.push(`${owner.name} already holds a better credential than this dir; snapshot-back skipped`);
+      }
+    } else {
+      // NO RESOLVABLE OWNER — PARK, NEVER DESTROY (bug 04a350a9, task
+      // 61148ec0). `restoreClaudeAuthIntoDir` below overwrites the dir's live
+      // credential wholesale, and a rotated-in refresh token exists nowhere
+      // else, so warning-and-overwriting destroyed the outgoing login. Park
+      // the bytes in a timestamped orphan snapshot instead; if parking THROWS,
+      // the switch aborts here — before the marker write and the restore —
+      // leaving the dir exactly as it was. Orphan snapshots are an interim
+      // crash-net until the zero-copies invariant design (task aaf4c98f)
+      // supersedes them.
+      const parked = parkOrphanDirAuth(configDir, tool);
+      if (parked) {
+        warnings.push(
+          `no profile could be identified as this dir's owner, so its outgoing credential was parked in ${parked} — ` +
+            `recover it with \`accounts add\` + \`accounts login\`, or by restoring that file deliberately`,
+        );
       }
     }
 
