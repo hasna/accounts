@@ -6,6 +6,22 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.35] - 2026-08-06
+
+### Changed
+
+- **Account switching rebuilt as an atomic symlink repoint over a single
+  central credential inode (task 46679f8b, PR #129).** Each OAuth account keeps
+  exactly one real credential file, keyed by account uuid, under the central
+  `auth/<uuid>/` store. A session points at its current account through a
+  symlink (`.credentials.json` -> that central file), and a switch atomically
+  repoints the symlink via a rename swap — no credential bytes are copied, no
+  logout occurs, and no husk is left behind. This removes the multi-copy fan-out
+  that was the husking root cause and lets two sessions safely share one central
+  inode, relying on Claude's on-disk mtime-watch + refresh-save CAS for
+  concurrent refresh on that single file. Adds `symlink-broker` with a
+  link-migration path and full regression coverage.
+
 ## [0.2.34] - 2026-08-06
 
 ### Fixed
