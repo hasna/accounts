@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
@@ -79,6 +79,7 @@ import {
   type SwitchMode,
 } from "./lib/switch.js";
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+import { migrateDirToLink } from "./lib/symlink-broker.js";
 import {
   buildIdentityIndex,
   dirAccountUuid,
@@ -1038,6 +1039,72 @@ program
         console.log(chalk.dim("  verify: the session's next reply runs as the new account; /status shows the email"));
       },
     ),
+  );
+
+program
+  .command("migrate-links")
+  .description(
+    "migrate config dirs to the single-inode broker: replace a dir's real .credentials.json with a symlink into " +
+      "the account's central store (inode move, no byte copy). Live dirs are skipped — convert them at their respawn window",
+  )
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("--dir <path>", "migrate a single config dir")
+  .option("--all", "migrate every registered profile dir for the tool")
+  .option("--json", "output JSON")
+  .action(
+    action(async (opts: { tool: string; dir?: string; all?: boolean; json?: boolean }) => {
+      const tool = getTool(opts.tool);
+      if (tool.id !== "claude") throw new AccountsError("migrate-links supports Claude Code only");
+      const store = resolveStore();
+      const dirs = new Set<string>();
+      if (opts.dir) dirs.add(resolve(opts.dir));
+      if (opts.all) for (const p of await store.listProfiles(tool.id)) dirs.add(resolve(p.dir));
+      if (dirs.size === 0) throw new AccountsError("pass --dir <path> or --all");
+
+      interface MigrateRow {
+        dir: string;
+        outcome: "migrated" | "already-linked" | "skipped" | "failed";
+        uuid?: string;
+        reason?: string;
+        quarantined?: string;
+      }
+      const rows: MigrateRow[] = [];
+      for (const dir of dirs) {
+        const uuid = dirAccountUuid(dir, tool);
+        if (!uuid || !isAccountUuid(uuid)) {
+          rows.push({ dir, outcome: "skipped", reason: "no resolvable account uuid on this dir" });
+          continue;
+        }
+        const live = listDirLiveSessions(dir).filter((s) => s.alive).length;
+        if (live > 0) {
+          rows.push({ dir, outcome: "skipped", uuid, reason: `${live} live session(s) — convert at the seat's respawn window` });
+          continue;
+        }
+        try {
+          const result = migrateDirToLink(dir, uuid);
+          rows.push({
+            dir,
+            outcome: result.changed ? "migrated" : "already-linked",
+            uuid,
+            ...(result.quarantined ? { quarantined: result.quarantined } : {}),
+          });
+        } catch (error) {
+          rows.push({ dir, outcome: "failed", uuid, reason: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify({ schema: "hasna.accounts.migrate-links/v1", results: rows }, null, 2));
+        return;
+      }
+      for (const row of rows) {
+        const detail = `${row.dir}${row.uuid ? ` (${row.uuid})` : ""}${row.reason ? ` — ${row.reason}` : ""}`;
+        if (row.outcome === "migrated") console.log(chalk.green(`✓ migrated: ${detail}`));
+        else if (row.outcome === "failed") console.log(chalk.yellow(`! failed: ${detail}`));
+        else console.log(chalk.dim(`• ${row.outcome}: ${detail}`));
+        if (row.quarantined) console.log(chalk.dim(`    preserved: ${row.quarantined}`));
+      }
+    }),
   );
 
 function printBrokerReport(report: ConvergeReport | EnsureFreshReport, quiet: boolean): void {

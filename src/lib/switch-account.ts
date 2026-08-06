@@ -1,9 +1,11 @@
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { withApplyLock } from "./apply-lock.js";
 import {
+  applyProfileOAuthIdentityToDir,
   claudeProfileAuthHealth,
   clearSwitchedAccountMarker,
   dirCredentialShouldUpdateProfile,
@@ -18,8 +20,15 @@ import {
   writeSwitchedAccountMarker,
 } from "./claude-auth.js";
 import { listDirLiveSessions, liveClaudeBase, liveClaudePaths, type DirSessionInfo } from "./claude-layout.js";
-import { isAccountUuid, profileAccountUuid } from "./auth-store.js";
+import { credentialHealth, isAccountUuid, profileAccountUuid } from "./auth-store.js";
 import { convergeIdentityCredential } from "./credential-broker.js";
+import { dirAccountUuid } from "./identity-index.js";
+import {
+  centralCredentialsPath,
+  inspectDirCredential,
+  migrateDirToLink,
+  repointDir,
+} from "./symlink-broker.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool } from "./tools.js";
 
@@ -243,6 +252,71 @@ export async function switchAccount(
 
   const warnings: string[] = [];
 
+  // === SINGLE-INODE BROKER: ATOMIC SYMLINK REPOINT (owner directive 2026-08-06) ===
+  //
+  // The target-state switch: point the session's `.credentials.json` at the
+  // incoming account's ONE central file by an atomic `rename` of a symlink,
+  // preserving the outgoing account's in-place refresh onto its own central
+  // file first. Zero credential bytes are copied and no central file is
+  // unlinked, so a switch can never destroy a login (design §4, task 46679f8b).
+  //
+  // ROLLOUT IS PER-DIR AND SAFE BY DEFAULT. A dir already ON the model — its
+  // `.credentials.json` is a symlink into the central store — MUST repoint,
+  // because the legacy copy path refuses to write through a symlink. A dir that
+  // is still a regular file keeps the legacy copy behaviour UNCHANGED until it
+  // is deliberately converted with `accounts migrate-links` (design GATE 1/2:
+  // symlinks are created on production dirs deliberately, not implicitly on
+  // every switch). `HASNA_ACCOUNTS_SYMLINK_BROKER=1` opts a box in to
+  // migrate-on-switch for regular dirs too. So installing this release changes
+  // nothing on a box whose dirs are all regular files; the model activates a
+  // dir at a time, on migration.
+  const targetUuid = profileAccountUuid(profile.dir, tool);
+  const targetHasCentral =
+    !!targetUuid && isAccountUuid(targetUuid) && existsSync(centralCredentialsPath(targetUuid));
+  if (dirKind !== "live-default") {
+    const dirInfo = inspectDirCredential(configDir);
+    const dirIsMigrated = dirInfo.kind === "link-central";
+    const brokerOptIn = process.env.HASNA_ACCOUNTS_SYMLINK_BROKER === "1";
+    if (dirIsMigrated || brokerOptIn) {
+      // A migrated dir can ONLY be switched by repoint; if the target has no
+      // central file, say so plainly rather than letting the copy-path
+      // fall-through raise a confusing "refusing to write through symlink".
+      if (dirIsMigrated && !targetHasCentral) {
+        throw new AccountsError(
+          `profile "${profile.name}" has no central credential to link this session to. ` +
+            `Re-authenticate with \`accounts login ${profile.name}\` first.`,
+        );
+      }
+      if (targetHasCentral) {
+        const outUuid =
+          dirInfo.kind === "link-central"
+            ? dirInfo.uuid
+            : dirInfo.kind === "regular"
+              ? dirAccountUuid(configDir, tool)
+              : undefined;
+        // The outgoing credential must be preservable: an already-linked dir, a
+        // Claude refresh fork of a known account, or an empty dir. An opt-in on
+        // a regular dir whose account cannot be resolved falls through to the
+        // legacy path, which PARKS it rather than risk losing a login.
+        const outgoingPreservable =
+          dirInfo.kind === "link-central" ||
+          dirInfo.kind === "missing" ||
+          (dirInfo.kind === "regular" && Boolean(outUuid));
+        if (outgoingPreservable) {
+          return await switchAccountViaRepoint(profile, tool, {
+            configDir,
+            dirKind,
+            targetUuid: targetUuid!,
+            outUuid,
+            warnings,
+            opts,
+            store,
+          });
+        }
+      }
+    }
+  }
+
   // BROKER CONVERGENCE BEFORE ANYTHING READS THE PROFILE'S CREDENTIAL. When
   // the target account is also live in another dir, this profile's parked copy
   // can be a SUPERSEDED PREDECESSOR of the account's current credential —
@@ -437,6 +511,124 @@ export async function switchAccount(
     alreadyActive: false,
     ...(outcome.previousEmail ? { previousEmail: outcome.previousEmail } : {}),
     ...(outcome.snapshotBackProfile ? { snapshotBackProfile: outcome.snapshotBackProfile } : {}),
+    liveSessions,
+    warnings,
+    restartRequired: false,
+    message: `${profile.name}${targetEmail ? ` (${targetEmail})` : ""} takes over this session on its next message — no restart needed`,
+  };
+}
+
+interface RepointContext {
+  configDir: string;
+  dirKind: SessionDirKind;
+  targetUuid: string;
+  outUuid?: string;
+  warnings: string[];
+  opts: SwitchAccountOptions;
+  store: AccountsStore;
+}
+
+/**
+ * The single-inode broker switch: preserve the outgoing account's in-place
+ * refresh onto its central file, then atomically repoint the dir's
+ * `.credentials.json` symlink at the incoming account's central file, and merge
+ * the incoming identity into the dir's account file. Zero credential bytes are
+ * copied and no central file is unlinked, so the switch cannot destroy a login
+ * (design §4). Health is gated on the credential OF RECORD — the central file —
+ * so a husked incoming account is refused before anything is touched.
+ */
+async function switchAccountViaRepoint(
+  profile: Profile,
+  tool: ToolDef,
+  ctx: RepointContext,
+): Promise<SwitchAccountResult> {
+  const { configDir, dirKind, targetUuid, outUuid, warnings, opts, store } = ctx;
+
+  const central = credentialHealth(centralCredentialsPath(targetUuid));
+  if (!central.exists || central.refreshTokenLength === 0) {
+    throw new AccountsError(
+      `profile "${profile.name}" cannot take over this session — its central credential is missing or has no refresh token. ` +
+        `Re-authenticate with \`accounts login ${profile.name}\` first.`,
+    );
+  }
+  if (central.expiresAt <= Date.now()) {
+    warnings.push(
+      `"${profile.name}" has an aged-out access token; its refresh token is intact, so the tool renews it on the next request`,
+    );
+  }
+
+  const sessions = listDirLiveSessions(configDir);
+  const liveSessions = sessions.filter((s: DirSessionInfo) => s.alive).length;
+  if (liveSessions > 1 && !opts.yes) {
+    throw new AccountsError(
+      `${liveSessions} live sessions share ${configDir} and ALL of them would switch to "${profile.name}" together. Re-run with --yes to proceed.`,
+    );
+  }
+  if (liveSessions > 1) {
+    warnings.push(`${liveSessions} live sessions share this config dir; all of them switch together`);
+  }
+
+  const targetEmail = profileOAuthEmail(profile.dir, tool) ?? profile.email;
+  const previousEmail = dirOAuthEmail(configDir, tool);
+
+  // Switching to the account the dir already carries: normalise onto the link
+  // model (adopt any refresh fork, relink) and report a no-op.
+  if (outUuid && outUuid.toLowerCase() === targetUuid.toLowerCase()) {
+    withApplyLock(() => {
+      migrateDirToLink(configDir, targetUuid);
+      clearSwitchedAccountMarker(configDir);
+    });
+    return {
+      profile,
+      tool,
+      configDir,
+      dirKind,
+      alreadyActive: true,
+      ...(previousEmail ? { previousEmail } : {}),
+      liveSessions,
+      warnings,
+      restartRequired: false,
+      message: `${profile.name}${targetEmail ? ` (${targetEmail})` : ""} already owns this session's config dir — nothing to switch`,
+    };
+  }
+
+  withApplyLock(() => {
+    const result = repointDir(configDir, {
+      ...(outUuid ? { fromUuid: outUuid } : {}),
+      toUuid: targetUuid,
+    });
+    if (result.quarantined) {
+      warnings.push(`outgoing credential preserved in ${result.quarantined}`);
+    }
+    // Per-key oauthAccount merge: the dir's account file names the incoming
+    // account; every other key survives, and no credential bytes are written.
+    applyProfileOAuthIdentityToDir(profile.dir, tool, configDir);
+    // Occupancy is the symlink itself now (readlink), so a legacy
+    // switched-account marker is vestigial and, left stale, mislabels the dir
+    // (bug 1eadc484). Clear it.
+    clearSwitchedAccountMarker(configDir);
+  });
+
+  try {
+    await store.useProfile(profile.name, tool.id);
+  } catch (error) {
+    warnings.push(`active-profile pointer not updated: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  let refreshed: Profile = profile;
+  try {
+    refreshed = await store.getProfile(profile.name, tool.id);
+  } catch {
+    // Registry read-back is cosmetic; the on-disk switch is done.
+  }
+
+  return {
+    profile: refreshed,
+    tool,
+    configDir,
+    dirKind,
+    alreadyActive: false,
+    ...(previousEmail ? { previousEmail } : {}),
     liveSessions,
     warnings,
     restartRequired: false,

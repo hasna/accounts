@@ -574,6 +574,29 @@ export function restoreClaudeAuthIntoDir(
 }
 
 /**
+ * Merge a profile's oauthAccount IDENTITY — never its credential bytes — into a
+ * config dir's account file. The single-inode broker (`symlink-broker.ts`)
+ * carries credentials via the dir's `.credentials.json` symlink, so a repoint
+ * only needs the dir's `.claude.json` to name the incoming account. This is the
+ * per-key oauthAccount merge of design §4 step 5: every other key in the dir's
+ * account file survives, and no credential file is written or read.
+ */
+export function applyProfileOAuthIdentityToDir(profileDir: string, tool: ToolDef, targetDir: string): void {
+  ensureProfileAuthSnapshot(profileDir, tool);
+  const oauth =
+    readOAuthSnapshot(profileDir) ??
+    centralOAuthRecordForProfile(profileDir, tool) ??
+    (readSwitchedAccountMarker(profileDir)
+      ? undefined
+      : readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool)));
+  if (!oauth) throw new AccountsError("profile has no OAuth account data to apply");
+  const accountFile = join(targetDir, tool.accountFile ?? ".claude.json");
+  assertSafeWritePath(accountFile, { mustStayUnder: targetDir });
+  mkdirSync(targetDir, { recursive: true });
+  mergeOAuthInto([accountFile], oauth, false, targetDir);
+}
+
+/**
  * If a profile's own dir was switched to another account (agreeing marker) and
  * no live session is using it, restore the profile's own auth so a fresh launch
  * runs as the profile it claims to be. Throws when live sessions still run on
