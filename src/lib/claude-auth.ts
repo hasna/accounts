@@ -247,11 +247,24 @@ function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
 
 /**
  * Best restorable credential snapshot for a profile: the per-profile copy vs
- * the central identity-keyed copy, `betterCredential` winner. Not "central
- * first" — during the 0.2.15/0.2.16 window an old binary may have rotated a
- * fresher token into the per-profile copy, and restoring a stale central one
- * would log the account out. `stayUnder` is the containment root for source
- * symlink checks on the winning path.
+ * the central identity-keyed copy vs the profile dir's own LIVE file,
+ * `betterCredential` winner. Not "central first" — during the 0.2.15/0.2.16
+ * window an old binary may have rotated a fresher token into the per-profile
+ * copy, and restoring a stale central one would log the account out.
+ * `stayUnder` is the containment root for source symlink checks on the
+ * winning path.
+ *
+ * THE DIR-LIVE COPY COUNTS (bug 04a350a9, task d132234c) — but only when the
+ * dir is carrying the profile's OWN account. `assertRestorableProfileAuth`
+ * has always counted `<dir>/.credentials.json` as a credential payload, while
+ * this function ignored it, so a profile whose only credential was its
+ * dir-live file passed the assert and then reached restore paths with
+ * "nothing restorable" — which `restoreClaudeAuthFromProfile` answered by
+ * DELETING the live default's credentials file. When the dir is occupied by
+ * another account (in-place switch or an in-session /login), the dir-live
+ * file is the OCCUPANT's token, not this profile's, and stays excluded —
+ * exactly the rule `claudeProfileAuthHealth` and
+ * `profileFileCredentialSecret` already apply.
  */
 function bestRestorableCredentialPath(
   profileDir: string,
@@ -260,6 +273,9 @@ function bestRestorableCredentialPath(
   const candidates: { path: string; stayUnder: string }[] = [
     { path: profileCredentialsSnapshot(profileDir), stayUnder: profileDir },
   ];
+  if (!profileDirCarriesForeignAccount(profileDir, tool)) {
+    candidates.push({ path: profileCredentialFile(profileDir), stayUnder: profileDir });
+  }
   const central = centralCredentialsPathForProfile(profileDir, tool);
   if (central) candidates.push({ path: central, stayUnder: accountsHome() });
   const existing = candidates
@@ -1360,7 +1376,6 @@ export function restoreClaudeAuthFromProfile(
 
   const live = liveClaudePaths();
   const liveRoot = liveClaudeBase();
-  mkdirSync(live.configDir, { recursive: true });
 
   const oauth =
     readOAuthSnapshot(profileDir) ??
@@ -1373,21 +1388,35 @@ export function restoreClaudeAuthFromProfile(
     throw new AccountsError("profile has no OAuth account data to apply");
   }
 
+  // RESOLVE THE CREDENTIAL BEFORE MUTATING ANYTHING, AND NEVER DELETE THE LIVE
+  // FILE (bug 04a350a9, task d132234c). This function used to answer "nothing
+  // restorable" by unlinking the live `.credentials.json` — destroying a live
+  // login that `applyProfileAuth`'s owner detection had just failed to park
+  // anywhere. A profile that cannot supply a credential of its own must not
+  // take over the live paths at all: refuse up front, leaving the live
+  // identity AND the live credential exactly as they were. (The same
+  // resolve-before-mutate order `restoreClaudeAuthIntoDir` already uses.)
+  const credSnap = bestRestorableCredentialPath(profileDir, tool);
+  if (!credSnap) {
+    throw new AccountsError(
+      `profile "${profileName ?? "NAME"}" has no restorable Claude credential (no parked snapshot, no central copy, ` +
+        `and its dir's live credential is not this profile's own) — refusing to touch the live credentials file. ` +
+        `Run \`accounts login ${profileName ?? "NAME"}\` first.`,
+    );
+  }
+
+  mkdirSync(live.configDir, { recursive: true });
+
   sanitizeClaudeOAuthProfileSettings(profileDir, tool);
   sanitizeLiveClaudeOAuthSettings();
 
   assertSafeWritePath(live.homeJson, { mustStayUnder: liveRoot });
   mergeOAuthInto([live.homeJson], oauth, false, liveRoot);
 
-  const credSnap = bestRestorableCredentialPath(profileDir, tool);
-  if (credSnap) {
-    assertSafeWritePath(live.credentialsFile, { mustStayUnder: liveRoot });
-    assertSafeWritePath(credSnap.path, { mustStayUnder: credSnap.stayUnder });
-    copyFileSync(credSnap.path, live.credentialsFile);
-    writeFileSync(live.credentialsFile, readFileSync(live.credentialsFile), { mode: 0o600 });
-  } else if (existsSync(live.credentialsFile)) {
-    if (!lstatSync(live.credentialsFile).isSymbolicLink()) unlinkSync(live.credentialsFile);
-  }
+  assertSafeWritePath(live.credentialsFile, { mustStayUnder: liveRoot });
+  assertSafeWritePath(credSnap.path, { mustStayUnder: credSnap.stayUnder });
+  copyFileSync(credSnap.path, live.credentialsFile);
+  writeFileSync(live.credentialsFile, readFileSync(live.credentialsFile), { mode: 0o600 });
 
   prepareClaudeProfileKeychain(profileDir, tool, profileName);
 }
