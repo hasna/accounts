@@ -6,6 +6,8 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.33] - 2026-08-06
+
 ### Fixed
 
 - **The converge allowlist is the UNION of the active and local registries
