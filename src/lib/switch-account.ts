@@ -260,16 +260,27 @@ export async function switchAccount(
   // file first. Zero credential bytes are copied and no central file is
   // unlinked, so a switch can never destroy a login (design §4, task 46679f8b).
   //
-  // ROLLOUT IS PER-DIR AND SAFE BY DEFAULT. A dir already ON the model — its
-  // `.credentials.json` is a symlink into the central store — MUST repoint,
-  // because the legacy copy path refuses to write through a symlink. A dir that
-  // is still a regular file keeps the legacy copy behaviour UNCHANGED until it
-  // is deliberately converted with `accounts migrate-links` (design GATE 1/2:
-  // symlinks are created on production dirs deliberately, not implicitly on
-  // every switch). `HASNA_ACCOUNTS_SYMLINK_BROKER=1` opts a box in to
-  // migrate-on-switch for regular dirs too. So installing this release changes
-  // nothing on a box whose dirs are all regular files; the model activates a
-  // dir at a time, on migration.
+  // ENGAGEMENT RULE: the broker runs whenever the INCOMING account has a
+  // central credential of record — plus, unconditionally, when the dir is
+  // already ON the model (a symlink into the central store). Two live-test
+  // defects on the shipped 0.2.35 gate (`dirIsMigrated || opt-in flag`) forced
+  // this (task 0c5cca34):
+  //   1. BROKER DORMANT IN PRODUCTION. `HASNA_ACCOUNTS_SYMLINK_BROKER` is unset
+  //      on every box and real seat dirs are regular files, so the husk-free
+  //      broker never ran for any real seat. But the incoming account's central
+  //      already exists — `ensureProfileAuthSnapshot` (login, and every legacy
+  //      switch) writes it via `syncProfileSnapshotToCentral` — so keying
+  //      engagement on `targetHasCentral` activates the broker for real seats
+  //      with no env var, and degrades gracefully to the legacy copy path only
+  //      when the incoming account has no central yet.
+  //   2. E1-FORK HUSK REGRESSION. Claude 2.1.223 refreshes its token by
+  //      rename-ing over `.credentials.json`, replacing a migrated dir's symlink
+  //      with a regular file (a fork). Under the old gate a plain switch on that
+  //      fork reverted to the legacy copy path and reintroduced a husk; keying
+  //      on `targetHasCentral` re-adopts the fork and keeps the dir linked.
+  // The `HASNA_ACCOUNTS_SYMLINK_BROKER=1` opt-in is retained as an explicit
+  // force (it can only reach the repoint when a central exists, so it never
+  // links to a missing central), but it is no longer the primary trigger.
   const targetUuid = profileAccountUuid(profile.dir, tool);
   const targetHasCentral =
     !!targetUuid && isAccountUuid(targetUuid) && existsSync(centralCredentialsPath(targetUuid));
@@ -277,7 +288,7 @@ export async function switchAccount(
     const dirInfo = inspectDirCredential(configDir);
     const dirIsMigrated = dirInfo.kind === "link-central";
     const brokerOptIn = process.env.HASNA_ACCOUNTS_SYMLINK_BROKER === "1";
-    if (dirIsMigrated || brokerOptIn) {
+    if (dirIsMigrated || targetHasCentral || brokerOptIn) {
       // A migrated dir can ONLY be switched by repoint; if the target has no
       // central file, say so plainly rather than letting the copy-path
       // fall-through raise a confusing "refusing to write through symlink".

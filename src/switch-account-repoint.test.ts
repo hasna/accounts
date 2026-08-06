@@ -261,7 +261,13 @@ test("F1: the legacy convergence writer cannot clobber a symlinked dir credentia
   rmSync(session, { recursive: true, force: true });
 });
 
-test("SAFE DEFAULT: with the opt-in OFF, a regular dir stays on the legacy copy path (no symlink)", async () => {
+test("DEFECT 1 (broker no longer dormant): with the opt-in OFF, a regular dir whose target HAS a central engages the broker", async () => {
+  // The shipped 0.2.35 gate was `dirIsMigrated || HASNA_ACCOUNTS_SYMLINK_BROKER===1`.
+  // The env var is unset on every production box, and real seat dirs are regular
+  // files, so the husk-free broker never ran for any real seat (defect 1). The
+  // engagement rule is now "the incoming account has a central credential of
+  // record" — which the existing snapshot machinery already creates on login and
+  // on every legacy switch — so no env var is needed for the broker to activate.
   delete process.env.HASNA_ACCOUNTS_SYMLINK_BROKER;
   makeAccount("alpha", UUID_A, "alpha@e.com");
   makeAccount("beta", UUID_B, "beta@e.com");
@@ -269,10 +275,82 @@ test("SAFE DEFAULT: with the opt-in OFF, a regular dir stays on the legacy copy 
 
   await switchAccount("beta", { dir: session, env: {}, allowUnregisteredDir: true });
 
-  // Installing the release changes nothing on an un-migrated dir: it is still a
-  // regular file (copied, not linked).
-  expect(lstatSync(join(session, ".credentials.json")).isSymbolicLink()).toBe(false);
+  // beta has a central credential, so the switch takes the zero-copy repoint
+  // path: the session credential is now a symlink into beta's ONE central file.
+  const link = join(session, ".credentials.json");
+  expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  expect(realpathSync(link)).toBe(realpathSync(centralCredentialsSnapshot(UUID_B)));
   expect(accessThroughDir(session)).toBe("beta@e.com-access");
+  rmSync(session, { recursive: true, force: true });
+});
+
+test("GRACEFUL DEGRADATION: with the opt-in OFF, a regular dir whose target has NO central stays on the legacy copy path", async () => {
+  // The broker can only link a dir to a central file that exists. An account
+  // that has never been migrated has no central yet, so the switch must fall
+  // through to the legacy copy path rather than crash — the residual safe
+  // default. (The very act of falling through creates the target's central via
+  // ensureProfileAuthSnapshot, so the NEXT switch to it engages the broker.)
+  delete process.env.HASNA_ACCOUNTS_SYMLINK_BROKER;
+  makeAccount("alpha", UUID_A, "alpha@e.com");
+  // gamma: registered, uuid-bearing, but its central is deleted to reproduce the
+  // genuine "never migrated, no central" state.
+  const gammaDir = mkdtempSync(join(tmpdir(), "repoint-nocentral-"));
+  const UUID_G = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  writeFileSync(
+    join(gammaDir, ".claude.json"),
+    JSON.stringify({ oauthAccount: { accountUuid: UUID_G, emailAddress: "g@e.com" } }),
+  );
+  writeFileSync(join(gammaDir, ".credentials.json"), credBytes("g@e.com"));
+  addProfile({ name: "gamma", dir: gammaDir });
+  ensureProfileAuthSnapshot(gammaDir, tool());
+  rmSync(centralCredentialsSnapshot(UUID_G), { force: true });
+
+  const session = sessionOn(UUID_A, "alpha@e.com");
+  await switchAccount("gamma", { dir: session, env: {}, allowUnregisteredDir: true });
+
+  // No central to link to at gate time, so the dir stays a copied regular file.
+  expect(lstatSync(join(session, ".credentials.json")).isSymbolicLink()).toBe(false);
+  expect(accessThroughDir(session)).toBe("g@e.com-access");
+  rmSync(session, { recursive: true, force: true });
+  rmSync(gammaDir, { recursive: true, force: true });
+});
+
+test("DEFECT 2 (E1-fork husk regression): a Claude refresh fork of a migrated dir re-adopts and stays a symlink WITHOUT the env flag", async () => {
+  // Claude Code 2.1.223 refreshes its OAuth token by rename-ing a temp file over
+  // `.credentials.json`, which REPLACES the migrated dir's symlink with a regular
+  // file (a "fork"). Under the shipped gate, a subsequent plain switch on that
+  // now-regular dir reverted to the legacy COPY path and reintroduced a husk
+  // (measured: migrated -> fork -> switch -> a 508b regular copy). Because the
+  // target account has a central, the switch must instead re-adopt the fork onto
+  // its central and repoint — no husk, no env flag.
+  makeAccount("alpha", UUID_A, "alpha@e.com", { refresh: "alpha-central-old" });
+  makeAccount("beta", UUID_B, "beta@e.com");
+  const session = sessionOn(UUID_A, "alpha@e.com");
+  // Migrate the dir onto the model (symlink into alpha's central)...
+  migrateDirToLink(session, UUID_A);
+  const link = join(session, ".credentials.json");
+  expect(lstatSync(link).isSymbolicLink()).toBe(true);
+
+  // ...simulate Claude's in-session refresh fork: the symlink becomes a regular
+  // file carrying a FRESH alpha refresh token that exists nowhere else.
+  rmSync(link, { force: true });
+  writeFileSync(link, credBytes("alpha@e.com", { refresh: "alpha-rotated-in-session" }), { mode: 0o600 });
+  expect(lstatSync(link).isSymbolicLink()).toBe(false);
+
+  // The env flag is unset (production state), yet the switch must repoint.
+  delete process.env.HASNA_ACCOUNTS_SYMLINK_BROKER;
+  await switchAccount("beta", { dir: session, env: {}, allowUnregisteredDir: true });
+
+  // The dir is a symlink into beta's central — not a legacy copy husk.
+  expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  expect(realpathSync(link)).toBe(realpathSync(centralCredentialsSnapshot(UUID_B)));
+  expect(accessThroughDir(session)).toBe("beta@e.com-access");
+  // The fork's fresh alpha refresh token was preserved onto alpha's central —
+  // the login was re-adopted, not lost to a husk.
+  const alphaCentral = JSON.parse(readFileSync(centralCredentialsSnapshot(UUID_A), "utf8")) as {
+    claudeAiOauth?: { refreshToken?: string };
+  };
+  expect(alphaCentral.claudeAiOauth?.refreshToken).toBe("alpha-rotated-in-session");
   rmSync(session, { recursive: true, force: true });
 });
 
