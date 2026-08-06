@@ -993,12 +993,23 @@ program
     "--allow-unregistered-dir",
     "write credentials into a dir that is neither the live config dir nor a registered profile dir",
   )
+  .option(
+    "--live-default",
+    "target the live default config dir deliberately when neither --dir nor the tool env var chose it (required while profile-dir sessions are live on this machine)",
+  )
   .option("--json", "output JSON")
   .action(
     action(
       async (
         name: string | undefined,
-        opts: { tool?: string; dir?: string; yes?: boolean; allowUnregisteredDir?: boolean; json?: boolean },
+        opts: {
+          tool?: string;
+          dir?: string;
+          yes?: boolean;
+          allowUnregisteredDir?: boolean;
+          liveDefault?: boolean;
+          json?: boolean;
+        },
       ) => {
         let target = name;
         if (!target) {
@@ -1012,6 +1023,7 @@ program
           yes: opts.yes,
           // Deliberate, human-typed override only. `usage-hook` never sets it.
           allowUnregisteredDir: opts.allowUnregisteredDir,
+          liveDefault: opts.liveDefault,
         });
         const output = publicSwitchResult(result);
         if (opts.json) {

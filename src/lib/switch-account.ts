@@ -10,6 +10,7 @@ import {
   dirOAuthEmail,
   ensureProfileAuthSnapshot,
   liveOAuthEmail,
+  parkOrphanDirAuth,
   profileOAuthEmail,
   readSwitchedAccountMarker,
   restoreClaudeAuthIntoDir,
@@ -43,6 +44,13 @@ export interface SwitchAccountOptions {
    * `accounts usage-hook` must never set it.
    */
   allowUnregisteredDir?: boolean;
+  /**
+   * Target the live default config dir DELIBERATELY when neither --dir nor the
+   * tool's env var chose it. Without this, a switch whose dir resolution FELL
+   * THROUGH to the live default is refused while live profile-dir sessions
+   * exist on the box — see the wrong-dir guard in {@link switchAccount}.
+   */
+  liveDefault?: boolean;
 }
 
 export interface SwitchAccountResult {
@@ -61,18 +69,35 @@ export interface SwitchAccountResult {
   message: string;
 }
 
+/** Which rung of the precedence chain picked the session config dir. */
+export type SessionConfigDirSource = "option" | "env" | "default";
+
+/**
+ * Session config dir precedence — explicit --dir, then the tool env var, then
+ * the live default — WITH the rung that decided it. The source matters
+ * because "the operator named this dir" and "nothing named a dir so the
+ * machine default caught it" demand different levels of caution from callers
+ * that write credentials (see the wrong-dir guard in {@link switchAccount}).
+ */
+export function resolveSessionConfigDirWithSource(
+  tool: ToolDef,
+  opts: { dir?: string; env?: NodeJS.ProcessEnv } = {},
+): { dir: string; source: SessionConfigDirSource } {
+  const env = opts.env ?? process.env;
+  const fromOption = opts.dir?.trim();
+  if (fromOption) return { dir: resolve(fromOption), source: "option" };
+  const fromEnv = env[tool.envVar]?.trim();
+  if (fromEnv) return { dir: resolve(fromEnv), source: "env" };
+  if (tool.id === "claude") return { dir: liveClaudePaths().configDir, source: "default" };
+  return { dir: tool.defaultDir, source: "default" };
+}
+
 /** Session config dir precedence: explicit --dir, then the tool env var, then the live default. */
 export function resolveSessionConfigDir(
   tool: ToolDef,
   opts: { dir?: string; env?: NodeJS.ProcessEnv } = {},
 ): string {
-  const env = opts.env ?? process.env;
-  const fromOption = opts.dir?.trim();
-  if (fromOption) return resolve(fromOption);
-  const fromEnv = env[tool.envVar]?.trim();
-  if (fromEnv) return resolve(fromEnv);
-  if (tool.id === "claude") return liveClaudePaths().configDir;
-  return tool.defaultDir;
+  return resolveSessionConfigDirWithSource(tool, opts).dir;
 }
 
 function singleMatch<T>(items: T[]): T | undefined {
@@ -141,7 +166,7 @@ export async function switchAccount(
     );
   }
 
-  const configDir = resolveSessionConfigDir(tool, opts);
+  const { dir: configDir, source: dirSource } = resolveSessionConfigDirWithSource(tool, opts);
   const resolvedConfigDir = resolve(configDir);
   if (resolvedConfigDir === resolve(liveClaudeBase())) {
     throw new AccountsError(
@@ -188,6 +213,32 @@ export async function switchAccount(
         `and it is not this machine's live config dir. Register it first ` +
         `(\`accounts add <name> --dir ${configDir}\`), or pass --allow-unregistered-dir to override deliberately.`,
     );
+  }
+
+  // WRONG-DIR SWITCH GUARD (bug 04a350a9, task c48e92b7). Profile wiring on
+  // this fleet lives only inside `accounts launch` process subtrees: a plain
+  // tmux pane shell carries no CLAUDE_CONFIG_DIR, so a switch typed at a pane
+  // prompt FALLS THROUGH to the live default and silently rewrites it — while
+  // the profile-dir sessions the operator is actually looking at never read
+  // that dir (measured: 20 of 31 live claudes on station01 ran under profile
+  // dirs). When the fallthrough lands on the live default AND live profile-dir
+  // sessions exist on this box, name the targeted dir and refuse unless
+  // --live-default says the default was meant. An explicit --dir or a set env
+  // var is a deliberate target and is never guarded.
+  if (dirKind === "live-default" && dirSource === "default" && !opts.liveDefault) {
+    const busyProfiles = profiles.filter(
+      (p) => resolve(p.dir) !== resolvedConfigDir && listDirLiveSessions(p.dir).some((s) => s.alive),
+    );
+    if (busyProfiles.length > 0) {
+      throw new AccountsError(
+        `this switch would target the LIVE DEFAULT config dir ${configDir} — no --dir was given and ` +
+          `${tool.envVar} is not set in this shell, so the fallthrough landed on the machine default. ` +
+          `${busyProfiles.length} registered profile dir(s) currently have live ${tool.label} session(s) ` +
+          `(${busyProfiles.map((p) => p.name).join(", ")}) and those sessions never read ${configDir}, so this ` +
+          `switch would rewrite the default silently while changing nothing you are looking at. ` +
+          `Pass --live-default to target ${configDir} deliberately, or --dir <config-dir> for the session you mean.`,
+      );
+    }
   }
 
   const warnings: string[] = [];
@@ -299,6 +350,23 @@ export async function switchAccount(
         snapshotBackProfile = owner.name;
       } else {
         warnings.push(`${owner.name} already holds a better credential than this dir; snapshot-back skipped`);
+      }
+    } else {
+      // NO RESOLVABLE OWNER — PARK, NEVER DESTROY (bug 04a350a9, task
+      // 61148ec0). `restoreClaudeAuthIntoDir` below overwrites the dir's live
+      // credential wholesale, and a rotated-in refresh token exists nowhere
+      // else, so warning-and-overwriting destroyed the outgoing login. Park
+      // the bytes in a timestamped orphan snapshot instead; if parking THROWS,
+      // the switch aborts here — before the marker write and the restore —
+      // leaving the dir exactly as it was. Orphan snapshots are an interim
+      // crash-net until the zero-copies invariant design (task aaf4c98f)
+      // supersedes them.
+      const parked = parkOrphanDirAuth(configDir, tool);
+      if (parked) {
+        warnings.push(
+          `no profile could be identified as this dir's owner, so its outgoing credential was parked in ${parked} — ` +
+            `recover it with \`accounts add\` + \`accounts login\`, or by restoring that file deliberately`,
+        );
       }
     }
 

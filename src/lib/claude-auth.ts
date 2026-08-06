@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -15,6 +15,7 @@ import {
   profileOAuthSnapshot,
   profileSwitchedAccountMarker,
   profileUnreadableCredentialsDir,
+  CREDENTIALS_SNAPSHOT,
   OAUTH_SNAPSHOT,
   dirCredentialsFile,
 } from "./claude-layout.js";
@@ -247,11 +248,24 @@ function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
 
 /**
  * Best restorable credential snapshot for a profile: the per-profile copy vs
- * the central identity-keyed copy, `betterCredential` winner. Not "central
- * first" — during the 0.2.15/0.2.16 window an old binary may have rotated a
- * fresher token into the per-profile copy, and restoring a stale central one
- * would log the account out. `stayUnder` is the containment root for source
- * symlink checks on the winning path.
+ * the central identity-keyed copy vs the profile dir's own LIVE file,
+ * `betterCredential` winner. Not "central first" — during the 0.2.15/0.2.16
+ * window an old binary may have rotated a fresher token into the per-profile
+ * copy, and restoring a stale central one would log the account out.
+ * `stayUnder` is the containment root for source symlink checks on the
+ * winning path.
+ *
+ * THE DIR-LIVE COPY COUNTS (bug 04a350a9, task d132234c) — but only when the
+ * dir is carrying the profile's OWN account. `assertRestorableProfileAuth`
+ * has always counted `<dir>/.credentials.json` as a credential payload, while
+ * this function ignored it, so a profile whose only credential was its
+ * dir-live file passed the assert and then reached restore paths with
+ * "nothing restorable" — which `restoreClaudeAuthFromProfile` answered by
+ * DELETING the live default's credentials file. When the dir is occupied by
+ * another account (in-place switch or an in-session /login), the dir-live
+ * file is the OCCUPANT's token, not this profile's, and stays excluded —
+ * exactly the rule `claudeProfileAuthHealth` and
+ * `profileFileCredentialSecret` already apply.
  */
 function bestRestorableCredentialPath(
   profileDir: string,
@@ -260,6 +274,9 @@ function bestRestorableCredentialPath(
   const candidates: { path: string; stayUnder: string }[] = [
     { path: profileCredentialsSnapshot(profileDir), stayUnder: profileDir },
   ];
+  if (!profileDirCarriesForeignAccount(profileDir, tool)) {
+    candidates.push({ path: profileCredentialFile(profileDir), stayUnder: profileDir });
+  }
   const central = centralCredentialsPathForProfile(profileDir, tool);
   if (central) candidates.push({ path: central, stayUnder: accountsHome() });
   const existing = candidates
@@ -376,6 +393,50 @@ export function liveOAuthEmail(): string | undefined {
   return typeof email === "string" && email ? email : undefined;
 }
 
+export const ORPHAN_SNAPSHOTS_DIR_NAME = "orphan-snapshots";
+
+/** Root under which unattributable outgoing credentials are parked. */
+export function orphanSnapshotsRoot(): string {
+  return join(accountsHome(), ORPHAN_SNAPSHOTS_DIR_NAME);
+}
+
+/**
+ * Park a config dir's outgoing live auth in a timestamped ORPHAN snapshot
+ * under {@link orphanSnapshotsRoot} (bug 04a350a9, task 61148ec0).
+ *
+ * Called when a switch is about to overwrite a dir's live credential and NO
+ * owning profile could be resolved for it (`detectDirOwner` returned
+ * undefined: the dir carries no account, no profile owns its email, or
+ * several profiles share it). 0.2.32 warned and overwrote — and because a
+ * rotated-in refresh token exists nowhere else, that destroyed the login
+ * outright. Parking is deliberately dumb: no identity guessing, no merging —
+ * a copy of the bytes plus the dir's oauth record, in a fresh timestamped
+ * directory, so a human (or a later reconcile flow) can recover the account.
+ *
+ * Orphan snapshots are an interim crash-net; the zero-copies invariant design
+ * (task aaf4c98f) supersedes them.
+ *
+ * Returns the snapshot directory, or undefined when the dir holds no live
+ * credential file (nothing to lose). Throws when the credential exists but
+ * cannot be parked — the caller must NOT proceed to overwrite it.
+ */
+export function parkOrphanDirAuth(sourceDir: string, tool: ToolDef): string | undefined {
+  const sourceCredentials = dirCredentialsFile(sourceDir);
+  if (!existsSync(sourceCredentials) || lstatSync(sourceCredentials).isSymbolicLink()) return undefined;
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = join(orphanSnapshotsRoot(), `${stamp}-${randomUUID().slice(0, 8)}`);
+  const credDest = join(dest, CREDENTIALS_SNAPSHOT);
+  assertSafeWritePath(credDest, { mustStayUnder: accountsHome() });
+  mkdirSync(dest, { recursive: true });
+  copyFileSync(sourceCredentials, credDest);
+  chmodSync(credDest, 0o600);
+
+  const oauth = readOAuthFromPaths([join(sourceDir, tool.accountFile ?? ".claude.json")]);
+  if (oauth) writeJsonFile(join(dest, OAUTH_SNAPSHOT), { oauthAccount: oauth }, accountsHome());
+  return dest;
+}
+
 /** Snapshot live Claude auth into a profile directory (used when switching away on apply). */
 export function snapshotLiveAuthToProfile(profileDir: string, _tool: ToolDef): void {
   const authDir = profileAuthDir(profileDir);
@@ -386,14 +447,26 @@ export function snapshotLiveAuthToProfile(profileDir: string, _tool: ToolDef): v
   const oauth = readOAuthFromPaths([live.homeJson]);
   if (oauth) writeJsonFile(profileOAuthSnapshot(profileDir), { oauthAccount: oauth }, profileDir);
 
+  // DOWNGRADE GUARD (bug 04a350a9, task 61148ec0). The live credential is not
+  // always a credential: when two dirs hold one account, the loser of the
+  // refresh-rotation race gets its `.credentials.json` BLANKED in place by
+  // Claude Code (empty tokens, expiresAt 0), and this copy then propagated
+  // that husk over the owning profile's parked snapshot — often the only good
+  // copy left. Rank with `betterCredential` exactly like the central store
+  // does (`syncCredentialsFile` never downgrades central): a genuinely rotated
+  // token still wins, a blank never does. The keychain write rides inside the
+  // guard because on a husked live default the machine keychain carries the
+  // same blanked secret.
   if (existsSync(live.credentialsFile)) {
     const dest = profileCredentialsSnapshot(profileDir);
-    assertSafeWritePath(dest, { mustStayUnder: profileDir });
-    copyFileSync(live.credentialsFile, dest);
+    if (!wouldDowngradeSnapshot(live.credentialsFile, dest)) {
+      assertSafeWritePath(dest, { mustStayUnder: profileDir });
+      copyFileSync(live.credentialsFile, dest);
 
-    if (keychainSupported()) {
-      const kc = readClaudeKeychain();
-      if (kc) writeJsonFile(profileKeychainSnapshot(profileDir), kc as unknown as JsonRecord, profileDir);
+      if (keychainSupported()) {
+        const kc = readClaudeKeychain();
+        if (kc) writeJsonFile(profileKeychainSnapshot(profileDir), kc as unknown as JsonRecord, profileDir);
+      }
     }
   }
 
@@ -1360,7 +1433,6 @@ export function restoreClaudeAuthFromProfile(
 
   const live = liveClaudePaths();
   const liveRoot = liveClaudeBase();
-  mkdirSync(live.configDir, { recursive: true });
 
   const oauth =
     readOAuthSnapshot(profileDir) ??
@@ -1373,21 +1445,35 @@ export function restoreClaudeAuthFromProfile(
     throw new AccountsError("profile has no OAuth account data to apply");
   }
 
+  // RESOLVE THE CREDENTIAL BEFORE MUTATING ANYTHING, AND NEVER DELETE THE LIVE
+  // FILE (bug 04a350a9, task d132234c). This function used to answer "nothing
+  // restorable" by unlinking the live `.credentials.json` — destroying a live
+  // login that `applyProfileAuth`'s owner detection had just failed to park
+  // anywhere. A profile that cannot supply a credential of its own must not
+  // take over the live paths at all: refuse up front, leaving the live
+  // identity AND the live credential exactly as they were. (The same
+  // resolve-before-mutate order `restoreClaudeAuthIntoDir` already uses.)
+  const credSnap = bestRestorableCredentialPath(profileDir, tool);
+  if (!credSnap) {
+    throw new AccountsError(
+      `profile "${profileName ?? "NAME"}" has no restorable Claude credential (no parked snapshot, no central copy, ` +
+        `and its dir's live credential is not this profile's own) — refusing to touch the live credentials file. ` +
+        `Run \`accounts login ${profileName ?? "NAME"}\` first.`,
+    );
+  }
+
+  mkdirSync(live.configDir, { recursive: true });
+
   sanitizeClaudeOAuthProfileSettings(profileDir, tool);
   sanitizeLiveClaudeOAuthSettings();
 
   assertSafeWritePath(live.homeJson, { mustStayUnder: liveRoot });
   mergeOAuthInto([live.homeJson], oauth, false, liveRoot);
 
-  const credSnap = bestRestorableCredentialPath(profileDir, tool);
-  if (credSnap) {
-    assertSafeWritePath(live.credentialsFile, { mustStayUnder: liveRoot });
-    assertSafeWritePath(credSnap.path, { mustStayUnder: credSnap.stayUnder });
-    copyFileSync(credSnap.path, live.credentialsFile);
-    writeFileSync(live.credentialsFile, readFileSync(live.credentialsFile), { mode: 0o600 });
-  } else if (existsSync(live.credentialsFile)) {
-    if (!lstatSync(live.credentialsFile).isSymbolicLink()) unlinkSync(live.credentialsFile);
-  }
+  assertSafeWritePath(live.credentialsFile, { mustStayUnder: liveRoot });
+  assertSafeWritePath(credSnap.path, { mustStayUnder: credSnap.stayUnder });
+  copyFileSync(credSnap.path, live.credentialsFile);
+  writeFileSync(live.credentialsFile, readFileSync(live.credentialsFile), { mode: 0o600 });
 
   prepareClaudeProfileKeychain(profileDir, tool, profileName);
 }

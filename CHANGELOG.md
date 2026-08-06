@@ -6,7 +6,50 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.34] - 2026-08-06
+
 ### Fixed
+
+- **`accounts apply` never deletes the live credentials file (bug 04a350a9,
+  task d132234c).** `restoreClaudeAuthFromProfile` answered "nothing
+  restorable" by `unlink`-ing the live `~/.claude/.credentials.json`,
+  destroying a live login that owner detection had just failed to park. It now
+  resolves the credential before mutating anything and refuses up front when a
+  profile has no restorable credential of its own, leaving the live identity
+  and credential exactly as they were. `bestRestorableCredentialPath` now also
+  counts the dir's own live file — unless the dir carries a foreign account —
+  matching what `assertRestorableProfileAuth` already accepted.
+
+- **A switch with no resolvable dir owner parks the outgoing credential
+  instead of overwriting it (bug 04a350a9, task 61148ec0).** When
+  `detectDirOwner` returns undefined (no account, no owning profile, or several
+  profiles share the email), `switchAccount` used to warn and then overwrite —
+  destroying a rotated-in refresh token that existed nowhere else. It now copies
+  the outgoing live credential into a timestamped `orphan-snapshots/` directory
+  under the accounts home before the restore; if parking throws, the switch
+  aborts before the marker write and the restore. `snapshotLiveAuthToProfile`
+  gained a downgrade guard so a husked (blank-token) live default can no longer
+  overwrite a good parked snapshot.
+
+- **A fallthrough switch onto the live default config dir is refused while
+  profile-dir sessions are live (bug 04a350a9, task c48e92b7).** A
+  `switch-account` typed at a plain tmux pane carries no `CLAUDE_CONFIG_DIR`, so
+  dir resolution fell through to `~/.claude` and silently rewrote it while the
+  profile-dir sessions the operator was looking at never read that dir.
+  `resolveSessionConfigDirWithSource` now reports which rung chose the dir; when
+  the fallthrough lands on the live default and other registered profile dirs
+  have live sessions, the switch names the targeted dir and refuses unless
+  `--live-default` is passed. An explicit `--dir` or a set env var is a
+  deliberate target and is never guarded.
+
+- **The live default's freshest account file wins identity attribution (bug
+  04a350a9, task 9b006e93).** The live default keeps its account record in both
+  the inner `~/.claude/.claude.json` and the home `~/.claude.json`;
+  `profileAccountJsonPaths` listed the inner file first, so a stale inner uuid
+  shadowed a fresh home one and the credential broker attributed and harvested
+  the live default under the wrong account. The two default-dir paths are now
+  ordered freshest-first by mtime (ties keep the historical inner-first order);
+  writers are unaffected because `mergeOAuthInto` writes every listed path.
 
 - **The converge allowlist is the UNION of the active and local registries
   (todos `2865f9f5`, follow-up to #123).** #123 re-pointed
