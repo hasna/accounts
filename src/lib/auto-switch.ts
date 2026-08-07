@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { accountsHome } from "../storage.js";
 import { AccountsError } from "../types.js";
@@ -154,6 +154,14 @@ export interface SelectionOptions {
   minSessionHeadroom?: number;
   /** uuid -> ISO time before which the account must not be re-selected. */
   cooldowns?: ReadonlyMap<string, string>;
+  /**
+   * uuid -> how many OTHER config dirs switched onto that account in the last
+   * couple of minutes (see `readRecentTargetClaims`).
+   *
+   * This DEMOTES, it never excludes — see the ranking comment in
+   * `selectHealthiestAccount`. Omit it and ranking is exactly as it was.
+   */
+  recentClaims?: ReadonlyMap<string, number>;
   now?: Date;
 }
 
@@ -286,6 +294,9 @@ export function selectHealthiestAccount(
     return { ranked: [], reason: "no-accounts", considered, excluded };
   }
 
+  const claims = opts.recentClaims;
+  const claimCount = (uuid: string): number => claims?.get(uuid) ?? 0;
+
   const ranked = [...eligible]
     .sort(
       (a, b) =>
@@ -295,6 +306,27 @@ export function selectHealthiestAccount(
         // must never demote a healthy account behind one that needs a round
         // trip to become usable.
         Number(b.entry.identity.status === "ok") - Number(a.entry.identity.status === "ok") ||
+        // THE HERD DAMPER (A3-00458). Every dir ranks from the same usage cache,
+        // so without this the single healthiest account wins for all of them at
+        // once: measured on station01 2026-08-07, TWELVE dirs switched onto one
+        // account within 25.2s and drove its 5-hour window to 100% while four
+        // other adequate targets sat unused.
+        //
+        // It is a SORT KEY and not a filter, and that distinction is the whole
+        // safety argument. Everything still in `eligible` has already cleared
+        // both headroom gates, so it is adequate by definition and preferring
+        // the least-recently-claimed among adequates costs nothing. When only
+        // one candidate remains it is still returned, however many dirs just
+        // claimed it — a herd onto the last healthy account is CORRECT.
+        //
+        // That fail-open property is not incidental. PR #87 deleted the
+        // `contended` exclusion on an owner directive ("i should be able to
+        // resume a profile in any session what so ever even if its used
+        // somewhere else") precisely because withholding shared accounts
+        // stranded sessions on exhausted ones — it refused every healthy
+        // account at once. A filter here would reintroduce that, time-boxed;
+        // a sort key cannot.
+        claimCount(a.entry.identity.accountUuid) - claimCount(b.entry.identity.accountUuid) ||
         bindingHeadroom(b.windows) - bindingHeadroom(a.windows) ||
         b.windows.weeklyHeadroom - a.windows.weeklyHeadroom ||
         b.windows.sessionHeadroom - a.windows.sessionHeadroom ||
@@ -418,6 +450,70 @@ export function readAutoSwitchState(configDir: string): AutoSwitchState | undefi
   } catch {
     return undefined;
   }
+}
+
+/**
+ * How recently another dir must have claimed an account for it to count.
+ *
+ * Sized against the measured herds rather than picked round: the seven bursts
+ * on station01 2026-08-06/07 spanned 8.3s to 125.1s end to end. Two minutes
+ * covers the widest of them with margin. It is deliberately far SHORTER than
+ * the 10-minute anti-flap cooldown — this exists to break up a simultaneous
+ * stampede, not to reserve an account, and a claim that outlived the burst
+ * would start withholding capacity for no reason.
+ */
+export const DEFAULT_CLAIM_WINDOW_MS = 2 * 60 * 1000;
+
+/**
+ * uuid -> how many OTHER config dirs switched onto that account within
+ * `withinMs`.
+ *
+ * Reads the per-dir anti-flap records that `writeAutoSwitchState` ALREADY
+ * writes on every switch, so this adds no new persistence, no new file format,
+ * and nothing to keep in sync. Failed attempts count too: a dir that tried and
+ * failed still consumed the target's capacity for the moment.
+ *
+ * Known and accepted limit: those records are last-write-wins per dir, so a dir
+ * that switches twice inside the window leaves only its latest claim. That
+ * UNDER-counts, never over-counts — the damper weakens toward the shipped
+ * behaviour rather than toward withholding, which is the direction that is safe
+ * to be wrong in.
+ *
+ * Never throws: an unreadable or absent state dir yields an empty map, which
+ * degrades to exactly the pre-existing ranking.
+ */
+export function readRecentTargetClaims(
+  withinMs: number = DEFAULT_CLAIM_WINDOW_MS,
+  now: Date = new Date(),
+  excludeConfigDir?: string,
+): Map<string, number> {
+  const claims = new Map<string, number>();
+  const dir = autoSwitchStateDir();
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return claims;
+  }
+  const selfPath = excludeConfigDir ? autoSwitchStatePath(excludeConfigDir) : undefined;
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const path = join(dir, name);
+    if (selfPath && path === selfPath) continue;
+    let state: AutoSwitchState;
+    try {
+      state = JSON.parse(readFileSync(path, "utf8")) as AutoSwitchState;
+    } catch {
+      continue;
+    }
+    if (typeof state?.toUuid !== "string" || typeof state?.lastSwitchAt !== "string") continue;
+    const at = Date.parse(state.lastSwitchAt);
+    if (!Number.isFinite(at)) continue;
+    const age = now.getTime() - at;
+    if (age < 0 || age > withinMs) continue;
+    claims.set(state.toUuid, (claims.get(state.toUuid) ?? 0) + 1);
+  }
+  return claims;
 }
 
 /**
