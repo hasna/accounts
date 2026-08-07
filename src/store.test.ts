@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { resolveStore } from "./lib/store.js";
+import { join, resolve } from "node:path";
+import { resolveLocalStore, resolveStore } from "./lib/store.js";
 import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
 import { loginToolChoices, prepareLogin } from "./lib/login.js";
@@ -478,5 +478,80 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect(active?.name).toBe("work");
     const list = await store.listProfiles("claude");
     expect(list.map((p) => p.name)).toContain("work");
+  });
+});
+
+describe("resolveLocalStore (the usage-hook's local view) unions on-disk profile dirs", () => {
+  let home: string;
+  let previousUrl: string | undefined;
+  let previousKey: string | undefined;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "accounts-hookstore-test-"));
+    process.env.ACCOUNTS_HOME = home;
+    delete process.env.ACCOUNTS_STORE_PATH;
+    previousUrl = process.env.HASNA_ACCOUNTS_API_URL;
+    previousKey = process.env.HASNA_ACCOUNTS_API_KEY;
+    delete process.env.HASNA_ACCOUNTS_API_URL;
+    delete process.env.HASNA_ACCOUNTS_API_KEY;
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    delete process.env.ACCOUNTS_HOME;
+    if (previousUrl === undefined) delete process.env.HASNA_ACCOUNTS_API_URL;
+    else process.env.HASNA_ACCOUNTS_API_URL = previousUrl;
+    if (previousKey === undefined) delete process.env.HASNA_ACCOUNTS_API_KEY;
+    else process.env.HASNA_ACCOUNTS_API_KEY = previousKey;
+  });
+
+  // The regression that pins f70e8357's completeness: in cloud mode the on-box
+  // `accounts.json` carries a fraction of the machine, so a session launched on
+  // an UNREGISTERED managed dir must still be a switch candidate and pass
+  // switchAccount's registered-dir allowlist — both of which read
+  // `store.listProfiles()`. A registry-only LocalStore would miss it entirely.
+  test("a managed profile dir present ONLY on disk (no accounts.json row) is listed and resolvable", async () => {
+    // No registry row is written: this dir exists solely on disk under
+    // <home>/profiles/claude, exactly like the 34 unregistered dirs measured on
+    // station01.
+    const diskOnlyDir = join(home, "profiles", "claude", "account037");
+    mkdirSync(diskOnlyDir, { recursive: true });
+
+    // Control: the ordinary registry-backed store cannot see it.
+    const registryStore = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    expect((await registryStore.listProfiles("claude")).map((p) => p.name)).not.toContain(
+      "account037",
+    );
+
+    // The hook's local view unions the disk dir in.
+    const hookStore = resolveLocalStore();
+    const listed = await hookStore.listProfiles("claude");
+    const match = listed.find((p) => p.name === "account037");
+    expect(match).toBeDefined();
+    expect(match!.dir).toBe(diskOnlyDir);
+    expect(match!.tool).toBe("claude");
+
+    // getProfile resolves it (switchAccount's first store call), and useProfile
+    // is best-effort — a disk-only profile has no row to update, and that must
+    // not throw and break the switch.
+    expect((await hookStore.getProfile("account037", "claude")).dir).toBe(diskOnlyDir);
+    await expect(hookStore.useProfile("account037", "claude")).resolves.toMatchObject({
+      toolId: "claude",
+    });
+  });
+
+  test("a caller-chosen directory outside the profile roots is still NOT listed (allowlist stays tight)", async () => {
+    // The anti-exfiltration guard's whole point: an arbitrary path a caller
+    // names must not enter the allowlist. Only dirs under the credential store's
+    // own roots are enumerated.
+    const outside = mkdtempSync(join(tmpdir(), "accounts-outside-"));
+    try {
+      const hookStore = resolveLocalStore();
+      const listed = await hookStore.listProfiles("claude");
+      expect(listed.some((p) => resolve(p.dir) === resolve(outside))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

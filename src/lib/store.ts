@@ -462,23 +462,113 @@ export function resolveStore(
 }
 
 /**
- * The on-box registry, ALWAYS local, never the cloud API — and never a throw
- * over storage-mode configuration. `resolveStore()` consults the cloud
- * resolver, which is correct for operator commands but wrong for a caller that
- * only ever touches local-machine state and must not fail when the cloud
- * variables are absent.
+ * The usage-hook's local profile view: the on-disk profile DIRECTORIES union
+ * the local registry rows. Read-only for the registry; grants ZERO cloud
+ * authority.
+ *
+ * Why the registry alone is not enough. In cloud mode the on-box
+ * `accounts.json` is a fraction of the machine — measured 2026-08-07 on
+ * station01: 7 claude rows against 41 managed profile dirs and 26 central-auth
+ * accounts. Every one of those 34 unregistered dirs has an on-box credential
+ * the hook can switch to, and — the case that actually breaks auto-switch — a
+ * session LAUNCHED on one of them has a config dir the registry does not list,
+ * so `switchAccount`'s allowlist would refuse the session's OWN dir as
+ * "external" and no auto-switch could ever happen there. The hook's whole job
+ * is "switch to any healthy account present on this box", so its profile set
+ * must be what is present on this box, not the sparse registry subset.
+ *
+ * Security: this list is BOTH the switch-candidate set AND the
+ * anti-exfiltration allowlist inside `switchAccount`. That allowlist must come
+ * from somewhere the calling (potentially prompt-injected) agent does not
+ * control. It still does: the added dirs live under `profilesDir()`
+ * (`<accountsHome>/profiles/...`) and each tool's native profile root — the
+ * credential store's own directories. An agent that could plant a profile dir
+ * there could already read the credential store directly, so enumerating those
+ * dirs is exactly as trustworthy as reading `accounts.json`, which lives in the
+ * same place. A caller-supplied `--dir <arbitrary path>` is still refused
+ * because it matches no enumerated dir.
+ */
+class HookLocalStore extends LocalStore {
+  private diskProfiles(toolId?: string): Profile[] {
+    const tools = toolId ? [getTool(toolId)] : BUILTIN_TOOLS;
+    // A synthetic createdAt keeps the shape a Profile; the hook and
+    // switchAccount read name/tool/dir/email only.
+    const created = new Date(0).toISOString();
+    return enumerateProfileDirs(tools).map(
+      (discovered): Profile => ({
+        name: discovered.name,
+        tool: discovered.provider,
+        dir: discovered.dir,
+        createdAt: created,
+      }),
+    );
+  }
+
+  /** Registry rows (email/uuid-bearing) unioned with on-disk dirs, by dir. */
+  private localView(toolId?: string): Profile[] {
+    const byDir = new Map<string, Profile>();
+    for (const profile of localList(toolId)) byDir.set(resolve(profile.dir), profile);
+    for (const profile of this.diskProfiles(toolId)) {
+      const key = resolve(profile.dir);
+      if (!byDir.has(key)) byDir.set(key, profile);
+    }
+    return [...byDir.values()].sort(
+      (a, b) => a.tool.localeCompare(b.tool) || a.name.localeCompare(b.name),
+    );
+  }
+
+  override async listProfiles(tool?: string): Promise<Profile[]> {
+    return this.localView(tool);
+  }
+
+  override async getProfile(name: string, tool?: string): Promise<Profile> {
+    const found = this.localView(tool).find((p) => p.name === name && (!tool || p.tool === tool));
+    if (!found) {
+      throw new AccountsError(
+        `no profile named "${name}"${tool ? ` for tool "${tool}"` : ""}. Run \`accounts list\` to see profiles.`,
+      );
+    }
+    return found;
+  }
+
+  override async findProfile(name: string, tool?: string): Promise<Profile | undefined> {
+    return this.localView(tool).find((p) => p.name === name && (!tool || p.tool === tool));
+  }
+
+  override async useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }> {
+    const profile = await this.getProfile(name, tool);
+    // Recording "current" in the on-box registry is best-effort here: the hook
+    // runs in a launched session whose profile may exist only on disk, and the
+    // session adopting the account on its next request does NOT depend on the
+    // registry pointer. A disk-only profile has no `accounts.json` row for
+    // `localUse` to update, so its throw must not fail the switch (switchAccount
+    // already tolerates it; applyProfile on the live-default path does not).
+    try {
+      await super.useProfile(name, tool);
+    } catch {
+      // best-effort
+    }
+    return { profile, toolId: profile.tool };
+  }
+}
+
+/**
+ * The on-box profile view for the usage-hook, ALWAYS local, never the cloud
+ * API — and never a throw over storage-mode configuration. `resolveStore()`
+ * consults the cloud resolver, which is correct for operator commands but wrong
+ * for a caller that only ever touches local-machine state and must not fail
+ * when the cloud variables are absent.
  *
  * The measured case: `accounts launch` strips `HASNA_ACCOUNTS_API_URL` /
  * `HASNA_ACCOUNTS_API_KEY` from the launched session (registry-authority
  * denial, #126) while leaving a `cloud` storage mode set, so `resolveStore()`
  * inside that session throws and the usage-hook fails open into "auto-switching
- * is NOT running". The hook reads a warmer-fed LOCAL cache, maps a uuid to a
- * local config dir, and repoints a local credential symlink on a switch —
- * every one of those is local-machine state. A `LocalStore` grants ZERO
- * registry authority, so using it here does not reopen #126; it just stops the
- * hook from depending on cloud variables it was deliberately denied.
+ * is NOT running". `HookLocalStore` grants ZERO registry authority, so using it
+ * here does not reopen #126; it just stops the hook from depending on cloud
+ * variables it was deliberately denied, and sources its profiles from what is
+ * actually on the box (see the class doc for the disk-union rationale).
  */
 export function resolveLocalStore(): AccountsStore {
   clearCustomToolsCache();
-  return new LocalStore();
+  return new HookLocalStore();
 }
