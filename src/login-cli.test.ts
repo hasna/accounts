@@ -352,6 +352,34 @@ test("launch --skip-configs --allow-empty-instructions is still allowed through"
   expect(readLogEntries()[0]?.tool).toBe("claude");
 });
 
+test("login into a Claude home with no operating rules is refused before spawn", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  expect(runCli("add", "login-ungoverned", "--tool", "claude").status).toBe(0);
+
+  const result = runCli("login", "login-ungoverned", "--tool", "claude");
+
+  expect(result.status).not.toBe(0);
+  expect(`${result.stderr}${result.stdout}`).toContain("no operating rules");
+  expect(readLogEntries()).toHaveLength(0);
+});
+
+test("login --allow-empty-instructions reaches an intentionally ungoverned Claude home", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  expect(runCli("add", "login-deliberate", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find(
+    (entry) => entry.name === "login-deliberate" && entry.tool === "claude",
+  );
+  expect(profile).toBeTruthy();
+  writeClaudeAuth(profile!.dir, "login-deliberate@example.com");
+
+  const result = runCli(
+    "login", "login-deliberate", "--tool", "claude", "--allow-empty-instructions",
+  );
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(readLogEntries()[0]?.tool).toBe("claude");
+});
+
 /**
  * Prelaunch renders only when it has an instruction source to render FROM.
  * These tests are about the render being WIRED UP, so they have to supply one;

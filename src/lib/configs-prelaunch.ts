@@ -8,7 +8,6 @@ import { controlledProbeEnv } from "./env.js";
 import { redactText } from "./redaction.js";
 import {
   assessConfigsManifest,
-  configsManifestPath,
   getConfigsPrelaunchSummary,
   readConfigsPrelaunchAudit,
   readManifestSourceIds,
@@ -86,6 +85,16 @@ export interface ConfigsPrelaunchResult {
 }
 
 const CONFIGS_SESSION_TOOL_IDS = new Set(["claude", "codex", "cursor", "opencode", "codewith"]);
+
+/** Top-level instruction indexes emitted for configs-session tools. */
+const CONFIGS_SESSION_INDEX_FILES: Readonly<Record<string, readonly string[]>> = {
+  claude: ["CLAUDE.md"],
+  codex: ["AGENTS.md"],
+  "codex-app": ["AGENTS.md"],
+  codewith: ["CODEWITH.md"],
+  opencode: ["AGENTS.md"],
+  cursor: [],
+};
 
 export function configsSessionToolFor(tool: ToolDef): string | undefined {
   if (tool.id === "codex-app") return "codex";
@@ -419,12 +428,10 @@ function outputSummary(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr
  * check that had to render in order to answer would take that away.
  *
  * WHAT IT CAN AND CANNOT SEE, stated because the boundary decides the false
- * positives. It reads the two artefacts accounts owns: the per-source files
- * under `.hasna/instructions` and the session render manifest. It does NOT read
- * the tool's index file (`CLAUDE.md` and friends) — `builtin-tools.ts` says in
- * as many words that those are "NOT handled here", and inventing per-tool
- * filename knowledge in this module to answer a safety question would be a guess
- * dressed as a measurement.
+ * positives. It reads the per-source files under `.hasna/instructions`, validates
+ * the session render manifest, and recognizes the small set of top-level index
+ * filenames emitted for configs-session tools. It does not treat arbitrary
+ * Markdown or mere manifest existence as instruction evidence.
  *
  * That makes the predicate CONSERVATIVE in the direction that matters: a home
  * carrying rules by some route accounts cannot see would be misread as empty.
@@ -444,22 +451,18 @@ export interface InstructionHomeAssessment {
   indexFileCount: number;
 }
 
-export function assessInstructionHome(profile: Profile): InstructionHomeAssessment {
+export function assessInstructionHome(profile: Profile, tool: ToolDef): InstructionHomeAssessment {
   const rendered = readRenderedInstructionEvidence(profile);
-  const manifestExists = existsSync(configsManifestPath(profile));
+  const manifest = assessConfigsManifest(profile, tool, configsSessionToolFor(tool));
+  const manifestExists = manifest.exists;
   if (rendered.state === "unreadable") {
     return { state: "unreadable", instructionFileCount: 0, manifestExists, indexFileCount: 0 };
   }
-  // The tool's own index file (`CLAUDE.md`, `AGENTS.md`, …) counts, and matching
-  // any top-level `.md` rather than a per-tool filename list is deliberate:
-  // `builtin-tools.ts` states that those files are not modelled here, so a
-  // hardcoded list in this module would be a guess that silently rots as tools
-  // are added. A home holding a markdown file at its root is a home somebody
-  // rendered instructions into, whatever the renderer chose to call it.
+  const expectedIndexFiles = new Set(CONFIGS_SESSION_INDEX_FILES[tool.id] ?? []);
   let indexFileCount = 0;
   try {
     indexFileCount = readdirSync(profile.dir, { withFileTypes: true }).filter(
-      (entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"),
+      (entry) => entry.isFile() && expectedIndexFiles.has(entry.name),
     ).length;
   } catch {
     // A profile dir that cannot be listed is handled by the caller, which treats
@@ -470,7 +473,8 @@ export function assessInstructionHome(profile: Profile): InstructionHomeAssessme
   // pins a home carrying only a stale `CLAUDE.md` as one that must still launch,
   // and turning that into a dead launch is the 0.2.9 breakage this module warns
   // about in three separate places.
-  const governed = rendered.count > 0 || manifestExists || indexFileCount > 0;
+  const manifestCarriesRules = manifest.drift === "ok" && manifest.sourceCount > 0;
+  const governed = rendered.count > 0 || manifestCarriesRules || indexFileCount > 0;
   return {
     state: governed ? "governed" : "ungoverned",
     instructionFileCount: rendered.count,
@@ -523,7 +527,7 @@ export function assertGovernedInstructionHome(
   // (fails closed otherwise)".
   if (opts.allowEmptySources === true) return;
 
-  const home = assessInstructionHome(profile);
+  const home = assessInstructionHome(profile, tool);
   if (home.state === "governed") return;
 
   const detail =

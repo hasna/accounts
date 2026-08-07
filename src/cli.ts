@@ -724,8 +724,9 @@ program
   .argument("<name>", "profile name")
   .description("choose or launch a tool login flow inside an isolated profile dir")
   .option("-t, --tool <tool>", "tool to use for this profile when creating it or when the name is ambiguous")
+  .option("--allow-empty-instructions", "launch a login flow in a home with no operating rules on purpose")
   .action(
-    action(async (name: string, opts: { tool?: string }) => {
+    action(async (name: string, opts: { tool?: string; allowEmptyInstructions?: boolean }) => {
       const store = resolveStore();
       const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env, store });
       if (prepared.status === "stopped") {
@@ -743,6 +744,9 @@ program
       if (tool.id === "claude") {
         console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
       }
+      assertGovernedInstructionHome(profile, tool, {
+        allowEmptySources: opts.allowEmptyInstructions === true,
+      });
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
       const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
