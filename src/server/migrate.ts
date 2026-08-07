@@ -53,7 +53,7 @@ async function main(): Promise<void> {
     // branch so `accounts-migrate --dry-run` is the pre-deploy check and refuses
     // without mutating anything. Throws when the pre-flight count is outside the
     // expected envelope; returns the counts when the deploy may proceed.
-    const preflight = await preflightDestructiveMigrations(client, status.pending);
+    const preflight = await preflightDestructiveMigrations(client, status, migrations);
     if (preflight.purgePending) {
       console.log(
         JSON.stringify(
@@ -62,6 +62,7 @@ async function main(): Promise<void> {
             migration: PURGE_MIGRATION_ID,
             withinEnvelope: preflight.withinEnvelope,
             acknowledged: preflight.acknowledged,
+            snapshotRefreshed: preflight.snapshotRefreshed,
             counts: preflight.counts.map((count) => ({
               table: count.table,
               column: count.column,

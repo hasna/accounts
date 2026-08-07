@@ -91,7 +91,8 @@ describe("destructive-migration gate, ARM 2 (pre-flight refusal)", () => {
   test("PROCEEDS on the expected envelope: zero accounts, at most the four tools", async () => {
     const report = await preflightDestructiveMigrations(
       stubClient({ accounts: 0, current_selections: 0, custom_tools: 4 }),
-      pending,
+      { pending },
+      [],
       {},
     );
     expect(report.withinEnvelope).toBe(true);
@@ -102,7 +103,8 @@ describe("destructive-migration gate, ARM 2 (pre-flight refusal)", () => {
     await expect(
       preflightDestructiveMigrations(
         stubClient({ accounts: 1, current_selections: 0, custom_tools: 4 }),
-        pending,
+        { pending },
+        [],
         {},
       ),
     ).rejects.toThrow(/REFUSING TO DEPLOY/);
@@ -112,7 +114,8 @@ describe("destructive-migration gate, ARM 2 (pre-flight refusal)", () => {
     await expect(
       preflightDestructiveMigrations(
         stubClient({ accounts: 0, current_selections: 1, custom_tools: 4 }),
-        pending,
+        { pending },
+        [],
         {},
       ),
     ).rejects.toThrow(/current_selections/);
@@ -121,7 +124,8 @@ describe("destructive-migration gate, ARM 2 (pre-flight refusal)", () => {
   test("the refusal names the restore command and the acknowledgement", async () => {
     const error = await preflightDestructiveMigrations(
       stubClient({ accounts: 2, current_selections: 0, custom_tools: 4 }),
-      pending,
+      { pending },
+      [],
       {},
     ).catch((err: Error) => err);
     expect((error as Error).message).toContain("accounts-migrate --restore-purge-archive");
@@ -131,7 +135,8 @@ describe("destructive-migration gate, ARM 2 (pre-flight refusal)", () => {
   test("an explicit acknowledgement converts the refusal into a proceed", async () => {
     const report = await preflightDestructiveMigrations(
       stubClient({ accounts: 5, current_selections: 0, custom_tools: 4 }),
-      pending,
+      { pending },
+      [],
       { [DESTRUCTIVE_ACK_ENV]: DESTRUCTIVE_ACK_VALUE },
     );
     expect(report.withinEnvelope).toBe(false);
@@ -141,7 +146,8 @@ describe("destructive-migration gate, ARM 2 (pre-flight refusal)", () => {
   test("a fresh database with no tables yet is the safe state, not a refusal", async () => {
     const report = await preflightDestructiveMigrations(
       stubClient({}, ["accounts", "current_selections", "custom_tools"]),
-      pending,
+      { pending },
+      [],
       {},
     );
     expect(report.withinEnvelope).toBe(true);
@@ -151,10 +157,86 @@ describe("destructive-migration gate, ARM 2 (pre-flight refusal)", () => {
   test("does nothing when the purge is already applied", async () => {
     const report = await preflightDestructiveMigrations(
       stubClient({ accounts: 999, current_selections: 999, custom_tools: 999 }),
+      { pending: [] },
       [],
       {},
     );
     expect(report.purgePending).toBe(false);
     expect(report.counts).toEqual([]);
+  });
+});
+
+describe("destructive-migration gate, stale-snapshot window", () => {
+  /**
+   * The archive normally runs immediately before the purge in one ledger pass.
+   * If the purge then fails, a re-run finds the archive already applied and the
+   * ledger will not re-run it — so rows created in between would be deleted with
+   * nothing preserved. The pre-flight re-executes the archive SQL in exactly
+   * that state, and only in that state.
+   */
+  function recordingClient(counts: Record<string, number>): {
+    client: TypedQueryClient;
+    executed: string[];
+  } {
+    const executed: string[] = [];
+    const client = {
+      async get<T>(sql: string, params?: readonly unknown[]) {
+        if (sql.includes("to_regclass")) return { present: true } as T;
+        const table = sql.match(/FROM (\w+) WHERE/)?.[1] ?? "";
+        return { matched: counts[table] ?? 0 } as T;
+      },
+      async many() {
+        return [];
+      },
+      async one<T>() {
+        return {} as T;
+      },
+      async query() {
+        return { rows: [], rowCount: 0 };
+      },
+      async execute(sql: string) {
+        executed.push(sql);
+      },
+    };
+    return { client: client as unknown as TypedQueryClient, executed };
+  }
+
+  const archive = { id: ARCHIVE_MIGRATION_ID, sql: "-- archive sql", checksum: "sha256:a" } as Migration;
+  const safe = { accounts: 0, current_selections: 0, custom_tools: 4 };
+
+  test("REFRESHES the snapshot when the archive is applied but the purge is still pending", async () => {
+    const { client, executed } = recordingClient(safe);
+    const report = await preflightDestructiveMigrations(
+      client,
+      { pending: [PURGE_MIGRATION_ID], ledgerPresent: true },
+      [archive],
+      {},
+    );
+    expect(report.snapshotRefreshed).toBe(true);
+    expect(executed).toContain("-- archive sql");
+  });
+
+  test("does NOT re-execute the archive when it is itself still pending", async () => {
+    const { client, executed } = recordingClient(safe);
+    const report = await preflightDestructiveMigrations(
+      client,
+      { pending: [ARCHIVE_MIGRATION_ID, PURGE_MIGRATION_ID], ledgerPresent: true },
+      [archive],
+      {},
+    );
+    expect(report.snapshotRefreshed).toBe(false);
+    expect(executed).toEqual([]);
+  });
+
+  test("does NOT re-execute the archive on a fresh database with no ledger", async () => {
+    const { client, executed } = recordingClient(safe);
+    const report = await preflightDestructiveMigrations(
+      client,
+      { pending: [PURGE_MIGRATION_ID], ledgerPresent: false },
+      [archive],
+      {},
+    );
+    expect(report.snapshotRefreshed).toBe(false);
+    expect(executed).toEqual([]);
   });
 });

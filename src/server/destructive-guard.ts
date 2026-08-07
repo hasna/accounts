@@ -130,6 +130,8 @@ export interface PreflightReport {
   readonly counts: readonly PredicateCount[];
   readonly withinEnvelope: boolean;
   readonly acknowledged: boolean;
+  /** True when the archive SQL was re-executed to close a stale-snapshot window. */
+  readonly snapshotRefreshed: boolean;
 }
 
 async function countMatches(
@@ -156,15 +158,47 @@ async function countMatches(
 /**
  * ARM 2. Pre-flight SELECT COUNT on the 0006 predicates. Returns the report
  * when the deploy may proceed; throws a loud, actionable error when it may not.
+ *
+ * Also refreshes the snapshot when it can go stale. The archive normally runs
+ * immediately before the purge in one ledger pass, leaving no window. But if the
+ * archive commits and the purge then fails — refused here, or any error — a later
+ * re-run finds the archive already applied and the purge still pending, and the
+ * ledger will not re-run an applied migration. Rows created in between would then
+ * be deleted with nothing preserved. Re-executing the archive SQL closes that
+ * window: it is idempotent by construction (CREATE TABLE IF NOT EXISTS plus
+ * ON CONFLICT DO NOTHING), and re-using the migration's own SQL keeps one source
+ * of truth rather than a second copy of the predicates.
  */
 export async function preflightDestructiveMigrations(
   client: TypedQueryClient,
-  pending: readonly string[],
+  status: { readonly pending: readonly string[]; readonly ledgerPresent?: boolean },
+  migrations: readonly Migration[] = [],
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<PreflightReport> {
+  const pending = status.pending;
   const purgePending = pending.includes(PURGE_MIGRATION_ID);
   if (!purgePending) {
-    return { purgePending: false, counts: [], withinEnvelope: true, acknowledged: false };
+    return {
+      purgePending: false,
+      counts: [],
+      withinEnvelope: true,
+      acknowledged: false,
+      snapshotRefreshed: false,
+    };
+  }
+
+  // Only when the archive already ran: if it is still pending the ledger applies
+  // it in the correct position, and on a fresh database its tables do not exist
+  // yet, so executing it here would fail.
+  const archiveAlreadyApplied =
+    status.ledgerPresent === true && !pending.includes(ARCHIVE_MIGRATION_ID);
+  let snapshotRefreshed = false;
+  if (archiveAlreadyApplied) {
+    const archive = migrations.find((migration) => migration.id === ARCHIVE_MIGRATION_ID);
+    if (archive) {
+      await client.execute(archive.sql);
+      snapshotRefreshed = true;
+    }
   }
 
   const counts: PredicateCount[] = [];
@@ -201,7 +235,7 @@ export async function preflightDestructiveMigrations(
     );
   }
 
-  return { purgePending, counts, withinEnvelope, acknowledged };
+  return { purgePending, counts, withinEnvelope, acknowledged, snapshotRefreshed };
 }
 
 function count_columns(): string {

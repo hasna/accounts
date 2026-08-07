@@ -595,6 +595,11 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0003_custom_tools",
       "accounts_0004_current_selection_account_fk",
       "accounts_0005_custom_tool_tombstones",
+      // Sorts here, not after 0006: '_' (0x5F) < 'a' (0x61), so
+      // "accounts_0005_custom_tool_tombstones" precedes
+      // "accounts_0005a_archive_purged_fixtures". `unknown` is sorted by
+      // readMigrationStatus.
+      "accounts_0005a_archive_purged_fixtures",
       "accounts_0006_purge_test_tool_fixtures",
       "accounts_0007_alias_records",
     ]);
