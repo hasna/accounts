@@ -130,12 +130,17 @@ function attestations(options: {
   statementType?: string;
   omitStatementType?: boolean;
 } = {}) {
+  // npm publishes these two attestations against DIFFERENT in-toto statement
+  // versions. This fixture defaulted BOTH to v1, which no real registry response
+  // has ever looked like, so the suite passed while every attested release failed
+  // at `verify-registry`. An explicit `statementType` still overrides both, which
+  // is what the negative arms below rely on.
   return [
     attestation(PUBLISH_PREDICATE, {
       name: options.publishName ?? candidate.name,
       version: candidate.version,
       registry: "https://registry.npmjs.org",
-    }, options),
+    }, { ...options, statementType: options.statementType ?? "https://in-toto.io/Statement/v0.1" }),
     attestation(PROVENANCE_PREDICATE, {
       buildDefinition: {
         externalParameters: { workflow: {
@@ -1846,6 +1851,56 @@ test("binds audited attestations to exact subject, workflow, repository, tag, an
     candidate,
     extractVerifiedAttestations(candidate, auditResult(malformedStatement)),
   )).toThrow();
+});
+
+/**
+ * Regression for the defect that blocked every attested release this repository
+ * ever produced: npm's publish attestation is an in-toto Statement **v0.1** while
+ * its SLSA provenance is **v1**, and the verifier required v1 of both.
+ *
+ * Measured on the live registry for @hasna/accounts@0.2.38 (release run
+ * 31185413057, which published the tarball and then failed at
+ * `verify-registry --phase staged`):
+ *
+ *   .../npm/attestation/tree/main/specs/publish/v0.1 -> https://in-toto.io/Statement/v0.1
+ *   https://slsa.dev/provenance/v1                   -> https://in-toto.io/Statement/v1
+ *
+ * The arms below pin BOTH directions, because a check that accepted either
+ * version for either predicate would pass this test while being weaker than the
+ * one it replaced.
+ */
+function withStatementType(bundle: ReturnType<typeof attestation>, statementType: string) {
+  const payload = JSON.parse(
+    Buffer.from(bundle.bundle.dsseEnvelope.payload, "base64").toString("utf8"),
+  );
+  payload._type = statementType;
+  bundle.bundle.dsseEnvelope.payload = Buffer.from(JSON.stringify(payload)).toString("base64");
+  return bundle;
+}
+
+test("accepts npm's real per-predicate in-toto statement versions and rejects either swap", () => {
+  // The shape npm actually returns. This must PASS, or no attested release can complete.
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(attestations())),
+  )).not.toThrow();
+
+  // The publish attestation carrying the provenance's version is a mismatch.
+  const publishUpgraded = attestations();
+  withStatementType(publishUpgraded[0]!, "https://in-toto.io/Statement/v1");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(publishUpgraded)),
+  )).toThrow("in-toto statement type");
+
+  // ...and the provenance carrying the publish attestation's version likewise.
+  // Without this arm a loosened "either version is fine" check would pass.
+  const provenanceDowngraded = attestations();
+  withStatementType(provenanceDowngraded[1]!, "https://in-toto.io/Statement/v0.1");
+  expect(() => verifyAttestations(
+    candidate,
+    extractVerifiedAttestations(candidate, auditResult(provenanceDowngraded)),
+  )).toThrow("in-toto statement type");
 });
 
 test("requires exact gitHead in the preserved and downloaded tarball manifest", () => {
