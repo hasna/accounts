@@ -1275,15 +1275,79 @@ export function createOriginPackumentReader(
   };
 }
 
-async function ensureUnpublished(value: ReleaseCandidate): Promise<void> {
+/**
+ * Decides whether this candidate may still be published, or whether the version
+ * on the registry is this exact candidate from an interrupted run of the same
+ * release.
+ *
+ * A publish consumes the version number irreversibly, so a run that published
+ * and then failed a later gate could not be re-run at all: the preflight refused
+ * at the first step and every subsequent step was skipped. That burned the
+ * version for a fault — a read-path visibility lag on npm's attestations
+ * endpoint — that had nothing to do with the artefact, and left four merged
+ * fixes published but unreachable behind an unmoved `latest`.
+ *
+ * `"resumable"` is returned only when the published version is provably the
+ * artefact in hand and nothing has been promoted from it. The proof does not
+ * trust any registry-reported field: `verifyDownloadedTarball` re-downloads the
+ * tarball and hashes those bytes locally (sha1 and sha512) against the integrity
+ * of the artefact `verifyCandidateArtifact` just re-hashed on disk. Registry
+ * metadata and dist-tags are checked too, but the byte identity is what carries
+ * the decision.
+ *
+ * The immutability guarantee is unchanged. A version occupied by anything other
+ * than this exact artefact still refuses, and now names which conjunct failed.
+ * Promotion is a separate gate and is untouched: `verifyDistTags(_, _, "staged")`
+ * refuses to resume once the intended tag already points at this version.
+ */
+export type PublicationState = "unpublished" | "resumable";
+
+export interface PublicationStateOperations {
+  readVersionMetadata: () => Promise<unknown>;
+  readPackageMetadata: () => Promise<unknown>;
+  readTarball: (url: URL) => Promise<Uint8Array>;
+}
+
+export async function resolvePublicationState(
+  value: ReleaseCandidate,
+  response: { status: number; ok: boolean },
+  operations: PublicationStateOperations,
+): Promise<PublicationState> {
+  if (response.status === 404) return "unpublished";
+  check(response.ok, `registry preflight returned ${response.status}`);
+  try {
+    const urls = verifyRegistryMetadata(value, await operations.readVersionMetadata());
+    verifyDownloadedTarball(value, await operations.readTarball(urls.tarballUrl));
+    verifyDistTags(value, await operations.readPackageMetadata(), "staged");
+  } catch (error) {
+    throw new Error(
+      `${value.name}@${value.version} already exists and is not this candidate ` +
+        `staged for release; versions are immutable (${
+          error instanceof Error ? error.message : String(error)
+        })`,
+    );
+  }
+  return "resumable";
+}
+
+async function ensurePublishable(value: ReleaseCandidate): Promise<PublicationState> {
   const response = await fetch(packageUrl(value.name, value.version), {
     redirect: "error",
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  check(response.status === 404, response.ok
-    ? `${value.name}@${value.version} already exists; versions are immutable`
-    : `registry preflight returned ${response.status}`);
-  console.log(`${value.name}@${value.version} is not published`);
+  const readPackageMetadata = createOriginPackumentReader(value.name);
+  const state = await resolvePublicationState(value, response, {
+    readVersionMetadata: () => fetchJson(packageUrl(value.name, value.version)),
+    readPackageMetadata,
+    readTarball: (url) => fetchLimited(url, MAX_TARBALL_BYTES),
+  });
+  console.log(
+    state === "unpublished"
+      ? `${value.name}@${value.version} is not published`
+      : `${value.name}@${value.version} is already published as this exact candidate ` +
+        `under ${value.stagingTag} and ${value.intendedTag} was not promoted from it; resuming`,
+  );
+  return state;
 }
 
 function safeRegistryUrl(value: unknown, label: string, prefix: string): URL {
@@ -2138,17 +2202,25 @@ async function main(): Promise<void> {
   } else if (subcommand === "ensure-unpublished") {
     const value = loadCandidate(resolve(option(args, "--candidate")));
     verifyCandidateArtifact(value);
-    await ensureUnpublished(value);
+    await ensurePublishable(value);
   } else if (subcommand === "publish-staged") {
     assertTrustedPublishEnvironment(manifest, process.env, currentToolchain(root));
     assertGitContext(root, manifest, process.env);
     const value = loadCandidate(resolve(option(args, "--candidate")));
     assertCandidateContext(value, manifest, process.env);
     verifyCandidateArtifact(value);
-    run("npm", [
-      "publish", value.artifactPath, "--ignore-scripts", "--provenance", "--access", "public",
-      "--tag", value.stagingTag, "--registry", REGISTRY,
-    ], root, { inherit: true, timeoutMs: 300_000 });
+    // Re-resolved immediately before the mutation rather than trusting the
+    // earlier step, matching how promotion re-reads its snapshot before acting.
+    if (await ensurePublishable(value) === "resumable") {
+      console.log(
+        `skipping publish: ${value.name}@${value.version} is already the staged candidate`,
+      );
+    } else {
+      run("npm", [
+        "publish", value.artifactPath, "--ignore-scripts", "--provenance", "--access", "public",
+        "--tag", value.stagingTag, "--registry", REGISTRY,
+      ], root, { inherit: true, timeoutMs: 300_000 });
+    }
   } else if (subcommand === "verify-registry") {
     const value = loadCandidate(resolve(option(args, "--candidate")));
     verifyCandidateArtifact(value);

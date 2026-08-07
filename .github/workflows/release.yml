@@ -157,7 +157,7 @@ jobs:
           --out "$RUNNER_TEMP/release-candidate.json"
           --artifact "$RUNNER_TEMP/release-candidate.tgz"
 
-      - name: Reject an existing immutable version
+      - name: Reject a foreign or promoted existing version
         run: >-
           bun run scripts/release-provenance.ts ensure-unpublished
           --candidate "$RUNNER_TEMP/release-candidate.json"
