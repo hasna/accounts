@@ -6,6 +6,42 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.38] - 2026-08-07
+
+### Fixed
+
+- **Usage-based auto-switch now RUNS and DECIDES in a launched, registry-stripped
+  session, and its candidate/allowlist set is what is actually on the box (tasks
+  f70e8357, d3845278).** `accounts launch` strips `HASNA_ACCOUNTS_API_URL` /
+  `HASNA_ACCOUNTS_API_KEY` from the launched session (registry-authority denial,
+  #126) while leaving a `cloud` storage mode set, so `resolveStore()` inside the
+  `usage-hook` command threw and the hook failed open into "usage-based
+  auto-switching is NOT running for this session — cloud storage mode requires
+  HASNA_ACCOUNTS_API_URL and HASNA_ACCOUNTS_API_KEY". The hook only ever touches
+  local-machine state (a warmer-fed usage cache, a uuid→dir map, the credential
+  symlink a switch repoints), so it now resolves a local-only store
+  (`resolveLocalStore` → `HookLocalStore`, zero registry authority) and its
+  broker convergence pass is handed that same local profile list, so no hook path
+  consults the cloud resolver. `HookLocalStore` sources profiles from the UNION of
+  the on-disk profile directories (`enumerateProfileDirs`) and the local registry
+  rows — in cloud mode the on-box `accounts.json` is a fraction of the machine (7
+  claude rows against 41 managed dirs on station01), and the hook's profile list
+  is both the switch-candidate set and `switchAccount`'s registered-dir
+  anti-exfiltration allowlist, so a session launched on an unregistered managed
+  dir would otherwise have its own config dir refused as "external". Security is
+  preserved: the enumerated dirs live under the credential store's own roots, as
+  trustworthy as `accounts.json`, and a caller-chosen path outside those roots is
+  still refused. This does not reopen #126.
+- **The warmer's `--refresh` now measures a logged-in `needs-refresh` account
+  instead of leaving it a readiness proxy (task d3845278).** An account whose
+  access token aged out but whose refresh token is intact was reported without
+  being queried, even under `--refresh`. `collectAccountsUsage` now mints a fresh
+  access token first via `ensureFreshIdentityCredential`
+  (`grant_type=refresh_token`, once, under the account's identity lock, converging
+  the single-inode model before it writes — no second credential copy), rebuilds
+  the identity, and then queries. The cache-only path is unchanged and never mints
+  a token.
+
 ## [0.2.37] - 2026-08-07
 
 ### Fixed
