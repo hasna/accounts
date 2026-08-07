@@ -19,8 +19,8 @@ import { join } from "node:path";
 let home: string;
 let dir: string;
 
-function runHook(env: Record<string, string> = {}) {
-  return spawnSync(process.execPath, ["run", "src/cli.ts", "usage-hook", "--dir", dir], {
+function runHook(env: Record<string, string> = {}, extraArgs: string[] = []) {
+  return spawnSync(process.execPath, ["run", "src/cli.ts", "usage-hook", "--dir", dir, ...extraArgs], {
     cwd: process.cwd(),
     encoding: "utf8",
     env: {
@@ -56,12 +56,34 @@ afterEach(() => {
 });
 
 test("a failure before the hook brain runs still exits 0 AND says something", () => {
-  // Storage mode set to `api` with no URL or key: `resolveStore()` throws, so
-  // the error never reaches runUsageHook's own handler.
-  const result = runHook({ HASNA_ACCOUNTS_STORAGE_MODE: "api", ACCOUNTS_STORAGE_MODE: "api" });
+  // Induce a pre-brain throw via an unknown tool id: `getTool` throws before
+  // the brain, so the error never reaches runUsageHook's own handler and must
+  // be caught by the CLI's outer catch. (The old inducer — a misconfigured
+  // cloud storage mode — no longer throws here, because the hook now resolves a
+  // LocalStore and never consults the cloud resolver; that is the f70e8357 fix,
+  // and the regression test directly below pins it.)
+  const result = runHook({}, ["--tool", "no-such-tool-xyz"]);
 
   expect(result.status).toBe(0);
   expect(systemMessage(result.stdout)).toMatch(/auto-switching is NOT running/i);
+});
+
+test("f70e8357: a launched, registry-stripped session (cloud mode, no API url/key) DECIDES rather than failing open", () => {
+  // Reproduces the owner-hit case: `accounts launch` denies
+  // HASNA_ACCOUNTS_API_URL/KEY to the launched session (#126) while a `cloud`
+  // storage mode remains set. Before the fix, `resolveStore()` inside the hook
+  // threw and the session got "auto-switching is NOT running". The hook must
+  // now reach its brain from local state and NOT emit that fail-open notice.
+  const result = runHook({
+    HASNA_ACCOUNTS_MODE: "cloud",
+    HASNA_ACCOUNTS_STORAGE_MODE: "cloud",
+    ACCOUNTS_STORAGE_MODE: "cloud",
+    // The two registry-authority vars are ABSENT on purpose — this is exactly
+    // what the launched session inherits after the #126 strip.
+  });
+
+  expect(result.status).toBe(0);
+  expect(systemMessage(result.stdout) ?? "").not.toMatch(/auto-switching is NOT running/i);
 });
 
 test("POSITIVE CONTROL: the healthy path is silent, so the assertion above means something", () => {

@@ -1,6 +1,6 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ToolDef } from "../types.js";
 
 export const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
@@ -41,11 +41,44 @@ export function liveClaudePaths(): { configDir: string; homeJson: string; creden
   };
 }
 
-/** Account JSON paths for a profile config dir (handles parent ~/.claude.json layout). */
+function fileMtimeMs(path: string): number {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Account JSON paths for a profile config dir (handles parent ~/.claude.json
+ * layout), FRESHEST FIRST for the default dir.
+ *
+ * THE ORDER IS THE FIX (bug 04a350a9, task 9b006e93). The live default keeps
+ * its account record in two places — the inner `~/.claude/.claude.json` and
+ * the home `~/.claude.json` — and readers over these paths (`dirAccountUuid`,
+ * `findOAuthSource`) take the FIRST record they can parse. With the inner
+ * file pinned first, a stale inner record shadowed a fresh home one: measured
+ * on station01, an Aug-3 inner uuid (643e2376) shadowing a same-day home uuid
+ * (11aabd84), so the credential broker attributed and harvested the live
+ * default under the wrong account. The freshest file speaks for the dir;
+ * missing files rank last, and ties keep the historical inner-first order.
+ * Writers are unaffected: `mergeOAuthInto` writes EVERY listed path, so both
+ * records converge on the next write regardless of order.
+ *
+ * The default-dir check also matches the LIVE claude config dir (which honors
+ * ACCOUNTS_TEST_LIVE_DIR) rather than only `tool.defaultDir`, which is frozen
+ * to the process's homedir at module load and therefore invisible to tests.
+ */
 export function profileAccountJsonPaths(profileDir: string, tool: ToolDef): string[] {
   if (!tool.accountFile) return [];
+  const isDefaultDir =
+    profileDir === tool.defaultDir ||
+    (tool.id === "claude" && resolve(profileDir) === resolve(liveClaudePaths().configDir));
   const paths = [join(profileDir, tool.accountFile)];
-  if (profileDir === tool.defaultDir) paths.push(join(dirname(profileDir), tool.accountFile));
+  if (isDefaultDir) {
+    paths.push(join(dirname(profileDir), tool.accountFile));
+    paths.sort((a, b) => fileMtimeMs(b) - fileMtimeMs(a));
+  }
   return paths;
 }
 

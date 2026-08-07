@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { registerEventsCommands } from "@hasna/events/commander";
@@ -22,7 +22,7 @@ import {
   expandPath,
   type ProfileMetadata,
 } from "./lib/profiles.js";
-import { resolveStore } from "./lib/store.js";
+import { resolveLocalStore, resolveStore } from "./lib/store.js";
 import {
   accountsHome,
   getAccountsStorageStatus,
@@ -79,6 +79,8 @@ import {
   type SwitchMode,
 } from "./lib/switch.js";
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
+import { migrateDirToLink, selfHealDirLink } from "./lib/symlink-broker.js";
+import { withIdentityLockSync } from "./lib/identity-lock.js";
 import {
   buildIdentityIndex,
   dirAccountUuid,
@@ -993,12 +995,23 @@ program
     "--allow-unregistered-dir",
     "write credentials into a dir that is neither the live config dir nor a registered profile dir",
   )
+  .option(
+    "--live-default",
+    "target the live default config dir deliberately when neither --dir nor the tool env var chose it (required while profile-dir sessions are live on this machine)",
+  )
   .option("--json", "output JSON")
   .action(
     action(
       async (
         name: string | undefined,
-        opts: { tool?: string; dir?: string; yes?: boolean; allowUnregisteredDir?: boolean; json?: boolean },
+        opts: {
+          tool?: string;
+          dir?: string;
+          yes?: boolean;
+          allowUnregisteredDir?: boolean;
+          liveDefault?: boolean;
+          json?: boolean;
+        },
       ) => {
         let target = name;
         if (!target) {
@@ -1012,6 +1025,7 @@ program
           yes: opts.yes,
           // Deliberate, human-typed override only. `usage-hook` never sets it.
           allowUnregisteredDir: opts.allowUnregisteredDir,
+          liveDefault: opts.liveDefault,
         });
         const output = publicSwitchResult(result);
         if (opts.json) {
@@ -1026,6 +1040,72 @@ program
         console.log(chalk.dim("  verify: the session's next reply runs as the new account; /status shows the email"));
       },
     ),
+  );
+
+program
+  .command("migrate-links")
+  .description(
+    "migrate config dirs to the single-inode broker: replace a dir's real .credentials.json with a symlink into " +
+      "the account's central store (inode move, no byte copy). Live dirs are skipped — convert them at their respawn window",
+  )
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("--dir <path>", "migrate a single config dir")
+  .option("--all", "migrate every registered profile dir for the tool")
+  .option("--json", "output JSON")
+  .action(
+    action(async (opts: { tool: string; dir?: string; all?: boolean; json?: boolean }) => {
+      const tool = getTool(opts.tool);
+      if (tool.id !== "claude") throw new AccountsError("migrate-links supports Claude Code only");
+      const store = resolveStore();
+      const dirs = new Set<string>();
+      if (opts.dir) dirs.add(resolve(opts.dir));
+      if (opts.all) for (const p of await store.listProfiles(tool.id)) dirs.add(resolve(p.dir));
+      if (dirs.size === 0) throw new AccountsError("pass --dir <path> or --all");
+
+      interface MigrateRow {
+        dir: string;
+        outcome: "migrated" | "already-linked" | "skipped" | "failed";
+        uuid?: string;
+        reason?: string;
+        quarantined?: string;
+      }
+      const rows: MigrateRow[] = [];
+      for (const dir of dirs) {
+        const uuid = dirAccountUuid(dir, tool);
+        if (!uuid || !isAccountUuid(uuid)) {
+          rows.push({ dir, outcome: "skipped", reason: "no resolvable account uuid on this dir" });
+          continue;
+        }
+        const live = listDirLiveSessions(dir).filter((s) => s.alive).length;
+        if (live > 0) {
+          rows.push({ dir, outcome: "skipped", uuid, reason: `${live} live session(s) — convert at the seat's respawn window` });
+          continue;
+        }
+        try {
+          const result = migrateDirToLink(dir, uuid);
+          rows.push({
+            dir,
+            outcome: result.changed ? "migrated" : "already-linked",
+            uuid,
+            ...(result.quarantined ? { quarantined: result.quarantined } : {}),
+          });
+        } catch (error) {
+          rows.push({ dir, outcome: "failed", uuid, reason: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify({ schema: "hasna.accounts.migrate-links/v1", results: rows }, null, 2));
+        return;
+      }
+      for (const row of rows) {
+        const detail = `${row.dir}${row.uuid ? ` (${row.uuid})` : ""}${row.reason ? ` — ${row.reason}` : ""}`;
+        if (row.outcome === "migrated") console.log(chalk.green(`✓ migrated: ${detail}`));
+        else if (row.outcome === "failed") console.log(chalk.yellow(`! failed: ${detail}`));
+        else console.log(chalk.dim(`• ${row.outcome}: ${detail}`));
+        if (row.quarantined) console.log(chalk.dim(`    preserved: ${row.quarantined}`));
+      }
+    }),
   );
 
 function printBrokerReport(report: ConvergeReport | EnsureFreshReport, quiet: boolean): void {
@@ -1309,8 +1389,28 @@ program
       // OPEN — any error lets the message through, exit 0 always.
       try {
         const tool = getTool(opts.tool);
-        const store = resolveStore();
+        // ALWAYS local, never the cloud registry. This hook runs inside a
+        // launched session that had HASNA_ACCOUNTS_API_URL/KEY stripped (#126);
+        // `resolveStore()` there throws over the now-orphaned cloud mode and the
+        // hook fails open into "auto-switching is NOT running" (task f70e8357).
+        // Everything the hook touches is local-machine state — the warmer-fed
+        // usage cache, the uuid->dir map, and the credential symlink a switch
+        // repoints — so a LocalStore is both sufficient and the only store that
+        // does not depend on cloud variables this session was denied. It also
+        // makes the switch-candidate set identical to what is actually present
+        // on this box: a profile the local registry does not carry has no
+        // on-box credential to switch to anyway.
+        const store = resolveLocalStore();
         const configDir = resolveSessionConfigDir(tool, opts.dir ? { dir: opts.dir } : {});
+        // The hook's local profile view (on-disk dirs unioned with the local
+        // registry), resolved ONCE. Passed to every broker call so they never
+        // fall through to `allowlistProfiles()` -> `resolveStore()`, which
+        // throws in a launched, registry-stripped session (#126) — the same
+        // failure that stopped the store resolution above, one layer earlier.
+        const hookProfiles = (await store.listProfiles(opts.tool)).map((p) => ({
+          name: p.name,
+          dir: p.dir,
+        }));
 
         // BROKER PASS, before the prompt runs. Two halves:
         //  1. SYNCHRONOUS convergence (file I/O only): this dir must hold its
@@ -1325,7 +1425,7 @@ program
         // Both fail OPEN — the prompt always goes through.
         let brokerConvergeFailure: string | undefined;
         try {
-          const converged = await convergeDirCredential(configDir, { tool });
+          const converged = await convergeDirCredential(configDir, { tool, profiles: hookProfiles });
           if (converged) {
             usageHookLog(
               `broker-converge uuid=${converged.accountUuid} writes=${converged.writes.length}` +
@@ -1378,6 +1478,38 @@ program
                 );
               }
             }
+
+            // SELF-HEAL the single-inode model against Claude's startup
+            // de-migration (task 46679f8b, defect C). At startup Claude
+            // materializes this dir's `.credentials.json` symlink into a REGULAR
+            // FILE and then lands its own token refreshes into that file; left
+            // alone the dir drifts off the model and the central goes stale, and
+            // the FIRST switch on a fresh session falls back to the copy path.
+            // Convergence just wrote the account's newest rotation to central
+            // under the identity lock, so re-adopt the dir's fork (newest
+            // rotation wins) and re-establish the symlink — under the SAME lock,
+            // so a concurrent sibling switch/converge cannot race the rare
+            // central write. Fail-open and best-effort: a heal failure must never
+            // block the prompt; the session keeps working on the file it holds.
+            // Gated on `converged`, so it only runs for a dir that already passed
+            // convergence's registered-dir security gate and carries a valid
+            // account.
+            try {
+              const heal = withIdentityLockSync(converged.accountUuid, () =>
+                selfHealDirLink(configDir, converged.accountUuid),
+              );
+              if (heal.healed) {
+                usageHookLog(
+                  `self-heal relinked dir=${JSON.stringify(configDir)} uuid=${converged.accountUuid}` +
+                    ` reason=${heal.reason}${heal.adopted ? " adopted=1" : ""}`,
+                );
+              }
+            } catch (healError) {
+              usageHookLog(
+                `self-heal failed dir=${JSON.stringify(configDir)} ` +
+                  `error=${JSON.stringify(healError instanceof Error ? healError.message : String(healError))}`,
+              );
+            }
           }
         } catch (error) {
           // The log line alone is the failure mode bug 2865f9f5 measured:
@@ -1420,11 +1552,7 @@ program
           {
             currentAccountUuid: (dir) => dirAccountUuid(dir, tool),
             readCache: (uuid, maxAgeMs) => readUsageCache(uuid, maxAgeMs),
-            listIdentities: async () =>
-              buildIdentityIndex(
-                (await store.listProfiles(opts.tool)).map((p) => ({ name: p.name, dir: p.dir })),
-                tool,
-              ),
+            listIdentities: async () => buildIdentityIndex(hookProfiles, tool),
             triggerRefresh: () => {
               const cliPath = process.argv[1];
               if (!cliPath) return;

@@ -1,15 +1,18 @@
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { withApplyLock } from "./apply-lock.js";
 import {
+  applyProfileOAuthIdentityToDir,
   claudeProfileAuthHealth,
   clearSwitchedAccountMarker,
   dirCredentialShouldUpdateProfile,
   dirOAuthEmail,
   ensureProfileAuthSnapshot,
   liveOAuthEmail,
+  parkOrphanDirAuth,
   profileOAuthEmail,
   readSwitchedAccountMarker,
   restoreClaudeAuthIntoDir,
@@ -17,8 +20,15 @@ import {
   writeSwitchedAccountMarker,
 } from "./claude-auth.js";
 import { listDirLiveSessions, liveClaudeBase, liveClaudePaths, type DirSessionInfo } from "./claude-layout.js";
-import { isAccountUuid, profileAccountUuid } from "./auth-store.js";
+import { credentialHealth, isAccountUuid, profileAccountUuid } from "./auth-store.js";
 import { convergeIdentityCredential } from "./credential-broker.js";
+import { dirAccountUuid } from "./identity-index.js";
+import {
+  centralCredentialsPath,
+  inspectDirCredential,
+  migrateDirToLink,
+  repointDir,
+} from "./symlink-broker.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool } from "./tools.js";
 
@@ -43,6 +53,13 @@ export interface SwitchAccountOptions {
    * `accounts usage-hook` must never set it.
    */
   allowUnregisteredDir?: boolean;
+  /**
+   * Target the live default config dir DELIBERATELY when neither --dir nor the
+   * tool's env var chose it. Without this, a switch whose dir resolution FELL
+   * THROUGH to the live default is refused while live profile-dir sessions
+   * exist on the box — see the wrong-dir guard in {@link switchAccount}.
+   */
+  liveDefault?: boolean;
 }
 
 export interface SwitchAccountResult {
@@ -61,18 +78,35 @@ export interface SwitchAccountResult {
   message: string;
 }
 
+/** Which rung of the precedence chain picked the session config dir. */
+export type SessionConfigDirSource = "option" | "env" | "default";
+
+/**
+ * Session config dir precedence — explicit --dir, then the tool env var, then
+ * the live default — WITH the rung that decided it. The source matters
+ * because "the operator named this dir" and "nothing named a dir so the
+ * machine default caught it" demand different levels of caution from callers
+ * that write credentials (see the wrong-dir guard in {@link switchAccount}).
+ */
+export function resolveSessionConfigDirWithSource(
+  tool: ToolDef,
+  opts: { dir?: string; env?: NodeJS.ProcessEnv } = {},
+): { dir: string; source: SessionConfigDirSource } {
+  const env = opts.env ?? process.env;
+  const fromOption = opts.dir?.trim();
+  if (fromOption) return { dir: resolve(fromOption), source: "option" };
+  const fromEnv = env[tool.envVar]?.trim();
+  if (fromEnv) return { dir: resolve(fromEnv), source: "env" };
+  if (tool.id === "claude") return { dir: liveClaudePaths().configDir, source: "default" };
+  return { dir: tool.defaultDir, source: "default" };
+}
+
 /** Session config dir precedence: explicit --dir, then the tool env var, then the live default. */
 export function resolveSessionConfigDir(
   tool: ToolDef,
   opts: { dir?: string; env?: NodeJS.ProcessEnv } = {},
 ): string {
-  const env = opts.env ?? process.env;
-  const fromOption = opts.dir?.trim();
-  if (fromOption) return resolve(fromOption);
-  const fromEnv = env[tool.envVar]?.trim();
-  if (fromEnv) return resolve(fromEnv);
-  if (tool.id === "claude") return liveClaudePaths().configDir;
-  return tool.defaultDir;
+  return resolveSessionConfigDirWithSource(tool, opts).dir;
 }
 
 function singleMatch<T>(items: T[]): T | undefined {
@@ -141,7 +175,7 @@ export async function switchAccount(
     );
   }
 
-  const configDir = resolveSessionConfigDir(tool, opts);
+  const { dir: configDir, source: dirSource } = resolveSessionConfigDirWithSource(tool, opts);
   const resolvedConfigDir = resolve(configDir);
   if (resolvedConfigDir === resolve(liveClaudeBase())) {
     throw new AccountsError(
@@ -190,7 +224,109 @@ export async function switchAccount(
     );
   }
 
+  // WRONG-DIR SWITCH GUARD (bug 04a350a9, task c48e92b7). Profile wiring on
+  // this fleet lives only inside `accounts launch` process subtrees: a plain
+  // tmux pane shell carries no CLAUDE_CONFIG_DIR, so a switch typed at a pane
+  // prompt FALLS THROUGH to the live default and silently rewrites it — while
+  // the profile-dir sessions the operator is actually looking at never read
+  // that dir (measured: 20 of 31 live claudes on station01 ran under profile
+  // dirs). When the fallthrough lands on the live default AND live profile-dir
+  // sessions exist on this box, name the targeted dir and refuse unless
+  // --live-default says the default was meant. An explicit --dir or a set env
+  // var is a deliberate target and is never guarded.
+  if (dirKind === "live-default" && dirSource === "default" && !opts.liveDefault) {
+    const busyProfiles = profiles.filter(
+      (p) => resolve(p.dir) !== resolvedConfigDir && listDirLiveSessions(p.dir).some((s) => s.alive),
+    );
+    if (busyProfiles.length > 0) {
+      throw new AccountsError(
+        `this switch would target the LIVE DEFAULT config dir ${configDir} — no --dir was given and ` +
+          `${tool.envVar} is not set in this shell, so the fallthrough landed on the machine default. ` +
+          `${busyProfiles.length} registered profile dir(s) currently have live ${tool.label} session(s) ` +
+          `(${busyProfiles.map((p) => p.name).join(", ")}) and those sessions never read ${configDir}, so this ` +
+          `switch would rewrite the default silently while changing nothing you are looking at. ` +
+          `Pass --live-default to target ${configDir} deliberately, or --dir <config-dir> for the session you mean.`,
+      );
+    }
+  }
+
   const warnings: string[] = [];
+
+  // === SINGLE-INODE BROKER: ATOMIC SYMLINK REPOINT (owner directive 2026-08-06) ===
+  //
+  // The target-state switch: point the session's `.credentials.json` at the
+  // incoming account's ONE central file by an atomic `rename` of a symlink,
+  // preserving the outgoing account's in-place refresh onto its own central
+  // file first. Zero credential bytes are copied and no central file is
+  // unlinked, so a switch can never destroy a login (design §4, task 46679f8b).
+  //
+  // ENGAGEMENT RULE: the broker runs whenever the INCOMING account has a
+  // central credential of record — plus, unconditionally, when the dir is
+  // already ON the model (a symlink into the central store). Two live-test
+  // defects on the shipped 0.2.35 gate (`dirIsMigrated || opt-in flag`) forced
+  // this (task 0c5cca34):
+  //   1. BROKER DORMANT IN PRODUCTION. `HASNA_ACCOUNTS_SYMLINK_BROKER` is unset
+  //      on every box and real seat dirs are regular files, so the husk-free
+  //      broker never ran for any real seat. But the incoming account's central
+  //      already exists — `ensureProfileAuthSnapshot` (login, and every legacy
+  //      switch) writes it via `syncProfileSnapshotToCentral` — so keying
+  //      engagement on `targetHasCentral` activates the broker for real seats
+  //      with no env var, and degrades gracefully to the legacy copy path only
+  //      when the incoming account has no central yet.
+  //   2. E1-FORK HUSK REGRESSION. Claude 2.1.223 refreshes its token by
+  //      rename-ing over `.credentials.json`, replacing a migrated dir's symlink
+  //      with a regular file (a fork). Under the old gate a plain switch on that
+  //      fork reverted to the legacy copy path and reintroduced a husk; keying
+  //      on `targetHasCentral` re-adopts the fork and keeps the dir linked.
+  // The `HASNA_ACCOUNTS_SYMLINK_BROKER=1` opt-in is retained as an explicit
+  // force (it can only reach the repoint when a central exists, so it never
+  // links to a missing central), but it is no longer the primary trigger.
+  const targetUuid = profileAccountUuid(profile.dir, tool);
+  const targetHasCentral =
+    !!targetUuid && isAccountUuid(targetUuid) && existsSync(centralCredentialsPath(targetUuid));
+  if (dirKind !== "live-default") {
+    const dirInfo = inspectDirCredential(configDir);
+    const dirIsMigrated = dirInfo.kind === "link-central";
+    const brokerOptIn = process.env.HASNA_ACCOUNTS_SYMLINK_BROKER === "1";
+    if (dirIsMigrated || targetHasCentral || brokerOptIn) {
+      // A migrated dir can ONLY be switched by repoint; if the target has no
+      // central file, say so plainly rather than letting the copy-path
+      // fall-through raise a confusing "refusing to write through symlink".
+      if (dirIsMigrated && !targetHasCentral) {
+        throw new AccountsError(
+          `profile "${profile.name}" has no central credential to link this session to. ` +
+            `Re-authenticate with \`accounts login ${profile.name}\` first.`,
+        );
+      }
+      if (targetHasCentral) {
+        const outUuid =
+          dirInfo.kind === "link-central"
+            ? dirInfo.uuid
+            : dirInfo.kind === "regular"
+              ? dirAccountUuid(configDir, tool)
+              : undefined;
+        // The outgoing credential must be preservable: an already-linked dir, a
+        // Claude refresh fork of a known account, or an empty dir. An opt-in on
+        // a regular dir whose account cannot be resolved falls through to the
+        // legacy path, which PARKS it rather than risk losing a login.
+        const outgoingPreservable =
+          dirInfo.kind === "link-central" ||
+          dirInfo.kind === "missing" ||
+          (dirInfo.kind === "regular" && Boolean(outUuid));
+        if (outgoingPreservable) {
+          return await switchAccountViaRepoint(profile, tool, {
+            configDir,
+            dirKind,
+            targetUuid: targetUuid!,
+            outUuid,
+            warnings,
+            opts,
+            store,
+          });
+        }
+      }
+    }
+  }
 
   // BROKER CONVERGENCE BEFORE ANYTHING READS THE PROFILE'S CREDENTIAL. When
   // the target account is also live in another dir, this profile's parked copy
@@ -300,6 +436,23 @@ export async function switchAccount(
       } else {
         warnings.push(`${owner.name} already holds a better credential than this dir; snapshot-back skipped`);
       }
+    } else {
+      // NO RESOLVABLE OWNER — PARK, NEVER DESTROY (bug 04a350a9, task
+      // 61148ec0). `restoreClaudeAuthIntoDir` below overwrites the dir's live
+      // credential wholesale, and a rotated-in refresh token exists nowhere
+      // else, so warning-and-overwriting destroyed the outgoing login. Park
+      // the bytes in a timestamped orphan snapshot instead; if parking THROWS,
+      // the switch aborts here — before the marker write and the restore —
+      // leaving the dir exactly as it was. Orphan snapshots are an interim
+      // crash-net until the zero-copies invariant design (task aaf4c98f)
+      // supersedes them.
+      const parked = parkOrphanDirAuth(configDir, tool);
+      if (parked) {
+        warnings.push(
+          `no profile could be identified as this dir's owner, so its outgoing credential was parked in ${parked} — ` +
+            `recover it with \`accounts add\` + \`accounts login\`, or by restoring that file deliberately`,
+        );
+      }
     }
 
     // Marker BEFORE mutation: if the restore fails midway, the fail state is a
@@ -369,6 +522,124 @@ export async function switchAccount(
     alreadyActive: false,
     ...(outcome.previousEmail ? { previousEmail: outcome.previousEmail } : {}),
     ...(outcome.snapshotBackProfile ? { snapshotBackProfile: outcome.snapshotBackProfile } : {}),
+    liveSessions,
+    warnings,
+    restartRequired: false,
+    message: `${profile.name}${targetEmail ? ` (${targetEmail})` : ""} takes over this session on its next message — no restart needed`,
+  };
+}
+
+interface RepointContext {
+  configDir: string;
+  dirKind: SessionDirKind;
+  targetUuid: string;
+  outUuid?: string;
+  warnings: string[];
+  opts: SwitchAccountOptions;
+  store: AccountsStore;
+}
+
+/**
+ * The single-inode broker switch: preserve the outgoing account's in-place
+ * refresh onto its central file, then atomically repoint the dir's
+ * `.credentials.json` symlink at the incoming account's central file, and merge
+ * the incoming identity into the dir's account file. Zero credential bytes are
+ * copied and no central file is unlinked, so the switch cannot destroy a login
+ * (design §4). Health is gated on the credential OF RECORD — the central file —
+ * so a husked incoming account is refused before anything is touched.
+ */
+async function switchAccountViaRepoint(
+  profile: Profile,
+  tool: ToolDef,
+  ctx: RepointContext,
+): Promise<SwitchAccountResult> {
+  const { configDir, dirKind, targetUuid, outUuid, warnings, opts, store } = ctx;
+
+  const central = credentialHealth(centralCredentialsPath(targetUuid));
+  if (!central.exists || central.refreshTokenLength === 0) {
+    throw new AccountsError(
+      `profile "${profile.name}" cannot take over this session — its central credential is missing or has no refresh token. ` +
+        `Re-authenticate with \`accounts login ${profile.name}\` first.`,
+    );
+  }
+  if (central.expiresAt <= Date.now()) {
+    warnings.push(
+      `"${profile.name}" has an aged-out access token; its refresh token is intact, so the tool renews it on the next request`,
+    );
+  }
+
+  const sessions = listDirLiveSessions(configDir);
+  const liveSessions = sessions.filter((s: DirSessionInfo) => s.alive).length;
+  if (liveSessions > 1 && !opts.yes) {
+    throw new AccountsError(
+      `${liveSessions} live sessions share ${configDir} and ALL of them would switch to "${profile.name}" together. Re-run with --yes to proceed.`,
+    );
+  }
+  if (liveSessions > 1) {
+    warnings.push(`${liveSessions} live sessions share this config dir; all of them switch together`);
+  }
+
+  const targetEmail = profileOAuthEmail(profile.dir, tool) ?? profile.email;
+  const previousEmail = dirOAuthEmail(configDir, tool);
+
+  // Switching to the account the dir already carries: normalise onto the link
+  // model (adopt any refresh fork, relink) and report a no-op.
+  if (outUuid && outUuid.toLowerCase() === targetUuid.toLowerCase()) {
+    withApplyLock(() => {
+      migrateDirToLink(configDir, targetUuid);
+      clearSwitchedAccountMarker(configDir);
+    });
+    return {
+      profile,
+      tool,
+      configDir,
+      dirKind,
+      alreadyActive: true,
+      ...(previousEmail ? { previousEmail } : {}),
+      liveSessions,
+      warnings,
+      restartRequired: false,
+      message: `${profile.name}${targetEmail ? ` (${targetEmail})` : ""} already owns this session's config dir — nothing to switch`,
+    };
+  }
+
+  withApplyLock(() => {
+    const result = repointDir(configDir, {
+      ...(outUuid ? { fromUuid: outUuid } : {}),
+      toUuid: targetUuid,
+    });
+    if (result.quarantined) {
+      warnings.push(`outgoing credential preserved in ${result.quarantined}`);
+    }
+    // Per-key oauthAccount merge: the dir's account file names the incoming
+    // account; every other key survives, and no credential bytes are written.
+    applyProfileOAuthIdentityToDir(profile.dir, tool, configDir);
+    // Occupancy is the symlink itself now (readlink), so a legacy
+    // switched-account marker is vestigial and, left stale, mislabels the dir
+    // (bug 1eadc484). Clear it.
+    clearSwitchedAccountMarker(configDir);
+  });
+
+  try {
+    await store.useProfile(profile.name, tool.id);
+  } catch (error) {
+    warnings.push(`active-profile pointer not updated: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  let refreshed: Profile = profile;
+  try {
+    refreshed = await store.getProfile(profile.name, tool.id);
+  } catch {
+    // Registry read-back is cosmetic; the on-disk switch is done.
+  }
+
+  return {
+    profile: refreshed,
+    tool,
+    configDir,
+    dirKind,
+    alreadyActive: false,
+    ...(previousEmail ? { previousEmail } : {}),
     liveSessions,
     warnings,
     restartRequired: false,

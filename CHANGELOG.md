@@ -6,6 +6,162 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.38] - 2026-08-07
+
+### Fixed
+
+- **Usage-based auto-switch now RUNS and DECIDES in a launched, registry-stripped
+  session, and its candidate/allowlist set is what is actually on the box (tasks
+  f70e8357, d3845278).** `accounts launch` strips `HASNA_ACCOUNTS_API_URL` /
+  `HASNA_ACCOUNTS_API_KEY` from the launched session (registry-authority denial,
+  #126) while leaving a `cloud` storage mode set, so `resolveStore()` inside the
+  `usage-hook` command threw and the hook failed open into "usage-based
+  auto-switching is NOT running for this session — cloud storage mode requires
+  HASNA_ACCOUNTS_API_URL and HASNA_ACCOUNTS_API_KEY". The hook only ever touches
+  local-machine state (a warmer-fed usage cache, a uuid→dir map, the credential
+  symlink a switch repoints), so it now resolves a local-only store
+  (`resolveLocalStore` → `HookLocalStore`, zero registry authority) and its
+  broker convergence pass is handed that same local profile list, so no hook path
+  consults the cloud resolver. `HookLocalStore` sources profiles from the UNION of
+  the on-disk profile directories (`enumerateProfileDirs`) and the local registry
+  rows — in cloud mode the on-box `accounts.json` is a fraction of the machine (7
+  claude rows against 41 managed dirs on station01), and the hook's profile list
+  is both the switch-candidate set and `switchAccount`'s registered-dir
+  anti-exfiltration allowlist, so a session launched on an unregistered managed
+  dir would otherwise have its own config dir refused as "external". Security is
+  preserved: the enumerated dirs live under the credential store's own roots, as
+  trustworthy as `accounts.json`, and a caller-chosen path outside those roots is
+  still refused. This does not reopen #126.
+- **The warmer's `--refresh` now measures a logged-in `needs-refresh` account
+  instead of leaving it a readiness proxy (task d3845278).** An account whose
+  access token aged out but whose refresh token is intact was reported without
+  being queried, even under `--refresh`. `collectAccountsUsage` now mints a fresh
+  access token first via `ensureFreshIdentityCredential`
+  (`grant_type=refresh_token`, once, under the account's identity lock, converging
+  the single-inode model before it writes — no second credential copy), rebuilds
+  the identity, and then queries. The cache-only path is unchanged and never mints
+  a token.
+
+## [0.2.37] - 2026-08-07
+
+### Fixed
+
+- **The usage-hook now self-heals a session dir that Claude re-materialized off
+  the single-inode model, and `adoptForkToCentral` never adopts an older fork
+  over a newer central (task 46679f8b defect C; fork-ranking follow-up
+  8686e6e8).** A freshly launched Claude session COPIES its symlinked
+  `.credentials.json` into a regular file at startup (materializes it), so the
+  dir stops being a symlink and Claude's later in-session token refreshes land
+  in that regular file while the account's central credential goes stale — the
+  first switch on a fresh session then falls back to the copy path. The
+  `UserPromptSubmit` usage-hook now, right after per-session convergence (so it
+  reuses convergence's registered-dir security gate and runs under the same
+  account identity lock), re-adopts the dir's fork onto central and re-symlinks
+  the dir to central whenever the dir's `.credentials.json` is a regular file
+  for an account that already has a central store. The heal is idempotent
+  (already-linked → no-op), fail-open (a heal failure never blocks the prompt),
+  atomic (inode moves by `rename`, atomic symlink swap, zero credential bytes
+  copied), and deliberately narrow (a regular file with no central, a missing
+  file, or a foreign symlink is left untouched). Separately, `adoptForkToCentral`
+  now ranks the dir's fork against the central with the canonical
+  `betterCredential` ordering (refresh-token presence, then usability, then
+  mtime, then expiry) instead of a refresh-presence-only check: a strictly older
+  materialized fork that another session has since superseded no longer clobbers
+  the fresher central, husk protection is preserved, and a same-instant tie still
+  keeps the session's live in-place token. New `selfHealDirLink` primitive with
+  full coverage: de-migrated symlink→regular re-links with the freshest token on
+  central; a stale fork is preserved in quarantine while the newer central is
+  kept and linked; idempotent, no-central, missing, and foreign-link cases are
+  no-ops.
+
+## [0.2.36] - 2026-08-06
+
+### Fixed
+
+- **The single-inode broker now engages for real seats, and re-adopts a Claude
+  refresh fork without an env flag (task 0c5cca34, follows #129).** The shipped
+  0.2.35 gate ran the husk-free broker only when the session dir was already a
+  symlink or `HASNA_ACCOUNTS_SYMLINK_BROKER=1` was set. That env var is unset on
+  every production box and real seat config dirs are regular files, so the
+  broker was dormant for every real seat — a switch still took the legacy copy
+  path (defect 1). Worse, Claude Code 2.1.223 refreshes its OAuth token by
+  `rename`-ing over `.credentials.json`, which replaces a migrated dir's symlink
+  with a regular file (a "fork"); a subsequent plain switch on that fork then
+  reverted to the legacy copy path and reintroduced a husk (defect 2, the E1
+  regression). Switching now engages the broker whenever the **incoming account
+  has a central credential of record** — which `ensureProfileAuthSnapshot`
+  already writes on login and on every legacy switch — so the broker activates
+  for real seats with no env var, re-adopts a post-refresh fork onto its central
+  and repoints, and degrades gracefully to the legacy copy path only when the
+  incoming account has no central yet. `HASNA_ACCOUNTS_SYMLINK_BROKER=1` remains
+  as an explicit force. Regression coverage: broker engages with the flag off
+  when the target has a central; a Claude fork of a migrated dir re-adopts and
+  stays a symlink with the flag off; and a target with no central still falls
+  through to the legacy copy path. Seat dirs still convert at their respawn
+  window via `accounts migrate-links`; this change makes that migration stick
+  across Claude's in-session refresh forks.
+
+## [0.2.35] - 2026-08-06
+
+### Changed
+
+- **Account switching rebuilt as an atomic symlink repoint over a single
+  central credential inode (task 46679f8b, PR #129).** Each OAuth account keeps
+  exactly one real credential file, keyed by account uuid, under the central
+  `auth/<uuid>/` store. A session points at its current account through a
+  symlink (`.credentials.json` -> that central file), and a switch atomically
+  repoints the symlink via a rename swap — no credential bytes are copied, no
+  logout occurs, and no husk is left behind. This removes the multi-copy fan-out
+  that was the husking root cause and lets two sessions safely share one central
+  inode, relying on Claude's on-disk mtime-watch + refresh-save CAS for
+  concurrent refresh on that single file. Adds `symlink-broker` with a
+  link-migration path and full regression coverage.
+
+## [0.2.34] - 2026-08-06
+
+### Fixed
+
+- **`accounts apply` never deletes the live credentials file (bug 04a350a9,
+  task d132234c).** `restoreClaudeAuthFromProfile` answered "nothing
+  restorable" by `unlink`-ing the live `~/.claude/.credentials.json`,
+  destroying a live login that owner detection had just failed to park. It now
+  resolves the credential before mutating anything and refuses up front when a
+  profile has no restorable credential of its own, leaving the live identity
+  and credential exactly as they were. `bestRestorableCredentialPath` now also
+  counts the dir's own live file — unless the dir carries a foreign account —
+  matching what `assertRestorableProfileAuth` already accepted.
+
+- **A switch with no resolvable dir owner parks the outgoing credential
+  instead of overwriting it (bug 04a350a9, task 61148ec0).** When
+  `detectDirOwner` returns undefined (no account, no owning profile, or several
+  profiles share the email), `switchAccount` used to warn and then overwrite —
+  destroying a rotated-in refresh token that existed nowhere else. It now copies
+  the outgoing live credential into a timestamped `orphan-snapshots/` directory
+  under the accounts home before the restore; if parking throws, the switch
+  aborts before the marker write and the restore. `snapshotLiveAuthToProfile`
+  gained a downgrade guard so a husked (blank-token) live default can no longer
+  overwrite a good parked snapshot.
+
+- **A fallthrough switch onto the live default config dir is refused while
+  profile-dir sessions are live (bug 04a350a9, task c48e92b7).** A
+  `switch-account` typed at a plain tmux pane carries no `CLAUDE_CONFIG_DIR`, so
+  dir resolution fell through to `~/.claude` and silently rewrote it while the
+  profile-dir sessions the operator was looking at never read that dir.
+  `resolveSessionConfigDirWithSource` now reports which rung chose the dir; when
+  the fallthrough lands on the live default and other registered profile dirs
+  have live sessions, the switch names the targeted dir and refuses unless
+  `--live-default` is passed. An explicit `--dir` or a set env var is a
+  deliberate target and is never guarded.
+
+- **The live default's freshest account file wins identity attribution (bug
+  04a350a9, task 9b006e93).** The live default keeps its account record in both
+  the inner `~/.claude/.claude.json` and the home `~/.claude.json`;
+  `profileAccountJsonPaths` listed the inner file first, so a stale inner uuid
+  shadowed a fresh home one and the credential broker attributed and harvested
+  the live default under the wrong account. The two default-dir paths are now
+  ordered freshest-first by mtime (ties keep the historical inner-first order);
+  writers are unaffected because `mergeOAuthInto` writes every listed path.
+
 ## [0.2.33] - 2026-08-06
 
 ### Fixed
