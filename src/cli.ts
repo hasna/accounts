@@ -22,7 +22,7 @@ import {
   expandPath,
   type ProfileMetadata,
 } from "./lib/profiles.js";
-import { resolveStore } from "./lib/store.js";
+import { resolveLocalStore, resolveStore } from "./lib/store.js";
 import {
   accountsHome,
   getAccountsStorageStatus,
@@ -1389,8 +1389,28 @@ program
       // OPEN — any error lets the message through, exit 0 always.
       try {
         const tool = getTool(opts.tool);
-        const store = resolveStore();
+        // ALWAYS local, never the cloud registry. This hook runs inside a
+        // launched session that had HASNA_ACCOUNTS_API_URL/KEY stripped (#126);
+        // `resolveStore()` there throws over the now-orphaned cloud mode and the
+        // hook fails open into "auto-switching is NOT running" (task f70e8357).
+        // Everything the hook touches is local-machine state — the warmer-fed
+        // usage cache, the uuid->dir map, and the credential symlink a switch
+        // repoints — so a LocalStore is both sufficient and the only store that
+        // does not depend on cloud variables this session was denied. It also
+        // makes the switch-candidate set identical to what is actually present
+        // on this box: a profile the local registry does not carry has no
+        // on-box credential to switch to anyway.
+        const store = resolveLocalStore();
         const configDir = resolveSessionConfigDir(tool, opts.dir ? { dir: opts.dir } : {});
+        // The hook's local profile view (on-disk dirs unioned with the local
+        // registry), resolved ONCE. Passed to every broker call so they never
+        // fall through to `allowlistProfiles()` -> `resolveStore()`, which
+        // throws in a launched, registry-stripped session (#126) — the same
+        // failure that stopped the store resolution above, one layer earlier.
+        const hookProfiles = (await store.listProfiles(opts.tool)).map((p) => ({
+          name: p.name,
+          dir: p.dir,
+        }));
 
         // BROKER PASS, before the prompt runs. Two halves:
         //  1. SYNCHRONOUS convergence (file I/O only): this dir must hold its
@@ -1405,7 +1425,7 @@ program
         // Both fail OPEN — the prompt always goes through.
         let brokerConvergeFailure: string | undefined;
         try {
-          const converged = await convergeDirCredential(configDir, { tool });
+          const converged = await convergeDirCredential(configDir, { tool, profiles: hookProfiles });
           if (converged) {
             usageHookLog(
               `broker-converge uuid=${converged.accountUuid} writes=${converged.writes.length}` +
@@ -1532,11 +1552,7 @@ program
           {
             currentAccountUuid: (dir) => dirAccountUuid(dir, tool),
             readCache: (uuid, maxAgeMs) => readUsageCache(uuid, maxAgeMs),
-            listIdentities: async () =>
-              buildIdentityIndex(
-                (await store.listProfiles(opts.tool)).map((p) => ({ name: p.name, dir: p.dir })),
-                tool,
-              ),
+            listIdentities: async () => buildIdentityIndex(hookProfiles, tool),
             triggerRefresh: () => {
               const cliPath = process.argv[1];
               if (!cliPath) return;

@@ -345,3 +345,103 @@ test("the shared no-usable-access-token verdict is the ONE place that word is ch
   expect(statusWithoutValidAccessToken(ref(false))).toBe("expired");
   expect(statusWithoutValidAccessToken(undefined)).toBe("no-credentials");
 });
+
+/**
+ * d3845278: a LOGGED-IN account whose access token has aged out (`needs-refresh`)
+ * used to come back from `--refresh` unmeasurable — readiness-proxy /
+ * no-cached-rate-limit-data — because the collector reported it without minting
+ * a token and querying. The warmer's refresh path now refreshes the access token
+ * FIRST (grant_type=refresh_token, under the account lock, single-inode safe),
+ * then queries, so the account becomes measurable.
+ */
+function needsRefreshProfile(name: string): string {
+  const dir = makeDir(name);
+  // The dir's own account, parked and live, with an aged-out access token and an
+  // intact refresh token: exactly `needs-refresh`.
+  writeSnapshot(dir, { ...HOST, expiresInMs: -8 * 60 * 60 * 1000 });
+  writeLive(dir, { ...HOST, expiresInMs: -8 * 60 * 60 * 1000 });
+  return dir;
+}
+
+const USAGE_BODY = {
+  limits: [
+    { kind: "session", group: "session", percent: 20, resets_at: null, scope: null, is_active: false },
+    { kind: "weekly_all", group: "weekly", percent: 35, resets_at: null, scope: null, is_active: true },
+  ],
+};
+
+/**
+ * A URL-aware counting stub: the OAuth token endpoint returns a fresh access
+ * token; the usage endpoint returns a real usage shape. Never a live credential.
+ */
+function refreshThenUsageFetch(opts: { tokenStatus?: number } = {}): {
+  impl: typeof fetch;
+  tokenCalls: () => number;
+  usageCalls: () => number;
+} {
+  let tokenCalls = 0;
+  let usageCalls = 0;
+  const impl = (async (input: unknown) => {
+    const url = String(input);
+    if (url.includes("/oauth/token")) {
+      tokenCalls += 1;
+      if (opts.tokenStatus && opts.tokenStatus !== 200) {
+        return new Response("invalid_grant", { status: opts.tokenStatus });
+      }
+      return new Response(
+        JSON.stringify({
+          access_token: "SYNTHETIC-fresh-access-token",
+          expires_in: 3600,
+          refresh_token: "SYNTHETIC-rotated-refresh-token",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    usageCalls += 1;
+    return new Response(JSON.stringify(USAGE_BODY), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  return { impl, tokenCalls: () => tokenCalls, usageCalls: () => usageCalls };
+}
+
+test("d3845278: --refresh mints a token for a needs-refresh account and MEASURES it", async () => {
+  const dir = needsRefreshProfile("account037");
+  const fetchStub = refreshThenUsageFetch();
+
+  const entries = await collectAccountsUsage(
+    { tool: "claude", refresh: true, maxAgeMs: 0, fetchImpl: fetchStub.impl },
+    stubStore([{ name: "account037", dir }]),
+  );
+  const owner = entries.find((e) => e.accountUuid === HOST.uuid)!;
+
+  // The refresh happened, then the usage query happened, and the account is now
+  // measurable rather than a readiness proxy.
+  expect(fetchStub.tokenCalls()).toBe(1);
+  expect(fetchStub.usageCalls()).toBe(1);
+  expect(owner.source).toBe("fetch");
+  expect(owner.usage).toBeDefined();
+  expect(owner.status).toBe("ok");
+  // No token value leaks into the reported entry.
+  expect(JSON.stringify(owner)).not.toContain("SYNTHETIC-fresh-access-token");
+});
+
+test("POSITIVE CONTROL: when the refresh exchange fails, the account stays unmeasured but never crashes", async () => {
+  const dir = needsRefreshProfile("account037-badgrant");
+  const fetchStub = refreshThenUsageFetch({ tokenStatus: 401 });
+
+  const entries = await collectAccountsUsage(
+    { tool: "claude", refresh: true, maxAgeMs: 0, fetchImpl: fetchStub.impl },
+    stubStore([{ name: "account037-badgrant", dir }]),
+  );
+  const owner = entries.find((e) => e.accountUuid === HOST.uuid)!;
+
+  // The exchange was attempted, it failed, and the usage endpoint was NEVER
+  // queried with a dead token — so "measured" in the test above is attributable
+  // to the successful refresh, not to the collector ignoring status.
+  expect(fetchStub.tokenCalls()).toBe(1);
+  expect(fetchStub.usageCalls()).toBe(0);
+  expect(owner.usage).toBeUndefined();
+  expect(owner.status).toBe("needs-refresh");
+});
