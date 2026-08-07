@@ -39,6 +39,7 @@ import {
   registryPromotionSnapshot,
   releaseTag,
   repositorySlug,
+  resolvePublicationState,
   stagingDistTag,
   verifyArchive,
   verifyAttestations,
@@ -2105,8 +2106,18 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(promotionImplementation).toContain("readPackage,");
   expect(promotionImplementation).toContain("setLatest:");
   expect(implementation).not.toContain("fetchJson(packageUrl(value.name))");
+  // Verification, promotion, and the resume preflight. Every packument read goes
+  // through the nonce-based reader so a cached dist-tag view can never decide
+  // whether a version is publishable, resumable, or already promoted.
   expect(implementation.match(/createOriginPackumentReader\(value\.name\)/g))
-    .toHaveLength(2);
+    .toHaveLength(3);
+  const publishableImplementation = implementation.slice(
+    implementation.indexOf("async function ensurePublishable("),
+    implementation.indexOf("function safeRegistryUrl("),
+  );
+  expect(publishableImplementation).toContain(
+    "const readPackageMetadata = createOriginPackumentReader(value.name);",
+  );
   const verificationImplementation = implementation.slice(
     implementation.indexOf("async function verifyRegistryRelease("),
     implementation.indexOf("async function promoteDistTag("),
@@ -2323,4 +2334,137 @@ test("deterministic pack verification stays in the required test job, and runs l
     expect(testJob.indexOf(cheaper)).toBeGreaterThan(-1);
     expect(testJob.indexOf(cheaper)).toBeLessThan(packStep);
   }
+});
+
+// A publish consumes the version irreversibly, so before this the release could
+// not be re-run at all once `publish-staged` had succeeded and a later gate
+// failed: `ensure-unpublished` refused at the first step and every step after it
+// was skipped. Release run 31225016753 lost 0.2.39 that way to a read-path
+// visibility lag on npm's attestations endpoint — the artefact was correct and
+// correctly attested, and four merged fixes sat published but unreachable
+// because `latest` could never be moved to them.
+//
+// The arms below are the whole safety argument. Resuming is allowed only for an
+// artefact proven identical by hashing the DOWNLOADED bytes locally, and the
+// registry's own reported hashes are deliberately not trusted to carry it.
+function stagedCandidateFixture(content = "exact") {
+  const manifestBytes = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
+  const bytes = archive([
+    tarEntry(`package/${content}.txt`, content.length, "0", Buffer.from(content)),
+    tarEntry("package/package.json", manifestBytes.length, "0", manifestBytes),
+  ]);
+  const value: ReleaseCandidate = {
+    ...candidate,
+    size: bytes.length,
+    fileCount: 2,
+    unpackedBytes: content.length + manifestBytes.length,
+    shasum: createHash("sha1").update(bytes).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
+  };
+  return { value, bytes };
+}
+
+function publicationOperations(
+  value: ReleaseCandidate,
+  bytes: Buffer,
+  packument: Record<string, unknown>,
+  metadata: Record<string, unknown> = registryVersionMetadata(value),
+) {
+  return {
+    readVersionMetadata: async () => metadata,
+    readPackageMetadata: async () => packument,
+    readTarball: async () => bytes,
+  };
+}
+
+const unreachableOperations = {
+  readVersionMetadata: async () => { throw new Error("must not read metadata"); },
+  readPackageMetadata: async () => { throw new Error("must not read packument"); },
+  readTarball: async () => { throw new Error("must not read tarball"); },
+};
+
+test("resolves an absent version as publishable without touching the registry further", async () => {
+  expect(
+    await resolvePublicationState(candidate, { status: 404, ok: false }, unreachableOperations),
+  ).toBe("unpublished");
+});
+
+test("rejects a registry preflight that neither found nor served the version", async () => {
+  await expect(
+    resolvePublicationState(candidate, { status: 500, ok: false }, unreachableOperations),
+  ).rejects.toThrow("registry preflight returned 500");
+});
+
+test("resumes an interrupted release whose published version is this exact unpromoted candidate", async () => {
+  const { value, bytes } = stagedCandidateFixture();
+  expect(
+    await resolvePublicationState(
+      value,
+      { status: 200, ok: true },
+      publicationOperations(value, bytes, registryPackage("0.2.9", [value.version], value)),
+    ),
+  ).toBe("resumable");
+});
+
+test("refuses to resume when another publisher already occupies the version", async () => {
+  const { value } = stagedCandidateFixture();
+  const foreign = stagedCandidateFixture("foreign");
+  await expect(
+    resolvePublicationState(
+      value,
+      { status: 200, ok: true },
+      publicationOperations(
+        value,
+        foreign.bytes,
+        registryPackage("0.2.9", [value.version], value),
+        registryVersionMetadata(foreign.value),
+      ),
+    ),
+  ).rejects.toThrow("already exists and is not this candidate");
+});
+
+test("refuses to resume on registry-reported hashes alone when the served bytes differ", async () => {
+  // The registry advertises OUR integrity and shasum while serving someone
+  // else's tarball. Only hashing the downloaded bytes locally catches this, so
+  // this arm fails if the resume decision is ever weakened to a metadata compare.
+  const { value } = stagedCandidateFixture();
+  const foreign = stagedCandidateFixture("foreign");
+  await expect(
+    resolvePublicationState(
+      value,
+      { status: 200, ok: true },
+      publicationOperations(value, foreign.bytes, registryPackage("0.2.9", [value.version], value)),
+    ),
+  ).rejects.toThrow("downloaded registry tarball");
+});
+
+test("refuses to resume once the intended tag was already promoted from the version", async () => {
+  const { value, bytes } = stagedCandidateFixture();
+  await expect(
+    resolvePublicationState(
+      value,
+      { status: 200, ok: true },
+      publicationOperations(value, bytes, registryPackage(value.version, [value.version], value)),
+    ),
+  ).rejects.toThrow("was promoted before registry verification completed");
+});
+
+test("refuses to resume when the published version was built from another commit", async () => {
+  const { value, bytes } = stagedCandidateFixture();
+  await expect(
+    resolvePublicationState(
+      value,
+      { status: 200, ok: true },
+      publicationOperations(
+        value,
+        bytes,
+        registryPackage("0.2.9", [value.version], value),
+        { ...registryVersionMetadata(value), gitHead: "f".repeat(40) },
+      ),
+    ),
+  ).rejects.toThrow("registry gitHead disagrees");
 });
