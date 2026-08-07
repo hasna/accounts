@@ -6,6 +6,33 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.36] - 2026-08-06
+
+### Fixed
+
+- **The single-inode broker now engages for real seats, and re-adopts a Claude
+  refresh fork without an env flag (task 0c5cca34, follows #129).** The shipped
+  0.2.35 gate ran the husk-free broker only when the session dir was already a
+  symlink or `HASNA_ACCOUNTS_SYMLINK_BROKER=1` was set. That env var is unset on
+  every production box and real seat config dirs are regular files, so the
+  broker was dormant for every real seat — a switch still took the legacy copy
+  path (defect 1). Worse, Claude Code 2.1.223 refreshes its OAuth token by
+  `rename`-ing over `.credentials.json`, which replaces a migrated dir's symlink
+  with a regular file (a "fork"); a subsequent plain switch on that fork then
+  reverted to the legacy copy path and reintroduced a husk (defect 2, the E1
+  regression). Switching now engages the broker whenever the **incoming account
+  has a central credential of record** — which `ensureProfileAuthSnapshot`
+  already writes on login and on every legacy switch — so the broker activates
+  for real seats with no env var, re-adopts a post-refresh fork onto its central
+  and repoints, and degrades gracefully to the legacy copy path only when the
+  incoming account has no central yet. `HASNA_ACCOUNTS_SYMLINK_BROKER=1` remains
+  as an explicit force. Regression coverage: broker engages with the flag off
+  when the target has a central; a Claude fork of a migrated dir re-adopts and
+  stays a symlink with the flag off; and a target with no central still falls
+  through to the legacy copy path. Seat dirs still convert at their respawn
+  window via `accounts migrate-links`; this change makes that migration stick
+  across Claude's in-session refresh forks.
+
 ## [0.2.35] - 2026-08-06
 
 ### Changed
