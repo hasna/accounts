@@ -138,7 +138,7 @@ test("the guard reads the home's STATE, so --skip-configs keeps its point", () =
   const profile = addProfile({ name: "probe-only", tool: "claude" });
   renderInstructionHome(profile, "claude");
 
-  const assessment = assessInstructionHome(profile);
+  const assessment = assessInstructionHome(profile, getTool("claude"));
 
   expect(assessment.state).toBe("governed");
   expect(assessment.instructionFileCount).toBe(1);
@@ -204,13 +204,41 @@ test("a stale-but-present home with only an index file still launches", () => {
   const profile = addProfile({ name: "stale-index-only", tool: "claude" });
   writeFileSync(join(profile.dir, "CLAUDE.md"), "# claude session instructions\n\nPR-first landing.\n");
 
-  const assessment = assessInstructionHome(profile);
+  const assessment = assessInstructionHome(profile, getTool("claude"));
 
   expect(assessment.state).toBe("governed");
   expect(assessment.instructionFileCount).toBe(0);
   expect(assessment.manifestExists).toBe(false);
   expect(assessment.indexFileCount).toBe(1);
   expect(() => assertGovernedInstructionHome(profile, getTool("claude"))).not.toThrow();
+});
+
+test("an unrelated Markdown file is not an instruction index", () => {
+  const profile = addProfile({ name: "notes-only", tool: "claude" });
+  writeFileSync(join(profile.dir, "README.md"), "# operator notes\n");
+
+  const assessment = assessInstructionHome(profile, getTool("claude"));
+
+  expect(assessment.state).toBe("ungoverned");
+  expect(assessment.instructionFileCount).toBe(0);
+  expect(assessment.manifestExists).toBe(false);
+  expect(assessment.indexFileCount).toBe(0);
+  expect(() => assertGovernedInstructionHome(profile, getTool("claude"))).toThrow(/no operating rules/i);
+});
+
+test("a corrupt manifest without instruction files fails closed", () => {
+  const profile = addProfile({ name: "corrupt-manifest", tool: "claude" });
+  const manifestPath = join(profile.dir, ".hasna", "session-render-manifest.json");
+  mkdirSync(dirname(manifestPath), { recursive: true });
+  writeFileSync(manifestPath, "not-json\n");
+
+  const assessment = assessInstructionHome(profile, getTool("claude"));
+
+  expect(assessment.state).toBe("ungoverned");
+  expect(assessment.instructionFileCount).toBe(0);
+  expect(assessment.manifestExists).toBe(true);
+  expect(assessment.indexFileCount).toBe(0);
+  expect(() => assertGovernedInstructionHome(profile, getTool("claude"))).toThrow(/no operating rules/i);
 });
 
 test("a tool with no configs session support is unaffected", () => {
