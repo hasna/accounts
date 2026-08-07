@@ -66,6 +66,39 @@ const MAX_TAR_STREAM_BYTES =
 const SIGSTORE_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 const DSSE_IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json";
 const IN_TOTO_STATEMENT_V1 = "https://in-toto.io/Statement/v1";
+const IN_TOTO_STATEMENT_V01 = "https://in-toto.io/Statement/v0.1";
+
+/**
+ * The two attestations npm returns are published against DIFFERENT in-toto
+ * statement versions, and that is npm's spec rather than a defect to tolerate:
+ *
+ *   npm publish attestation  -> https://in-toto.io/Statement/v0.1
+ *   SLSA provenance          -> https://in-toto.io/Statement/v1
+ *
+ * Measured on the live registry for @hasna/accounts@0.2.38, the first release
+ * this repository ever published with attestations:
+ *
+ *   predicateType .../npm/attestation/tree/main/specs/publish/v0.1
+ *     statement _type  https://in-toto.io/Statement/v0.1
+ *   predicateType https://slsa.dev/provenance/v1
+ *     statement _type  https://in-toto.io/Statement/v1
+ *
+ * Requiring v1 of BOTH — which this file did until now — is unsatisfiable by
+ * construction, so `verify-registry --phase staged` rejected every attested
+ * release after the tarball had already been published, leaving the intended
+ * dist-tag unpromoted and requiring a manual repair. Release run 31185413057
+ * failed exactly there on 0.2.38.
+ *
+ * This maps each predicate to the ONE statement version it is allowed to carry
+ * rather than accepting either version for either predicate. That is strictly
+ * tighter than the check it replaces in the dimension that matters: an unknown
+ * predicate type now fails closed instead of being silently admitted, and a
+ * provenance statement downgraded to v0.1 is still rejected.
+ */
+const REQUIRED_STATEMENT_TYPE = new Map<string, string>([
+  [PUBLISH_PREDICATE, IN_TOTO_STATEMENT_V01],
+  [PROVENANCE_PREDICATE, IN_TOTO_STATEMENT_V1],
+]);
 
 interface SigstoreVerifyOptions {
   certificateIdentityURI: string;
@@ -1417,9 +1450,14 @@ function auditedStatement(item: unknown, value: ReleaseCandidate): RecordValue {
     JSON.parse(decodeBase64(envelope.payload, "DSSE payload").toString("utf8")),
     "in-toto statement",
   );
+  const requiredStatementType = REQUIRED_STATEMENT_TYPE.get(predicateType);
   check(
-    decoded._type === IN_TOTO_STATEMENT_V1,
-    `in-toto statement type must be exactly ${IN_TOTO_STATEMENT_V1}`,
+    requiredStatementType !== undefined,
+    `unrecognised attestation predicate type ${predicateType}`,
+  );
+  check(
+    decoded._type === requiredStatementType,
+    `in-toto statement type for ${predicateType} must be exactly ${requiredStatementType}`,
   );
   check(decoded.predicateType === predicateType, "attestation predicate types disagree");
   const subjects = decoded.subject;
