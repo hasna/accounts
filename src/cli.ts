@@ -121,7 +121,7 @@ import {
   runUsageHook,
 } from "./lib/usage-hook.js";
 import { profileCredentialLayers } from "./lib/credential-state.js";
-import { configsSessionToolFor, resolveRequiredInstructionSourceIds, runConfigsPrelaunch, REQUIRED_INSTRUCTION_SOURCES_ENV, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
+import { assertGovernedInstructionHome, configsSessionToolFor, resolveRequiredInstructionSourceIds, runConfigsPrelaunch, REQUIRED_INSTRUCTION_SOURCES_ENV, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
   listSupervisorStates,
@@ -966,6 +966,10 @@ addConfigsOptions(program
         }
         if (opts.launch) {
           runConfigsPrelaunch(result.profile, result.tool, configsPrelaunchOptions(opts));
+          // After the render, never inside it: --skip-configs returns before every
+          // instruction guard in that module, so this is the only check a skipped
+          // launch still meets. Todos OPE15-00059.
+          assertGovernedInstructionHome(result.profile, result.tool, configsPrelaunchOptions(opts));
           const [bin, ...launchArgs] = result.command;
           const res = spawnSync(bin!, launchArgs, {
             stdio: "inherit",
@@ -1788,6 +1792,9 @@ addConfigsOptions(program
       const tool = getTool(profile.tool);
       const plan = planClaudeLaunch(tool, args, opts);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
+      // The exact path account095 took on 2026-08-07: `accounts launch <name>
+      // --tool claude --permissions dangerous`, with the render skipped.
+      assertGovernedInstructionHome(profile, tool, configsPrelaunchOptions(opts));
       const env = await profileEnv(profile, tool);
       const launchArgs = mergeToolArgs(tool, plan.args, { permissions: opts.permissions, profile });
       if (!plan.nonInteractive) await store.useProfile(name, tool.id);
@@ -1827,6 +1834,7 @@ addConfigsOptions(program
       });
       if (launch.nonInteractive) {
         runConfigsPrelaunch(plan.profile, plan.tool, configsPrelaunchOptions(opts));
+        assertGovernedInstructionHome(plan.profile, plan.tool, configsPrelaunchOptions(opts));
         const env = await profileEnv(plan.profile, plan.tool);
         const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
         console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([plan.tool.bin, ...runArgs]).join(" ")}`));

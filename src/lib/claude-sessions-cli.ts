@@ -12,6 +12,7 @@ import {
   type ClaudeSessionScanSkip,
 } from "./claude-sessions.js";
 import { formatEnvAssignments, profileEnv, providerLaunchEnv } from "./env.js";
+import { assertGovernedInstructionHome } from "./configs-prelaunch.js";
 import { runClaudeLaunch, redactArgv } from "./claude-launch.js";
 import { getTool } from "./tools.js";
 
@@ -252,6 +253,7 @@ interface SessionsResumeCliOptions {
   cwd?: string;
   dryRun?: boolean;
   json?: boolean;
+  allowEmptyInstructions?: boolean;
 }
 
 function formatMergeReport(report: SessionMergeReport): string {
@@ -411,6 +413,12 @@ async function resumeSession(
   }
 
   const tool = getTool("claude");
+  // This path never calls the configs prelaunch at all, so it is the one launch
+  // route a guard placed inside the render module could not have reached — the
+  // reason this check lives at the launch boundary. Todos OPE15-00059.
+  assertGovernedInstructionHome(targetProfile, tool, {
+    allowEmptySources: options.allowEmptyInstructions === true,
+  });
   const env = await profileEnv(targetProfile, tool);
   console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv(plan.command).join(" ")}`));
   const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
@@ -448,6 +456,7 @@ export function registerClaudeSessionCommands(program: Command, wrapAction: Acti
     .option("--cwd <path>", "absolute launch cwd; required when the catalog did not observe one")
     .option("--dry-run", "validate the same-binding resume plan without launching Claude")
     .option("--json", "output the dry-run plan as structured JSON")
+    .option("--allow-empty-instructions", "resume into a home with no operating rules on purpose (fails closed otherwise)")
     .action(wrapAction((catalogRef: string, options: SessionsResumeCliOptions) => resumeSession(catalogRef, options)));
 
   sessions

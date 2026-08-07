@@ -8,6 +8,7 @@ import { controlledProbeEnv } from "./env.js";
 import { redactText } from "./redaction.js";
 import {
   assessConfigsManifest,
+  configsManifestPath,
   getConfigsPrelaunchSummary,
   readConfigsPrelaunchAudit,
   readManifestSourceIds,
@@ -407,6 +408,135 @@ function outputSummary(result: Pick<SpawnSyncReturns<Buffer>, "stdout" | "stderr
   return `: ${bounded
     .map((record) => redactText(record).replace(/\r\n|\r|\n/g, " "))
     .join(" ")}`;
+}
+
+/**
+ * Is this home carrying operating rules RIGHT NOW, independent of any render?
+ *
+ * Deliberately a state read and not a render: it costs one `existsSync` plus at
+ * most one `readdirSync`, which is what lets `--skip-configs` keep its point.
+ * The flag exists so a known-good home is not re-rendered on every launch, and a
+ * check that had to render in order to answer would take that away.
+ *
+ * WHAT IT CAN AND CANNOT SEE, stated because the boundary decides the false
+ * positives. It reads the two artefacts accounts owns: the per-source files
+ * under `.hasna/instructions` and the session render manifest. It does NOT read
+ * the tool's index file (`CLAUDE.md` and friends) — `builtin-tools.ts` says in
+ * as many words that those are "NOT handled here", and inventing per-tool
+ * filename knowledge in this module to answer a safety question would be a guess
+ * dressed as a measurement.
+ *
+ * That makes the predicate CONSERVATIVE in the direction that matters: a home
+ * carrying rules by some route accounts cannot see would be misread as empty.
+ * Measured on station01 2026-08-07 across all 54 profile directories present
+ * (account095 excluded from the scan under an incident hold): of the 14 that
+ * carry neither artefact, ZERO carry an index file, and all 40 that carry an
+ * index file carry both artefacts. So on the estate this was written against the
+ * conservative direction costs nothing today. Re-measure rather than trusting
+ * that sentence — it is a fact about one box on one day.
+ */
+export type InstructionHomeState = "governed" | "ungoverned" | "unreadable";
+
+export interface InstructionHomeAssessment {
+  state: InstructionHomeState;
+  instructionFileCount: number;
+  manifestExists: boolean;
+  indexFileCount: number;
+}
+
+export function assessInstructionHome(profile: Profile): InstructionHomeAssessment {
+  const rendered = readRenderedInstructionEvidence(profile);
+  const manifestExists = existsSync(configsManifestPath(profile));
+  if (rendered.state === "unreadable") {
+    return { state: "unreadable", instructionFileCount: 0, manifestExists, indexFileCount: 0 };
+  }
+  // The tool's own index file (`CLAUDE.md`, `AGENTS.md`, …) counts, and matching
+  // any top-level `.md` rather than a per-tool filename list is deliberate:
+  // `builtin-tools.ts` states that those files are not modelled here, so a
+  // hardcoded list in this module would be a guess that silently rots as tools
+  // are added. A home holding a markdown file at its root is a home somebody
+  // rendered instructions into, whatever the renderer chose to call it.
+  let indexFileCount = 0;
+  try {
+    indexFileCount = readdirSync(profile.dir, { withFileTypes: true }).filter(
+      (entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"),
+    ).length;
+  } catch {
+    // A profile dir that cannot be listed is handled by the caller, which treats
+    // "cannot see the home" as ungoverned rather than as governed.
+  }
+  // ANY of the three is enough, and the disjunction is what keeps a legitimately
+  // preserved home out of the refusal: `empty-instruction-render.test.ts` path 2
+  // pins a home carrying only a stale `CLAUDE.md` as one that must still launch,
+  // and turning that into a dead launch is the 0.2.9 breakage this module warns
+  // about in three separate places.
+  const governed = rendered.count > 0 || manifestExists || indexFileCount > 0;
+  return {
+    state: governed ? "governed" : "ungoverned",
+    instructionFileCount: rendered.count,
+    manifestExists,
+    indexFileCount,
+  };
+}
+
+/**
+ * REFUSE A LAUNCH INTO A HOME THAT CARRIES NO RULES — however we got here.
+ *
+ * This is the only instruction guard in this module that is NOT inside the
+ * render path, and that placement is the entire fix. The three guards that were
+ * already here (empty-source, incumbent floor, post-render shortfall) all live
+ * below `runConfigsPrelaunch`'s `mode === "skip"` early return, so one flag
+ * reaches past all three at once. Adding a fourth guard in the same place would
+ * have inherited the same bypass.
+ *
+ * IT IS CALLED AT THE LAUNCH BOUNDARY, NOT FROM `runConfigsPrelaunch`, and that
+ * distinction was settled by measurement rather than taste. Wrapping the
+ * prelaunch entry point was tried first and broke seven of this repo's own unit
+ * tests — bare fixtures that exercise audit recording on an empty profile dir
+ * and never launch anything. Those tests were right and the placement was wrong:
+ * `runConfigsPrelaunch` is a RENDER function, and "may this agent start" is not
+ * its question. The launch sites are where a tool binary is about to be spawned,
+ * which is the only place the question means anything.
+ *
+ * It also reaches one path that has no prelaunch call at all — `accounts claude
+ * sessions resume` spawns Claude through `runClaudeLaunch` without ever invoking
+ * the render. A guard inside `runConfigsPrelaunch` could not have covered it,
+ * because there is nothing there to wrap.
+ *
+ * IT REFUSES RATHER THAN WARNING. A warning is what the estate already had: the
+ * empty-source branch writes a loud line to stderr, and account095 launched
+ * anyway and ran for hours under `--permissions dangerous`. The cost of refusing
+ * is real and is bounded to homes that carry no rules at all — a state no
+ * healthy profile is ever in, and one that `--allow-empty-instructions` exists
+ * to declare on purpose.
+ */
+export function assertGovernedInstructionHome(
+  profile: Profile,
+  tool: ToolDef,
+  opts: Pick<ConfigsPrelaunchOptions, "allowEmptySources"> = {},
+): void {
+  // Nothing renders instructions for an unsupported tool, so an empty home is
+  // its normal state and refusing would break every launch of it.
+  if (!configsSessionToolFor(tool)) return;
+  // The documented override, and the only one. Its help text already promises
+  // exactly this behaviour: "render a home with no operating rules on purpose
+  // (fails closed otherwise)".
+  if (opts.allowEmptySources === true) return;
+
+  const home = assessInstructionHome(profile);
+  if (home.state === "governed") return;
+
+  const detail =
+    home.state === "unreadable"
+      ? "its instruction directory cannot be read"
+      : "it carries no instruction files, no session render manifest, and no instruction index";
+  throw new AccountsError(
+    `refusing to launch ${tool.id}/${profile.name}: the instruction home at ${profile.dir} ` +
+      `would give the agent no operating rules — ${detail}. ` +
+      `Render it first (accounts launch ${profile.name} --tool ${tool.id} without --skip-configs, ` +
+      `after accounts set ${profile.name} --tool ${tool.id} --identity <path>), ` +
+      `or pass --allow-empty-instructions to launch an ungoverned home on purpose.`,
+  );
 }
 
 export function runConfigsPrelaunch(

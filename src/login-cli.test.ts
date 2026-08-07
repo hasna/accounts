@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -123,6 +123,30 @@ function writeFakeSecurity() {
   );
   chmodSync(fakeSecurity, 0o755);
   return fakeSecurity;
+}
+
+/**
+ * Mark a profile home as one a render has already reached.
+ *
+ * A launch now refuses an instruction home carrying no operating rules (todos
+ * OPE15-00059), so a test that launches with `--skip-configs` has to say whether
+ * its fixture is a governed home or an ungoverned one. Both cases are exercised
+ * below; this makes the distinction explicit rather than incidental.
+ */
+function markInstructionHomeRendered(profileDir: string, tool: string, profile: string) {
+  mkdirSync(join(profileDir, ".hasna"), { recursive: true });
+  writeFileSync(
+    join(profileDir, ".hasna", "session-render-manifest.json"),
+    JSON.stringify({
+      schema: "hasna.configs.session-render/v1",
+      tool,
+      profile,
+      targetHome: profileDir,
+      generatedAt: "2026-07-01T00:00:00.000Z",
+      sources: [{ id: "hasna-agent-operating-rules" }],
+      files: [],
+    }) + "\n",
+  );
 }
 
 function writeClaudeAuth(profileDir: string, email: string) {
@@ -273,6 +297,7 @@ test("launch syncs Claude profile credentials into keychain before spawning", ()
   const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
   expect(profile).toBeTruthy();
   writeClaudeAuth(profile!.dir, "acct@example.com");
+  markInstructionHomeRendered(profile!.dir, "claude", "acct");
 
   const result = runCliWith(["launch", "acct", "--tool", "claude", "--skip-configs", "--", "--version"], {
     env: {
@@ -290,6 +315,41 @@ test("launch syncs Claude profile credentials into keychain before spawning", ()
   expect(keychainLog).toContain("add-generic-password");
   expect(keychainPayload).toContain("account=acct");
   expect(keychainPayload).toContain("acct@example.com-access-token");
+});
+
+test("launch --skip-configs into a home with no operating rules is refused end to end", () => {
+  // The exact shape of the station01 incident on 2026-08-07: `accounts launch
+  // <name> --tool claude --permissions dangerous --skip-configs` into a profile
+  // whose config dir holds no rules file, no `.hasna/instructions` and no render
+  // manifest. It ran for hours and `accounts doctor` reported it green.
+  //
+  // This runs the real CLI, so it covers the wiring and not only the guard: the
+  // three earlier guards in the prelaunch module are all unreachable on this
+  // path, because --skip-configs returns before every one of them.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  expect(runCli("add", "ungoverned", "--tool", "claude").status).toBe(0);
+
+  const result = runCli("launch", "ungoverned", "--tool", "claude", "--skip-configs", "--", "--version");
+
+  expect(result.status).not.toBe(0);
+  expect(`${result.stderr}${result.stdout}`).toContain("no operating rules");
+  // The tool binary must never have been reached.
+  expect(readLogEntries().length).toBe(0);
+});
+
+test("launch --skip-configs --allow-empty-instructions is still allowed through", () => {
+  // The single documented override, exercised end to end so the refusal above
+  // cannot wedge an operator who genuinely wants an ungoverned home.
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  expect(runCli("add", "deliberate", "--tool", "claude").status).toBe(0);
+
+  const result = runCli(
+    "launch", "deliberate", "--tool", "claude",
+    "--skip-configs", "--allow-empty-instructions", "--", "--version",
+  );
+
+  expect(result.status).toBe(0);
+  expect(readLogEntries()[0]?.tool).toBe("claude");
 });
 
 /**

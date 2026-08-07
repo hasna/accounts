@@ -164,6 +164,11 @@ test("accounts run/supervisor prelaunch renders an empty session only when expli
 test("supervisor start and failure logs recover credentials after unmatched quotes", async () => {
   const secret = "supervisor-unmatched-secret";
   const profile = addProfile({ name: "false-marker", tool: "codex" });
+  // A home that has been rendered at least once. This test is about log
+  // redaction, but a launch now refuses an instruction home carrying no
+  // operating rules (todos OPE15-00059), and a bare fixture is not a state any
+  // real profile reaches.
+  writeManifest(profile, "codex");
   const tool = {
     ...getTool("codex"),
     bin: `missing-supervisor "unterminated －－ --client-key=${secret} --trace keep-supervisor-log`,
@@ -188,6 +193,7 @@ test("supervisor start and failure logs recover credentials after unmatched quot
 test("supervisor start and failure logs redact wrapper-bound split credentials without widening URIs", async () => {
   const secret = "supervisor-wrapper-split-log-secret";
   const profile = addProfile({ name: "wrapper-split-log", tool: "codex" });
+  writeManifest(profile, "codex");
   const tool = {
     ...getTool("codex"),
     bin:
@@ -975,6 +981,12 @@ test("supervisor switch preflights configs before queueing or stopping the curre
   const one = addProfileWithInstructions("one", "codewith");
   const two = addProfileWithInstructions("two", "codewith");
   const bad = addProfileWithInstructions("bad", "codewith");
+  // `addProfileWithInstructions` supplies an identity for the RENDER to consume;
+  // it does not put anything in the home. This test switches with
+  // `mode: "skip"`, so no render runs and the home stays empty — which a launch
+  // now refuses (todos OPE15-00059). A profile the supervisor switches to in
+  // real use has been rendered before, so the fixture says so.
+  for (const profile of [one, two, bad]) writeManifest(profile, "codewith");
   const tool = { ...getTool("codewith"), bin: process.execPath, resumeArgs: [scriptPath] };
   const calls: string[][] = [];
 
