@@ -27,7 +27,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { REGISTRY_AUTHORITY_ENV_KEYS } from "./lib/env.js";
@@ -182,6 +182,26 @@ function createProfile(name: string): void {
   if (added.status !== 0) {
     throw new Error(`failed to create profile: status=${added.status}\n${added.stdout}\n${added.stderr}`);
   }
+  // A launch now refuses an instruction home carrying no operating rules (todos
+  // OPE15-00059), and every test here has to actually SPAWN the tool binary —
+  // its own probe raises "the tool binary never ran" otherwise. This test is
+  // about registry-authority containment in the spawned environment, not about
+  // whether an ungoverned home may start, and a profile that gets launched in
+  // real use has been rendered.
+  const dir = join(home, "profiles", "claude", name);
+  mkdirSync(join(dir, ".hasna"), { recursive: true });
+  writeFileSync(
+    join(dir, ".hasna", "session-render-manifest.json"),
+    JSON.stringify({
+      schema: "hasna.configs.session-render/v1",
+      tool: "claude",
+      profile: name,
+      targetHome: dir,
+      generatedAt: "2026-07-01T00:00:00.000Z",
+      sources: [{ id: "hasna-agent-operating-rules" }],
+      files: [],
+    }) + "\n",
+  );
 }
 
 /**
