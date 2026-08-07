@@ -79,7 +79,8 @@ import {
   type SwitchMode,
 } from "./lib/switch.js";
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
-import { migrateDirToLink } from "./lib/symlink-broker.js";
+import { migrateDirToLink, selfHealDirLink } from "./lib/symlink-broker.js";
+import { withIdentityLockSync } from "./lib/identity-lock.js";
 import {
   buildIdentityIndex,
   dirAccountUuid,
@@ -1456,6 +1457,38 @@ program
                     ` dir=${JSON.stringify(configDir)}`,
                 );
               }
+            }
+
+            // SELF-HEAL the single-inode model against Claude's startup
+            // de-migration (task 46679f8b, defect C). At startup Claude
+            // materializes this dir's `.credentials.json` symlink into a REGULAR
+            // FILE and then lands its own token refreshes into that file; left
+            // alone the dir drifts off the model and the central goes stale, and
+            // the FIRST switch on a fresh session falls back to the copy path.
+            // Convergence just wrote the account's newest rotation to central
+            // under the identity lock, so re-adopt the dir's fork (newest
+            // rotation wins) and re-establish the symlink — under the SAME lock,
+            // so a concurrent sibling switch/converge cannot race the rare
+            // central write. Fail-open and best-effort: a heal failure must never
+            // block the prompt; the session keeps working on the file it holds.
+            // Gated on `converged`, so it only runs for a dir that already passed
+            // convergence's registered-dir security gate and carries a valid
+            // account.
+            try {
+              const heal = withIdentityLockSync(converged.accountUuid, () =>
+                selfHealDirLink(configDir, converged.accountUuid),
+              );
+              if (heal.healed) {
+                usageHookLog(
+                  `self-heal relinked dir=${JSON.stringify(configDir)} uuid=${converged.accountUuid}` +
+                    ` reason=${heal.reason}${heal.adopted ? " adopted=1" : ""}`,
+                );
+              }
+            } catch (healError) {
+              usageHookLog(
+                `self-heal failed dir=${JSON.stringify(configDir)} ` +
+                  `error=${JSON.stringify(healError instanceof Error ? healError.message : String(healError))}`,
+              );
             }
           }
         } catch (error) {

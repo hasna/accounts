@@ -6,6 +6,38 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.37] - 2026-08-07
+
+### Fixed
+
+- **The usage-hook now self-heals a session dir that Claude re-materialized off
+  the single-inode model, and `adoptForkToCentral` never adopts an older fork
+  over a newer central (task 46679f8b defect C; fork-ranking follow-up
+  8686e6e8).** A freshly launched Claude session COPIES its symlinked
+  `.credentials.json` into a regular file at startup (materializes it), so the
+  dir stops being a symlink and Claude's later in-session token refreshes land
+  in that regular file while the account's central credential goes stale — the
+  first switch on a fresh session then falls back to the copy path. The
+  `UserPromptSubmit` usage-hook now, right after per-session convergence (so it
+  reuses convergence's registered-dir security gate and runs under the same
+  account identity lock), re-adopts the dir's fork onto central and re-symlinks
+  the dir to central whenever the dir's `.credentials.json` is a regular file
+  for an account that already has a central store. The heal is idempotent
+  (already-linked → no-op), fail-open (a heal failure never blocks the prompt),
+  atomic (inode moves by `rename`, atomic symlink swap, zero credential bytes
+  copied), and deliberately narrow (a regular file with no central, a missing
+  file, or a foreign symlink is left untouched). Separately, `adoptForkToCentral`
+  now ranks the dir's fork against the central with the canonical
+  `betterCredential` ordering (refresh-token presence, then usability, then
+  mtime, then expiry) instead of a refresh-presence-only check: a strictly older
+  materialized fork that another session has since superseded no longer clobbers
+  the fresher central, husk protection is preserved, and a same-instant tie still
+  keeps the session's live in-place token. New `selfHealDirLink` primitive with
+  full coverage: de-migrated symlink→regular re-links with the freshest token on
+  central; a stale fork is preserved in quarantine while the newer central is
+  kept and linked; idempotent, no-central, missing, and foreign-link cases are
+  no-ops.
+
 ## [0.2.36] - 2026-08-06
 
 ### Fixed

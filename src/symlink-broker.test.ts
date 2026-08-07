@@ -10,6 +10,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,12 +19,14 @@ import { centralCredentialsSnapshot } from "./lib/auth-store.js";
 import { dirCredentialsFile } from "./lib/claude-layout.js";
 import {
   adoptForkToCentral,
+  centralCredentialsPath,
   centralUuidOfCredentialsPath,
   inspectDirCredential,
   linkDirToCentral,
   migrateDirToLink,
   quarantineRoot,
   repointDir,
+  selfHealDirLink,
 } from "./lib/symlink-broker.js";
 import { AccountsError } from "./types.js";
 
@@ -204,6 +207,79 @@ test("adoptForkToCentral NEVER downgrades central: a husk fork is quarantined, c
   }
 });
 
+test("adoptForkToCentral does NOT downgrade a fresher central with a stale (older) fork — newest rotation wins (8686e6e8)", () => {
+  const dir = newConfigDir();
+  try {
+    // Central is the NEWER rotation: later expiry AND (forced below) later mtime.
+    const { path: central, inode } = seedCentral(A, "a@e.com", {
+      refresh: "new-central-refresh",
+      expiresInMs: 3_600_000,
+    });
+    // A stale materialized fork: an OLDER rotation that is still usable (it has a
+    // refresh token, so it is NOT a husk) but strictly older than central. This
+    // is the E1 hazard the follow-up 8686e6e8 names: a startup-materialized copy
+    // that another session has since superseded must not overwrite the fresher
+    // central.
+    const forkPath = dirCredentialsFile(dir);
+    writeFileSync(forkPath, cred("a@e.com", { refresh: "old-fork-refresh", expiresInMs: 60_000 }));
+    const centralMtime = statSync(central).mtimeMs;
+    utimesSync(forkPath, new Date(centralMtime - 10_000), new Date(centralMtime - 10_000));
+
+    const result = adoptForkToCentral(dir, A);
+
+    // The fork LOST: central is byte- and inode-identical, not downgraded.
+    expect(result.adopted).toBe(false);
+    expect(statSync(central).ino).toBe(inode);
+    const centralRec = JSON.parse(readFileSync(central, "utf8")) as {
+      claudeAiOauth?: { refreshToken?: string };
+    };
+    expect(centralRec.claudeAiOauth?.refreshToken).toBe("new-central-refresh");
+    // The stale fork is preserved in quarantine, not deleted, not adopted; the
+    // dir no longer masks central with the stale copy.
+    expect(result.quarantined).toBeDefined();
+    expect(existsSync(result.quarantined!)).toBe(true);
+    expect(existsSync(forkPath)).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("adoptForkToCentral keeps the LIVE fork on a same-instant tie (never strands the session token)", () => {
+  const dir = newConfigDir();
+  try {
+    const { path: central } = seedCentral(A, "a@e.com", { refresh: "central-refresh" });
+    // Fork carries a different (live, in-place) rotation; force an exact mtime
+    // and expiry tie so only the tie-break decides.
+    const forkPath = dirCredentialsFile(dir);
+    const centralRec = JSON.parse(readFileSync(central, "utf8")) as {
+      claudeAiOauth?: { expiresAt?: number };
+    };
+    const expiresAt = centralRec.claudeAiOauth?.expiresAt ?? Date.now() + 60_000;
+    writeFileSync(
+      forkPath,
+      JSON.stringify({
+        claudeAiOauth: { accessToken: "a@e.com-access", refreshToken: "live-fork-refresh", expiresAt },
+      }) + "\n",
+    );
+    // Force an EXACT mtime tie on BOTH files (integer ms so it round-trips
+    // through the filesystem) — the only tie-break left is betterCredential's,
+    // which must return the fork.
+    const tie = new Date(Math.floor(statSync(central).mtimeMs));
+    utimesSync(central, tie, tie);
+    utimesSync(forkPath, tie, tie);
+    expect(statSync(forkPath).mtimeMs).toBe(statSync(central).mtimeMs);
+
+    const result = adoptForkToCentral(dir, A);
+    expect(result.adopted).toBe(true);
+    const adopted = JSON.parse(readFileSync(central, "utf8")) as {
+      claudeAiOauth?: { refreshToken?: string };
+    };
+    expect(adopted.claudeAiOauth?.refreshToken).toBe("live-fork-refresh");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("adoptForkToCentral creates central from the fork when none exists (first migration)", () => {
   const dir = newConfigDir();
   try {
@@ -322,6 +398,158 @@ test("migrateDirToLink relinks a dir whose credential belongs to a different acc
     const result = migrateDirToLink(dir, B);
     expect(result.changed).toBe(true);
     expect(accessTokenThroughDir(dir)).toBe("b@e.com-access");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- selfHealDirLink: startup de-migration recovery (fix C, task 46679f8b) ---
+//
+// Claude Code materializes a session dir's `.credentials.json` symlink into a
+// regular file at startup, and lands its own token refreshes into that regular
+// file. The usage-hook calls this on every prompt to re-adopt the fork onto the
+// account's central file (newest rotation wins) and re-establish the symlink, so
+// the single-inode model is self-healing against Claude re-materializing it.
+
+test("selfHealDirLink re-symlinks a dir Claude de-migrated (symlink -> regular) back to central, freshest token preserved", () => {
+  const dir = newConfigDir();
+  try {
+    // On the model: dir symlinked to central.
+    seedCentral(A, "a@e.com", { refresh: "r1" });
+    linkDirToCentral(dir, A);
+    expect(inspectDirCredential(dir).kind).toBe("link-central");
+
+    // STARTUP DE-MIGRATION: Claude materializes the symlink into a regular file
+    // (a copy of central's bytes), so the dir is no longer a symlink.
+    const link = dirCredentialsFile(dir);
+    const materialized = readFileSync(link); // reads THROUGH the symlink
+    rmSync(link);
+    writeFileSync(link, materialized);
+    expect(inspectDirCredential(dir).kind).toBe("regular");
+
+    // Claude then REFRESHES its token into that regular file: the fork is now the
+    // freshest rotation and central is stale.
+    writeFileSync(link, cred("a@e.com", { refresh: "r2-rotated" }));
+
+    // Hook fires -> self-heal.
+    const result = selfHealDirLink(dir, A);
+    expect(result.healed).toBe(true);
+
+    // The dir is a SYMLINK to central again.
+    const healed = inspectDirCredential(dir);
+    expect(healed.kind).toBe("link-central");
+    if (healed.kind === "link-central") expect(healed.uuid).toBe(A);
+
+    // Central holds the FRESHEST token (the r2 rotation), reachable through the dir.
+    const rec = JSON.parse(readFileSync(dirCredentialsFile(dir), "utf8")) as {
+      claudeAiOauth?: { refreshToken?: string };
+    };
+    expect(rec.claudeAiOauth?.refreshToken).toBe("r2-rotated");
+    // And central itself carries it — the fork was adopted, not stranded in the dir.
+    const central = JSON.parse(readFileSync(centralCredentialsPath(A), "utf8")) as {
+      claudeAiOauth?: { refreshToken?: string };
+    };
+    expect(central.claudeAiOauth?.refreshToken).toBe("r2-rotated");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("selfHealDirLink is idempotent — a dir already linked to central is an unchanged no-op", () => {
+  const dir = newConfigDir();
+  try {
+    seedCentral(A, "a@e.com");
+    linkDirToCentral(dir, A);
+    const before = readlinkSync(dirCredentialsFile(dir));
+    const result = selfHealDirLink(dir, A);
+    expect(result.healed).toBe(false);
+    expect(result.reason).toBe("already-linked");
+    expect(inspectDirCredential(dir).kind).toBe("link-central");
+    expect(readlinkSync(dirCredentialsFile(dir))).toBe(before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("selfHealDirLink leaves a regular file untouched when the account has no central store", () => {
+  const dir = newConfigDir();
+  try {
+    // A fresh login: a regular file, and NO central for the account yet. Adopting
+    // it here would migrate a login into the pool implicitly; the hook must not.
+    writeFileSync(dirCredentialsFile(dir), cred("a@e.com"));
+    const result = selfHealDirLink(dir, A);
+    expect(result.healed).toBe(false);
+    expect(result.reason).toBe("no-central");
+    expect(inspectDirCredential(dir).kind).toBe("regular");
+    expect(existsSync(centralCredentialsPath(A))).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("selfHealDirLink is a no-op for a missing dir file", () => {
+  const dir = newConfigDir();
+  try {
+    seedCentral(A, "a@e.com");
+    // No .credentials.json at all — nothing to heal.
+    const result = selfHealDirLink(dir, A);
+    expect(result.healed).toBe(false);
+    expect(result.reason).toBe("missing");
+    expect(inspectDirCredential(dir).kind).toBe("missing");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("selfHealDirLink preserves a fresher central and still relinks when the dir's fork is stale (8686e6e8)", () => {
+  const dir = newConfigDir();
+  try {
+    const { path: central, inode } = seedCentral(A, "a@e.com", {
+      refresh: "central-new",
+      expiresInMs: 3_600_000,
+    });
+    // A stale materialized fork (older rotation than central).
+    const link = dirCredentialsFile(dir);
+    writeFileSync(link, cred("a@e.com", { refresh: "fork-old", expiresInMs: 60_000 }));
+    const cm = statSync(central).mtimeMs;
+    utimesSync(link, new Date(cm - 10_000), new Date(cm - 10_000));
+
+    const result = selfHealDirLink(dir, A);
+    expect(result.healed).toBe(true);
+    expect(result.adopted).toBe(false);
+
+    // Central kept (inode + newest token), the stale fork was NOT adopted.
+    expect(statSync(central).ino).toBe(inode);
+    // The dir now links to the FRESHER central, so the session reads the newest token.
+    expect(inspectDirCredential(dir).kind).toBe("link-central");
+    const rec = JSON.parse(readFileSync(dirCredentialsFile(dir), "utf8")) as {
+      claudeAiOauth?: { refreshToken?: string };
+    };
+    expect(rec.claudeAiOauth?.refreshToken).toBe("central-new");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("selfHealDirLink leaves a FOREIGN symlink untouched — narrow scope, never strands a target's fresher bytes", () => {
+  const dir = newConfigDir();
+  try {
+    seedCentral(A, "a@e.com");
+    // A symlink that does NOT point into the central store (a legacy/foreign
+    // link). The startup de-migration symptom is a REGULAR file, not this; the
+    // self-heal is deliberately narrow and must not relink a foreign target,
+    // which could point at a fresher credential that a blind repoint would drop.
+    const link = dirCredentialsFile(dir);
+    const strayTarget = join(home, "stray-a.json");
+    writeFileSync(strayTarget, cred("a@e.com"));
+    symlinkSync(strayTarget, link);
+    expect(inspectDirCredential(dir).kind).toBe("link-foreign");
+
+    const result = selfHealDirLink(dir, A);
+    expect(result.healed).toBe(false);
+    expect(result.reason).toBe("link-foreign");
+    // Untouched: still the foreign link.
+    expect(inspectDirCredential(dir).kind).toBe("link-foreign");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
