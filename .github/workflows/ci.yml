@@ -107,6 +107,14 @@ jobs:
       - name: Run tests
         run: bun test
 
+      # Named separately from `bun test`, which already covers it, so that a
+      # failure here reads as "the destructive-migration gate broke" rather than
+      # as one more red test. Migration 0006 deletes production rows and keeps no
+      # original; this asserts its snapshot migration still ships and still runs
+      # first, and that the pre-flight both refuses and proceeds.
+      - name: Destructive-migration gate
+        run: bun test src/server/destructive-guard.test.ts
+
       - name: Verify pinned Sigstore identity policy
         run: bun run test:provenance-crypto
 
