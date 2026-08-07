@@ -6,6 +6,8 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.37] - 2026-08-07
+
 ### Fixed
 
 - **The usage-hook now self-heals a session dir that Claude re-materialized off
