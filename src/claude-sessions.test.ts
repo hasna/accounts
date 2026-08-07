@@ -1018,6 +1018,23 @@ describe("accounts sessions CLI", () => {
     const project = join(root, "repo-resume-launch");
     mkdirSync(project, { recursive: true });
     writeSession(owner.dir, "-repo-resume-launch", UUID_A, project);
+    // A resume now refuses an instruction home carrying no operating rules
+    // (todos OPE15-00059). This test is about argv and routing policy, and a
+    // profile a session can be resumed into has been rendered before, so the
+    // fixture says so.
+    mkdirSync(join(alias.dir, ".hasna"), { recursive: true });
+    writeFileSync(
+      join(alias.dir, ".hasna", "session-render-manifest.json"),
+      JSON.stringify({
+        schema: "hasna.configs.session-render/v1",
+        tool: "claude",
+        profile: alias.name,
+        targetHome: alias.dir,
+        generatedAt: "2026-07-01T00:00:00.000Z",
+        sources: [{ id: "hasna-agent-operating-rules" }],
+        files: [],
+      }) + "\n",
+    );
     writeStore([alias, owner]);
     const catalog = parseCatalog(runCli("sessions", "--json")) as Array<{ catalogRef: string }>;
     const fake = fakeClaudeEnv();

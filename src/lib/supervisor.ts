@@ -38,7 +38,7 @@ import {
   type SwitchResult,
 } from "./switch.js";
 import { getTool } from "./tools.js";
-import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchOptions, type ConfigsPrelaunchResult } from "./configs-prelaunch.js";
+import { assertGovernedInstructionHome, configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchOptions, type ConfigsPrelaunchResult } from "./configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./configs-prelaunch-status.js";
 
 export interface SupervisorState {
@@ -1077,6 +1077,11 @@ export async function runSupervisedTool(
     const configs = preflightedConfigs ?? runConfigsPrelaunch(nextProfile, tool, configOpts);
     requireStableBoundary(boundary);
     logConfigsResult(configs, nextProfile, configOpts);
+    // `startChild` is the supervisor's only spawn site, so one check here covers
+    // both the initial start and every profile switch — including the switch path
+    // that preflights configs separately and passes the result in. Todos
+    // OPE15-00059.
+    assertGovernedInstructionHome(nextProfile, tool, configOpts);
     profile = nextProfile;
     childArgs = nextArgs;
     // Mark this profile as the tool's active selection through the Store so the

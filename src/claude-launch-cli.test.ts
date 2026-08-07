@@ -285,6 +285,31 @@ function profileDir(name: string): string {
 function addProfile(name: string, credential?: string): void {
   expectStatus(runCli(["add", name, "--tool", "claude"]), 0);
   if (credential) writeFileSync(join(profileDir(name), ".credentials.json"), credential, { mode: 0o600 });
+  // A launch now refuses an instruction home carrying no operating rules (todos
+  // OPE15-00059). Every test in this file launches, and none of them is about
+  // whether an ungoverned home may start — they are about argv, stdout, exit
+  // codes, redaction and keychain handling. A profile that gets launched in real
+  // use has been rendered, so the fixture says so once, here, rather than in
+  // each test.
+  markInstructionHomeRendered(name);
+}
+
+/** Mark a profile home as one a render has already reached. */
+function markInstructionHomeRendered(name: string): void {
+  const dir = profileDir(name);
+  mkdirSync(join(dir, ".hasna"), { recursive: true });
+  writeFileSync(
+    join(dir, ".hasna", "session-render-manifest.json"),
+    JSON.stringify({
+      schema: "hasna.configs.session-render/v1",
+      tool: "claude",
+      profile: name,
+      targetHome: dir,
+      generatedAt: "2026-07-01T00:00:00.000Z",
+      sources: [{ id: "hasna-agent-operating-rules" }],
+      files: [],
+    }) + "\n",
+  );
 }
 
 function setKeychain(account: string, secret: string): void {
