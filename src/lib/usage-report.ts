@@ -16,6 +16,7 @@ import {
   type SwitchCandidate,
 } from "./auto-switch.js";
 import { fetchAccountUsage, type AccountUsage, type UsageFetchError } from "./usage.js";
+import { ensureFreshIdentityCredential } from "./credential-broker.js";
 import { activeCooldowns, readExhaustionLedger } from "./exhaustion-ledger.js";
 import { deriveWindowHealth } from "./usage-windows.js";
 import {
@@ -101,30 +102,73 @@ export async function collectAccountsUsage(
         displacedFrom: displacedProfileNames(identity),
         source: "none",
       };
-      if (identity.status !== "ok") {
-        // Only `ok` carries an access token the endpoint will accept, so
-        // `needs-refresh` accounts are reported without being queried — the
-        // widened STATUS must not widen what gets called. This is not a demotion:
-        // `accounts` never mints tokens, so a renewable-but-aged-out credential
-        // has nothing to authenticate with until the tool itself renews it.
-        // Non-ok accounts are REPORTED, never queried and never crashed on.
+      // `expired` (no refresh token) and `no-credentials` are genuinely dead:
+      // reported, never queried, never crashed on. `needs-refresh` is NOT dead
+      // — its access token aged out but its refresh token is intact — so it is
+      // handled below on the refresh path rather than dropped here.
+      if (identity.status !== "ok" && identity.status !== "needs-refresh") {
         return base;
       }
 
       if (!opts.refresh) {
+        // The cache-only path is OFFLINE: it never mints a token and never
+        // queries the provider. A `needs-refresh` account has an aged-out
+        // access token, so with no fresh cache it stays unmeasured HERE — the
+        // warmer's `--refresh` path below is what mints a token and measures it.
         const cached = readUsageCache(identity.accountUuid, maxAgeMs);
         if (cached?.usage) return { ...base, usage: cached.usage, source: "cache" };
-        if (opts.cachedOnly) return base;
+        if (identity.status !== "ok" || opts.cachedOnly) return base;
       }
 
-      const token = accessTokenForAccount(identity);
+      // REFRESH-THEN-FETCH. A `needs-refresh` account cannot authenticate the
+      // usage endpoint with its aged-out access token, so it was previously
+      // reported unmeasurable (readiness-proxy / no-cached-rate-limit-data) even
+      // under `--refresh` (task d3845278). Mint a fresh access token FIRST —
+      // once, under the account's identity lock, converging the single-inode
+      // model before it writes (no second credential copy). This runs in the
+      // warmer's env OUTSIDE any session, and only for an account whose token is
+      // already aged out, so it is a scoped refresh-for-MEASUREMENT, not the
+      // blanket proactive refresh that was mitigated on the in-session hook and
+      // the credential-broker cron.
+      let queryIdentity = identity;
+      if (opts.refresh && identity.status === "needs-refresh") {
+        try {
+          const fresh = await ensureFreshIdentityCredential(identity.accountUuid, {
+            tool,
+            profiles,
+            ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+          });
+          // Re-derive the identity from the world the exchange just created:
+          // ensureFresh wrote the rotated credential to the central snapshot and
+          // fanned it out, so the fresh access token is visible to a rebuilt
+          // index. `refreshed` OR a converged winner can both make it usable.
+          const rebuilt = fresh.winner
+            ? buildIdentityIndex(profiles, tool).find(
+                (candidate) => candidate.accountUuid === identity.accountUuid,
+              )
+            : undefined;
+          if (rebuilt) queryIdentity = rebuilt;
+          if (queryIdentity.status !== "ok") {
+            // No usable access token after the attempt (no refresh token, or the
+            // exchange failed). Report the account without querying — fail-safe,
+            // never a crash.
+            return { ...base, status: queryIdentity.status };
+          }
+        } catch {
+          // One account's refresh failure must never take down usage collection
+          // for the rest of the fleet.
+          return base;
+        }
+      }
+
+      const token = accessTokenForAccount(queryIdentity);
       // The index said `ok`, so the file was readable and unexpired when it was
       // scanned; getting nothing back now means it changed underneath us (a
       // concurrent refresh or park rewrites it in place). Downgrade to what the
       // credential can still do rather than to the word for "dead" — the same
       // conflation, one layer up.
       if (!token) {
-        return { ...base, status: statusWithoutValidAccessToken(identity.credential) };
+        return { ...base, status: statusWithoutValidAccessToken(queryIdentity.credential) };
       }
 
       const result = await fetchAccountUsage(token, {
@@ -136,14 +180,14 @@ export async function collectAccountsUsage(
           fetchedAt: result.usage.fetchedAt,
           usage: result.usage,
         });
-        return { ...base, usage: result.usage, source: "fetch" };
+        return { ...base, status: queryIdentity.status, usage: result.usage, source: "fetch" };
       }
       writeUsageCache({
         accountUuid: identity.accountUuid,
         fetchedAt: new Date().toISOString(),
         error: result.error,
       });
-      return { ...base, error: result.error, source: "fetch" };
+      return { ...base, status: queryIdentity.status, error: result.error, source: "fetch" };
     }),
   );
 }

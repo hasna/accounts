@@ -460,3 +460,25 @@ export function resolveStore(
   clearCustomToolsCache();
   return new LocalStore();
 }
+
+/**
+ * The on-box registry, ALWAYS local, never the cloud API — and never a throw
+ * over storage-mode configuration. `resolveStore()` consults the cloud
+ * resolver, which is correct for operator commands but wrong for a caller that
+ * only ever touches local-machine state and must not fail when the cloud
+ * variables are absent.
+ *
+ * The measured case: `accounts launch` strips `HASNA_ACCOUNTS_API_URL` /
+ * `HASNA_ACCOUNTS_API_KEY` from the launched session (registry-authority
+ * denial, #126) while leaving a `cloud` storage mode set, so `resolveStore()`
+ * inside that session throws and the usage-hook fails open into "auto-switching
+ * is NOT running". The hook reads a warmer-fed LOCAL cache, maps a uuid to a
+ * local config dir, and repoints a local credential symlink on a switch —
+ * every one of those is local-machine state. A `LocalStore` grants ZERO
+ * registry authority, so using it here does not reopen #126; it just stops the
+ * hook from depending on cloud variables it was deliberately denied.
+ */
+export function resolveLocalStore(): AccountsStore {
+  clearCustomToolsCache();
+  return new LocalStore();
+}
