@@ -6,6 +6,53 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.39] - 2026-08-08
+
+Release span measured from the previous release tag to the head being published
+(`npm/accounts/v0.2.38` = `ba3c2aae` .. `db782050`), not from the last merged PR:
+five commits, four of them behaviour changes. `e56c311` (#127) is docs-only and
+recorded 0.2.33's break-glass row.
+
+### Fixed
+
+- **`verify-registry` no longer rejects every attested release after the tarball
+  is already published (#137).** npm publishes its two attestations against
+  DIFFERENT in-toto statement versions — the publish attestation as
+  `https://in-toto.io/Statement/v0.1`, the SLSA provenance as
+  `https://in-toto.io/Statement/v1`. The check demanded v1 of both, which is
+  unsatisfiable by construction, so release run `31185413057` published the
+  0.2.38 tarball and then failed at step 17 (`verify-registry --phase staged`)
+  with `in-toto statement type must be exactly https://in-toto.io/Statement/v1`,
+  leaving `latest` unpromoted and requiring a manual repair. Each predicate is
+  now bound to the one statement version it is allowed to carry. That is
+  strictly tighter than the check it replaces in the dimension that matters: an
+  unrecognised predicate type now fails closed instead of being admitted, and a
+  provenance statement downgraded to v0.1 is still rejected.
+- **A launch into an instruction home carrying no rules is refused (#134).** The
+  existing `--allow-empty-instructions` protection guards a RENDER from
+  overwriting a full home with an empty one; it did not guard a LAUNCH into a
+  home that was already empty, and the empty-source branch wrote a loud warning
+  and launched regardless. The guard now sits at the launch boundary —
+  `cli.ts` launch/run/switch-account `--launch`, supervisor `startChild`, and
+  claude-sessions resume, the last of which never called the render prelaunch at
+  all. `--allow-empty-instructions` remains available on every guarded path and
+  non-configs tools are exempt.
+- **Two bypasses of that guard are closed (#136).** `accounts login` spawned the
+  tool binary without asserting a governed home; it now asserts and accepts
+  `--allow-empty-instructions`. And the governance predicate no longer counts
+  any top-level `.md` file or the mere existence of a render manifest as
+  evidence of rules — it recognises the specific index filename emitted for each
+  configs-session tool, and requires the manifest to be drift-free with a
+  non-zero source count.
+- **Simultaneous usage-based auto-switches are spread instead of stacking on one
+  account (#138).** Measured from the append-only usage-hook log: 69 switches
+  across 17 config dirs in 42 hours, in seven clusters, the largest putting 12
+  dirs onto one account in 25.2 seconds. This is a SORT KEY, not a filter — a
+  shared account-keyed cooldown is forbidden by the #87 directive that a profile
+  stay resumable in any session even when in use elsewhere. Demotion applies only
+  among candidates that have already cleared both headroom gates, so the last
+  healthy account is still returned however many dirs just claimed it.
+
 ## [0.2.38] - 2026-08-07
 
 ### Fixed
