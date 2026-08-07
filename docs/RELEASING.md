@@ -297,6 +297,44 @@ both gaps, and 0.2.25 is accounted for in the 0.2.26 row as retired-superseded
 rather than published — so every version from 0.2.24 on now has a row or a
 stated reason for having none.
 
+### ⚠ THE FOLLOW-UP COLUMN ABOVE IS STALE AND WILL SEND YOU TO BREAK-GLASS UNNECESSARILY
+
+**Every row above says, in one wording or another, that the npm trusted publisher
+"is now the ONLY thing standing between this repo and an attested release". As of
+0.2.38 that is FALSE, and following the most recent row today would break-glass an
+unattested release while an attested path exists.**
+
+The publisher IS configured. Measured from the registry rather than inferred from
+a run: `https://registry.npmjs.org/-/npm/v1/attestations/@hasna%2faccounts@0.2.38`
+returns HTTP 200 with two Sigstore bundles. Negative control on the same probe —
+`@hasna/accounts@0.2.37`, a break-glass publish — returns `{"error":"Not found"}`,
+so the 200 is an observation and not an artefact of the probe.
+
+The rows are left exactly as written. They were true when written, and the log's
+own instruction is to count rows rather than read the most recent one. This notice
+is what a reader needs in order to do that safely.
+
+## Workflow release log
+
+Releases that used the tag-triggered workflow rather than the override. **Kept
+separate from the break-glass table on purpose: that table's own instruction is to
+read it by counting rows, so adding a non-break-glass entry to it would corrupt the
+count it asks you to take.**
+
+| Date (UTC) | Version | Operator | Outcome |
+| --- | --- | --- | --- |
+| 2026-08-07 22:51 | 0.2.39 | agent Silvanus (station01), rows `OPE15-00059` / `OPE4-00007` | **Published by the workflow, NOT promoted. `latest` remains 0.2.38 and was deliberately not moved by hand.** Run `31225016753` for annotated tag `npm/accounts/v0.2.39` at `3becd9e9` passed steps 1-16 and published the tarball at `22:51:48.830Z` with real SLSA provenance, then failed step 17 (`verify-registry --phase staged`) with `npm audit signatures --json --include-attestations failed with exit 1: "code": "E404", "summary": "Not Found - GET https://registry.npmjs.org/-/npm/v1/attestations/@hasna%2faccounts@0.2.39 - Not found"`. **This is NOT the defect #137 fixed, and #137 is confirmed working on real bytes**: the shipped `verifyAttestations()` ACCEPTS the live 0.2.39 bundles (rc=0) while the pre-fix tree at `eca22a3` REJECTS the same input file with the exact 0.2.38 message — same harness, same bytes, code the only variable. **The failure is a read-path visibility lag on npm's attestations endpoint**: both bundles carry Sigstore `integratedTime` of `22:51:47Z` and `22:51:49Z`, i.e. they were signed at or before step 17 started at `22:51:49.5Z`, and the endpoint still 404'd at `22:52:13.5Z` before serving HTTP 200 with both correct predicates by `22:55:54Z`. So the objects existed and the read path did not serve them. **What is NOT established is whether an achievable wait would have covered it** — the lag is bounded only as `>24s` and `<4m05s` from one observation, and `parseRetryOptions` caps the budget at 6 attempts x 10s = 50s, so raising the defaults is not provably sufficient. **Losing this race BURNS THE VERSION**: `ensureUnpublished` is a bare `check(response.status === 404)` with no idempotent branch, so attempt 2 of the same run failed at step 14 with `@hasna/accounts@0.2.39 already exists; versions are immutable` and steps 15-20 skipped — measured against a prediction stated in advance, not inferred. Tracked as todos `3fdfd3f6`. Environment gate approved under ruling `k_ms7ng4oe_mxeodj` on both attempts, recorded in `git-releases` (680287, 680345); intent in `git-publishing` 680278, outcome 680377. |
+
+**A candidate remedy that CANNOT work, recorded so nobody spends time on it:**
+reordering the workflow to verify before publishing. The attestation is *produced
+by* `npm publish --provenance` — its subject is the published tarball's digest and
+it is submitted to the registry as part of the publish — so no registry attestation
+can exist before the publish that creates it. Verification of registry attestations
+is therefore necessarily post-publish, and the unrecoverability has to be fixed on
+the other side: give `ensure-unpublished` an exact-idempotent branch (same version
+AND same integrity AND same `gitHead` already published ⇒ continue) so a lost race
+is retryable instead of terminal.
+
 ## Pinned release substrate
 
 Node, npm, and Bun versions are declared once, in
