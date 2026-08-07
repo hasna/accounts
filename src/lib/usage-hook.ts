@@ -82,6 +82,13 @@ export interface UsageHookDeps {
    * restarts.
    */
   activeCooldowns?(now: Date): Map<string, string>;
+  /**
+   * Accounts OTHER config dirs have just switched onto, uuid -> count. Used to
+   * spread simultaneous breachers across adequate targets instead of stacking
+   * them all onto the single healthiest one (A3-00458). Optional: without it
+   * the ranking is unchanged, so this can never be the reason a switch fails.
+   */
+  recentTargetClaims?(now: Date): Map<string, number>;
   recordExhaustion?(input: RecordExhaustionInput): void;
   clearExhaustion?(accountUuid: string): void;
   /**
@@ -341,6 +348,9 @@ async function decide(opts: UsageHookOptions, deps: UsageHookDeps): Promise<Usag
     ...(opts.minSessionHeadroom !== undefined ? { minSessionHeadroom: opts.minSessionHeadroom } : {}),
     now: clock,
     ...(deps.activeCooldowns ? { cooldowns: deps.activeCooldowns(clock) } : {}),
+    // Spread, do not withhold: this reorders adequate candidates and can never
+    // empty the pool. See the ranking comment in selectHealthiestAccount.
+    ...(deps.recentTargetClaims ? { recentClaims: deps.recentTargetClaims(clock) } : {}),
   });
 
   const breachedWindow = breach.window!;

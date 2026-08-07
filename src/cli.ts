@@ -92,11 +92,13 @@ import { enumerateProfileDirs, mergedNameUniverse } from "./lib/profile-namespac
 import { grandfatherManifestPath, writeGrandfatherManifest } from "./lib/grandfather-manifest.js";
 import {
   DEFAULT_COOLDOWN_MS,
+  DEFAULT_CLAIM_WINDOW_MS,
   DEFAULT_MIN_HEADROOM,
   DEFAULT_MIN_SESSION_HEADROOM,
   DEFAULT_SWITCH_THRESHOLD,
   readAutoSwitchState,
   readHookNoticeState,
+  readRecentTargetClaims,
   readUsageCache,
   writeAutoSwitchState,
   writeHookNoticeState,
@@ -1580,9 +1582,17 @@ program
             // every other session for ten minutes, silently.
             readState: () => readAutoSwitchState(configDir),
             writeState: (state) => writeAutoSwitchState(state, configDir),
-            // Contention detection: an account another dir is actively running
-            // must not be taken as a switch target.
+            // REPORTING ONLY. This used to power the `contended` exclusion —
+            // an account another dir was running could not be a target at all —
+            // which PR #87 removed on an owner directive after the credential
+            // broker dissolved the hazard. The switch message now just says
+            // when the target is shared; nothing here withholds an account.
             liveSessionsIn: (dir) => listDirLiveSessions(dir).filter((session) => session.alive).length,
+            // A3-00458: how many OTHER dirs just switched onto each account, so
+            // simultaneous breachers spread across adequate targets rather than
+            // all landing on the healthiest one. Read from the per-dir anti-flap
+            // records that already exist; adds no new state.
+            recentTargetClaims: (at) => readRecentTargetClaims(DEFAULT_CLAIM_WINDOW_MS, at, configDir),
             readNotices: () => readHookNoticeState(),
             writeNotices: (state) => writeHookNoticeState(state),
             activeCooldowns: (at) => activeCooldowns(readExhaustionLedger(), at),
