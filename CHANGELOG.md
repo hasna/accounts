@@ -162,6 +162,10 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   ordered freshest-first by mtime (ties keep the historical inner-first order);
   writers are unaffected because `mergeOAuthInto` writes every listed path.
 
+## [0.2.33] - 2026-08-06
+
+### Fixed
+
 - **The converge allowlist is the UNION of the active and local registries
   (todos `2865f9f5`, follow-up to #123).** #123 re-pointed
   `convergeDirCredential`'s allowlist from the local file to the active
