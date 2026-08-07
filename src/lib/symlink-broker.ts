@@ -14,6 +14,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { accountsHome } from "../storage.js";
 import { AccountsError } from "../types.js";
 import {
+  betterCredential,
   centralAuthDir,
   centralCredentialsSnapshot,
   credentialHealth,
@@ -175,22 +176,38 @@ export function adoptForkToCentral(configDir: string, uuid: string): AdoptResult
       const quarantined = quarantineCredential(id, forkPath, "identical-fork");
       return { adopted: false, quarantined };
     }
-    // The fork is the account's LIVE credential — Claude wrote it in place, so
-    // it is by construction the newest rotation and adopting it is not a
-    // downgrade. The one case that WOULD destroy a login is a husk fork (a
-    // login-empty / no-refresh-token file) overwriting a central that still
-    // holds a usable refresh token: refuse that, preserving the fork for
-    // forensics and keeping the good central intact. Every other fork wins,
-    // including a fork that merely aged out its access token (its refresh
-    // survives). Ranking on mtime/expiry is deliberately NOT used here: a
-    // same-millisecond tie must not strand the session's live token behind a
-    // stale central.
+    // NEWEST ROTATION WINS. Rank the fork against the central with the canonical
+    // credential ordering ({@link betterCredential}: refresh-token presence, then
+    // usability, then mtime, then expiry). The central is adopted-over ONLY when
+    // the fork is at least as good; a strictly better central is preserved. This
+    // makes the implementation match this function's own documented contract.
+    //
+    //   - HUSK PROTECTION: a fork with no refresh token loses to a usable
+    //     central, so a login-empty refresh fork can never destroy a working
+    //     login. (`betterCredential` decides refresh-presence first.)
+    //   - E1-FORK STALENESS (follow-up 8686e6e8): a startup-materialized copy
+    //     that ANOTHER session has since superseded is a strictly OLDER rotation
+    //     than the central and must NOT overwrite it. The pre-8686e6e8 gate keyed
+    //     only on refresh presence, so ANY usable fork won and a stale
+    //     materialized copy clobbered the fresher central — the regression this
+    //     fixes and the exact hazard the self-heal path can hit.
+    //   - LIVE-TOKEN TIE: `betterCredential(central, fork)` returns the FORK on a
+    //     full tie, so a same-instant rotation keeps the session's live in-place
+    //     token rather than stranding it behind an equal central. This preserves
+    //     the switch-path guarantee that adopting the outgoing dir's just-written
+    //     token is never a downgrade.
     const forkHealth = credentialHealth(forkPath);
     const centralHealth = credentialHealth(central);
-    const forkUsable = forkHealth.exists && forkHealth.refreshTokenLength > 0;
-    const centralUsable = centralHealth.exists && centralHealth.refreshTokenLength > 0;
-    if (centralUsable && !forkUsable) {
-      const quarantined = quarantineCredential(id, forkPath, "husk-fork");
+    const forkWins =
+      forkHealth.exists &&
+      centralHealth.exists &&
+      betterCredential(centralHealth, forkHealth) === forkHealth;
+    if (!forkWins) {
+      // Fork lost: a husk (no refresh token) or a strictly older rotation.
+      // Preserve it in quarantine for forensics and keep the good central.
+      const label =
+        forkHealth.exists && forkHealth.refreshTokenLength > 0 ? "stale-fork" : "husk-fork";
+      const quarantined = quarantineCredential(id, forkPath, label);
       return { adopted: false, quarantined };
     }
     const quarantined = quarantineCredential(id, central, "superseded-central");
@@ -305,6 +322,83 @@ export function migrateDirToLink(configDir: string, uuid: string): MigrateResult
   // central, which must already exist.
   linkDirToCentral(configDir, id);
   return { changed: true, reason: "linked" };
+}
+
+export interface SelfHealResult {
+  /**
+   * The dir was (re)established as a symlink into the central store by this
+   * call. False for a no-op — already linked, nothing to heal, or skipped.
+   */
+  healed: boolean;
+  reason:
+    | "already-linked"
+    | "adopted-and-linked"
+    | "relinked-central-kept"
+    | "no-central"
+    | "missing"
+    | "link-foreign"
+    | "link-central-other";
+  /** The dir's fork was the newest rotation and replaced the central. */
+  adopted?: boolean;
+  /** Path a displaced artifact (the stale fork, or the superseded central) was preserved at. */
+  quarantined?: string;
+}
+
+/**
+ * Self-heal a session config dir back onto the single-inode model, for the ONE
+ * account it already carries.
+ *
+ * This is the fix for the startup de-migration (task 46679f8b, defect C): Claude
+ * Code materializes a dir's `.credentials.json` symlink into a REGULAR FILE at
+ * startup, and lands its own token refreshes into that regular file — so a
+ * migrated dir silently reverts to a husk-prone copy and the central goes stale.
+ * The usage-hook calls this on every prompt: when the dir is a regular file for
+ * an account that HAS a central store, adopt the fork onto central (newest
+ * rotation wins, via {@link adoptForkToCentral}) and re-establish the symlink.
+ *
+ * Deliberately NARROW and idempotent:
+ *   - already linked to this account -> no-op;
+ *   - a regular file with NO central for the account -> left untouched (a fresh
+ *     login is not migrated into the pool implicitly — that is login's job, and
+ *     `linkDirToCentral` has no central to point at anyway);
+ *   - a missing file, a foreign symlink, or a symlink to a DIFFERENT account's
+ *     central -> left untouched. The startup symptom is a regular file; a blind
+ *     repoint of a foreign target could drop a credential that lives only there.
+ *
+ * Atomicity and safety come from the primitives it composes: `adoptForkToCentral`
+ * moves inodes by rename and never deletes a credential; `linkDirToCentral`
+ * swaps the symlink atomically. It copies zero credential bytes.
+ *
+ * CONCURRENCY: when the fork is a NEWER rotation than central, the adopt writes
+ * central. Callers that may run this concurrently for the same account across
+ * sessions (the hook) MUST serialize it under the account's identity lock; the
+ * post-convergence common case adopts an identical fork and never writes central,
+ * so it is race-free there.
+ */
+export function selfHealDirLink(configDir: string, uuid: string): SelfHealResult {
+  const id = assertUuid(uuid);
+  const info = inspectDirCredential(configDir);
+
+  if (info.kind === "link-central") {
+    return info.uuid === id
+      ? { healed: false, reason: "already-linked" }
+      : { healed: false, reason: "link-central-other" };
+  }
+  if (info.kind === "missing") return { healed: false, reason: "missing" };
+  if (info.kind === "link-foreign") return { healed: false, reason: "link-foreign" };
+
+  // info.kind === "regular": the startup-de-migration / refresh-fork symptom.
+  if (!existsSync(centralCredentialsPath(id))) {
+    return { healed: false, reason: "no-central" };
+  }
+  const adopt = adoptForkToCentral(configDir, id);
+  linkDirToCentral(configDir, id);
+  return {
+    healed: true,
+    reason: adopt.adopted ? "adopted-and-linked" : "relinked-central-kept",
+    adopted: adopt.adopted,
+    ...(adopt.quarantined ? { quarantined: adopt.quarantined } : {}),
+  };
 }
 
 /** Central credential path for an account uuid (canonical builder re-export). */
