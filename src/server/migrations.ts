@@ -16,6 +16,7 @@ import {
   type TypedQueryClient,
 } from "../generated/storage-kit/index.js";
 import { API_KEYS_TABLE } from "./config.js";
+import { assertArchivePrecedesPurge } from "./destructive-guard.js";
 
 /** Ordered app-schema SQL files, applied before the auth table migrations. */
 export const APP_MIGRATION_FILES = [
@@ -24,6 +25,11 @@ export const APP_MIGRATION_FILES = [
   "0003_custom_tools.sql",
   "0004_current_selection_account_fk.sql",
   "0005_custom_tool_tombstones.sql",
+  // Snapshot-before-delete for 0006. Ordered here deliberately: the ledger
+  // applies migrations in this array's order and stops on the first error, so
+  // either the archive commits or the purge never runs. `assertArchivePrecedesPurge`
+  // (src/server/destructive-guard.ts) fails the build if this pair is reordered.
+  "0005a_archive_purged_fixtures.sql",
   "0006_purge_test_tool_fixtures.sql",
   "0007_alias_records.sql",
 ] as const;
@@ -77,7 +83,12 @@ export function accountsMigrations(): Migration[] {
   }
   const app = APP_MIGRATION_FILES.map((file) => readAppMigration(dir, file));
   const auth = apiKeyMigrations(API_KEYS_TABLE).map((m) => defineMigration(m.id, m.sql));
-  return [...app, ...auth];
+  const migrations = [...app, ...auth];
+  // A destructive migration may not exist in a build without the snapshot that
+  // precedes it. Enforced here, at list-construction time, so every consumer
+  // (server, migrate task, tests) inherits the check rather than remembering it.
+  assertArchivePrecedesPurge(migrations);
+  return migrations;
 }
 
 export interface MigrationStatus {

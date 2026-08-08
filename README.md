@@ -564,6 +564,47 @@ DDL. Without `--dry-run`, it applies pending migrations and prints a JSON
 summary; when the ledger is already current it exits successfully with a
 `migrate_noop` event.
 
+### Destructive-migration gate
+
+Migration `0006_purge_test_tool_fixtures` deletes production rows. It is the one
+migration in this repo that destroys data rather than reshaping it, so it runs
+behind a two-armed gate.
+
+**Snapshot.** `0005a_archive_purged_fixtures` copies every row the 0006
+predicates match into `destructive_migration_archive` and is ordered immediately
+before 0006. The ledger applies migrations in order and stops on the first
+error, so either the archive commits or the purge never runs. The archive covers
+three tables — `accounts`, `custom_tools`, and `current_selections`, which no
+DELETE in 0006 names and which disappears through `ON DELETE CASCADE`.
+
+**Refusal.** Every `accounts-migrate` run, `--dry-run` included, takes a
+pre-flight `SELECT COUNT` on those predicates while 0006 is pending. The
+expected state is zero `accounts` rows, zero cascaded selections, and at most the
+four known fixture tools. Anything else stops the deploy:
+
+```
+REFUSING TO DEPLOY: accounts_0006_purge_test_tool_fixtures would destroy more than the four known fixture rows.
+  accounts.tool: 4 row(s) match, at most 0 expected — real account rows; 0006 deletes these only to defeat 0005's in-use guard
+```
+
+Run `accounts-migrate --dry-run` as the pre-deploy check: it refuses without
+mutating anything. If the destruction is genuinely intended, re-run with
+`HASNA_ACCOUNTS_ALLOW_DESTRUCTIVE_PURGE=confirm`; the snapshot is taken either
+way.
+
+**Restore.** Read the preserved originals back with:
+
+```bash
+accounts-migrate --restore-purge-archive
+```
+
+Order is why this is a command and not a documented `INSERT`. `custom_tools`
+restores first, because inserting a custom tool fires the reactivation trigger
+from 0005 that clears the tombstone 0006 wrote; until that tombstone is gone
+every account insert raises `custom tool "..." was explicitly removed`. The
+insert also names only the columns the snapshot actually carries, so a snapshot
+taken before 0007 added `aliases NOT NULL` still restores.
+
 ## Account Metadata
 
 Profiles can carry non-secret ownership metadata alongside their isolated config

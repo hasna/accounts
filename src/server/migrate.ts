@@ -14,9 +14,15 @@ import {
 } from "./migrations.js";
 import { APP_SLUG } from "./config.js";
 import { grantAccountsRuntimeRole } from "./runtime-role.js";
+import {
+  preflightDestructiveMigrations,
+  restorePurgeArchive,
+  PURGE_MIGRATION_ID,
+} from "./destructive-guard.js";
 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
+  const restore = process.argv.includes("--restore-purge-archive");
   const resolution = resolveStorageMode(APP_SLUG, process.env);
   if (resolution.mode !== "cloud") {
     console.error("accounts-migrate requires HASNA_ACCOUNTS_STORAGE_MODE=cloud and HASNA_ACCOUNTS_DATABASE_URL.");
@@ -24,6 +30,13 @@ async function main(): Promise<void> {
   }
   const { client } = createCloudPoolFromEnv(APP_SLUG, { applicationName: "accounts-migrate", max: 2 });
   try {
+    // Recovery path for the destructive purge. Runs before any migration work
+    // so a restore is possible even when the schema is otherwise up to date.
+    if (restore) {
+      const result = await restorePurgeArchive(client);
+      console.log(JSON.stringify({ evt: "purge_archive_restored", ...result }, null, 2));
+      return;
+    }
     const migrations = accountsMigrations();
     const runtimeRole = process.env.HASNA_ACCOUNTS_RUNTIME_ROLE?.trim();
     if (!runtimeRole) {
@@ -36,6 +49,33 @@ async function main(): Promise<void> {
     // reapply the runtime role's direct grants.
     const status = await readMigrationStatus(client, migrations);
     assertMigrationStatusCompatible(status);
+    // Destructive-migration gate, ARM 2. Deliberately placed BEFORE the dry-run
+    // branch so `accounts-migrate --dry-run` is the pre-deploy check and refuses
+    // without mutating anything. Throws when the pre-flight count is outside the
+    // expected envelope; returns the counts when the deploy may proceed.
+    const preflight = await preflightDestructiveMigrations(client, status, migrations);
+    if (preflight.purgePending) {
+      console.log(
+        JSON.stringify(
+          {
+            evt: "destructive_preflight",
+            migration: PURGE_MIGRATION_ID,
+            withinEnvelope: preflight.withinEnvelope,
+            acknowledged: preflight.acknowledged,
+            snapshotRefreshed: preflight.snapshotRefreshed,
+            counts: preflight.counts.map((count) => ({
+              table: count.table,
+              column: count.column,
+              matched: count.matched,
+              maxExpected: count.maxExpected,
+              tablePresent: count.tablePresent,
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+    }
     if (status.ledgerPresent && status.pending.length === 0) {
       if (!dryRun) {
         const grant = await grantAccountsRuntimeRole(client, runtimeRole);
