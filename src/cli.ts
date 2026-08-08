@@ -81,8 +81,8 @@ import {
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
 import { migrateDirToLink, selfHealDirLink } from "./lib/symlink-broker.js";
 import {
+  classifySessionsDrift,
   ensureSharedClaudeSessions,
-  inspectSessionsDir,
   sharedClaudeSessionsDir,
 } from "./lib/claude-session-registry.js";
 import { withIdentityLockSync } from "./lib/identity-lock.js";
@@ -3005,8 +3005,13 @@ program
         // check the symlink rots invisibly — nothing errors, the profile's
         // sessions just stop being seen by other profiles' ListAgents.
         if (p.tool === "claude") {
-          const sessionsState = inspectSessionsDir(p.dir);
-          if (sessionsState.kind !== "shared-link") {
+          // Off Linux the shared registry is unsupported (`classifySessionsDrift`
+          // gates on the same predicate `ensureSharedClaudeSessions` no-ops on),
+          // so a real per-profile dir there is the CORRECT state and is never
+          // flagged — flagging it would make every macOS/Windows profile fail
+          // `doctor` forever, for a feature that never applies to them.
+          const drift = classifySessionsDrift(p.dir);
+          if (drift.needsAttention) {
             if (opts.apply) {
               const repair = ensureSharedClaudeSessions(p.dir);
               if (repair.outcome === "blocked" || repair.outcome === "no-config-dir") {
@@ -3017,14 +3022,14 @@ program
               } else {
                 console.log(
                   chalk.green(
-                    `    ✓ ${p.name}: relinked sessions registry (${sessionsState.kind}${repair.moved.length > 0 ? `, ${repair.moved.length} entrie(s) migrated` : ""})`,
+                    `    ✓ ${p.name}: relinked sessions registry (${drift.state.kind}${repair.moved.length > 0 ? `, ${repair.moved.length} entrie(s) migrated` : ""})`,
                   ),
                 );
               }
             } else {
               console.log(
                 chalk.red(
-                  `    ✗ ${p.name}: sessions registry is ${sessionsState.kind}, not the shared machine dir — ` +
+                  `    ✗ ${p.name}: sessions registry is ${drift.state.kind}, not the shared machine dir — ` +
                     `run \`accounts migrate-sessions --all\` or \`accounts doctor --apply\``,
                 ),
               );

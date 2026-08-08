@@ -57,6 +57,33 @@ import { sharedClaudeSessionsDir } from "../storage.js";
  * `sharedClaudeSessionsDir()` in `storage.ts`.
  */
 
+/**
+ * Whether the machine-shared Claude session registry is meaningful on the
+ * given platform.
+ *
+ * Cross-session discovery over the shared `sessions/` dir is native Claude
+ * behaviour on any OS, but ATTRIBUTING a shared entry back to the config dir
+ * that owns it (`claude-layout.ts`, `attributeSharedEntry`) reads
+ * `/proc/<pid>/environ`, which exists only on Linux (`readProcEnvironConfigDir`
+ * already returns `undefined` off Linux for exactly this reason). Off Linux
+ * every live session in the shared dir would count as `unknown` against
+ * every profile at once, so `healSwitchedProfileDir`, the wrong-dir switch
+ * guard, and the multi-session `--yes` gate would all see every profile as
+ * busy whenever anything runs anywhere on the machine.
+ *
+ * So linking is Linux-only: off Linux a profile keeps (or is left with) a
+ * normal per-profile `sessions/` directory, exactly as it behaved before this
+ * feature shipped. A Linux-side darwin/win32 attribution reader is tracked
+ * separately (task 758b62a6) rather than attempted here.
+ */
+export function sharedSessionsSupportedFor(targetPlatform: NodeJS.Platform): boolean {
+  return targetPlatform === "linux";
+}
+
+export function sharedSessionsSupported(): boolean {
+  return sharedSessionsSupportedFor(process.platform);
+}
+
 export type SessionsDirKind =
   /** No `sessions` path at all (a profile that has never run a session). */
   | "missing"
@@ -90,7 +117,9 @@ export interface EnsureSessionsResult {
     /** Refused without mutating anything; `reason` says why. */
     | "blocked"
     /** The config dir itself does not exist. */
-    | "no-config-dir";
+    | "no-config-dir"
+    /** No-op: the shared registry is not supported on this platform (non-Linux). */
+    | "unsupported-platform";
   changed: boolean;
   /** Registry filenames moved into the shared dir. */
   moved: string[];
@@ -142,6 +171,38 @@ export function inspectSessionsDir(configDir: string): SessionsDirState {
   }
   if (st.isDirectory()) return { kind: "real-dir", path };
   return { kind: "unexpected", path };
+}
+
+export interface ClassifySessionsDriftOptions {
+  /** Injectable for tests: which platform to gate on (defaults to `process.platform`). */
+  platform?: NodeJS.Platform;
+}
+
+export interface SessionsDriftClassification {
+  /** True when `doctor` should treat this profile's sessions dir as a problem. */
+  needsAttention: boolean;
+  state: SessionsDirState;
+}
+
+/**
+ * `doctor`'s sessions-registry drift check, factored out so the platform gate
+ * can be exercised in tests without touching the real `process.platform`.
+ *
+ * A real per-profile `sessions/` dir is drift ONLY on a platform where the
+ * shared registry is actually supported (Linux) — off Linux
+ * `ensureSharedClaudeSessions` never links it (see `sharedSessionsSupportedFor`
+ * above), so a real dir there is the CORRECT, pre-feature state, not
+ * something `doctor` should flag or repair.
+ */
+export function classifySessionsDrift(
+  configDir: string,
+  options: ClassifySessionsDriftOptions = {},
+): SessionsDriftClassification {
+  const state = inspectSessionsDir(configDir);
+  if (!sharedSessionsSupportedFor(options.platform ?? process.platform)) {
+    return { needsAttention: false, state };
+  }
+  return { needsAttention: state.kind !== "shared-link", state };
 }
 
 /**
@@ -198,13 +259,27 @@ function migrateEntry(
   moved.push(name);
 }
 
+export interface EnsureSharedClaudeSessionsOptions {
+  /** Injectable for tests: which platform to gate on (defaults to `process.platform`). */
+  platform?: NodeJS.Platform;
+}
+
 /**
  * Idempotently converge one Claude config dir onto the shared session
  * registry. Never throws and never deletes registry data: unexpected content
  * blocks the migration (reported, not removed), and dedupe keeps the newest
  * copy of an entry. Safe to run with live sessions attached.
+ *
+ * NO-OP off Linux (`sharedSessionsSupportedFor`), and this is checked FIRST,
+ * before anything else — including the `no-config-dir` check — so that every
+ * call site (provisioning, `switch`, `env`, `doctor --apply`,
+ * `migrate-sessions`) leaves a non-Linux profile's `sessions/` exactly as it
+ * found it: a normal per-profile directory, never linked or migrated.
  */
-export function ensureSharedClaudeSessions(configDir: string): EnsureSessionsResult {
+export function ensureSharedClaudeSessions(
+  configDir: string,
+  options: EnsureSharedClaudeSessionsOptions = {},
+): EnsureSessionsResult {
   const done = (
     outcome: EnsureSessionsResult["outcome"],
     changed: boolean,
@@ -215,6 +290,16 @@ export function ensureSharedClaudeSessions(configDir: string): EnsureSessionsRes
 
   const moved: string[] = [];
   const deduped: string[] = [];
+  if (!sharedSessionsSupportedFor(options.platform ?? process.platform)) {
+    return done(
+      "unsupported-platform",
+      false,
+      moved,
+      deduped,
+      "shared Claude session registry is Linux-only (cross-profile attribution reads /proc); " +
+        "leaving the per-profile sessions dir untouched",
+    );
+  }
   try {
     const dir = resolve(configDir);
     if (!existsSync(dir)) {

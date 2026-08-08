@@ -16,9 +16,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  classifySessionsDrift,
   ensureSharedClaudeSessions,
   inspectSessionsDir,
   sharedClaudeSessionsDir,
+  sharedSessionsSupportedFor,
 } from "./lib/claude-session-registry.js";
 import { listDirLiveSessions } from "./lib/claude-layout.js";
 
@@ -206,6 +208,80 @@ describe("ensureSharedClaudeSessions", () => {
     mkdirSync(sharedClaudeSessionsDir(), { recursive: true });
     symlinkSync(sharedClaudeSessionsDir(), join(dir, "sessions"));
     expect(inspectSessionsDir(dir).kind).toBe("shared-link");
+  });
+});
+
+// Off Linux, cross-profile attribution has no /proc to read (claude-layout.ts
+// readProcEnvironConfigDir returns undefined there), so linking is refused
+// entirely — driven via the injectable `platform` option rather than
+// mutating the real `process.platform`, matching the `keychainSupportedFor`
+// injection pattern already used in this codebase (lib/keychain.ts).
+describe("platform gating — the shared registry is Linux-only", () => {
+  test("sharedSessionsSupportedFor is true only for linux", () => {
+    expect(sharedSessionsSupportedFor("linux")).toBe(true);
+    expect(sharedSessionsSupportedFor("darwin")).toBe(false);
+    expect(sharedSessionsSupportedFor("win32")).toBe(false);
+  });
+
+  test("ensureSharedClaudeSessions is a no-op on a profile with no sessions dir yet", () => {
+    const dir = makeProfileDir("darwin-fresh");
+
+    const result = ensureSharedClaudeSessions(dir, { platform: "darwin" });
+
+    expect(result.outcome).toBe("unsupported-platform");
+    expect(result.changed).toBe(false);
+    expect(result.moved).toEqual([]);
+    expect(result.deduped).toEqual([]);
+    // Never created — a profile born off Linux has no sessions dir at all
+    // until Claude itself creates one, exactly as before this feature shipped.
+    expect(existsSync(join(dir, "sessions"))).toBe(false);
+  });
+
+  test("ensureSharedClaudeSessions leaves an existing real sessions dir untouched off Linux", () => {
+    const dir = makeProfileDir("darwin-real-dir");
+    const sessions = join(dir, "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "999.json"), sessionEntry(999));
+
+    const result = ensureSharedClaudeSessions(dir, { platform: "darwin" });
+
+    expect(result.outcome).toBe("unsupported-platform");
+    expect(result.changed).toBe(false);
+    // Still a real directory — never converted to a symlink, never drained
+    // into the (Linux-only) shared dir.
+    expect(lstatSync(sessions).isDirectory()).toBe(true);
+    expect(lstatSync(sessions).isSymbolicLink()).toBe(false);
+    expect(readdirSync(sessions)).toEqual(["999.json"]);
+    expect(existsSync(sharedClaudeSessionsDir())).toBe(false);
+  });
+
+  test("classifySessionsDrift treats a real per-profile dir as CORRECT off Linux (doctor stays clean)", () => {
+    const dir = makeProfileDir("darwin-doctor");
+    mkdirSync(join(dir, "sessions"), { recursive: true });
+    writeFileSync(join(dir, "sessions", "111.json"), sessionEntry(111));
+
+    const darwin = classifySessionsDrift(dir, { platform: "darwin" });
+    expect(darwin.needsAttention).toBe(false);
+    expect(darwin.state.kind).toBe("real-dir");
+
+    const win32 = classifySessionsDrift(dir, { platform: "win32" });
+    expect(win32.needsAttention).toBe(false);
+  });
+
+  test("classifySessionsDrift still flags the identical real per-profile dir as drift on linux", () => {
+    const dir = makeProfileDir("linux-doctor");
+    mkdirSync(join(dir, "sessions"), { recursive: true });
+    writeFileSync(join(dir, "sessions", "111.json"), sessionEntry(111));
+
+    const linux = classifySessionsDrift(dir, { platform: "linux" });
+    expect(linux.needsAttention).toBe(true);
+    expect(linux.state.kind).toBe("real-dir");
+
+    // A profile actually linked to the shared registry is never drift, on
+    // any platform — the check is about what the state MEANS, not the OS.
+    const linkedDir = makeProfileDir("linux-doctor-linked");
+    expect(ensureSharedClaudeSessions(linkedDir).outcome).toBe("linked");
+    expect(classifySessionsDrift(linkedDir, { platform: "linux" }).needsAttention).toBe(false);
   });
 });
 
