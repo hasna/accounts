@@ -6,6 +6,30 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- **The machine-shared Claude session registry: native cross-session messaging
+  works across ALL account profiles.** Claude Code discovers cross-session
+  peers (ListAgents/SendMessage) only through
+  `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, while the socket transport
+  underneath is already machine-wide — so sessions in different profiles could
+  talk but could not see each other. Every Claude profile's `sessions/` is now
+  a symlink to one machine-level registry
+  (`~/.hasna/accounts/shared/claude-sessions/`), following the 0.2.38
+  single-inode broker shape: one real home, per-profile pointers, an
+  idempotent migration, a doctor drift check. New profiles are born linked;
+  launch/switch/env self-heal the link; `accounts migrate-sessions
+  [--dir|--all]` converts existing dirs (rename-based, safe with live
+  sessions, dedupes duplicated `<pid>.json` bridges by newest copy); `accounts
+  doctor` flags a link a Claude update replaced with a real dir and `doctor
+  --apply` repairs it. Per-dir liveness semantics are preserved:
+  `listDirLiveSessions` attributes shared entries back to their owning config
+  dir (via `/proc/<pid>/environ`, then transcript presence, erring toward
+  inclusion when unattributable), so switch guards, auth heal, and occupancy
+  counts do not see the machine-wide union. Auth stays strictly per-profile:
+  the one path touched is `<configDir>/sessions`, and the registry — pids and
+  `/tmp` socket paths — is machine-local and must never be synced off-box.
+
 ## [0.2.40] - 2026-08-08
 
 Release span measured from the previous release tag to the head being published

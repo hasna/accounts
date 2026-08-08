@@ -42,6 +42,22 @@ export function profilesDir(): string {
   return join(accountsHome(), "profiles");
 }
 
+/**
+ * The ONE machine-level home for Claude Code's live-session registry
+ * (`sessions/<pid>.json`). Every Claude profile's `sessions/` directory is a
+ * symlink here (see `lib/claude-session-registry.ts`), so native cross-session
+ * discovery (ListAgents/SendMessage) sees sessions across ALL profiles.
+ *
+ * STRICTLY MACHINE-LOCAL. Entries are keyed by pid and carry `/tmp` socket
+ * paths — both meaningless on any other machine — so this directory must never
+ * be synced, backed up cross-machine, or shipped by any cloud path. It sits
+ * beside `auth/` (the per-account credential store from the single-inode
+ * broker) but shares nothing with it: no credential material lives here.
+ */
+export function sharedClaudeSessionsDir(): string {
+  return join(accountsHome(), "shared", "claude-sessions");
+}
+
 const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
 
 /**

@@ -80,6 +80,11 @@ import {
 } from "./lib/switch.js";
 import { listDirLiveSessions, resolveSessionConfigDir, switchAccount } from "./lib/switch-account.js";
 import { migrateDirToLink, selfHealDirLink } from "./lib/symlink-broker.js";
+import {
+  ensureSharedClaudeSessions,
+  inspectSessionsDir,
+  sharedClaudeSessionsDir,
+} from "./lib/claude-session-registry.js";
 import { withIdentityLockSync } from "./lib/identity-lock.js";
 import {
   buildIdentityIndex,
@@ -1115,6 +1120,66 @@ program
         else console.log(chalk.dim(`• ${row.outcome}: ${detail}`));
         if (row.quarantined) console.log(chalk.dim(`    preserved: ${row.quarantined}`));
       }
+    }),
+  );
+
+program
+  .command("migrate-sessions")
+  .description(
+    "migrate Claude config dirs onto the machine-shared session registry: move sessions/<pid>.json into the shared " +
+      "dir and replace each dir's sessions/ with a symlink, so native cross-session discovery (ListAgents/SendMessage) " +
+      "sees sessions across ALL profiles. Safe with live sessions — entries move by rename and the path keeps " +
+      "resolving through the link. The shared dir is machine-local and must never be synced off-box",
+  )
+  .option("-t, --tool <tool>", "tool id (Claude-only today)", DEFAULT_TOOL)
+  .option("--dir <path>", "migrate a single config dir")
+  .option("--all", "migrate every registered profile dir for the tool")
+  .option("--json", "output JSON")
+  .action(
+    action(async (opts: { tool: string; dir?: string; all?: boolean; json?: boolean }) => {
+      const tool = getTool(opts.tool);
+      if (tool.id !== "claude") throw new AccountsError("migrate-sessions supports Claude Code only");
+      const store = resolveStore();
+      const dirs = new Set<string>();
+      if (opts.dir) dirs.add(resolve(opts.dir));
+      if (opts.all) for (const p of await store.listProfiles(tool.id)) dirs.add(resolve(p.dir));
+      if (dirs.size === 0) throw new AccountsError("pass --dir <path> or --all");
+
+      const rows = [...dirs].sort().map((dir) => {
+        const result = ensureSharedClaudeSessions(dir);
+        return {
+          dir,
+          outcome: result.outcome,
+          ...(result.moved.length > 0 ? { moved: result.moved.sort() } : {}),
+          ...(result.deduped.length > 0 ? { deduped: result.deduped.sort() } : {}),
+          ...(result.reason ? { reason: result.reason } : {}),
+        };
+      });
+
+      if (opts.json) {
+        console.log(
+          JSON.stringify(
+            { schema: "hasna.accounts.migrate-sessions/v1", sharedDir: sharedClaudeSessionsDir(), results: rows },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+      console.log(chalk.bold(`shared registry: ${sharedClaudeSessionsDir()}`));
+      for (const row of rows) {
+        const movedNote = row.moved ? ` (${row.moved.length} entrie(s) moved)` : "";
+        const detail = `${row.dir}${movedNote}${row.reason ? ` — ${row.reason}` : ""}`;
+        if (row.outcome === "migrated" || row.outcome === "linked" || row.outcome === "repointed") {
+          console.log(chalk.green(`✓ ${row.outcome}: ${detail}`));
+        } else if (row.outcome === "blocked") {
+          console.log(chalk.yellow(`! blocked: ${detail}`));
+        } else {
+          console.log(chalk.dim(`• ${row.outcome}: ${detail}`));
+        }
+      }
+      const blocked = rows.filter((row) => row.outcome === "blocked").length;
+      if (blocked > 0) process.exit(1);
     }),
   );
 
@@ -2899,8 +2964,12 @@ program
     "--accept-capability-baseline",
     "accept the current size of every shared capability corpus as the new floor (use after an intentional deletion)",
   )
+  .option(
+    "--apply",
+    "repair what doctor can repair mechanically (today: relink Claude's shared sessions registry)",
+  )
   .action(
-    action(async (opts: { acceptCapabilityBaseline?: boolean }) => {
+    action(async (opts: { acceptCapabilityBaseline?: boolean; apply?: boolean }) => {
       console.log(chalk.bold(`store: ${storePath()}`));
       const store = resolveStore();
       if (opts.acceptCapabilityBaseline) {
@@ -2930,6 +2999,39 @@ program
           console.log(chalk.yellow(`  ! ${p.name}: no email recorded`));
         }
         if (missing) continue;
+        // Sessions-registry drift check: the Claude binary owns `sessions/` and
+        // an update may recreate it as a real dir, silently unsharing this
+        // profile from machine-wide cross-session discovery. Without this
+        // check the symlink rots invisibly — nothing errors, the profile's
+        // sessions just stop being seen by other profiles' ListAgents.
+        if (p.tool === "claude") {
+          const sessionsState = inspectSessionsDir(p.dir);
+          if (sessionsState.kind !== "shared-link") {
+            if (opts.apply) {
+              const repair = ensureSharedClaudeSessions(p.dir);
+              if (repair.outcome === "blocked" || repair.outcome === "no-config-dir") {
+                console.log(
+                  chalk.red(`    ✗ ${p.name}: sessions registry could not be relinked — ${repair.reason ?? repair.outcome}`),
+                );
+                problems++;
+              } else {
+                console.log(
+                  chalk.green(
+                    `    ✓ ${p.name}: relinked sessions registry (${sessionsState.kind}${repair.moved.length > 0 ? `, ${repair.moved.length} entrie(s) migrated` : ""})`,
+                  ),
+                );
+              }
+            } else {
+              console.log(
+                chalk.red(
+                  `    ✗ ${p.name}: sessions registry is ${sessionsState.kind}, not the shared machine dir — ` +
+                    `run \`accounts migrate-sessions --all\` or \`accounts doctor --apply\``,
+                ),
+              );
+              problems++;
+            }
+          }
+        }
         // Capability check: a profile that carries none of the machine's skills,
         // subagents, or MCP servers is broken even when its auth is perfect.
         const tool = listTools().find((t) => t.id === p.tool);

@@ -284,7 +284,7 @@ the same explicitly configured corpus:
 | Concern | Where it lives | Shared? |
 |---------|----------------|---------|
 | OAuth account, credentials, keychain snapshot | `<profile>/.claude.json`, `<profile>/.credentials.json`, `<profile>/.accounts-auth/` | No — per profile |
-| Live per-process session state | `<profile>/sessions` | No — per profile |
+| Live-session registry (`sessions/<pid>.json`) | `<profile>/sessions` → `~/.hasna/accounts/shared/claude-sessions` | Yes — symlink, machine-local only |
 | Transcripts (sessions, subagents, workflows) | `<profile>/projects` → `~/.claude/projects` | Yes — symlink, **after `accounts sessions merge`** |
 | Prompt history | `<profile>/history.jsonl` → `~/.claude/history.jsonl` | Yes — symlink, **after `accounts sessions merge`** |
 | Skills | `<profile>/skills` → `~/.claude/skills` | Yes — symlink |
@@ -312,6 +312,34 @@ unsubstituted `{{PLACEHOLDER}}` is dropped rather than shipped broken, and the
 identity's tool list is the closest thing to sharing tokens without sharing them.
 If the profile's own config file exists but does not parse, the merge is refused
 and reported: it is never rebuilt from scratch over whatever the file still held.
+
+### Live-session registry: machine-shared, never synced
+
+Claude Code discovers cross-session peers (its native ListAgents/SendMessage)
+only through `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`; the socket transport
+underneath is already machine-wide. So every Claude profile's `sessions/`
+directory is a symlink to the one machine-level registry at
+`~/.hasna/accounts/shared/claude-sessions/`, which is what lets a session in
+one profile message a session in another. Entries are pid-keyed (no write
+collisions) and reaped by pid-liveness (machine-scoped, so shared reaping is
+safe). Registry files carry no credential material.
+
+```bash
+accounts migrate-sessions --all    # move existing entries in, link every profile
+accounts doctor                    # flags a profile whose link was replaced (e.g. by a Claude update)
+accounts doctor --apply            # ...and relinks it, migrating any stranded entries
+```
+
+The migration is idempotent and safe with live sessions: entries move by
+`rename(2)` and the registry path keeps resolving through the link, so a live
+session's next heartbeat simply lands in the shared directory. Guards that ask
+"which live sessions are bound to THIS config dir" (switch guards, auth heal)
+attribute shared entries back to their owning dir, so per-dir semantics do not
+change.
+
+**Machine boundary:** the shared registry is strictly machine-local. Entries
+name pids and `/tmp` socket paths, both meaningless on another machine — never
+sync, back up cross-machine, or ship this directory by any cloud path.
 
 ### Sessions: merge first, then link
 
@@ -732,10 +760,14 @@ then invokes the real `claude` binary. Full behavior and footguns: [docs/hook.md
     claude.json              # supervisor pid/profile/command metadata
   profiles/
     claude/<name>/           # managed config dir
+    claude/<name>/sessions   # symlink -> ../../../shared/claude-sessions
     claude/<name>/.accounts-auth/   # auth snapshots for apply mode
       oauth-account.json
       credentials.json       # Linux / file-based auth
       keychain.json          # macOS keychain payload
+  shared/
+    claude-sessions/         # machine-local live-session registry (never synced)
+      <pid>.json
 ```
 
 Overrides: `ACCOUNTS_HOME`, `ACCOUNTS_STORE_PATH`.

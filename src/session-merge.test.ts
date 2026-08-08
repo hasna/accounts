@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile } from "./lib/profiles.js";
 import { getTool } from "./lib/tools.js";
-import { profilesDir } from "./storage.js";
+import { profilesDir, sharedClaudeSessionsDir } from "./storage.js";
 import { ensureSharedCapabilities, sharedCapabilityHealth, sharedEntriesFor } from "./lib/shared-capabilities.js";
 import { mergeClaudeSessions, type SessionMergeReport } from "./lib/session-merge.js";
 
@@ -291,17 +291,25 @@ test("merges nested non-transcript files at any depth", () => {
   ]);
 });
 
-test("never touches live per-process session state", () => {
+test("never merges live per-process session state into the tool's shared home", () => {
   const dir = registerProfile("alpha");
-  mkdirSync(join(dir, "sessions"), { recursive: true });
+  // `sessions/` is provisioned at birth as a link to the MACHINE registry
+  // (lib/claude-session-registry.ts); a write through the profile path lands
+  // there, not in any per-profile dir.
   writeFileSync(join(dir, "sessions", "147698.json"), JSON.stringify({ pid: 147698, status: "busy" }));
   writeSession(dir, PROJECT_A, uuid(16), transcript(uuid(16), 2));
 
   mergeClaudeSessions({ link: true });
 
+  // The merge shares transcripts/history into the TOOL shared home and must
+  // never copy the live-process registry there — that dir is machine
+  // infrastructure with its own home, not a capability.
   expect(existsSync(join(sharedHome, "sessions"))).toBe(false);
-  expect(lstatSync(join(dir, "sessions")).isDirectory()).toBe(true);
-  expect(lstatSync(join(dir, "sessions")).isSymbolicLink()).toBe(false);
+  // The registry entry survives the merge, still reachable through the
+  // profile path and stored in the machine-level registry.
+  expect(lstatSync(join(dir, "sessions")).isSymbolicLink()).toBe(true);
+  expect(existsSync(join(dir, "sessions", "147698.json"))).toBe(true);
+  expect(existsSync(join(sharedClaudeSessionsDir(), "147698.json"))).toBe(true);
 });
 
 test("a dry run reports the work without writing anything", () => {
