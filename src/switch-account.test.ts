@@ -23,20 +23,24 @@ import { publicSwitchResult } from "./lib/switch.js";
 import { loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
+import { attachLiveClaudeSession, type LiveClaudeSession } from "./test-support/live-claude-session.js";
 
 let home: string;
 let liveBase: string;
+let liveSessions: LiveClaudeSession[];
 const tool = () => getTool("claude");
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-swa-"));
   liveBase = mkdtempSync(join(tmpdir(), "accounts-swa-live-"));
+  liveSessions = [];
   process.env.ACCOUNTS_HOME = home;
   process.env.ACCOUNTS_TEST_LIVE_DIR = liveBase;
   delete process.env.ACCOUNTS_STORE_PATH;
 });
 
 afterEach(() => {
+  for (const session of liveSessions) session.stop();
   rmSync(home, { recursive: true, force: true });
   rmSync(liveBase, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
@@ -517,8 +521,10 @@ test("profileEnv refuses to heal while a live session still runs on the dir", as
   const alphaDir = makeProfile("alpha", { email: "alpha@example.com" });
   makeProfile("beta", { email: "beta@example.com" });
   await switchAccount("beta", { dir: alphaDir, env: {} });
-  mkdirSync(join(alphaDir, "sessions"), { recursive: true });
-  writeFileSync(join(alphaDir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+  // A real live session attributable to alphaDir (CLAUDE_CONFIG_DIR=alphaDir),
+  // so the shared registry counts it against this dir as a launched Claude
+  // process would.
+  liveSessions.push(attachLiveClaudeSession(alphaDir));
 
   const { getProfile } = await import("./lib/profiles.js");
   await expect(profileEnv(getProfile("alpha", "claude"), tool())).rejects.toThrow(/live session/);

@@ -1,4 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
+import { attachLiveClaudeSession, type LiveClaudeSession } from "./test-support/live-claude-session.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,7 +50,10 @@ let liveBase: string;
 const scratch: string[] = [];
 const tool = () => getTool("claude");
 
+let liveSessions: LiveClaudeSession[] = [];
+
 beforeEach(() => {
+  liveSessions = [];
   home = mkdtempSync(join(tmpdir(), "accounts-gates-"));
   liveBase = mkdtempSync(join(tmpdir(), "accounts-gates-live-"));
   process.env.ACCOUNTS_HOME = home;
@@ -58,6 +62,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const session of liveSessions) session.stop();
   rmSync(home, { recursive: true, force: true });
   rmSync(liveBase, { recursive: true, force: true });
   while (scratch.length > 0) rmSync(scratch.pop()!, { recursive: true, force: true });
@@ -124,10 +129,13 @@ function makeProfile(name: string, uuid: string, label: string): string {
   return dir;
 }
 
-/** Pretend a session is attached to the dir (matches `listDirLiveSessions`). */
+/**
+ * Attach a REAL live session attributable to the dir (a child process holding
+ * CLAUDE_CONFIG_DIR=<dir>), so `listDirLiveSessions` counts it against this dir
+ * through the machine-shared registry exactly as it would a launched Claude.
+ */
 function attachLiveSession(dir: string): void {
-  mkdirSync(join(dir, "sessions"), { recursive: true });
-  writeFileSync(join(dir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+  liveSessions.push(attachLiveClaudeSession(dir));
 }
 
 // ---------------------------------------------------------------------------

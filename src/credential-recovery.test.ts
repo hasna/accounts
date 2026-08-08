@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile } from "./lib/profiles.js";
+import { attachLiveClaudeSession, type LiveClaudeSession } from "./test-support/live-claude-session.js";
 import {
   ensureProfileAuthSnapshot,
   healSwitchedProfileDir,
@@ -40,7 +41,10 @@ let home: string;
 let liveBase: string;
 const tool = () => getTool("claude");
 
+let liveSessions: LiveClaudeSession[] = [];
+
 beforeEach(() => {
+  liveSessions = [];
   home = mkdtempSync(join(tmpdir(), "accounts-recov-"));
   liveBase = mkdtempSync(join(tmpdir(), "accounts-recov-live-"));
   process.env.ACCOUNTS_HOME = home;
@@ -49,6 +53,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const session of liveSessions) session.stop();
   rmSync(home, { recursive: true, force: true });
   rmSync(liveBase, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
@@ -300,8 +305,9 @@ test("recovery works even with live sessions attached — there is no identity t
   // credential that is already dead.
   const dir = makeProfile("alpha", UUID_A, "alpha");
   writeFileSync(join(dir, ".credentials.json"), rotatedAwayJson());
-  mkdirSync(join(dir, "sessions"), { recursive: true });
-  writeFileSync(join(dir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+  // A real live session attributable to this dir, so "recovers even WITH a
+  // live session attached" is genuinely exercised, not decoration.
+  liveSessions.push(attachLiveClaudeSession(dir));
 
   const result = recoverParkedCredential(dir, tool(), "alpha");
 
