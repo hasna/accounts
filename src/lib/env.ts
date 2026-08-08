@@ -11,6 +11,7 @@ import { ensureCodexAppProfileConfig } from "./codex-app.js";
 import { storageEnvKeys } from "../generated/storage-kit/mode.js";
 import { redactText } from "./redaction.js";
 import { assertProfileGuarded, ensureSharedCapabilities } from "./shared-capabilities.js";
+import { ensureSharedClaudeSessions } from "./claude-session-registry.js";
 
 /**
  * Runtime request diagnostics that can print provider request headers or
@@ -210,6 +211,10 @@ export async function profileEnv(profile: Profile, tool: ToolDef): Promise<Recor
   // Every launch surface goes through here, so profiles created before shared
   // capabilities existed are repaired the next time they are used.
   ensureSharedCapabilities(profile.dir, tool);
+  // Same self-heal for the machine-shared session registry: a Claude update
+  // that recreates `sessions/` as a real dir is re-linked on the next launch
+  // (entries written in between are migrated, not lost).
+  if (tool.id === "claude") ensureSharedClaudeSessions(profile.dir);
   // ...and then verified, because "the repair ran" is not "the profile is
   // correct". Seeding is best-effort by design (it must not stop a tool from
   // starting), so without this the failure mode of a failed seed is a profile

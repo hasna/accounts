@@ -7,6 +7,7 @@ import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
 import { sameConfigDir } from "./safe-path.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
+import { ensureSharedClaudeSessions } from "./claude-session-registry.js";
 import { isAccountUuid } from "./auth-store.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
@@ -192,6 +193,9 @@ export function addProfile(opts: AddOptions): Profile {
   // A new profile starts with the machine's shared skills/subagents/MCP servers;
   // only credentials stay per-profile.
   ensureSharedCapabilities(dir, tool);
+  // ...and with its live-session registry linked to the machine-shared dir, so
+  // native cross-session discovery sees this profile's sessions from birth.
+  if (tool.id === "claude") ensureSharedClaudeSessions(dir);
 
   const email = opts.email ?? detectEmail(dir, tool);
   if (opts.cardLast4) assertCardLast4(opts.cardLast4);

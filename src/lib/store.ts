@@ -68,6 +68,7 @@ import { assertSafeWritePath } from "./safe-path.js";
 import { assertNameFree, type NameInvariantVerdict } from "./name-invariant.js";
 import { grandfatheredPairs } from "./grandfather-manifest.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
+import { ensureSharedClaudeSessions } from "./claude-session-registry.js";
 import {
   enumerateProfileDirs,
   mergedNameUniverse,
@@ -239,6 +240,7 @@ class ApiStore implements AccountsStore {
     // with LocalStore: a profile must be born with the shared Claude settings
     // that the selected machine declares, not repaired by a later sweep.
     ensureSharedCapabilities(dir, tool);
+    if (tool.id === "claude") ensureSharedClaudeSessions(dir);
     const email = opts.email ?? detectEmail(dir, tool) ?? undefined;
     try {
       return await this.api.create({

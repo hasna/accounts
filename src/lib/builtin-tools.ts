@@ -114,12 +114,20 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     // subagent transcripts and per-project memory nested beneath the same root,
     // and the prompt history at `<CLAUDE_CONFIG_DIR>/history.jsonl`.
     //
-    // `sessions/` is NOT listed and must not be: it holds one file per running
-    // process (`<pid>.json` with a status heartbeat and `peerProtocol`), so
-    // sharing it would show every profile the other profiles' live processes as
-    // its own peers, and each instance reaps entries whose PID it believes to be
-    // dead. Nothing is lost by keeping it per-profile — a finished session's
-    // durable record is the transcript under `projects/`.
+    // `sessions/` is NOT listed here, but for the opposite reason it used to
+    // be. It IS machine-shared now (owner directive 2026-08-08): every Claude
+    // profile's `sessions/` is a symlink to the ONE machine-level registry at
+    // `sharedClaudeSessionsDir()`, so native cross-session discovery
+    // (ListAgents/SendMessage) sees sessions across ALL profiles — see
+    // lib/claude-session-registry.ts. It stays off `sharedEntries` because
+    // those link into the tool's shared home (the person's capability corpus),
+    // while the session registry is machine infrastructure with its own home
+    // under `~/.hasna/accounts/shared/`. The old objections are answered, not
+    // ignored: entries are pid-keyed (no write collisions), reaping is by
+    // pid-liveness which is machine-scoped, and per-dir liveness questions go
+    // through `listDirLiveSessions`, which attributes shared entries back to
+    // their config dir. The registry never syncs off-box — pids and /tmp
+    // socket paths are meaningless on another machine.
     sessions: { transcripts: "projects", history: "history.jsonl" },
   },
   {

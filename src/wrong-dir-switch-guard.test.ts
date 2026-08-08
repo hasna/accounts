@@ -21,20 +21,24 @@ import { ensureProfileAuthSnapshot } from "./lib/claude-auth.js";
 import { switchAccount } from "./lib/switch-account.js";
 import { loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
+import { attachLiveClaudeSession, type LiveClaudeSession } from "./test-support/live-claude-session.js";
 
 let home: string;
 let liveBase: string;
+let liveSessions: LiveClaudeSession[];
 const tool = () => getTool("claude");
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-wdg-"));
   liveBase = mkdtempSync(join(tmpdir(), "accounts-wdg-live-"));
+  liveSessions = [];
   process.env.ACCOUNTS_HOME = home;
   process.env.ACCOUNTS_TEST_LIVE_DIR = liveBase;
   delete process.env.ACCOUNTS_STORE_PATH;
 });
 
 afterEach(() => {
+  for (const session of liveSessions) session.stop();
   rmSync(home, { recursive: true, force: true });
   rmSync(liveBase, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
@@ -66,11 +70,15 @@ function makeProfile(name: string, email: string): string {
   return dir;
 }
 
-/** A profile dir with a LIVE session attached (this test process's own pid). */
+/**
+ * A profile dir with a LIVE session attributable to it. The session is a real
+ * child process carrying `CLAUDE_CONFIG_DIR=<dir>`, so the machine-shared
+ * registry attributes it back to this dir exactly as it would a real
+ * `accounts launch` Claude process.
+ */
 function makeBusyProfile(name: string, email: string): string {
   const dir = makeProfile(name, email);
-  mkdirSync(join(dir, "sessions"), { recursive: true });
-  writeFileSync(join(dir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+  liveSessions.push(attachLiveClaudeSession(dir));
   return dir;
 }
 

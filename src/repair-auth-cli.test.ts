@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { attachLiveClaudeSession, type LiveClaudeSession } from "./test-support/live-claude-session.js";
 
 /**
  * CLI-level regressions for bb267228.
@@ -25,6 +26,7 @@ const CLI_TIMEOUT_MS = 60_000;
 
 let home: string;
 const scratch: string[] = [];
+let liveSessions: LiveClaudeSession[] = [];
 
 function runCli(...args: string[]) {
   return spawnSync(process.execPath, ["run", "src/cli.ts", ...args], {
@@ -36,10 +38,12 @@ function runCli(...args: string[]) {
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-repair-cli-"));
+  liveSessions = [];
   mkdirSync(join(home, "live"), { recursive: true });
 });
 
 afterEach(() => {
+  for (const session of liveSessions) session.stop();
   rmSync(home, { recursive: true, force: true });
   while (scratch.length > 0) rmSync(scratch.pop()!, { recursive: true, force: true });
 });
@@ -141,8 +145,9 @@ test(
     parkAll();
     writeFileSync(join(dir, ".claude.json"), identityJson(UUID_GUEST, "guest"));
     writeFileSync(join(dir, ".credentials.json"), rotatedAwayJson());
-    mkdirSync(join(dir, "sessions"), { recursive: true });
-    writeFileSync(join(dir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+    // A real live session attributable to this dir; the repair CLI subprocess
+    // reads /proc/<pid>/environ (CLAUDE_CONFIG_DIR=dir) to attribute it.
+    liveSessions.push(attachLiveClaudeSession(dir));
 
     const dry = rowFor(repairRows("--dry-run"), "switched");
     const real = rowFor(repairRows(), "switched");

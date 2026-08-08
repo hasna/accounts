@@ -10,6 +10,7 @@ import {
   quotePosixShellWord,
 } from "./env.js";
 import { ensureSharedCapabilities } from "./shared-capabilities.js";
+import { ensureSharedClaudeSessions } from "./claude-session-registry.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import type { SwitchAccountResult } from "./switch-account.js";
 import {
@@ -160,6 +161,7 @@ export async function switchProfile(
   // repaired, or `switch` (the headline way to change profiles) leaves it
   // broken for every later isolated launch.
   ensureSharedCapabilities(profile.dir, tool);
+  if (tool.id === "claude") ensureSharedClaudeSessions(profile.dir);
   const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : await profileEnv(profile, tool);
   const command = commandFor(profile, tool, opts);
   prepareClaudeProfileKeychain(profile.dir, tool, profile.name);

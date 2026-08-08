@@ -13,6 +13,7 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { AccountsError, type Profile } from "../types.js";
 import { profilesDir } from "../storage.js";
+import { claudeProjectKey } from "./claude-layout.js";
 import { getTool } from "./tools.js";
 
 export const CLAUDE_SESSION_METADATA_MAX_BYTES = 64 * 1024;
@@ -238,17 +239,13 @@ function canonicalExistingDirectory(path: string, label: string): string {
   }
 }
 
-/**
- * Reproduce Claude's own project-directory encoding. It is lossy — `/a.b`,
- * `/a-b` and `/a_b` all encode to `-a-b` — so the fallback check in
- * `canonicalResumeCwd` is only as strong as the encoded name, and admits
- * sibling directories that differ solely in punctuation. That is the whole of
- * the available data when the transcript recorded no cwd; the observed-cwd
- * path above is an exact comparison and is preferred whenever it applies.
- */
-function claudeProjectKey(cwd: string): string {
-  return cwd.replace(/[^A-Za-z0-9]/g, "-");
-}
+// Claude's project-directory encoding is lossy — `/a.b`, `/a-b` and `/a_b`
+// all encode to `-a-b` — so the fallback check in `canonicalResumeCwd` is only
+// as strong as the encoded name, and admits sibling directories that differ
+// solely in punctuation. That is the whole of the available data when the
+// transcript recorded no cwd; the observed-cwd path above is an exact
+// comparison and is preferred whenever it applies. The one definition of the
+// encoding lives in claude-layout.ts (`claudeProjectKey`).
 
 function canonicalResumeCwd(
   requestedCwd: string | undefined,

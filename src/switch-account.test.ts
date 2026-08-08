@@ -23,20 +23,24 @@ import { publicSwitchResult } from "./lib/switch.js";
 import { loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
+import { attachLiveClaudeSession, type LiveClaudeSession } from "./test-support/live-claude-session.js";
 
 let home: string;
 let liveBase: string;
+let liveSessions: LiveClaudeSession[];
 const tool = () => getTool("claude");
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-swa-"));
   liveBase = mkdtempSync(join(tmpdir(), "accounts-swa-live-"));
+  liveSessions = [];
   process.env.ACCOUNTS_HOME = home;
   process.env.ACCOUNTS_TEST_LIVE_DIR = liveBase;
   delete process.env.ACCOUNTS_STORE_PATH;
 });
 
 afterEach(() => {
+  for (const session of liveSessions) session.stop();
   rmSync(home, { recursive: true, force: true });
   rmSync(liveBase, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
@@ -517,8 +521,10 @@ test("profileEnv refuses to heal while a live session still runs on the dir", as
   const alphaDir = makeProfile("alpha", { email: "alpha@example.com" });
   makeProfile("beta", { email: "beta@example.com" });
   await switchAccount("beta", { dir: alphaDir, env: {} });
-  mkdirSync(join(alphaDir, "sessions"), { recursive: true });
-  writeFileSync(join(alphaDir, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+  // A real live session attributable to alphaDir (CLAUDE_CONFIG_DIR=alphaDir),
+  // so the shared registry counts it against this dir as a launched Claude
+  // process would.
+  liveSessions.push(attachLiveClaudeSession(alphaDir));
 
   const { getProfile } = await import("./lib/profiles.js");
   await expect(profileEnv(getProfile("alpha", "claude"), tool())).rejects.toThrow(/live session/);
@@ -568,4 +574,40 @@ test("a failed switch leaves no agreeing marker behind (fail-safe ordering)", as
   expect(marker?.email === dirEmail(sessionDir)).toBe(false);
   rmSync(sessionDir, { recursive: true, force: true });
   rmSync(outside, { recursive: true, force: true });
+});
+
+// --- shared session registry (PR #146 remediation) --------------------------
+
+test("switchAccount succeeds with a FOREIGN live session in the shared registry, and leaves it byte-identical", async () => {
+  // alpha's own profile dir carries a REAL live session, attributable ONLY to
+  // alpha via /proc/<pid>/environ (the shared registry's Linux attribution
+  // path — see claude-layout.ts:attributeSharedEntry). It has nothing to do
+  // with the switch below; it exists purely to populate the SAME shared
+  // registry that the unrelated dir's occupancy check also reads.
+  const alphaDir = makeProfile("alpha", { email: "alpha@example.com" });
+  makeProfile("beta", { email: "beta@example.com" });
+  liveSessions.push(attachLiveClaudeSession(alphaDir));
+  const alphaCredsBefore = readFileSync(join(alphaDir, ".credentials.json"), "utf8");
+  const alphaSnapBefore = readFileSync(profileCredentialsSnapshot(alphaDir), "utf8");
+
+  // An unrelated session dir switches to beta while alpha's foreign session is
+  // live in the shared registry. If attribution were wrong (or absent, as it
+  // is off Linux — see sharedSessionsSupportedFor), this dir's occupancy check
+  // would see alpha's entry as an unattributable/"unknown" live session and
+  // either refuse the switch or misdirect the auth write. Correct attribution
+  // must exclude it, so the switch succeeds cleanly.
+  const sessionDir = mkdtempSync(join(tmpdir(), "swa-foreign-live-"));
+  writeIdentity(sessionDir, { email: "gamma@example.com" });
+
+  const result = await switchAccount("beta", { dir: sessionDir, env: {}, allowUnregisteredDir: true });
+
+  expect(result.restartRequired).toBe(false);
+  expect(dirEmail(sessionDir)).toBe("beta@example.com");
+  expect(dirAccessToken(sessionDir)).toBe("beta@example.com-access");
+  // Alpha's own on-disk credential and profile snapshot must be untouched,
+  // byte for byte — the foreign live session must never cause an unrelated
+  // switch to read from, write to, or snapshot-back onto alpha's dir.
+  expect(readFileSync(join(alphaDir, ".credentials.json"), "utf8")).toBe(alphaCredsBefore);
+  expect(readFileSync(profileCredentialsSnapshot(alphaDir), "utf8")).toBe(alphaSnapBefore);
+  rmSync(sessionDir, { recursive: true, force: true });
 });

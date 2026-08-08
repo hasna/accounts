@@ -1,7 +1,8 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ToolDef } from "../types.js";
+import { sharedClaudeSessionsDir } from "../storage.js";
 
 export const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 export const ACCOUNTS_AUTH_DIR = ".accounts-auth";
@@ -115,28 +116,157 @@ export function profileSwitchedAccountMarker(profileDir: string): string {
 export interface DirSessionInfo {
   pid: number;
   alive: boolean;
+  /**
+   * Present only for entries read from the SHARED machine registry:
+   * `own` means the entry was positively attributed to this config dir,
+   * `unknown` means it could not be attributed and is included so that every
+   * caller errs toward caution (a guard that over-counts refuses; one that
+   * under-counts destroys a live session's identity).
+   */
+  attribution?: "own" | "unknown";
+}
+
+export interface ListDirSessionsOptions {
+  /** Injectable for tests: the liveness probe (defaults to `kill(pid, 0)`). */
+  isAlive?: (pid: number) => boolean;
+  /**
+   * Injectable for tests: resolve a process's CLAUDE_CONFIG_DIR. Returns the
+   * value when set, `null` when the process is readable and the variable is
+   * unset (a default-dir session), `undefined` when unreadable. The default
+   * reader uses `/proc/<pid>/environ` and returns `undefined` off Linux.
+   */
+  readEnvironConfigDir?: (pid: number) => string | null | undefined;
+}
+
+/**
+ * Reproduce Claude's lossy project-directory encoding (`/a.b`, `/a-b`, `/a_b`
+ * all encode to `-a-b`). Exported so there is exactly one definition.
+ */
+export function claudeProjectKey(cwd: string): string {
+  return cwd.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+function canonicalDirPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/** True when a config dir's `sessions` is the machine-shared registry link. */
+function sessionsDirIsShared(sessionsDir: string): boolean {
+  try {
+    if (!lstatSync(sessionsDir).isSymbolicLink()) return false;
+    const target = resolve(dirname(sessionsDir), readlinkSync(sessionsDir));
+    return canonicalDirPath(target) === canonicalDirPath(sharedClaudeSessionsDir());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Default attribution source: `/proc/<pid>/environ`, same-uid readable on
+ * Linux. `null` means the variable is genuinely unset (a default-dir session);
+ * `undefined` means the environment could not be read at all (dead process,
+ * foreign uid, non-Linux platform).
+ */
+function readProcEnvironConfigDir(pid: number): string | null | undefined {
+  if (process.platform !== "linux") return undefined;
+  let raw: Buffer;
+  try {
+    raw = readFileSync(`/proc/${pid}/environ`);
+  } catch {
+    return undefined;
+  }
+  if (raw.length === 0) return undefined; // zombie: environ exists but is empty
+  for (const chunk of raw.toString("utf8").split("\0")) {
+    if (chunk.startsWith("CLAUDE_CONFIG_DIR=")) {
+      const value = chunk.slice("CLAUDE_CONFIG_DIR=".length);
+      return value || null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Attribute one SHARED-registry entry to a config dir.
+ *
+ * Order of evidence: the process's own CLAUDE_CONFIG_DIR (definitive), then
+ * the transcript the entry names (`<configDir>/projects/<encoded-cwd>/
+ * <sessionId>.jsonl` — transcripts stay per-profile, so presence here is
+ * ownership). An entry that resists both stays `unknown` when alive (included,
+ * so guards err toward caution) and is dropped when dead (a dead entry carries
+ * no guard weight and will be reaped).
+ */
+function attributeSharedEntry(
+  configDir: string,
+  pid: number,
+  alive: boolean,
+  record: { sessionId?: unknown; cwd?: unknown },
+  options: ListDirSessionsOptions,
+): "own" | "unknown" | "excluded" {
+  const reader = options.readEnvironConfigDir ?? readProcEnvironConfigDir;
+  const environDir = reader(pid);
+  if (typeof environDir === "string") {
+    return canonicalDirPath(environDir) === canonicalDirPath(configDir) ? "own" : "excluded";
+  }
+  if (environDir === null) {
+    return canonicalDirPath(liveClaudePaths().configDir) === canonicalDirPath(configDir)
+      ? "own"
+      : "excluded";
+  }
+  if (typeof record.sessionId === "string" && typeof record.cwd === "string" && record.cwd) {
+    const transcript = join(
+      configDir,
+      "projects",
+      claudeProjectKey(record.cwd),
+      `${record.sessionId.toLowerCase()}.jsonl`,
+    );
+    if (existsSync(transcript)) return "own";
+  }
+  return alive ? "unknown" : "excluded";
 }
 
 /**
  * Live sessions bound to a config dir, from the tool's `sessions/<pid>.json`
  * heartbeat files. Every one of them flips identity together on an in-place
  * switch — the dir is shared state, not per-session state.
+ *
+ * When the dir's `sessions/` is the machine-shared registry link (see
+ * `lib/claude-session-registry.ts`), the raw listing is machine-wide, so
+ * entries are attributed back to this config dir first — otherwise every
+ * switch guard, auth heal, and occupancy count would see every profile as
+ * busy whenever anything runs anywhere on the box.
  */
-export function listDirLiveSessions(configDir: string): DirSessionInfo[] {
+export function listDirLiveSessions(
+  configDir: string,
+  options: ListDirSessionsOptions = {},
+): DirSessionInfo[] {
   const sessionsDir = join(configDir, "sessions");
   if (!existsSync(sessionsDir)) return [];
+  const aliveProbe = options.isAlive ?? processAlive;
+  const shared = sessionsDirIsShared(sessionsDir);
   const sessions: DirSessionInfo[] = [];
   for (const entry of readdirSync(sessionsDir)) {
     if (!entry.endsWith(".json")) continue;
     let pid = Number.parseInt(entry.slice(0, -".json".length), 10);
+    let record: { pid?: unknown; sessionId?: unknown; cwd?: unknown } = {};
     try {
-      const parsed = JSON.parse(readFileSync(join(sessionsDir, entry), "utf8")) as { pid?: unknown };
-      if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid)) pid = parsed.pid;
+      record = JSON.parse(readFileSync(join(sessionsDir, entry), "utf8")) as typeof record;
+      if (typeof record.pid === "number" && Number.isInteger(record.pid)) pid = record.pid;
     } catch {
       // Fall back to the pid encoded in the filename.
     }
     if (!Number.isInteger(pid) || pid <= 0) continue;
-    sessions.push({ pid, alive: processAlive(pid) });
+    const alive = aliveProbe(pid);
+    if (!shared) {
+      sessions.push({ pid, alive });
+      continue;
+    }
+    const attribution = attributeSharedEntry(configDir, pid, alive, record, options);
+    if (attribution === "excluded") continue;
+    sessions.push({ pid, alive, attribution });
   }
   return sessions.sort((a, b) => a.pid - b.pid);
 }

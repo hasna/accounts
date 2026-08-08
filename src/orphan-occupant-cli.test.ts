@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { attachLiveClaudeSession, type LiveClaudeSession } from "./test-support/live-claude-session.js";
 
 /**
  * The operator surface for the orphan-occupant defect.
@@ -16,6 +17,7 @@ import { join } from "node:path";
 let home: string;
 let sessionDir: string;
 let liveBase: string;
+let liveSessions: LiveClaudeSession[];
 
 const UUID_HOST = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
 const UUID_GUEST = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
@@ -118,12 +120,14 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-orphan-cli-"));
   liveBase = mkdtempSync(join(tmpdir(), "accounts-orphan-live-"));
   sessionDir = join(home, "session-claude");
+  liveSessions = [];
   // The session runs as a fourth account so nothing under test is excluded as
   // "the current one".
   occupy(sessionDir, "dddddddd-4444-4444-8444-dddddddddddd", "session@example.com", "session");
 });
 
 afterEach(() => {
+  for (const session of liveSessions) session.stop();
   rmSync(home, { recursive: true, force: true });
   rmSync(liveBase, { recursive: true, force: true });
 });
@@ -214,8 +218,9 @@ test("auth adopt refuses a live-session dir and exits non-zero", () => {
   const occupied = addFixtureProfile("account006");
   park(occupied, UUID_HOST, "host@example.com", "host");
   occupy(occupied, UUID_GUEST, "guest@example.com", "guest");
-  mkdirSync(join(occupied, "sessions"), { recursive: true });
-  writeFileSync(join(occupied, "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid }));
+  // A real live session attributable to the occupied dir; the CLI subprocess
+  // reads its /proc/<pid>/environ (CLAUDE_CONFIG_DIR=occupied) to attribute it.
+  liveSessions.push(attachLiveClaudeSession(occupied));
   const before = readFileSync(join(occupied, ".credentials.json"));
 
   const adopted = runCli("auth", "adopt", "anya", "--account", UUID_GUEST);
