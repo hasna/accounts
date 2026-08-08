@@ -53,6 +53,15 @@ export const MAX_ARCHIVE_UNPACKED_BYTES = 64 * 1024 * 1024;
 export const MAX_PROMOTION_ATTEMPTS = 6;
 export const FETCH_TIMEOUT_MS = 15_000;
 export const COMMAND_TIMEOUT_MS = 180_000;
+export const INSTALL_VISIBILITY_TIMEOUT_MS = 120_000;
+export const INSTALL_VISIBILITY_POLL_MS = 2_000;
+
+/**
+ * The Accept header npm sends when it resolves an install. The registry varies
+ * on it, so this is a different CDN cache entry from the full document every
+ * other read in this file uses.
+ */
+export const NPM_INSTALL_ACCEPT = "application/vnd.npm.install-v1+json";
 
 const REGISTRY = "https://registry.npmjs.org";
 const GITHUB_API = "https://api.github.com";
@@ -190,6 +199,7 @@ export interface RegistryReleaseAttemptOperations {
   readVersionMetadata: () => Promise<unknown>;
   readPackageMetadata: () => Promise<unknown>;
   readTarball: (url: URL) => Promise<Uint8Array>;
+  awaitInstallVisibility: () => Promise<void>;
   verifyConsumer: () => unknown[];
   verifyCryptographically: (bundles: unknown[]) => Promise<void>;
   verifySemantically: (bundles: unknown[]) => void;
@@ -1275,6 +1285,90 @@ export function createOriginPackumentReader(
   };
 }
 
+export interface InstallVisibilityOperations {
+  readInstallPackument: () => Promise<unknown>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+}
+
+/**
+ * Reads the abbreviated packument — the document npm's install resolver reads,
+ * and the one this file otherwise never touches.
+ *
+ * Deliberately NOT nonce-busted, unlike `createOriginPackumentReader`. The point
+ * of this read is to observe the shared cache entry npm itself will be served,
+ * so a unique URL would answer a question nobody asked. It is safe to poll for
+ * exactly the reason the npm-driven reads are not: the package already exists,
+ * so every response is a 200 that the CDN was going to hold anyway. Polling
+ * cannot install a cache entry that was not already there.
+ */
+export function createInstallPackumentReader(
+  name: string,
+  fetcher?: OriginPackumentFetcher,
+): () => Promise<unknown> {
+  const url = packageUrl(name);
+  return () => fetchJson(url, MAX_JSON_BYTES, { accept: NPM_INSTALL_ACCEPT }, fetcher);
+}
+
+export function packumentListsVersion(input: unknown, version: string): boolean {
+  const versions = record(
+    record(input, "registry packument").versions,
+    "registry packument versions",
+  );
+  return Object.prototype.hasOwnProperty.call(versions, version);
+}
+
+/**
+ * Blocks until npm's install resolver can see this version, before any npm
+ * command is run against the registry.
+ *
+ * A publish is not visible on every read path at once, and the paths do not
+ * share a cache entry: the registry sends `vary: accept`, so the abbreviated
+ * packument npm resolves from (`max-age=300`) is stored separately from the
+ * full document `verifyRegistryMetadata` and `verifyDistTags` already checked.
+ * Passing those three gates therefore says nothing about whether `npm install`
+ * can resolve the version — measured on 0.2.40, which cleared registry bytes,
+ * gitHead, dist-tags and attestations and then failed `npm install` with
+ * ETARGET twenty-one seconds after publishing.
+ *
+ * Waiting here rather than retrying afterwards is the whole point, because the
+ * failing reads poison themselves. The attestations endpoint answers a miss with
+ * `cache-control: max-age=60` and a hit with `max-age=31557600` (measured
+ * against the live registry), so a probe issued before the object is visible
+ * installs a negative entry at the edge and every retry inside the next minute
+ * reads back its own 404. That is why the observed lag tracked the first probe
+ * rather than the publish, and why a wider retry budget cannot fix it: the
+ * budget buys more of the thing that caused the failure.
+ *
+ * This is a condition with a timeout, not a sleep. It costs nothing once the
+ * version is visible, and it is bounded so a genuine registry outage still
+ * fails the release instead of hanging it.
+ */
+export async function waitForInstallVisibility(
+  value: ReleaseCandidate,
+  operations: InstallVisibilityOperations,
+  timeoutMs = INSTALL_VISIBILITY_TIMEOUT_MS,
+  pollMs = INSTALL_VISIBILITY_POLL_MS,
+): Promise<void> {
+  const deadline = operations.now() + timeoutMs;
+  let lastFailure = "no read attempted";
+  for (;;) {
+    try {
+      if (packumentListsVersion(await operations.readInstallPackument(), value.version)) return;
+      lastFailure = `the abbreviated packument does not list ${value.version}`;
+    } catch (error) {
+      lastFailure = error instanceof Error ? error.message : String(error);
+    }
+    if (operations.now() >= deadline) {
+      throw new Error(
+        `${value.name}@${value.version} did not become visible to npm's install resolver ` +
+          `within ${timeoutMs}ms (${lastFailure})`,
+      );
+    }
+    await operations.sleep(pollMs);
+  }
+}
+
 /**
  * Decides whether this candidate may still be published, or whether the version
  * on the registry is this exact candidate from an interrupted run of the same
@@ -1961,10 +2055,17 @@ export function assertExactCliVersion(value: ReleaseCandidate, stdout: string): 
 
 function verifyExactInstallAndAttestations(value: ReleaseCandidate): unknown[] {
   const root = mkdtempSync(join(tmpdir(), "accounts-consumer-"));
+  // npm's cache is process-wide and outlives this function, so a retry would
+  // otherwise re-read whatever the previous attempt stored — including a
+  // pre-publish packument or a 404 from the attestations endpoint. Scoping the
+  // cache to this root, which is created per call and deleted below, makes each
+  // attempt an independent observation of the registry instead of a replay.
+  const cache = join(root, ".npm-cache");
   try {
     writeFileSync(join(root, "package.json"), `${JSON.stringify({ private: true })}\n`, { mode: 0o600 });
     run("npm", [
       "install", "--ignore-scripts", "--audit=false", "--fund=false", "--save-exact",
+      "--cache", cache,
       `${value.name}@${value.version}`,
     ], root, { timeoutMs: 300_000 });
     const packageRoot = join(root, "node_modules", ...value.name.split("/"));
@@ -1979,6 +2080,7 @@ function verifyExactInstallAndAttestations(value: ReleaseCandidate): unknown[] {
     assertExactCliVersion(value, run("node", [cliPath, "--version"], root));
     const audit = JSON.parse(run("npm", [
       "audit", "signatures", "--json", "--include-attestations",
+      "--cache", cache,
     ], root, { timeoutMs: 300_000 })) as unknown;
     return extractVerifiedAttestations(value, audit);
   } finally {
@@ -2020,6 +2122,12 @@ export async function verifyRegistryReleaseAttempt(
   const urls = verifyRegistryMetadata(value, versionMetadata);
   verifyRegistryPackageState(value, phase, await operations.readPackageMetadata());
   verifyDownloadedTarball(value, await operations.readTarball(urls.tarballUrl));
+
+  // Every gate above reads the full packument. npm resolves from the abbreviated
+  // one, which is a separate cache entry, so the consumer install must not be
+  // attempted until that entry has caught up — a premature attempt caches its
+  // own failure and no retry can outlive it.
+  await operations.awaitInstallVisibility();
   const auditedBundles = operations.verifyConsumer();
   await operations.verifyCryptographically(auditedBundles);
   operations.verifySemantically(auditedBundles);
@@ -2038,12 +2146,19 @@ async function verifyRegistryRelease(
 ): Promise<void> {
   let failure: unknown;
   const readPackageMetadata = createOriginPackumentReader(value.name);
+  const readInstallPackument = createInstallPackumentReader(value.name);
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       await verifyRegistryReleaseAttempt(value, phase, {
         readVersionMetadata: () => fetchJson(packageUrl(value.name, value.version)),
         readPackageMetadata,
         readTarball: (url) => fetchLimited(url, MAX_TARBALL_BYTES),
+        awaitInstallVisibility: () =>
+          waitForInstallVisibility(value, {
+            readInstallPackument,
+            sleep: (ms) => Bun.sleep(ms),
+            now: () => Date.now(),
+          }),
         verifyConsumer: () => verifyExactInstallAndAttestations(value),
         verifyCryptographically: (bundles) =>
           verifyProvenanceBundleCryptographically(value, bundles),
