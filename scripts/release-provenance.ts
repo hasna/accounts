@@ -1297,10 +1297,19 @@ export interface InstallVisibilityOperations {
  *
  * Deliberately NOT nonce-busted, unlike `createOriginPackumentReader`. The point
  * of this read is to observe the shared cache entry npm itself will be served,
- * so a unique URL would answer a question nobody asked. It is safe to poll for
- * exactly the reason the npm-driven reads are not: the package already exists,
- * so every response is a 200 that the CDN was going to hold anyway. Polling
- * cannot install a cache entry that was not already there.
+ * so a unique URL would answer a question nobody asked.
+ *
+ * What makes that safe is NOT that the read leaves the edge untouched. A probe
+ * against a URL the CDN is not already holding populates it — the same mechanism
+ * `waitForInstallVisibility` documents below, where a premature read of the
+ * attestations endpoint installs a negative entry and every retry inside the next
+ * minute reads back its own 404. Two other things make it safe. By the time this
+ * read is issued the version provably exists, because `verifyRegistryReleaseAttempt`
+ * has already read its version metadata and re-hashed its downloaded tarball, so
+ * what a miss can install here is a 200 the CDN was going to hold anyway rather
+ * than that negative entry. And nothing acts on a stale hit:
+ * `waitForInstallVisibility` returns only once the document it observes lists the
+ * version, and otherwise fails the release rather than proceeding.
  */
 export function createInstallPackumentReader(
   name: string,
