@@ -18,6 +18,7 @@ import {
   ADVISORY_LOCK_SQL,
   toolLockKey,
 } from "./repo.js";
+import { PURGE_MIGRATION_ID, restorePurgeArchive } from "./destructive-guard.js";
 import { createHandler, type ServiceContext } from "./app.js";
 import { grantAccountsRuntimeRole } from "./runtime-role.js";
 
@@ -275,10 +276,22 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       (migration) => migration.id === "accounts_0003_custom_tools",
     );
     const beforeCustomTools = appMigrations.slice(0, customToolsIndex);
-    const fixturePurgeIndex = appMigrations.findIndex(
-      (migration) => migration.id === "accounts_0006_purge_test_tool_fixtures",
+    // Stop BEFORE the archive, not before the purge.
+    //
+    // `0005a` is ordered between 0005 and 0006, so slicing at the purge applies
+    // the archive HERE — while the fixture tables are still empty — and the
+    // ledger never re-runs an applied migration. The snapshot then captures
+    // nothing, 0006 still destroys every fixture row, and no assertion
+    // downstream can tell that apart from a working archive.
+    //
+    // Seeding while the archive is still pending is what makes the archive
+    // observable, and it is also the real production sequence: the rows exist
+    // first, then archive and purge run together in a single ledger pass.
+    const fixtureArchiveIndex = appMigrations.findIndex(
+      (migration) => migration.id === "accounts_0005a_archive_purged_fixtures",
     );
-    const beforeFixturePurge = appMigrations.slice(0, fixturePurgeIndex);
+    expect(fixtureArchiveIndex).toBeGreaterThan(-1);
+    const beforeFixtureArchive = appMigrations.slice(0, fixtureArchiveIndex);
 
     await new MigrationLedger(client, beforeCustomTools).migrate();
     expect(
@@ -296,7 +309,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       ["migration-probe", "valid", "migration-orphan", "missing"],
     );
 
-    const upgraded = await new MigrationLedger(client, beforeFixturePurge).migrate();
+    const upgraded = await new MigrationLedger(client, beforeFixtureArchive).migrate();
     expect(
       upgraded.plan.find((item) => item.migration.id === "accounts_0003_custom_tools")?.state,
     ).toBe("pending");
@@ -408,6 +421,109 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         ["migration-keep-tool"],
       ),
     ).toEqual({ tool: "migration-keep-tool", name: "migration-fixture-profile" });
+
+    // ARM 1, OBSERVED. Everything above proves 0006 DELETED the fixtures, and
+    // none of it can distinguish a working snapshot from one that preserved
+    // nothing: neuter every archive INSERT and all of it still passes. These
+    // assertions read `destructive_migration_archive` itself, per table, so a
+    // snapshot that captures nothing fails the suite instead of passing it.
+    //
+    // `current_selections` is the row that matters most here. No DELETE in 0006
+    // names it — it is removed by ON DELETE CASCADE — so an archive that missed
+    // it would lose a row silently while every other check stayed green.
+    expect(
+      await client.many<{ table_name: string; archived: number }>(
+        `SELECT table_name, count(*)::int AS archived
+           FROM destructive_migration_archive
+          WHERE migration_id = $1
+          GROUP BY table_name
+          ORDER BY table_name`,
+        [PURGE_MIGRATION_ID],
+      ),
+    ).toEqual([
+      { table_name: "accounts", archived: 4 },
+      { table_name: "current_selections", archived: 1 },
+      { table_name: "custom_tools", archived: 4 },
+    ]);
+    // The archive holds the four leaked tools and nothing else: a snapshot of
+    // the wrong rows is as useless as no snapshot.
+    expect(
+      await client.many<{ tool: string }>(
+        `SELECT row_data ->> 'tool' AS tool
+           FROM destructive_migration_archive
+          WHERE migration_id = $1 AND table_name = 'accounts'
+          ORDER BY tool`,
+        [PURGE_MIGRATION_ID],
+      ),
+    ).toEqual(leakedToolIds.map((tool) => ({ tool })));
+    // row_data carries the real row, not an empty object.
+    expect(
+      await client.get<{ name: string }>(
+        `SELECT row_data ->> 'name' AS name
+           FROM destructive_migration_archive
+          WHERE migration_id = $1 AND table_name = 'accounts' AND row_data ->> 'tool' = $2`,
+        [PURGE_MIGRATION_ID, "fake-login"],
+      ),
+    ).toEqual({ name: "migration-fixture-profile" });
+
+    // A snapshot nobody can restore from is theatre, so exercise the restore
+    // rather than asserting the SQL text mentions it. Both documented traps are
+    // live in this fixture: `custom_tools` must go back first so migration
+    // 0005's reactivate trigger clears the tombstone 0006 wrote, and migration
+    // 0007 has since added `aliases NOT NULL` to a table whose snapshot predates
+    // that column.
+    const restore = await restorePurgeArchive(client);
+    expect(restore.migrationId).toBe(PURGE_MIGRATION_ID);
+    expect(restore.archived).toEqual({
+      custom_tools: 4,
+      accounts: 4,
+      current_selections: 1,
+    });
+    expect(restore.restored).toEqual(restore.archived);
+    expect(
+      await client.many<{ tool: string; name: string }>(
+        "SELECT tool, name FROM accounts WHERE tool = ANY($1::text[]) ORDER BY tool",
+        [leakedToolIds],
+      ),
+    ).toEqual(leakedToolIds.map((tool) => ({ tool, name: "migration-fixture-profile" })));
+    expect(
+      await client.many<{ tool: string }>(
+        "SELECT tool FROM current_selections WHERE tool = ANY($1::text[]) ORDER BY tool",
+        [leakedToolIds],
+      ),
+    ).toEqual([{ tool: "fake-login" }]);
+    // The reactivate trigger cleared the tombstones, which is why custom_tools
+    // has to restore before accounts: with the tombstone still present,
+    // `accounts_guard_removed_custom_tool` raises on every account insert.
+    expect(
+      await client.many<{ id: string }>(
+        "SELECT id FROM custom_tool_tombstones WHERE id = ANY($1::text[]) ORDER BY id",
+        [leakedToolIds],
+      ),
+    ).toEqual([]);
+    // Restoring is idempotent: the archive is still intact and a second restore
+    // adds nothing, so an operator can re-run it without duplicating rows.
+    const restoredTwice = await restorePurgeArchive(client);
+    expect(restoredTwice.archived).toEqual(restore.archived);
+    expect(restoredTwice.restored).toEqual({
+      custom_tools: 0,
+      accounts: 0,
+      current_selections: 0,
+    });
+
+    // Return the schema to the purged state this test's later assertions
+    // describe, and prove the purge is re-runnable over restored rows.
+    const purgeMigration = appMigrations.find(
+      (migration) => migration.id === "accounts_0006_purge_test_tool_fixtures",
+    );
+    expect(purgeMigration).toBeDefined();
+    await client.execute(purgeMigration!.sql);
+    expect(
+      await client.many<{ tool: string }>(
+        "SELECT tool FROM accounts WHERE tool = ANY($1::text[]) ORDER BY tool",
+        [leakedToolIds],
+      ),
+    ).toEqual([]);
 
     await client.close();
     client = openClient();
