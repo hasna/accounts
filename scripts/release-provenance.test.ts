@@ -7,12 +7,15 @@ import {
   BREAK_GLASS_MIN_REASON_LENGTH,
   BREAK_GLASS_REASON_ENV,
   BREAK_GLASS_TOKEN,
+  INSTALL_VISIBILITY_POLL_MS,
+  INSTALL_VISIBILITY_TIMEOUT_MS,
   MAX_ARCHIVE_ENTRIES,
   MAX_ARCHIVE_ENTRY_BYTES,
   MAX_ARCHIVE_UNPACKED_BYTES,
   MAX_JSON_BYTES,
   MAX_PROMOTION_ATTEMPTS,
   MAX_TARBALL_BYTES,
+  NPM_INSTALL_ACCEPT,
   PUBLISH_PREDICATE,
   PROVENANCE_PREDICATE,
   RELEASE_BUN_VERSION,
@@ -27,12 +30,14 @@ import {
   assertPromotionSnapshotUnchanged,
   assertPromotionVersion,
   assertTrustedPublishEnvironment,
+  createInstallPackumentReader,
   createOriginPackumentReader,
   evaluateDirectPublish,
   expectedSigstoreIdentity,
   extractVerifiedAttestations,
   originIntentPackumentUrl,
   packagePurl,
+  packumentListsVersion,
   parseRetryOptions,
   promoteLatestMonotonically,
   readLimited,
@@ -50,6 +55,7 @@ import {
   verifyRegistryReleaseAttempt,
   verifyReleaseRulesets,
   verifySigstoreBundle,
+  waitForInstallVisibility,
   type PackResult,
   type ReleaseCandidate,
 } from "./release-provenance";
@@ -759,6 +765,7 @@ test("uses distinct origin-intent initial and terminal reads for staged and prom
       readVersionMetadata: async () => registryVersionMetadata(value),
       readPackageMetadata,
       readTarball: async () => tarball,
+      awaitInstallVisibility: async () => {},
       verifyConsumer: () => attestations(),
       verifyCryptographically: async () => {},
       verifySemantically: () => {},
@@ -898,6 +905,7 @@ test("terminal promoted verification cannot succeed from a permanently stale pla
     readVersionMetadata: async () => registryVersionMetadata(value),
     readPackageMetadata,
     readTarball: async () => tarball,
+    awaitInstallVisibility: async () => {},
     verifyConsumer: () => attestations(),
     verifyCryptographically: async () => {},
     verifySemantically: () => {},
@@ -1530,6 +1538,7 @@ test("rejects a staged dist-tag mutation during install and audit before reporti
       return packageMetadata;
     },
     readTarball: async () => tarball,
+    awaitInstallVisibility: async () => {},
     verifyConsumer: () => {
       packageMetadata = registryPackage(
         value.version,
@@ -1621,6 +1630,7 @@ test("validates every version identity and dist-tag target in every package rere
               : validForPhase(phase);
           },
           readTarball: async () => tarball,
+          awaitInstallVisibility: async () => {},
           verifyConsumer: () => attestations(),
           verifyCryptographically: async () => {},
           verifySemantically: () => {},
@@ -1675,6 +1685,7 @@ test("validates every version identity and dist-tag target in every package rere
           return packageReads === 1 ? change.initial : change.terminal;
         },
         readTarball: async () => tarball,
+        awaitInstallVisibility: async () => {},
         verifyConsumer: () => attestations(),
         verifyCryptographically: async () => {},
         verifySemantically: () => {},
@@ -1728,6 +1739,7 @@ test("rejects promoted monotonic drift at every slow verification gate before re
         if (mutationGate === "tarball") mutatePackage();
         return tarball;
       },
+      awaitInstallVisibility: async () => {},
       verifyConsumer: () => {
         if (mutationGate === "consumer") mutatePackage();
         return attestations();
@@ -2134,6 +2146,142 @@ test("release workflow publishes one preserved tarball under staging before prom
   expect(implementation).toContain(
     "readTarball: (url) => fetchLimited(url, MAX_TARBALL_BYTES)",
   );
+});
+
+test("waits for the version on npm's own install packument, polling the shared entry rather than a nonce", async () => {
+  const requested: URL[] = [];
+  const accepted: Array<string | undefined> = [];
+  let reads = 0;
+  const readInstallPackument = createInstallPackumentReader(
+    candidate.name,
+    async (url, init) => {
+      requested.push(new URL(url));
+      accepted.push((init.headers as Record<string, string> | undefined)?.accept);
+      reads += 1;
+      return Response.json(
+        reads < 3
+          ? { versions: { "0.2.12": {} } }
+          : { versions: { "0.2.12": {}, [candidate.version]: {} } },
+      );
+    },
+  );
+  const slept: number[] = [];
+
+  await expect(waitForInstallVisibility(candidate, {
+    readInstallPackument,
+    sleep: async (ms) => { slept.push(ms); },
+    now: () => 0,
+  })).resolves.toBeUndefined();
+
+  expect(reads).toBe(3);
+  expect(slept).toEqual([INSTALL_VISIBILITY_POLL_MS, INSTALL_VISIBILITY_POLL_MS]);
+  // npm's Accept header, because the registry sends `vary: accept` and this must
+  // observe the entry npm is served rather than the full document.
+  expect(accepted).toEqual([NPM_INSTALL_ACCEPT, NPM_INSTALL_ACCEPT, NPM_INSTALL_ACCEPT]);
+  // Deliberately the opposite of createOriginPackumentReader: one shared URL,
+  // never a unique one, or it would answer about a cache entry npm never reads.
+  expect(new Set(requested.map((url) => url.href)).size).toBe(1);
+  expect(requested[0]!.search).toBe("");
+});
+
+test("fails the release instead of hanging when npm's install packument never catches up", async () => {
+  let elapsed = 0;
+  let reads = 0;
+
+  await expect(waitForInstallVisibility(candidate, {
+    readInstallPackument: async () => {
+      reads += 1;
+      return { versions: { "0.2.12": {} } };
+    },
+    sleep: async (ms) => { elapsed += ms; },
+    now: () => elapsed,
+  })).rejects.toThrow(
+    `${candidate.name}@${candidate.version} did not become visible to npm's install resolver`,
+  );
+
+  expect(reads).toBe(INSTALL_VISIBILITY_TIMEOUT_MS / INSTALL_VISIBILITY_POLL_MS + 1);
+});
+
+test("keeps waiting when the install packument read itself fails, and reports the last failure", async () => {
+  let elapsed = 0;
+  await expect(waitForInstallVisibility(candidate, {
+    readInstallPackument: async () => { throw new Error("GET registry.npmjs.org returned 503"); },
+    sleep: async (ms) => { elapsed += ms; },
+    now: () => elapsed,
+  })).rejects.toThrow("GET registry.npmjs.org returned 503");
+});
+
+test("reads version presence from the packument npm resolves against", () => {
+  const packument = registryPackage("0.2.12", ["0.2.12", candidate.version]);
+  expect(packumentListsVersion(packument, candidate.version)).toBe(true);
+  expect(packumentListsVersion(packument, "9.9.9")).toBe(false);
+  expect(() => packumentListsVersion({}, candidate.version)).toThrow(
+    "registry packument versions",
+  );
+});
+
+test("establishes install visibility before the consumer install, not after it fails", async () => {
+  const packageJson = Buffer.from(JSON.stringify({
+    name: candidate.name,
+    version: candidate.version,
+    gitHead: candidate.commit,
+  }));
+  const tarball = archive([
+    tarEntry("package/package.json", packageJson.length, "0", packageJson),
+    tarEntry("package/dist/cli.js", 3, "0", Buffer.from("cli")),
+  ]);
+  const value: ReleaseCandidate = {
+    ...candidate,
+    size: tarball.length,
+    shasum: createHash("sha1").update(tarball).digest("hex"),
+    integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+    fileCount: 2,
+    unpackedBytes: packageJson.length + 3,
+  };
+  const order: string[] = [];
+
+  await expect(verifyRegistryReleaseAttempt(value, "staged", {
+    readVersionMetadata: async () => registryVersionMetadata(value),
+    readPackageMetadata: async () => registryPackage("0.2.12", ["0.2.12", value.version], value),
+    readTarball: async () => tarball,
+    awaitInstallVisibility: async () => { order.push("visibility"); },
+    verifyConsumer: () => { order.push("consumer"); return attestations(); },
+    verifyCryptographically: async () => { order.push("cryptographic"); },
+    verifySemantically: () => { order.push("semantic"); },
+  })).resolves.toBeUndefined();
+
+  // Without the gate this reads ["consumer", ...]: `npm install` and
+  // `npm audit signatures` ran against read paths that had not caught up, and a
+  // miss on the attestations endpoint is cached for 60s, so the retries that
+  // followed re-read the probe's own 404.
+  expect(order).toEqual(["visibility", "consumer", "cryptographic", "semantic"]);
+});
+
+test("gives every consumer verification its own npm cache so a retry is a fresh observation", () => {
+  const implementation = readFileSync(
+    new URL("./release-provenance.ts", import.meta.url),
+    "utf8",
+  );
+  const consumer = implementation.slice(
+    implementation.indexOf("function verifyExactInstallAndAttestations("),
+    implementation.indexOf("export function parseRetryOptions("),
+  );
+  expect(consumer).toContain('const cache = join(root, ".npm-cache");');
+  // Both npm invocations, or the one left out keeps reading the shared cache.
+  expect(consumer.match(/"--cache", cache,/g)).toHaveLength(2);
+  // The cache lives under the per-call temp root, so it is removed with it.
+  expect(consumer).toContain('mkdtempSync(join(tmpdir(), "accounts-consumer-"))');
+  expect(consumer).toContain("rmSync(root, { recursive: true, force: true })");
+
+  const verification = implementation.slice(
+    implementation.indexOf("async function verifyRegistryRelease("),
+    implementation.indexOf("async function promoteDistTag("),
+  );
+  // Created once, outside the retry loop, like the origin reader beside it.
+  expect(
+    verification.indexOf("const readInstallPackument = createInstallPackumentReader(value.name);"),
+  ).toBeLessThan(verification.indexOf("for (let attempt = 1;"));
+  expect(verification).toContain("awaitInstallVisibility: () =>");
 });
 
 test("package lifecycle rejects direct publication outside the preserved-artifact wrapper", () => {
