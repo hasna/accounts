@@ -6,6 +6,55 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.40] - 2026-08-08
+
+Release span measured from the previous release tag to the head being published
+(`npm/accounts/v0.2.39` = `3becd9e9` .. `a955485e`): two commits, one of them a
+behaviour change. `2e30fd6` (#140) is docs-only and recorded the 0.2.39 workflow
+release.
+
+**This release also carries everything 0.2.39 carried.** 0.2.39 published to the
+registry and was never promoted, so `latest` stayed at 0.2.38 and #134, #136,
+#137 and #138 reached no install. Their entries are under `[0.2.39]` below and
+are not repeated here.
+
+### Fixed
+
+- **An interrupted release resumes instead of burning the version (#141).** A
+  publish consumes the version number irreversibly, and `ensureUnpublished` was
+  a bare `check(response.status === 404)` with no idempotent branch — so a run
+  that published and then failed a later gate could not be re-run at all: the
+  preflight refused at the first step and every subsequent step was skipped.
+  Measured on release run `31225016753`, which published the 0.2.39 tarball at
+  `22:51:48.830Z` and then failed step 17 (`verify-registry --phase staged`) on
+  an npm attestations-endpoint `E404`; attempt 2 of the same run failed at step
+  14 with `@hasna/accounts@0.2.39 already exists; versions are immutable` and
+  steps 15-20 skipped. The version was burned for a fault that had nothing to do
+  with the artefact.
+
+  `resolvePublicationState()` is now shared by `ensure-unpublished` and
+  `publish-staged`, and `publish-staged` re-resolves immediately before it
+  mutates rather than trusting the earlier step — matching how promotion re-reads
+  its snapshot before acting. `"resumable"` is returned only when the published
+  version is provably the artefact in hand and nothing has been promoted from it,
+  and the proof trusts no registry-reported field: `verifyDownloadedTarball`
+  re-downloads the tarball and hashes those bytes locally (sha1 and sha512)
+  against the integrity of the artefact just re-hashed on disk. Registry metadata
+  and dist-tags are checked too, but byte identity carries the decision.
+
+  The immutability guarantee is unchanged. A version occupied by anything other
+  than this exact artefact still refuses, and now names which conjunct failed.
+  Promotion gating is untouched: `verifyDistTags(_, _, "staged")` refuses to
+  resume once the intended tag already points at this version.
+
+  **Deliberately not shipped alongside it: a wider retry budget for the
+  attestation read.** The endpoint lag is bounded only as `>24s` and `<4m05s`
+  from a single observation, and `parseRetryOptions` caps the expressible budget
+  at 6 attempts x 10s = 50s, so raising the defaults is not provably sufficient
+  and must not be reported as a fix on that basis. Making the lost race
+  recoverable fixes the expensive half regardless of what the lag turns out to
+  be. Tracked as todos `3fdfd3f6`.
+
 ## [0.2.39] - 2026-08-08
 
 Release span measured from the previous release tag to the head being published
