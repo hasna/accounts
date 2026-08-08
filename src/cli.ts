@@ -1155,6 +1155,7 @@ program
           ...(result.reason ? { reason: result.reason } : {}),
         };
       });
+      const blocked = rows.filter((row) => row.outcome === "blocked").length;
 
       if (opts.json) {
         console.log(
@@ -1164,6 +1165,7 @@ program
             2,
           ),
         );
+        if (blocked > 0) process.exitCode = 1;
         return;
       }
       console.log(chalk.bold(`shared registry: ${sharedClaudeSessionsDir()}`));
@@ -1178,8 +1180,7 @@ program
           console.log(chalk.dim(`• ${row.outcome}: ${detail}`));
         }
       }
-      const blocked = rows.filter((row) => row.outcome === "blocked").length;
-      if (blocked > 0) process.exit(1);
+      if (blocked > 0) process.exitCode = 1;
     }),
   );
 

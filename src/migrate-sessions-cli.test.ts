@@ -83,6 +83,29 @@ test("migrate-sessions --dir migrates a real dir and is idempotent", () => {
   expect(parsedSecond.results[0]?.outcome).toBe("already-linked");
 });
 
+test("migrate-sessions --json exits non-zero while preserving a blocked structured result", () => {
+  const dir = join(root, "blocked-json");
+  mkdirSync(join(dir, "sessions"), { recursive: true });
+  writeFileSync(join(dir, "sessions", "notes.txt"), "unexpected registry content\n");
+
+  const result = runCli("migrate-sessions", "--dir", dir, "--json");
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toBe("");
+  const parsed = JSON.parse(result.stdout) as {
+    schema: string;
+    results: Array<{ dir: string; outcome: string; reason?: string }>;
+  };
+  expect(parsed.schema).toBe("hasna.accounts.migrate-sessions/v1");
+  expect(parsed.results).toHaveLength(1);
+  expect(parsed.results[0]?.dir).toBe(dir);
+  expect(parsed.results[0]?.outcome).toBe("blocked");
+  expect(parsed.results[0]?.reason).toContain("unexpected content");
+  expect(lstatSync(join(dir, "sessions")).isDirectory()).toBe(true);
+  expect(lstatSync(join(dir, "sessions")).isSymbolicLink()).toBe(false);
+  expect(readdirSync(join(dir, "sessions"))).toEqual(["notes.txt"]);
+});
+
 test("migrate-sessions --all covers every registered claude profile", () => {
   expect(runCli("add", "mig-one", "--email", "one@example.com").status).toBe(0);
   expect(runCli("add", "mig-two", "--email", "two@example.com").status).toBe(0);
